@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Logs
+log_info/base/logs/
+*.log
+nohup.out
+
+# Editor
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Trained model weights (too large for git, use Git LFS or download separately)
+model/
+paddle_jetson/base/deploy/
+paddle_jetson/base/front_model2/
+paddle_jetson/base/task_wbt2025/
+paddle_jetson/base/task2025/
+paddle_jetson/base/mot_ppyoloe_s_36e_pipeline/
+paddle_jetson/base/PPLCNet_x1_0_person_attribute_945_infer/
+paddle_jetson/base/ch_PP-OCRv3_det_infer/
+paddle_jetson/base/ch_PP-OCRv3_rec_infer/
+paddle_jetson/base/lane_model/
+vehicle/base/Run.bin
+
+# Collected data
+collect_wrap/base/image_set1/
+collect_wrap/base/image_set2/
+
+
+.pubrak

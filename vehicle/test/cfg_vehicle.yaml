@@ -1,0 +1,62 @@
+vehicle_cfg:
+  chassis_type: MecanumChassis  # TricycleChassis
+  
+  wheel:
+    motor_type: motor_280
+    raduis: 0.03
+  
+  Diff2Chassis:
+    size:
+      track: 0.2 # 轮距
+    wheel:
+      port_list: [1, 2]
+
+  Diff4Chassis:
+    size:
+      track: 0.2 # 轮距
+    wheel:
+      port_list: [1, 2, 3, 4]
+
+  TricycleChassis:
+    size:
+      raduis_base: 0.1 # 轮距
+    wheel:
+      port_list: [1, 2, 3]
+
+  QuadricycleChassis:
+    size:
+      raduis_base: 0.113 # 轮中心距
+    wheel:
+      port_list: [1, 2, 3, 4]
+
+  MecanumChassis:
+    size:
+      track: 0.205 # 轮距
+      wheel_base: 0.14 # 轴距
+    wheel:
+      port_list: [2, 1, 3, 4]
+  
+pid_yaw_params:
+  Kp: 8
+  Ki: 0.0
+  Kd: 0
+  setpoint: 0
+  output_limits:
+  - -1.5
+  - 1.5
+pid_x_params:
+  Kp: 6
+  Ki: 0
+  Kd: 0.2
+  setpoint: 0
+  output_limits:
+  - -0.3
+  - 0.3
+pid_y_params:
+  Kp: 6
+  Ki: 0
+  Kd: 0.2
+  setpoint: 0
+  output_limits:
+  - -0.3
+  - 0.3

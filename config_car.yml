@@ -1,0 +1,61 @@
+wbt_car: 0.1
+camera:
+  front: 2
+  side: 1
+io:
+  left_sensor: 8
+  right_sensor: 7
+  key: 1
+  light: 2
+speed:
+  x:
+    limit: 0.7
+  y:
+    limit: 0.7
+  angle:
+    limit: 3
+
+# 巡航pid
+lane_pid:
+  cfg_pid_y:
+    Kp: 4
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+  cfg_pid_angle:
+    Kp: 3
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-1.5, 1.5]
+
+# det巡航pid
+det_pid:
+  cfg_pid_y:
+    Kp: 1
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+  cfg_pid_angle:
+    Kp: 1
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-1.5, 1.5]
+
+# 定位pid参数
+location_pid:
+  pid_x:
+    Kp: 2
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
+  pid_y:
+    Kp: 2
+    Ki: 0
+    Kd: 0
+    setpoint: 0
+    output_limits: [-0.7, 0.7]
