@@ -14,6 +14,7 @@
 | [camera-system.md](camera-system.md) | 摄像头采集、线程模型、设备约定 | ⭐⭐ |
 | [llm-integration.md](llm-integration.md) | 大模型集成（ErnieBot/DeepSeek/Qwen）、Prompt 工程 | ⭐⭐ |
 | [task-system.md](task-system.md) | 任务原语 MyTask、竞赛脚本组织、任务流程 | ⭐⭐⭐ |
+| [qqq-control-layers.md](qqq-control-layers.md) | qqq.py 机器控制层次分析（6 层架构自底向上） | ⭐⭐⭐ |
 | [config-reference.md](config-reference.md) | 所有配置文件详解、参数说明 | ⭐⭐ |
 | [file-structure.md](file-structure.md) | 目录结构、文件清单、可删除文件 | ⭐ |
 | [known-issues.md](known-issues.md) | 已知 Bug、安全问题、技术债务 | ⭐⭐⭐ |
