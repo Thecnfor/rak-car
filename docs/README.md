@@ -8,6 +8,7 @@
 |------|------|:---:|
 | [architecture.md](architecture.md) | 整体架构、分层设计、依赖关系 | ⭐⭐⭐ |
 | [hardware-comm.md](hardware-comm.md) | Jetson ↔ 单片机通信协议（MC601/MC602 帧格式、命令表） | ⭐⭐⭐ |
+| [hardware-port-mapping.md](hardware-port-mapping.md) | 代码文件与 MC602 硬件接口对应表（M口/S口/P口/步进电机） | ⭐⭐⭐ |
 | [vehicle-system.md](vehicle-system.md) | 底盘运动学、里程计、麦轮/差速/三轮运动学公式 | ⭐⭐⭐ |
 | [arm-system.md](arm-system.md) | 机械臂子系统、步进电机、舵机、真空泵 | ⭐⭐ |
 | [inference-system.md](inference-system.md) | ZMQ 推理服务、模型部署、检测/分割/OCR 流水线 | ⭐⭐⭐ |
