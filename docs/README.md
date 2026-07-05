@@ -21,6 +21,9 @@
 | [known-issues.md](known-issues.md) | 已知 Bug、安全问题、技术债务 | ⭐⭐⭐ |
 | [system-environment.md](system-environment.md) | 系统环境依赖、刷机恢复指南、udev 规则、systemd 服务 | ⭐⭐⭐ |
 | [ros-analysis.md](ros-analysis.md) | ROS 状态分析、ROS2 迁移评估、替代方案 | ⭐⭐ |
+| [branch-strategy.md](contributing/branch-strategy.md) | 分支策略与协作工作流（main / develop/ros2-sidecar） | ⭐⭐⭐ |
+| [jetpack6-ros2-humble.md](migration/jetpack6-ros2-humble.md) | JetPack 6 / Ubuntu 22.04 / ROS2 Humble 迁移计划（赛后） | ⭐⭐ |
+| [2026-07-05-ros2-sidecar-design.md](superpowers/specs/2026-07-05-ros2-sidecar-design.md) | ROS2 Sidecar 架构完整设计 spec（A+C 仿真路线） | ⭐⭐⭐ |
 
 ### 架构决策记录 (ADR)
 
@@ -28,6 +31,7 @@
 |-----|:---:|------|
 | [ADR-001](adr/ADR-001-ros-noetic-integration.md) | 提议中 | 是否集成 ROS Noetic — 推荐渐进式轻量集成（方案 C） |
 | [ADR-002](adr/ADR-002-python-environment.md) | 提议中 | Python 环境管理 — 推荐 venv + system-site-packages |
+| [ADR-003](adr/ADR-003-ros2-sidecar-integration.md) | 提议中 | ROS2 Sidecar 架构 + 仿真回路（A+C 路线，赛后执行） |
 
 ADR 模板：[adr/TEMPLATE.md](adr/TEMPLATE.md)
 
