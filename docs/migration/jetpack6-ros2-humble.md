@@ -273,4 +273,4 @@ ls -la /tmp/backup/
 
 **变更记录**:
 - 2026-07-05: 初稿，由 Thecnfor 起草
-- 待补充: 真实 Orin 模组型号 + 备用载板 availability
+- 2026-07-05: 填入 Orin 模组信息 — Jetson Orin NX 16GB（项目当前使用，见 `docs/system-environment.md`）；备用载板 availability 待 Thecnfor 现场确认（建议刷机前向 NVIDIA 经销商备货 1 块备用模组，预算约 ¥3500）

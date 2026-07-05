@@ -58,7 +58,7 @@ ADR-001 同时给出了 ROS2 迁移触发条件：
 - 同步部署 Gazebo Garden 仿真回路（URDF 来源：`docs/hardware-port-mapping.md`），实现"host PC 离线仿真 + Jetson 实机回归"双轨开发
 - **比赛前 4 周内（2026-07-13 → 2026-08-12）冻结所有 ROS2 相关代码改动**，与 `docs/migration/jetpack6-ros2-humble.md` 时间表对齐
 
-> ADR-001 方案 C（Noetic sidecar）作为**短期临时桥梁**继续执行至 8.10 比赛结束。比赛结束后本 ADR-003 接管，ROS Noetic 节点下线，ROS2 Humble 节点接替。ADR-001 不撤销，但其"ROS1 Noetic"路径在赛后被本 ADR 取代。
+> ADR-001 方案 C（Noetic sidecar）作为**短期临时桥梁**继续执行至 2026-08-12 比赛结束。比赛结束后本 ADR-003 接管，ROS Noetic 节点下线，ROS2 Humble 节点接替。ADR-001 不撤销，但其"ROS1 Noetic"路径在赛后被本 ADR 取代。
 
 ## 方案对比
 
@@ -214,21 +214,23 @@ URDF 来源：`docs/hardware-port-mapping.md` 已记录 M1-M6 / S2-S3-S7 / stepp
 
 | Topic | Type | 发布节点 | 频率 |
 |-------|------|----------|------|
-| `/camera/front/image_raw` | sensor_msgs/Image | camera_node | 10 Hz (限频) |
-| `/camera/side/image_raw` | sensor_msgs/Image | camera_node | 10 Hz |
-| `/odom` | nav_msgs/Odometry | car_status_node | 30 Hz |
-| `/joint_states` | sensor_msgs/JointState | car_status_node | 30 Hz |
-| `/arm/state` | ros2_sidecar_msgs/ArmState | car_status_node | 10 Hz |
-| `/detection/results` | ros2_sidecar_msgs/DetectionArray | inference_bridge_node | 5 Hz |
-| `/lane/result` | ros2_sidecar_msgs/LaneResult | inference_bridge_node | 20 Hz |
-| `/tf`, `/tf_static` | tf2_msgs/TFMessage | tf_broadcaster | 30 Hz |
+| `/vehicle_wbt/camera/front/image_raw` | sensor_msgs/Image | camera_node | 10 Hz (限频，与下游 10 Hz 推理匹配) |
+| `/vehicle_wbt/camera/side/image_raw` | sensor_msgs/Image | camera_node | 10 Hz |
+| `/vehicle_wbt/odom` | nav_msgs/Odometry | car_status_node | 50 Hz (控制回路需要) |
+| `/vehicle_wbt/joint_states` | sensor_msgs/JointState | car_status_node | 50 Hz |
+| `/vehicle_wbt/arm/state` | vehicle_wbt_msgs/ArmState | car_status_node | 10 Hz |
+| `/vehicle_wbt/perception/detections/task` | vehicle_wbt_msgs/DetectionArray | inference_bridge_node | 10 Hz |
+| `/vehicle_wbt/perception/lane` | vehicle_wbt_msgs/LaneResult | inference_bridge_node | 20 Hz |
+| `/vehicle_wbt/tf`, `/vehicle_wbt/tf_static` | tf2_msgs/TFMessage | tf_broadcaster | 50 Hz / latched |
 | `/visualization_marker` | visualization_msgs/Marker | rviz_markers_node | 10 Hz |
+
+> 注：以上 topic 名称与 `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md` 中的完整 schema 完全对齐；命名空间 `/vehicle_wbt/...` 是为了避免与 Jetson 上其他 ROS2 节点冲突。
 
 ### 安全约束（与 CLAUDE.md 一致）
 
 - **sidecar 节点不得调用任何 `controller_wrap` 写方法**（电机 / 舵机 / 步进 / 真空泵 / IO）。违反此约束将破坏现有运动控制不变量。
 - **sidecar 节点不得改写 `/tmp/cam_front.jpg` 等共享文件**。
-- **sidecar 节点写频率受 rclpy QoS 限频**：图像 10 Hz、状态 30 Hz、检测 5 Hz（避免拖慢 Jetson）。
+- **sidecar 节点写频率受 rclpy QoS 限频**：图像 10 Hz、状态 50 Hz（控制回路需要）、检测 10 Hz、车道线 20 Hz（避免拖慢 Jetson）。
 - **Gazebo 仿真回路默认在 host PC**，不在 Jetson 上跑（Gazebo 资源消耗大）。
 - **systemd 服务分层**：`py_boot.service`（现有，依赖 `infer_back_end.service`）+ `ros2_sidecar.service`（新增，独立启动，ros2_sidecar.service 不依赖 py_boot.service，反之亦然）。
 
