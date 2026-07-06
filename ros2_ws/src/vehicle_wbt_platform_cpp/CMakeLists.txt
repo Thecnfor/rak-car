@@ -62,6 +62,37 @@ ament_target_dependencies(${PROJECT_NAME} PUBLIC
 )
 
 # -----------------------------------------------------------------------------
+# Executable rclcpp nodes
+# -----------------------------------------------------------------------------
+add_executable(camera_node src/camera_node.cpp)
+ament_target_dependencies(camera_node rclcpp sensor_msgs)
+
+add_executable(infrared_node src/infrared_node.cpp)
+ament_target_dependencies(infrared_node rclcpp sensor_msgs)
+
+add_executable(mecanum_chassis_node src/mecanum_chassis_node.cpp)
+ament_target_dependencies(mecanum_chassis_node
+  rclcpp geometry_msgs nav_msgs tf2_ros
+)
+target_link_libraries(mecanum_chassis_node ${PROJECT_NAME})
+
+add_executable(arm_node src/arm_node.cpp)
+ament_target_dependencies(arm_node
+  rclcpp trajectory_msgs "rosidl_typesupport_cpp"
+)
+target_link_libraries(arm_node ${PROJECT_NAME})
+
+add_executable(safety_gate_node src/safety_gate_node.cpp)
+ament_target_dependencies(safety_gate_node
+  rclcpp geometry_msgs std_msgs
+)
+
+install(TARGETS
+  camera_node infrared_node mecanum_chassis_node arm_node safety_gate_node
+  RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+# -----------------------------------------------------------------------------
 # ros2_control hardware interface plugin (pluginlib export)
 # -----------------------------------------------------------------------------
 pluginlib_export_plugin_description_file(hardware_interface plugin.xml)
@@ -75,8 +106,8 @@ install(
 )
 
 install(
-  DIRECTORY launch
-  DESTINATION share/${PROJECT_NAME}/launch
+  DIRECTORY launch config params urdf
+  DESTINATION share/${PROJECT_NAME}
 )
 
 install(

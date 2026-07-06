@@ -4,154 +4,132 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Python robotics project for an autonomous vehicle robot running on NVIDIA Jetson. The robot performs lane following, object detection, robotic arm manipulation, food sorting, and AI-powered natural language interaction. Runs as a systemd service (`py_boot.service`) at boot.
+**vehicle_wbt** is a ROS2 Humble-based autonomous vehicle robot. It runs on NVIDIA Jetson Orin Nano (4GB) and is observed/controlled via standard ROS2 topics, services, and ros2_control hardware interfaces. The system performs lane following, object detection, robotic arm manipulation, and AI-assisted task execution.
 
-## Development vs Target Architecture
+**Branch**: This branch (`develop/ros2-sidecar`) is the ROS2 future. The legacy Python+ZMQ stack on `main` is frozen for the 8.10-8.12 competition.
 
-> **重要**: 本项目采用 **dev/target 双机架构**，所有开发、测试、可视化在 dev 桌面完成，Jetson 只跑 sidecar 节点。
+## Architecture: dev/target dual-machine
 
-- **Dev 桌面机**（当前 Ubuntu 26.04，需装 ROS2 — 推荐 Docker 跑 Jazzy）：编辑、pytest、gtest、Gazebo 仿真、RViz 可视化
-- **Jetson Orin Nano 4GB**（JetPack 6 + Ubuntu 22.04 + ROS2 Humble base）：SSH `xrak@orin`，跑 sidecar 节点发布真实传感器数据
-- 详见 [`docs/development/README.md`](docs/development/README.md)
+- **Dev desktop** (Ubuntu 22.04/24.04/26.04 + ROS2 desktop): editing, testing, simulation, RViz visualization
+- **Target** (Jetson Orin Nano 4GB, JetPack 6 + ROS2 Humble base): real hardware I/O, sidecar nodes, no GUI
+- SSH: `ssh xrak@orin` (orin hostname)
+- Both communicate via ROS_DOMAIN_ID=42 over DDS
+- See [`docs/development/README.md`](docs/development/README.md) for the complete dev/target workflow
 
-**Dev 工作流**（5 步日常循环）：
+## Repository structure
+
+This branch is a **complete ROS2 project**. All legacy Python/ZMQ code has been removed.
+
+```
+ros2_ws/src/
+├── vehicle_wbt_platform_cpp/      # C++ core (5 rclcpp nodes + ros2_control plugin)
+│   ├── include/                   # public headers (BaseController, MecanumChassis, ...)
+│   ├── src/                       # 5 rclcpp nodes + MecanumChassis + MC602Adapter + ros2_control plugin
+│   ├── msg/                       # custom messages (LaneResult, DetectionArray, ActuatorState)
+│   ├── launch/                    # full_system.launch.py + mock_system.launch.py
+│   ├── config/                    # cyclonedds.xml + safety.yaml
+│   ├── urdf/                      # robot description
+│   ├── test/                      # gtest
+│   └── CMakeLists.txt
+└── vehicle_wbt_platform/          # Python orchestrator (config_loader, SidecarOrchestrator)
+    ├── vehicle_wbt_platform/
+    │   ├── config_loader.py        # strict schema validation
+    │   ├── component_base.py       # BaseComponent + ComponentContext
+    │   ├── controller_base.py      # BaseControllerHardwareInterface
+    │   ├── mc602_adapter.py        # MC602Adapter (Python fallback)
+    │   ├── chassis_base.py         # BaseChassis
+    │   ├── orchestrator.py         # SidecarOrchestrator
+    │   └── __main__.py             # ENABLE_ROS2 gate
+    └── test/                       # pytest (45 tests, all passing)
+```
+
+`config_sensors.yml` at repo root is the **single source of truth** for what hardware is wired.
+
+## Key conventions
+
+### Topic namespace
+
+**ALL** ROS2 topics under `/vehicle_wbt/v1/...`. The namespace is enforced by:
+- `config_loader.py` (Python): rejects topics not starting with `/vehicle_wbt/v1/`
+- The C++ sidecar publishes to the same namespace
+
+### Adding new hardware
+
+1. Add 1 line to `config_sensors.yml`
+2. Add 1 link to `urdf/vehicle_wbt.urdf.xacro`
+3. (Optional) Add reserved topic namespace in the spec
+
+**Zero business code touched.** This is the platform-level abstraction principle.
+
+### ENABLE_ROS2 gate
+
+`os.environ["ENABLE_ROS2"]` controls whether the sidecar is active. When unset, `__main__.py` returns 0 immediately without importing rclpy. **Main behavior is byte-identical to pre-sidecar state.**
+
+## Critical warnings (carried over from legacy)
+
+The following still apply even after the rewrite:
+
+1. **Never `eval()` LLM output** (legacy CLAUDE.md rule) — `ernie_bot/base/answer.py` style vulnerabilities are out of scope now but the principle stands.
+2. **Never bare `except:`** — use `except Exception as e:` with logging.
+3. **Never `while True: time.sleep(1)`** to mask errors — raise or return error codes.
+4. **Never hardcode API keys** — use env vars or `.env`.
+5. **Never `eval(chassis_type)`** — use dict lookup.
+
+## Build / test commands
 
 ```bash
-# 1. 编辑
-$EDITOR ~/work/rak-car/...
+# Build
+cd ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform
 
-# 2. 推 Jetson
-push2orin  # 见 ssh-workflow.md
+# Test (Python, no ROS2 required)
+cd ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/ -v
+# → 45/45 pass
 
-# 3. 远程 build
-ssh orin "cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_*"
+# Test (C++, requires ROS2 Humble)
+cd ros2_ws && colcon test --packages-select vehicle_wbt_platform_cpp
+# → 25 gtest cases
 
-# 4. dev 上跑测试
-dev-ros2 pytest ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform/test/
+# Run mock system (dev, no hardware)
+source /opt/ros/humble/setup.bash  # or jazzy
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
 
-# 5. dev 上启 RViz 看 Jetson 真实数据
-dev-ros2 rviz2
+# Run full system (Jetson, real hardware)
+ssh xrak@orin
+cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 launch vehicle_wbt_platform_cpp full_system.launch.py
 ```
 
-## Running
-
-No build step — pure Python. The inference backend must be running separately before task scripts.
+## Daily dev workflow
 
 ```bash
-# Start inference server (must run first, serves ZMQ on ports 5001-5004)
-python infer_cs/base/infer_back_end.py
+# 1. Edit
+$EDITOR ros2_ws/src/...
 
-# Primary boot entry point (also the systemd service target)
-python main/qqq.py
+# 2. Run unit tests (dev, < 1s)
+cd ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/ -q
 
-# Competition entry points
-python main/main.py
-python car_start.py
-python important_car.py
+# 3. Run integration tests (dev, with mock hardware)
+cd ros2_ws && colcon build
+ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
+# → In another terminal: rviz2 to see published topics
 
-# HRI robot face display (PySide2/QML)
-python main/hri/main.py
+# 4. Push to Jetson for real-hardware test
+git push origin develop/ros2-sidecar
+ssh orin "cd ~/ros2_ws && git pull && colcon build"
+ssh orin "ros2 launch vehicle_wbt_platform_cpp full_system.launch.py"
 
-# Install systemd auto-start service
-sudo bash main/boot_py.sh
+# 5. dev: subscribe to Jetson topics via DDS
+export ROS_DOMAIN_ID=42
+ros2 topic list
+rviz2
 ```
 
-No formal test framework or linter configuration exists. Test files are in `vehicle/test/`.
+## Competition window (2026-08-10 to 08-12)
 
-## Critical Warnings
-
-**Never run `eval()` on LLM output.** `ernie_bot/base/answer.py` lines 95/122/144 use `eval(answer)` — this is a known security vulnerability. Use `json.loads()` instead.
-
-**Never add bare `except:` clauses.** Several exist in the codebase — always use `except Exception as e:` with logging.
-
-**Never replace error conditions with `while True: time.sleep(1)`.** This pattern appears in `serial_wrap.py`, `controller_wrap.py`, and `vehicle_base.py` — it hangs the program forever. Raise exceptions or return error codes instead.
-
-**Never hardcode API keys/secrets in source.** Several exist — use environment variables or `.env` files.
-
-**Never use `eval(chassis_type)` from config.** `vehicle_base.py:309` does this — use a dict lookup instead.
-
-## Architecture
-
-Six-layer design, bottom-up:
-
-**Hardware Drivers** (`vehicle/base/`) — Serial communication with MC601/MC602 motor controllers via USB/CH340. `controller_wrap.py` wraps Motors, ServoBus, Infrared, LedLight, Beep, StepperWrap, etc. `serial_wrap.py` auto-detects controller type (MC601 at 380400 baud, MC602 at 1000000 baud, MC602 wireless at 115200 baud). MC601 encoders are **simulated** (velocity×time integration); MC602 encoders are **real hardware** values.
-
-**Vehicle Kinematics** (`vehicle/driver/`) — `CarBase` with pluggable chassis: Mecanum, Diff2, Diff4, Tricycle. Dead-reckoning odometry from wheel encoders. Forward/inverse kinematics. Velocity PID control.
-
-**Perception** (`camera/`, `infer_cs/`, `paddle_jetson/`) — Camera captures from `/dev/cam*`. ZMQ client-server inference: `ClintInterface` sends images to `InferServer` which hosts PaddlePaddle models (YOLOE detection, lane segmentation, OCR, human attributes, MOT tracking).
-
-**Task Execution** (`task_func.py`, `car_wrap.py`) — `MyTask` controls arm/ejection/servos. `MyCar` (extends `CarBase`) adds lane-following PID, object-detection navigation, sensor navigation, target localization.
-
-**Application Scripts** (top-level `.py`, `main/`) — Competition scripts combining driving, detection, arm manipulation. Tasks: Hanoi tower, food sorting, plant watering, BMI analysis, object fetching. AI integration via ErnieBot/OpenAI for NL understanding.
-
-**HRI** (`main/hri/`) — PySide2/QML robot face display.
-
-## Key Classes
-
-- `MyCar` (`car_wrap.py`) — Central orchestrator: driving + perception + tasks. **1438-line God Object** — see docs/ for decomposition plan.
-- `CarBase` (`vehicle/driver/vehicle_base.py`) — Chassis kinematics and motor control
-- `ArmBase` (`vehicle/arm/arm_base.py`) — Robotic arm with stepper motors, servos, vacuum pump
-- `MyTask` / `Ejection` (`task_func.py`) — Task-level primitives. Uses two-phase `arm_set` pattern.
-- `ClintInterface` (`infer_cs/base/infer_front.py`) — ZMQ inference client. Auto-launches `infer_back_end.py` if not running.
-- `InferServer` (`infer_cs/base/infer_back_end.py`) — ZMQ inference server hosting models
-- `Camera` (`camera/base/camera.py`) — Threaded USB camera capture (daemon thread, no lock on `self.frame`)
-- `ErnieBotWrap` / `OpenAiWrap` (`ernie_bot/`) — LLM integration with JSON schema prompts
-
-## The `ctl_id` Global Dispatch Pattern
-
-This is the most pervasive architectural pattern. Every hardware class in `controller_wrap.py` holds both MC601 and MC602 instances and dispatches via a global `ctl_id` (0 or 1):
-
-```python
-ctl_id = get_devid()  # Set at import time, never changes
-
-class Motors():
-    def __init__(self, port_id):
-        self.motor_1 = Motor_1(port=port_id)   # MC601 impl
-        self.motor_2 = Motor_2(port_id=port_id) # MC602 impl
-
-    def set_speed(self, speed):
-        fucs = [self.motor_1.rotate, self.motor_2.set_speed]
-        fucs[ctl_id](speed)  # Global dispatch
-```
-
-This pattern repeats in 20+ classes (Motors, ServoBus, Infrared, Key4Btn, etc.). `NoneDev` is used as a placeholder for unsupported features on MC601 — calling its methods hangs forever.
-
-## Import Mechanics
-
-The project uses `sys.path.append` extensively (30+ occurrences) instead of proper package structure. Many `*/base/` subdirectories lack `__init__.py`. When adding new modules, follow the existing `sys.path.append(os.path.abspath(...))` pattern rather than trying to fix the package structure.
-
-**Import-time side effects:** Importing `vehicle` triggers serial port scanning (`serial_wrap.py:352`), controller detection (`controller_wrap.py:37`), and potentially firmware download. This means `import vehicle` cannot run without hardware connected.
-
-## Configuration Files
-
-- `config_car.yml` — Camera indices, IO pins, speed limits, PID params (lane/detection/location)
-- `vehicle/driver/cfg_vehicle.yaml` — Chassis type, wheel dimensions, velocity PID
-- `vehicle/arm/arm_cfg.yaml` — Arm motor ports, stepper/servo config, PID, limits
-- `infer_cs/base/infer.yaml` — Inference service definitions (ports 5001-5004)
-- `vehicle/base/mc602_cfg.yaml` — MC602 controller calibration
-
-Config loading is inconsistent: `config_car.yml` and `infer.yaml` use `get_yaml()` from `tools/`; others use `yaml.load()` directly. When modifying config, match the existing pattern for that file.
-
-## Inference Services
-
-| Name  | Type       | Port | Model              | Purpose            |
-|-------|------------|------|--------------------|--------------------|
-| lane  | LaneInfer  | 5001 | (built-in)         | Lane segmentation  |
-| task  | YoloeInfer | 5002 | task_wbt2025       | Task object detect |
-| front | YoloeInfer | 5003 | front_model2       | Front detection    |
-| ocr   | OCRReco    | 5004 | ch_PP-OCRv3_rec    | Text recognition   |
-
-## Competition Script Duplication
-
-The `main/` directory contains many near-copies of competition scripts (`qqq.py`, `main.py`, `finalall.py`, `scripy1-5.py`). Only `main/qqq.py` (systemd boot target) and `main/main.py` (most complete) are active. Functions like `get_key_by_value()` and `index_form` are copy-pasted across 15+ files.
-
-## Dependencies
-
-Python packages (pre-installed on Jetson): opencv-python, numpy, pyserial, simple_pid, paddlepaddle, erniebot, pyzmq, PySide2, psutil, PyYAML, jsonschema.
-
-## Detailed Documentation
-
-Comprehensive project docs are in `docs/` — see `docs/README.md` for the full index. Key topics:
-- `docs/hardware-comm.md` — MC601/MC602 frame formats, full command tables, encoding/decoding formulas
-- `docs/vehicle-system.md` — Mecanum kinematics formulas, odometry update algorithm
-- `docs/known-issues.md` — All known bugs, security issues, and technical debt with severity ratings
+- `main` branch is **frozen** for the competition
+- `develop/ros2-sidecar` continues post-competition work
+- After 2026-08-12, main can merge from develop/ros2-sidecar (after Plan B/D)
+- See [`docs/contributing/branch-strategy.md`](docs/contributing/branch-strategy.md)

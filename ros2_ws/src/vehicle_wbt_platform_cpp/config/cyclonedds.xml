@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!--
+  CycloneDDS configuration for vehicle_wbt Platform.
+
+  Copy to /etc/cyclonedds.xml on both dev and target machines, OR set:
+    export CYCLONEDDS_URI=file://$(pwd)/ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml
+
+  Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §远程接入
+-->
+<CycloneDDS xmlns="https://cdds.io/config" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="https://cdds.io/config https://raw.githubusercontent.com/eclipse-cyclonedds/cyclonedds/master/etc/cyclonedds.xsd">
+  <Domain id="any">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetect="true" priority="default" multicast="default" />
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <SocketReceiveBufferSize>2MiB</SocketReceiveBufferSize>
+      <Watermark>256KiB</Watermark>
+    </Internal>
+  </Domain>
+</CycloneDDS>
