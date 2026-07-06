@@ -2,24 +2,23 @@
 // SPDX-License-Identifier: Proprietary
 //
 // ArmNode — subscribes /vehicle_wbt/v1/cmd/arm/trajectory (JointTrajectory),
-// publishes /vehicle_wbt/v1/state/actuators (custom ActuatorState.msg).
+// publishes /vehicle_wbt/v1/state/actuators (sensor_msgs/JointState — standard
+// ROS2 message; we previously used a custom ActuatorState.msg but skipped
+// rosidl_generate_interfaces for Lyrical 2.8.7 compatibility).
 //
 // Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §机械臂抽象
 //
 // Phase 1.5: stub. Real impl wires StepperWrap + ServoBus + PoutD via
-// MC602Adapter in Plan B. Stub echoes trajectory commands back as state
-// so downstream monitoring can be developed.
-
-#include "vehicle_wbt_platform_cpp/vehicle_wbt_platform_cpp/msg/actuator_state.hpp"
+// MC602Adapter in Plan B.
 
 #include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
 
 #include <chrono>
 #include <string>
 
 using namespace std::chrono_literals;
-using vehicle_wbt_platform_cpp::msg::ActuatorState;
 
 class ArmNode : public rclcpp::Node
 {
@@ -48,7 +47,7 @@ public:
           arm_id_.c_str(), msg->points.size());
       });
 
-    state_pub_ = this->create_publisher<ActuatorState>(state_topic, 10);
+    state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(state_topic, 10);
 
     const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / rate));
     timer_ = this->create_wall_timer(period, [this]() { this->publish_state(); });
@@ -61,16 +60,12 @@ public:
 private:
   void publish_state()
   {
-    auto msg = std::make_unique<ActuatorState>();
+    auto msg = std::make_unique<sensor_msgs::msg::JointState>();
     msg->header.stamp = this->now();
-    msg->header.frame_id = arm_id_ + "_base";
-    msg->actuator_id = arm_id_;
-    msg->joint_names = joint_names_;
-    msg->positions.assign(joint_names_.size(), 0.0);
-    msg->velocities.assign(joint_names_.size(), 0.0);
+    msg->name = joint_names_;
+    msg->position.assign(joint_names_.size(), 0.0);
+    msg->velocity.assign(joint_names_.size(), 0.0);
     msg->effort.assign(joint_names_.size(), 0.0);
-    msg->vacuum = false;
-    msg->valve = false;
     state_pub_->publish(std::move(msg));
   }
 
@@ -78,7 +73,7 @@ private:
   std::vector<std::string> joint_names_;
   trajectory_msgs::msg::JointTrajectory last_traj_;
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr traj_sub_;
-  rclcpp::Publisher<ActuatorState>::SharedPtr state_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr state_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
 };
 
