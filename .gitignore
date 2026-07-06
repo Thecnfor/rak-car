@@ -42,3 +42,14 @@ collect_wrap/base/image_set2/
 
 
 .pubrak
+
+# Reference packages (kept locally, not in git)
+# - baidu_smartcar_2026.zip: 307MB full reference implementation from 2026
+#   Baidu Smart Car competition. Extracted to reference/baidu-2026/ for
+#   browse-only access.
+# - reference/baidu-2026/: extracted contents of above zip (~327MB).
+baidu_smartcar_2026.zip
+reference/baidu-2026/
+
+# ROS2 Lyrical build artifacts
+ros2_ws/build/ ros2_ws/install/ ros2_ws/log/
