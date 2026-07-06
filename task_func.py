@@ -581,20 +581,319 @@ def eject_test():
     task = MyTask()
     task.eject(2)
 
-if __name__ == "__main__":
-    
-    import argparse
-    args = argparse.ArgumentParser()
-    args.add_argument('--op', type=str, default="none")
-    args = args.parse_args()
-    print(args)
-    if args.op == "reset":
-        task_reset()
+# =============================================================================
+# 8.10 比赛任务 — 智慧农业赛道 (新增 6 个任务，借鉴 baidu_smartcar_2026 参考)
+# =============================================================================
+# 现有 8 个测试函数: bmi/cylinder/ingredients/pick/answer/food/eject (legacy)
+# 新增 6 个比赛任务: seeding/pest_scout/shoot_pest/harvest/read_order/delivery
+# 共 14 个任务,覆盖 8.10 比赛全流程。
+#
+# 设计原则:
+#   1. 每个任务是一个独立函数,可以用 --op task_name 单独跑
+#   2. 不抄参考包的 SDK 调用 — 用我们的 MyTask + MyCar API
+#   3. 不依赖具体场地坐标 — 用 0/1 站位模式,实际比赛调 cfg_mission.yml
+#   4. 失败时 raise 而非 sleep 掩盖 — 比赛当天错误必须立即浮现
+#
+# 配置: 站位坐标在 cfg_mission.yml,见 config_mission.yml.example
+# =============================================================================
 
-    # eject_test()
-    # cylinder_test()
-    bmi_test()
-    # ingredients_test()
-    # pick_ingredients_test()
-    # answer_test()
-    # food_test()
+
+def seeding_task(task: 'MyTask', car: 'MyCar', stations: list = None) -> dict:
+    """播种任务 — 在 3 个播种点依次放下种子。
+
+    Args:
+        task: MyTask 实例 (eject + arm)
+        car: MyCar 实例 (move_base, lane)
+        stations: 3 个播种点坐标 [(x, y, theta), ...]; None=用默认
+
+    Returns:
+        dict[station_id, (x, y, z)] 实际播种位置
+    """
+    if stations is None:
+        stations = [(0.45, 0.55, 0.785), (0.60, 0.70, 0.785), (0.75, 0.85, 0.785)]
+    station_ids = ["seed_1", "seed_2", "seed_3"]
+    poses = {}
+
+    task.arm.set_arm_pose(x=0.0, y=0.2, arm="LEFT", hand="DOWN")
+    car.lane_dis_offset(speed=0.3, dis_hold=0.85)  # 巡线到基地
+    time.sleep(0.5)
+
+    for sid, (x, y, theta) in zip(station_ids, stations):
+        car.move_to_position([x, y, theta])
+        car.move_to_detection_target()
+        cur = car.get_odometry()
+        poses[sid] = (cur[0], cur[1], cur[2])
+        task.ring.rings()
+    return poses
+
+
+def pest_scout_task(car: 'MyCar', scan_passes: int = 2) -> list:
+    """除害侦察任务 — 巡线扫描检测虫害位置。
+
+    Args:
+        car: MyCar 实例
+        scan_passes: 扫描次数,默认 2 次覆盖全区域
+
+    Returns:
+        list[dict] 每个虫害 {class_id, label, x, y, conf}
+    """
+    pests = []
+    for _ in range(scan_passes):
+        car.lane_dis_offset(speed=0.25, dis_hold=2.0)
+        det = car.move_to_detection_target()  # 用 YOLOE 模型
+        if det and det.get('class_name', '').lower() in ('pest', 'aphid', 'caterpillar'):
+            pests.append({
+                'class_id': det['class_id'],
+                'label': det['class_name'],
+                'x': det['x'],
+                'y': det['y'],
+                'conf': det.get('score', 0.0),
+            })
+    return pests
+
+
+def shoot_pest_task(task: 'MyTask', car: 'MyCar', pests: list) -> int:
+    """射击除害任务 — 对每个害虫用 Ejection 射击。
+
+    Args:
+        task: MyTask 实例 (eject)
+        car: MyCar 实例
+        pests: pest_scout_task 返回的列表
+
+    Returns:
+        成功射击的害虫数
+    """
+    shot = 0
+    for pest in pests:
+        car.move_to_position([pest['x'], pest['y'], 0])
+        # Ejection: 拉回 → 释放
+        task.ejection.eject(x=0.5, vel=0.05)
+        task.ring.rings()
+        shot += 1
+    return shot
+
+
+def harvest_task(task: 'MyTask', car: 'MyCar', crop_stations: list = None) -> int:
+    """采收任务 — 在作物位置用机械臂抓取。
+
+    Args:
+        task: MyTask 实例 (arm)
+        car: MyCar 实例
+        crop_stations: 作物坐标 [(x, y, theta), ...]; None=用默认
+
+    Returns:
+        抓取数量
+    """
+    if crop_stations is None:
+        crop_stations = [(0.4, 0.3, 0), (0.5, 0.3, 0), (0.6, 0.3, 0)]
+
+    task.arm.set_hand_angle(90)  # 掌心向下 (抓取姿态)
+    picked = 0
+    for (x, y, theta) in crop_stations:
+        car.move_to_position([x, y, theta])
+        car.move_to_detection_target(crop_class='crop')
+        task.arm.set(horiz=task.arm.horiz_mid, vert=0.0)  # 下降到抓取高度
+        task.arm.grasp()  # 真空泵吸住
+        car.lane_base(speed=0.2, end_fuction=lambda: False)  # 回基地
+        task.arm.set(horiz=task.arm.horiz_mid, vert=0.15)  # 抬起
+        picked += 1
+    return picked
+
+
+def read_order_task(car: 'MyCar', ocr_service: str = 'ocr') -> list:
+    """OCR 读单任务 — 停在订单板前,识别订单内容。
+
+    Args:
+        car: MyCar 实例
+        ocr_service: ZMQ OCR service name (config_car.yml)
+
+    Returns:
+        list[dict] 订单项 {crop_name, qty, dest_station}
+    """
+    import zmq
+    # 订单板固定位置(实际比赛调 cfg_mission.yml)
+    order_board = (0.8, 0.0, 0)
+    car.move_to_position(list(order_board))
+
+    # 用 ZMQ 调 OCR 服务
+    ctx = zmq.Context()
+    sock = ctx.socket(zmq.REQ)
+    sock.settimeout(5.0)
+    sock.connect("tcp://127.0.0.1:5004")  # OCR port per infer.yaml
+    sock.send_json({"frame": None, "task": "read_order"})
+    raw = sock.recv_json()
+
+    items = []
+    for line in raw.get('text', '').split('\n'):
+        if not line.strip():
+            continue
+        # 简单解析 "作物 数量 站点" 格式
+        parts = line.split()
+        if len(parts) >= 3:
+            items.append({
+                'crop_name': parts[0],
+                'qty': int(parts[1]) if parts[1].isdigit() else 1,
+                'dest_station': parts[2],
+            })
+    sock.close()
+    ctx.term()
+    return items
+
+
+def delivery_task(task: 'MyTask', car: 'MyCar', order_items: list,
+                  station_coords: dict = None) -> int:
+    """配送任务 — 按订单依次送作物到指定站位。
+
+    Args:
+        task: MyTask 实例
+        car: MyCar 实例
+        order_items: read_order_task 返回的订单列表
+        station_coords: 站位坐标 {"A": (x,y,theta), ...}; None=用默认
+
+    Returns:
+        成功配送次数
+    """
+    if station_coords is None:
+        station_coords = {
+            "A": (0.9, 0.3, 0), "B": (0.9, 0.6, 0), "C": (0.9, 0.9, 0),
+        }
+    delivered = 0
+    task.arm.set_hand_angle(0)  # 掌心向前 (释放姿态)
+    for item in order_items:
+        dest = station_coords.get(item['dest_station'])
+        if dest is None:
+            continue
+        car.move_to_position(list(dest))
+        task.arm.set(horiz=task.arm.horiz_mid, vert=0.10)  # 放下高度
+        task.arm.release()  # 释放真空
+        task.ring.rings()
+        delivered += 1
+    return delivered
+
+
+def mission_main(task: 'MyTask', car: 'MyCar', run_seeding: bool = True,
+                 run_watering: bool = True, run_shooting: bool = True,
+                 run_harvest: bool = True, run_sort: bool = True,
+                 run_read_order: bool = True, run_delivery: bool = True) -> dict:
+    """完整 8.10 比赛 orchestrator — 串行 6 个新任务 (灌溉/分类已有 legacy 函数)。
+
+    Returns:
+        dict 各任务的结果统计
+    """
+    results = {}
+    car.arm.reset()
+
+    if run_seeding:
+        try:
+            results['seeding'] = seeding_task(task, car)
+        except Exception as e:
+            results['seeding'] = f'FAILED: {e}'
+            raise  # 比赛当天失败立即停止,不掩盖
+    if run_watering:
+        try:
+            task.lane_det_location_plant(speed=0.3)  # 已有 legacy 实现
+            results['watering'] = 'OK'
+        except Exception as e:
+            results['watering'] = f'FAILED: {e}'
+            raise
+    if run_shooting:
+        try:
+            pests = pest_scout_task(car)
+            shot = shoot_pest_task(task, car, pests)
+            results['shooting'] = f'shot {shot}/{len(pests)} pests'
+        except Exception as e:
+            results['shooting'] = f'FAILED: {e}'
+            raise
+    if run_harvest:
+        try:
+            n = harvest_task(task, car)
+            results['harvest'] = f'picked {n}'
+        except Exception as e:
+            results['harvest'] = f'FAILED: {e}'
+            raise
+    if run_sort:
+        try:
+            task.set_food(arm_set=True)  # 已有 legacy food sorting
+            results['sort'] = 'OK'
+        except Exception as e:
+            results['sort'] = f'FAILED: {e}'
+            raise
+    if run_read_order:
+        try:
+            order = read_order_task(car)
+            results['read_order'] = f'{len(order)} items'
+        except Exception as e:
+            results['read_order'] = f'FAILED: {e}'
+            raise
+    if run_delivery:
+        try:
+            delivered = delivery_task(task, car, results.get('read_order_obj', []))
+            results['delivery'] = f'delivered {delivered}'
+        except Exception as e:
+            results['delivery'] = f'FAILED: {e}'
+            raise
+
+    return results
+
+
+if __name__ == "__main__":
+
+    import argparse
+    parser = argparse.ArgumentParser(description='vehicle_wbt 任务入口')
+    parser.add_argument('--op', type=str, default='none',
+                        choices=['none', 'reset',
+                                 'seeding', 'pest_scout', 'shoot_pest', 'harvest',
+                                 'read_order', 'delivery',
+                                 'bmi', 'cylinder', 'ingredients', 'pick',
+                                 'answer', 'food', 'eject',
+                                 'mission'],
+                        help='要运行的任务')
+    parser.add_argument('--station', type=int, default=0,
+                        help='单独跑任务时使用的站位索引(0/1/2)')
+    args = parser.parse_args()
+    print(f"[task_func] op={args.op}")
+
+    if args.op == 'reset':
+        task_reset()
+    elif args.op == 'mission':
+        # 完整比赛 — 需要 MyCar 全栈
+        from car_wrap import MyCar
+        from task_func import MyTask
+        my_car = MyCar()
+        task = my_car.task
+        results = mission_main(task, my_car)
+        print("[task_func] mission results:", results)
+    elif args.op in ('seeding', 'pest_scout', 'shoot_pest', 'harvest',
+                     'read_order', 'delivery'):
+        # 新任务单独跑
+        from car_wrap import MyCar
+        my_car = MyCar()
+        task = my_car.task
+        if args.op == 'seeding':
+            print(seeding_task(task, my_car))
+        elif args.op == 'pest_scout':
+            print(pest_scout_task(my_car))
+        elif args.op == 'shoot_pest':
+            print(shoot_pest_task(task, my_car, []))
+        elif args.op == 'harvest':
+            print(harvest_task(task, my_car))
+        elif args.op == 'read_order':
+            print(read_order_task(my_car))
+        elif args.op == 'delivery':
+            print(delivery_task(task, my_car, []))
+    else:
+        # legacy 任务 (bmi/cylinder/ingredients/pick/answer/food/eject)
+        if args.op == 'bmi':
+            bmi_test()
+        elif args.op == 'cylinder':
+            cylinder_test()
+        elif args.op == 'ingredients':
+            ingredients_test()
+        elif args.op == 'pick':
+            pick_ingredients_test()
+        elif args.op == 'answer':
+            answer_test()
+        elif args.op == 'food':
+            food_test()
+        elif args.op == 'eject':
+            eject_test()
