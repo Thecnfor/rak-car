@@ -183,7 +183,7 @@
     <parent link="base_link"/>
     <child link="camera_front_link"/>
     <origin xyz="${chassis_length/2 - 0.01} 0 ${chassis_height/2}" rpy="0 0 0"/>
-  </link>
+  </joint>
 
   <!-- Side camera (P8 /dev/cam1) -->
   <link name="camera_side_link"/>
@@ -199,13 +199,13 @@
     <parent link="base_link"/>
     <child link="ir_left_link"/>
     <origin xyz="0 ${chassis_width/2 - 0.02} ${chassis_height/2}" rpy="0 0 0"/>
-  </link>
+  </joint>
   <link name="ir_right_link"/>
   <joint name="ir_right_joint" type="fixed">
     <parent link="base_link"/>
     <child link="ir_right_link"/>
     <origin xyz="0 ${-chassis_width/2 + 0.02} ${chassis_height/2}" rpy="0 0 0"/>
-  </link>
+  </joint>
 
   <!-- ================= ros2_control hardware interface ================= -->
   <ros2_control name="MC602" type="system">
