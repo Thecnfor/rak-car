@@ -27,9 +27,9 @@ def test_orchestrator_init_loads_config(tmp_path: Path) -> None:
     assert "ir1" in orch.registry.sensors
 
 
-def test_orchestrator_init_creates_adapter() -> None:
+def test_orchestrator_init_creates_adapter(repo_config_path: str) -> None:
     orch = SidecarOrchestrator(
-        config_path="config_sensors.yml",
+        config_path=repo_config_path,
         serial_port="/dev/ttyUSB0",
         ros_domain_id=42,
     )
@@ -37,18 +37,18 @@ def test_orchestrator_init_creates_adapter() -> None:
     assert orch.adapter.serial_port == "/dev/ttyUSB0"
 
 
-def test_orchestrator_adapter_not_open_at_init() -> None:
+def test_orchestrator_adapter_not_open_at_init(repo_config_path: str) -> None:
     orch = SidecarOrchestrator(
-        config_path="config_sensors.yml",
+        config_path=repo_config_path,
         serial_port="/dev/ttyUSB0",
         ros_domain_id=42,
     )
     assert not orch.adapter.is_open
 
 
-def test_orchestrator_shutdown_is_safe_to_call_twice() -> None:
+def test_orchestrator_shutdown_is_safe_to_call_twice(repo_config_path: str) -> None:
     orch = SidecarOrchestrator(
-        config_path="config_sensors.yml",
+        config_path=repo_config_path,
         serial_port="/dev/ttyUSB0",
         ros_domain_id=42,
     )
@@ -56,9 +56,9 @@ def test_orchestrator_shutdown_is_safe_to_call_twice() -> None:
     orch.shutdown()  # must not raise
 
 
-def test_orchestrator_summary_reports_counts() -> None:
+def test_orchestrator_summary_reports_counts(repo_config_path: str) -> None:
     orch = SidecarOrchestrator(
-        config_path="config_sensors.yml",
+        config_path=repo_config_path,
         serial_port="/dev/ttyUSB0",
         ros_domain_id=42,
     )
