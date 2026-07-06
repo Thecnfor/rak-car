@@ -1352,14 +1352,44 @@ ENABLE_ROS2=0                → sidecar 不启动, 主程序保持原样
 
 ## 远程接入
 
+> **重要**: 本项目采用 **dev/target 双机架构**。Dev 桌面机装完整 ROS2 desktop (RViz2 + Gazebo + 工具链);Jetson Orin Nano 4GB 只装 ROS2 Humble base (rclcpp + rclpy, 无 GUI)。两者通过 ROS_DOMAIN_ID=42 自动发现,DDS 跨机器通信。详细 setup 见 [../../development/README.md](../../development/README.md)。
+
+### 部署拓扑 (dev + target)
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Dev 桌面机 (Ubuntu 22.04/24.04/26.04 + ROS2 desktop) │
+│  ┌────────────────────────────────────────────────┐ │
+│  │ rclcpp + rclpy + RViz2 + ros2 bag + Gazebo     │ │
+│  │ 编辑代码 + 跑测试 + 仿真 + 可视化              │ │
+│  └────────────────────────────────────────────────┘ │
+│                  │                                  │
+│                  │ DDS over LAN (cyclonedds)        │
+│                  │ ROS_DOMAIN_ID=42                 │
+│                  ▼                                  │
+│  ┌────────────────────────────────────────────────┐ │
+│  │ Jetson Orin Nano 4GB (JetPack 6 + Humble base) │ │
+│  │ rclcpp + rclpy only                            │ │
+│  │ ssh xrak@orin 跑 sidecar 节点                 │ │
+│  │ 发布真实传感器数据 + 接收控制指令              │ │
+│  └────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+**关键原则**:
+- dev 装 **desktop** 版 (含 RViz/Gazebo);Jetson 装 **base** 版 (无 GUI)
+- dev 可以装 Jazzy/Humble/Kilted 任意桌面版 (享受新功能);Jetson 锁 Humble LTS (生产稳定性)
+- dev 跑 80% 的工作 (单元测试、lint、仿真、可视化);Jetson 跑 20% (真硬件冒烟、生产部署)
+- 同一份代码在 dev + Jetson 都能跑,差别只是 dev 用 mock / Gazebo,Jetson 用真硬件
+
 ### DDS 配置
 
 | 场景 | 部署 | ROS_DOMAIN_ID | DDS 实现 | RMW |
 |------|------|:---:|---------|-----|
 | 单 Jetson 本机 | Jetson 单独跑 sidecar | 42 | cyclonedds | rmw_cyclonedds_cpp |
-| 同 LAN 多端 | Jetson + 开发笔记本 | 42 | cyclonedds | rmw_cyclonedds_cpp |
+| **dev + target 协作 (推荐)** | **dev 桌面 ROS2 desktop + Jetson Humble base** | **42** | **cyclonedds** | **rmw_cyclonedds_cpp** |
 | VPN 跨网 | Jetson + 异地开发机 | 42 | cyclonedds | rmw_cyclonedds_cpp |
-| Gazebo 离线 | 开发笔记本独立运行 | 43 (避开主 domain) | fastrtps | rmw_fastrtps_cpp |
+| Gazebo 离线 | dev 桌面独立运行 | 43 (避开主 domain) | fastrtps | rmw_fastrtps_cpp |
 
 #### cyclonedds 配置 (`/etc/cyclonedds.xml`)
 

@@ -57,6 +57,7 @@ ADR-001 同时给出了 ROS2 迁移触发条件：
 - 现有 6 层架构（CLAUDE.md）保持不变，ROS2 作为**旁挂进程**启动一组 publisher / service 节点，把现有数据流以 ROS2 Topic / Service 形式暴露出来
 - 同步部署 Gazebo Garden 仿真回路（URDF 来源：`docs/hardware-port-mapping.md`），实现"host PC 离线仿真 + Jetson 实机回归"双轨开发
 - **比赛前 4 周内（2026-07-13 → 2026-08-12）冻结所有 ROS2 相关代码改动**，与 `docs/migration/jetpack6-ros2-humble.md` 时间表对齐
+- **采用 dev/target 双机开发架构**：dev 桌面 (ROS2 desktop) 跑 80% 工作 (编辑/测试/仿真/可视化), Jetson Orin Nano 4GB (Humble base) 跑 20% (真硬件冒烟/生产部署)。详见 [`docs/development/README.md`](../development/README.md) 与 [`docs/development/test-matrix.md`](../development/test-matrix.md)
 
 > ADR-001 方案 C（Noetic sidecar）作为**短期临时桥梁**继续执行至 2026-08-12 比赛结束。比赛结束后本 ADR-003 接管，ROS Noetic 节点下线，ROS2 Humble 节点接替。ADR-001 不撤销，但其"ROS1 Noetic"路径在赛后被本 ADR 取代。
 

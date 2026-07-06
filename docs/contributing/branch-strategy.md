@@ -2,6 +2,8 @@
 
 本文档定义 vehicle_wbt 项目团队的 Git 分支管理规范与协作流程。所有人(4-6 人)必须遵守,目标是让 main 分支随时可以上场比赛,同时保留 ROS2 sidecar 等长周期实验的并行空间。
 
+> **重要**: 本项目采用 dev/target 双机开发架构。开发在桌面机,生产部署在 Jetson Orin。详见 [../development/README.md](../development/README.md)。
+
 ## 当前分支拓扑
 
 ```
@@ -120,10 +122,12 @@ git push origin feat/thecnfor-tf-broadcaster
 feat/<name>-<feature>
     │  gh pr create --base develop/ros2-sidecar
     │  1 reviewer approve
+    │  必跑: dev 上 pytest (45 cases) + clang-format + flake8
     ▼
 develop/ros2-sidecar  (测试线,可包含多个 feat 合并)
     │  gh pr create --base main
     │  Thecnfor 单独 review + merge
+    │  必跑: ssh orin 上 colcon build + ros2 launch (真硬件冒烟)
     │  (仅 bug fix 与 critical patch 可走这条)
     ▼
 main (LTS, 比赛线)

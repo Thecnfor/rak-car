@@ -25,6 +25,16 @@
 | [jetpack6-ros2-humble.md](migration/jetpack6-ros2-humble.md) | JetPack 6 / Ubuntu 22.04 / ROS2 Humble 迁移计划（赛后） | ⭐⭐ |
 | [2026-07-05-ros2-sidecar-design.md](superpowers/specs/2026-07-05-ros2-sidecar-design.md) | ROS2 Sidecar 架构完整设计 spec（A+C 仿真路线） | ⭐⭐⭐ |
 
+### 开发工作流（Dev 桌面 + Jetson Orin 双机架构）
+
+| 文档 | 内容 | 重要程度 |
+|------|------|:---:|
+| [development/README.md](development/README.md) | 双机开发架构总览（thick client + thin server） | ⭐⭐⭐ |
+| [development/dev-machine-setup.md](development/dev-machine-setup.md) | 桌面开发机 ROS2 全安装（Jazzy/Humble 容器或裸机） | ⭐⭐⭐ |
+| [development/jetson-target-setup.md](development/jetson-target-setup.md) | Jetson Orin Nano 4GB 最小安装（Humble base） | ⭐⭐⭐ |
+| [development/ssh-workflow.md](development/ssh-workflow.md) | SSH 到 orin + 文件同步 + 远程 build | ⭐⭐⭐ |
+| [development/test-matrix.md](development/test-matrix.md) | dev vs target 测试分工矩阵 | ⭐⭐⭐ |
+
 ### 架构决策记录 (ADR)
 
 | ADR | 状态 | 决策 |

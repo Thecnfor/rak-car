@@ -2,7 +2,8 @@
 
 > **负责人**: Thecnfor（亲自刷机）
 > **目标读者**: 项目硬件负责人，需要逐条照做的实操 runbook
-> **当前文档状态**: 计划草案（ADR-001 明确表示当前不迁移 ROS2，本文档仅作"赛后迁移"预案，不在 8.10 比赛前执行）
+> **当前文档状态**: ⚠️ **已部分完成** — 当前 Jetson Orin 已运行 JetPack 6 + Ubuntu 22.04 + ROS2 Humble base，**本计划已退化为"目标环境参考文档"**。完整刷机步骤保留作为备用 / 未来载板参考。
+> **新工作流**: 见 [../development/README.md](../development/README.md) — dev 桌面跑完整开发,Jetson 只跑 sidecar 节点
 
 ---
 
@@ -235,19 +236,21 @@ scp -r jetson@<jetson-ip>:/tmp/backup ./jetson_pre_migration_backup_$(date +%Y%m
 
 ## 时间表
 
-| 日期 | 里程碑 |
-|------|--------|
-| 2026-08-12 | 比赛结束 |
-| 2026-08-13 | 备份当前 Jetson（dd + scp，约 30 分钟） |
-| 2026-08-13 | SDK Manager 烧 JetPack 6.1（约 45-60 分钟） |
-| 2026-08-13/14 | oem-config + apt update/upgrade |
-| 2026-08-14 | 装 ROS2 Humble + 项目 pip 依赖（约 2 小时） |
-| 2026-08-15 | 还原 systemd service + vehicle_wbt 源码 |
-| 2026-08-15/16 | 跑"迁移后第一周验证"7 项 |
-| 2026-08-17 | 排查任何冒烟失败项 |
-| 2026-08-20 | 缓冲窗口（处理意外问题） |
-| 2026-08-25 | 里程碑: 完整回归（跑一次完整比赛流程，无人工干预） |
-| 2026-09-01 | 新赛季开发可在 ROS2 Humble 环境下继续 |
+| 日期 | 里程碑 | 实际状态 (2026-07-05) |
+|------|--------|---------|
+| 2026-08-12 | 比赛结束 | 未到 |
+| 2026-08-13 | 备份当前 Jetson（dd + scp，约 30 分钟） | — |
+| 2026-08-13 | SDK Manager 烧 JetPack 6.1（约 45-60 分钟） | **已完成** (R36) |
+| 2026-08-13/14 | oem-config + apt update/upgrade | **已完成** |
+| 2026-08-14 | 装 ROS2 Humble + 项目 pip 依赖（约 2 小时） | **已完成 (base)**，colcon 待装 |
+| 2026-08-15 | 还原 systemd service + vehicle_wbt 源码 | — |
+| 2026-08-15/16 | 跑"迁移后第一周验证"7 项 | — |
+| 2026-08-17 | 排查任何冒烟失败项 | — |
+| 2026-08-20 | 缓冲窗口（处理意外问题） | — |
+| 2026-08-25 | 里程碑: 完整回归（跑一次完整比赛流程，无人工干预） | — |
+| 2026-09-01 | 新赛季开发可在 ROS2 Humble 环境下继续 | — |
+
+**实际状态**: Jetson Orin 已经提前进入目标环境（JetPack 6 + Ubuntu 22.04 + Humble base），**刷机步骤（§刷机步骤）作为未来备件载板的参考**。下一步只需要：① 装 colcon (`sudo apt install python3-colcon-common-extensions`) ② 验证集成（详见 [../development/jetson-target-setup.md](../development/jetson-target-setup.md)）。
 
 **预留缓冲**: 总共 2 周（08-13 → 08-25），其中 5 天是缓冲期。期间若硬件相关问题卡住超过 2 天，**立刻回滚到 JetPack 5** 不要硬撑 — 比赛已经结束，下赛季再迁移。
 

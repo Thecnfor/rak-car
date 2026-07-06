@@ -6,6 +6,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Python robotics project for an autonomous vehicle robot running on NVIDIA Jetson. The robot performs lane following, object detection, robotic arm manipulation, food sorting, and AI-powered natural language interaction. Runs as a systemd service (`py_boot.service`) at boot.
 
+## Development vs Target Architecture
+
+> **重要**: 本项目采用 **dev/target 双机架构**，所有开发、测试、可视化在 dev 桌面完成，Jetson 只跑 sidecar 节点。
+
+- **Dev 桌面机**（当前 Ubuntu 26.04，需装 ROS2 — 推荐 Docker 跑 Jazzy）：编辑、pytest、gtest、Gazebo 仿真、RViz 可视化
+- **Jetson Orin Nano 4GB**（JetPack 6 + Ubuntu 22.04 + ROS2 Humble base）：SSH `xrak@orin`，跑 sidecar 节点发布真实传感器数据
+- 详见 [`docs/development/README.md`](docs/development/README.md)
+
+**Dev 工作流**（5 步日常循环）：
+
+```bash
+# 1. 编辑
+$EDITOR ~/work/rak-car/...
+
+# 2. 推 Jetson
+push2orin  # 见 ssh-workflow.md
+
+# 3. 远程 build
+ssh orin "cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_*"
+
+# 4. dev 上跑测试
+dev-ros2 pytest ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform/test/
+
+# 5. dev 上启 RViz 看 Jetson 真实数据
+dev-ros2 rviz2
+```
+
 ## Running
 
 No build step — pure Python. The inference backend must be running separately before task scripts.
