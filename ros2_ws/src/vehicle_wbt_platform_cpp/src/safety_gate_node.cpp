@@ -1,21 +1,28 @@
 // Copyright 2026 Thecnfor
 // SPDX-License-Identifier: Proprietary
 //
-// SafetyGateNode — implements the 4-layer safety gate per
-// docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §安全设计
+// SafetyGateNode — rclcpp::Node wrapper for the 4-layer safety gate.
 //
-// Layer 1: mode check (only MANUAL/DEV_TEST accepts /cmd/*)
-// Layer 2: rate limit (0.3 m/s velocity cap)
-// Layer 3: deadman switch (500 ms heartbeat timeout)
-// Layer 4: physical estop priority (BUTTON3 always wins)
+// The actual gate logic lives in include/.../safety_gate_logic.hpp as a
+// pure function (apply_safety_gate) that this node calls. Keeping the
+// logic pure means it can be unit-tested with gtest without a ROS2
+// runtime (see test/test_safety_gate_logic.cpp).
 //
-// Output: /vehicle_wbt/v1/state/safety (safety_msgs/msg/SupervisoryControl) —
-// placeholder for now. Subscribes:
+// 4 layers (handled by apply_safety_gate):
+//   1. Physical estop: if pressed, output zero twist + always publish stop
+//   2. Mode: if AUTO, drop the message (don't publish)
+//   3. Rate limit: clamp linear/angular velocity to max_linear/max_angular
+//   4. Heartbeat: tracked here via the deadman_timer_ (not in pure fn)
+//
+// Subscribes:
 //   /vehicle_wbt/v1/safety/heartbeat (std_msgs/Empty)
 //   /vehicle_wbt/v1/safety/estop (std_msgs/Bool)
 //   /vehicle_wbt/v1/safety/mode_cmd (std_msgs/String)
+//   /vehicle_wbt/v1/cmd/vel_raw (geometry_msgs/Twist)
 // Publishes (after gating):
 //   /vehicle_wbt/v1/cmd/vel_safe (geometry_msgs/Twist)
+
+#include "vehicle_wbt_platform_cpp/safety_gate_logic.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -29,7 +36,7 @@
 
 using namespace std::chrono_literals;
 
-enum class Mode { AUTO, MANUAL, DEV_TEST, E_STOP };
+namespace vwpc = vehicle_wbt_platform_cpp;
 
 class SafetyGateNode : public rclcpp::Node
 {
@@ -58,7 +65,7 @@ public:
         std::lock_guard<std::mutex> lock(state_mutex_);
         estop_pressed_ = msg->data;
         if (estop_pressed_) {
-          mode_ = Mode::E_STOP;
+          mode_ = vwpc::GateMode::E_STOP;
         }
       });
 
@@ -66,19 +73,16 @@ public:
       "/vehicle_wbt/v1/safety/mode_cmd", 10,
       [this](const std_msgs::msg::String::SharedPtr msg) {
         std::lock_guard<std::mutex> lock(state_mutex_);
-        if (msg->data == "AUTO") mode_ = Mode::AUTO;
-        else if (msg->data == "MANUAL") mode_ = Mode::MANUAL;
-        else if (msg->data == "DEV_TEST") mode_ = Mode::DEV_TEST;
-        else if (msg->data == "E_STOP") mode_ = Mode::E_STOP;
+        if (msg->data == "AUTO") mode_ = vwpc::GateMode::AUTO;
+        else if (msg->data == "MANUAL") mode_ = vwpc::GateMode::MANUAL;
+        else if (msg->data == "DEV_TEST") mode_ = vwpc::GateMode::DEV_TEST;
+        else if (msg->data == "E_STOP") mode_ = vwpc::GateMode::E_STOP;
       });
 
     cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
       "/vehicle_wbt/v1/cmd/vel_raw", 10,
       [this](const geometry_msgs::msg::Twist::SharedPtr msg) {
-        geometry_msgs::msg::Twist gated;
-        if (gate(*msg, gated)) {
-          safe_pub_->publish(gated);
-        }
+        this->apply_and_publish(*msg);
       });
 
     safe_pub_ = this->create_publisher<geometry_msgs::msg::Twist>(
@@ -89,7 +93,8 @@ public:
       [this]() {
         std::lock_guard<std::mutex> lock(state_mutex_);
         const auto now = this->now();
-        if (mode_ != Mode::AUTO && (now - last_heartbeat_).seconds() * 1000.0 > deadman_ms_) {
+        if (mode_ != vwpc::GateMode::AUTO &&
+            (now - last_heartbeat_).seconds() * 1000.0 > deadman_ms_) {
           RCLCPP_WARN_THROTTLE(
             this->get_logger(), *this->get_clock(), 1000,
             "Deadman timeout in mode MANUAL/DEV_TEST — publishing stop");
@@ -105,36 +110,47 @@ public:
   }
 
 private:
-  bool gate(const geometry_msgs::msg::Twist & in, geometry_msgs::msg::Twist & out) const
+  void apply_and_publish(const geometry_msgs::msg::Twist & raw_cmd)
   {
-    std::lock_guard<std::mutex> lock(state_mutex_);
-
-    // Layer 4: physical estop always wins.
-    if (estop_pressed_) {
-      out = geometry_msgs::msg::Twist();
-      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000, "E-STOP active");
-      return true;  // publish stop, do NOT pass-through
+    vwpc::GateInput in;
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      in.mode = mode_;
+      in.estop_pressed = estop_pressed_;
+      in.max_linear = max_v_;
+      in.max_angular = max_w_;
     }
 
-    // Layer 1: mode gate. AUTO blocks all /cmd/*.
-    if (mode_ == Mode::AUTO) {
-      return false;  // drop
+    const auto decision = vwpc::apply_safety_gate(
+      in, raw_cmd.linear.x, raw_cmd.linear.y, raw_cmd.angular.z);
+
+    if (static_cast<bool>(decision.reason & vwpc::GateDecision::Reason::ESTOP)) {
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000, "E-STOP active");
+    }
+    if (static_cast<bool>(decision.reason & vwpc::GateDecision::Reason::MODE_DROPPED)) {
+      RCLCPP_DEBUG_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Dropped cmd (AUTO mode)");
+    }
+    if (static_cast<bool>(decision.reason & vwpc::GateDecision::Reason::RATE_LIMITED)) {
+      RCLCPP_INFO_THROTTLE(
+        this->get_logger(), *this->get_clock(), 1000,
+        "Rate limited: vx=%.2f vy=%.2f wz=%.2f",
+        decision.linear_x, decision.linear_y, decision.angular_z);
     }
 
-    // Layer 2: rate limit (clamp, not drop).
-    out = in;
-    const double vx = std::clamp(in.linear.x, -max_v_, max_v_);
-    const double vy = std::clamp(in.linear.y, -max_v_, max_v_);
-    const double wz = std::clamp(in.angular.z, -max_w_, max_w_);
-    out.linear.x = vx;
-    out.linear.y = vy;
-    out.angular.z = wz;
-
-    return true;
+    if (decision.publish) {
+      geometry_msgs::msg::Twist out;
+      out.linear.x = decision.linear_x;
+      out.linear.y = decision.linear_y;
+      out.angular.z = decision.angular_z;
+      safe_pub_->publish(out);
+    }
   }
 
   mutable std::mutex state_mutex_;
-  Mode mode_{Mode::AUTO};
+  vwpc::GateMode mode_{vwpc::GateMode::AUTO};
   bool estop_pressed_{false};
   rclcpp::Time last_heartbeat_;
   int deadman_ms_{500};

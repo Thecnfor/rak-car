@@ -159,6 +159,12 @@ if(BUILD_TESTING)
     test/test_base_controller_iface.cpp
   )
   target_include_directories(test_base_controller_iface PUBLIC include)
+
+  # Pure-logic safety gate tests — no rclcpp needed, just gtest
+  ament_add_gmock(test_safety_gate_logic
+    test/test_safety_gate_logic.cpp
+  )
+  target_include_directories(test_safety_gate_logic PUBLIC include)
 endif()
 
 ament_package()

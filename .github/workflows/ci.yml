@@ -50,18 +50,18 @@ jobs:
       image: ros:humble-ros-base
     steps:
       - uses: actions/checkout@v4
-      - name: Install colcon
+      - name: Install colcon + ament_cmake_gmock
         run: |
           apt-get update
-          apt-get install -y python3-colcon-common-extensions
+          apt-get install -y python3-colcon-common-extensions ros-humble-ament-cmake-gmock
       - name: Source ROS
         run: source /opt/ros/humble/setup.bash
-      - name: Build
+      - name: Build (incl. tests with BUILD_TESTING=ON)
         working-directory: ros2_ws
         run: |
           source /opt/ros/humble/setup.bash
-          colcon build --packages-up-to vehicle_wbt_platform_cpp --event-handlers console_direct+
-      - name: Test
+          colcon build --packages-up-to vehicle_wbt_platform_cpp --cmake-args -DBUILD_TESTING=ON --event-handlers console_direct+
+      - name: Run gtest (test_safety_gate_logic, test_mc602_adapter, etc.)
         working-directory: ros2_ws
         run: |
           source /opt/ros/humble/setup.bash
@@ -72,6 +72,26 @@ jobs:
         run: |
           source /opt/ros/humble/setup.bash
           colcon test-result --verbose
+
+  cpp-lint:
+    name: C++ lint (ament_lint_common on dev machine)
+    runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-ros-base
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ament_lint_common
+        run: |
+          apt-get update
+          apt-get install -y ros-humble-ament-lint-common
+      - name: Run ament_lint
+        working-directory: ros2_ws
+        run: |
+          source /opt/ros/humble/setup.bash
+          # Lint may find issues on first run (since we haven't enforced it).
+          # We use || true to keep CI green while we fix the issues incrementally.
+          colcon lint --packages-up-to vehicle_wbt_platform_cpp || \
+            echo "ament_lint_common found issues (non-blocking)"
 
   xacro-check:
     name: URDF xacro validation

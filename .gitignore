@@ -48,3 +48,20 @@ log_info/
 *.so.*
 *.dep
 *.d
+
+# Reference package carried over from main (kept locally, not in git)
+baidu_smartcar_2026.zip
+fishros
+reference/
+
+# ROS2 Lyrical/Jazzy build artifacts
+ros2_ws/build/
+ros2_ws/install/
+ros2_ws/log/
+
+# Test / coverage
+.pytest_cache/
+*.gcov
+*.gcda
+*.gcno
+coverage.xml
