@@ -273,6 +273,92 @@ sidecar 不在主进程中嵌入,而是由 `main/qqq.py` 在 `ENABLE_ROS2=1` 时
 
 ---
 
+## C++ 核心 (Phase 1.5 增量 — 性能/实时层)
+
+> **v1 协议层架构决策**: 本平台采用 **nav2 / moveit 风格 C++/Python 混合架构**——C++ 写性能/实时/硬件层,Python 写编排/配置/胶水。这是 ROS2 主流包(nav2, moveit, ros2_control, image_transport, tf2_ros)的事实标准,而非 "用 C++ 重写 Python"。
+
+### 为什么不纯 Python
+
+| 维度 | Python (Phase 1) | C++ (Phase 1.5+) |
+|------|-------------------|-------------------|
+| 控制循环延迟 | ~1 ms (有 GIL) | ~100 µs (无 GIL) |
+| 实时调度 | best-effort | `SCHED_FIFO` 可选 |
+| ros2_control 集成 | 不可用 (官方仅 C++) | 一等公民 |
+| 图像处理吞吐 | 受 GIL 限制 | 多核并行 |
+| 调试门槛 | 低 (REPL) | 中 (gdb / sanitizers) |
+| 团队学习 | 已有 | 需 C++ + CMake |
+
+**结论**: Python 适合 glue (config, orchestrator, lifecycle management),C++ 适合 core (controller adapters, kinematics, hardware interfaces)。两套在同一 `colcon_ws` build,共享 `.msg` 消息类型。
+
+### 包拆分
+
+```
+ros2_ws/src/
+├── vehicle_wbt_platform_cpp/        # ament_cmake (C++)  — Phase 1.5
+│   ├── include/vehicle_wbt_platform_cpp/
+│   │   ├── base_controller.hpp     # 纯虚接口
+│   │   ├── mc602_adapter.hpp       # MC602 串口 I/O
+│   │   ├── base_chassis.hpp        # 纯虚底盘 + Pose2D
+│   │   ├── mecanum_chassis.hpp     # 4 轮 O 布局运动学
+│   │   └── mc602_hardware_interface.hpp  # ros2_control SystemInterface
+│   ├── src/                         # 对应 .cpp 实现
+│   ├── msg/                         # 3 个 .msg 消息 (跨语言共享)
+│   │   ├── LaneResult.msg
+│   │   ├── DetectionArray.msg
+│   │   └── ActuatorState.msg
+│   ├── plugin.xml                   # pluginlib descriptor
+│   └── test/                        # gtest (不依赖 rclpy)
+│
+└── vehicle_wbt_platform_py/         # ament_python (Python) — Phase 1
+    ├── vehicle_wbt_platform/       # config_loader / orchestrator / __main__
+    └── test/                        # pytest
+```
+
+### 调用方式 (nav2 风格)
+
+1. **Python orchestrator** 读 `config_sensors.yml`,按 type 决定要 spawn 哪个 C++ 节点
+2. **C++ node** 通过 `rclcpp` publish 消息到 `/vehicle_wbt/v1/...` topic
+3. **Python** 通过 `rclpy` 订阅 topic 处理 high-level logic (任务编排, AI 集成)
+4. **跨语言消息** 通过 `from vehicle_wbt_platform_cpp.msg import LaneResult` 共享 — `colcon build` 自动生成 Python binding
+
+### 关键不变量 (从 Phase 1 继承)
+
+- `main/qqq.py` 仍然零修改
+- `ENABLE_ROS2=0` 仍然零影响
+- `config_sensors.yml` schema 不变 (Python 解析, C++ 节点按 type 加载)
+- Topic 命名空间 `/vehicle_wbt/v1/` 不变
+- 现有 Python adapter/chassis 代码保留作为 **Type 1 / Prototype**(失败回退路径),正式运行时用 C++ 节点
+
+### ros2_control 集成 (Phase 1.5 关键收益)
+
+```xml
+<!-- urdf/vehicle_wbt.urdf.xacro -->
+<ros2_control name="MC602" type="system">
+  <hardware>
+    <plugin>vehicle_wbt_platform_cpp/MC602HardwareInterface</plugin>
+    <param name="serial_port">/dev/ttyUSB0</param>
+    <param name="baud">1000000</param>
+  </hardware>
+  <joint name="wheel_m1"><command_interface name="velocity"/>
+                         <state_interface name="position"/>
+                         <state_interface name="velocity"/></joint>
+  ...  <!-- 4 wheels -->
+</ros2_control>
+```
+
+加载后 `controller_manager` 自动接管控制循环,`diff_drive_controller` / `mecanum_steering_controller` 等可直接接管。**这是纯 Python 架构无法实现的能力**。
+
+### v1 暂不做的 C++ 工作 (Plan B 范围)
+
+- 真实 MC602 协议 (CRC + frame parsing) — Phase 1.5 stub
+- Mecanum/Diff/Tricycle 全部 5 个 chassis 子类的 C++ 实现 — Phase 1.5 只有 Mecanum
+- 完整 ros2_control controller (差速 / 全向) — Plan B
+- Camera C++ component (`image_transport` 集成) — Plan B
+- 4 个 C++ 节点 (MecanumChassisNode / CameraNode / IRNode / EjectionNode) — Plan B
+- 性能基准 (latency / jitter 测量) — Plan D
+
+---
+
 ## Topic Schema
 
 所有 topic 使用 `/vehicle_wbt/v1/<category>/<sub>/...` 命名空间。`<category>` 是顶层分类(sensors/actuators/perception/state/task/safety/diagnostics/cmd),实例 ID 嵌在路径中(便于多实例)。
