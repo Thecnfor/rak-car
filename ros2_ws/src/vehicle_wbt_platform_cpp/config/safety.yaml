@@ -1,0 +1,17 @@
+# vehicle_wbt safety_gate configuration
+#
+# Loaded by safety_gate_node from this file at startup.
+# Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §安全设计
+
+safety_gate:
+  ros__parameters:
+    max_linear_velocity: 0.3      # m/s — absolute cap
+    max_angular_velocity: 0.5     # rad/s — absolute cap
+    deadman_ms: 500               # ms without heartbeat → emergency stop
+    # Physical E-Stop is on P1 button3 per hardware-port-mapping.md.
+    # The sidecar subscribes to /vehicle_wbt/v1/safety/estop (Bool);
+    # main/qqq.py publishes True when BUTTON3 is pressed.
+    estop_pin: "BUTTON3"
+    # Mode state machine: AUTO / MANUAL / DEV_TEST / E_STOP
+    # Default to AUTO; only MANUAL or DEV_TEST accept /cmd/vel_raw.
+    default_mode: "AUTO"

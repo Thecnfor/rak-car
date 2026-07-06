@@ -1,0 +1,181 @@
+# vehicle_wbt Platform — Sensors/Actuators Registry
+#
+# Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §配置系统
+#
+# This file is the single source of truth for what hardware is connected.
+# Adding new hardware = adding one entry here + one URDF link.
+# Sidecar reads this file at startup and spawns corresponding ROS2 nodes.
+
+sensors:
+  # ---- Currently wired (v1 enabled) ----
+  - id: left_ir
+    type: ir
+    port_id: 8
+    port_physical: P8
+    topic: /vehicle_wbt/v1/sensors/ir/left
+    msg_type: std_msgs/Float32
+    rate_hz: 20
+    enabled: true
+
+  - id: right_ir
+    type: ir
+    port_id: 7
+    port_physical: P7
+    topic: /vehicle_wbt/v1/sensors/ir/right
+    msg_type: std_msgs/Float32
+    rate_hz: 20
+    enabled: true
+
+  - id: vert_limit
+    type: analog_input
+    port_id: 6
+    port_physical: P6
+    topic: /vehicle_wbt/v1/sensors/analog/vert_limit
+    msg_type: std_msgs/Int32
+    rate_hz: 50
+    invert: false
+    threshold: 1000
+    enabled: true   # sensor wired, mechanical mount pending per hardware-port-mapping.md
+
+  # ---- Reserved (v1 disabled, hardware not wired) ----
+  - id: ultrasonic_front
+    type: ultrasonic
+    port_id: 5
+    port_physical: P5
+    topic: /vehicle_wbt/v1/sensors/ultrasonic/front
+    msg_type: std_msgs/Float32
+    rate_hz: 10
+    enabled: false
+
+actuators:
+  # ---- Currently wired (v1 enabled) ----
+  - id: motor_ejection
+    type: motor
+    port_id: 5
+    port_physical: M5
+    topic: /vehicle_wbt/v1/actuators/motor/m5/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    perimeter: 0.032
+    reverse: -1
+    enabled: true
+
+  - id: motor_arm_horiz
+    type: motor
+    port_id: 6
+    port_physical: M6
+    topic: /vehicle_wbt/v1/actuators/motor/m6/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    perimeter: 0.032
+    reverse: -1
+    enabled: true
+
+  - id: stepper_ejection_angle
+    type: stepper
+    port_id: 1
+    port_physical: STEP1
+    topic: /vehicle_wbt/v1/actuators/stepper/1/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    perimeter: 0.008
+    stepper2rad: 0.001963   # math.pi/180 * 1.8 / 16
+    enabled: true
+
+  - id: stepper_arm_vert
+    type: stepper
+    port_id: 3
+    port_physical: STEP3
+    topic: /vehicle_wbt/v1/actuators/stepper/3/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    perimeter: 0.008
+    stepper2rad: 0.001963
+    reverse: -1
+    enabled: true
+
+  - id: servo_hand_rotate
+    type: servo_bus
+    port_id: 3
+    port_physical: S3
+    topic: /vehicle_wbt/v1/actuators/servo/s3/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    enabled: true
+
+  - id: servo_hand_grip
+    type: servo_pwm
+    port_id: 7
+    port_physical: S7
+    mode: 270
+    topic: /vehicle_wbt/v1/actuators/servo/s7/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    enabled: true
+
+  - id: servo_weather
+    type: servo_bus
+    port_id: 2
+    port_physical: S2
+    topic: /vehicle_wbt/v1/actuators/servo/s2/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    enabled: true
+
+  - id: vacuum_pump
+    type: dout
+    port_id: 2
+    port_physical: P2
+    topic: /vehicle_wbt/v1/actuators/io/p2/state
+    msg_type: std_msgs/Bool
+    rate_hz: 20
+    enabled: true
+
+  - id: vacuum_valve
+    type: dout
+    port_id: 3
+    port_physical: P3
+    topic: /vehicle_wbt/v1/actuators/io/p3/state
+    msg_type: std_msgs/Bool
+    rate_hz: 20
+    enabled: true
+
+  - id: ejection_valve
+    type: dout
+    port_id: 4
+    port_physical: P4
+    topic: /vehicle_wbt/v1/actuators/io/p4/state
+    msg_type: std_msgs/Bool
+    rate_hz: 20
+    enabled: true
+
+  # ---- Reserved (v1 disabled) ----
+  - id: stepper_2
+    type: stepper
+    port_id: 2
+    port_physical: STEP2
+    topic: /vehicle_wbt/v1/actuators/stepper/2/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    perimeter: 0.008
+    stepper2rad: 0.001963
+    enabled: false
+
+  - id: servo_s1_reserved
+    type: servo_bus
+    port_id: 1
+    port_physical: S1
+    topic: /vehicle_wbt/v1/actuators/servo/s1/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    enabled: false
+
+  - id: servo_s4_reserved
+    type: servo_pwm
+    port_id: 4
+    port_physical: S4
+    mode: 270
+    topic: /vehicle_wbt/v1/actuators/servo/s4/state
+    msg_type: std_msgs/Float32
+    rate_hz: 50
+    enabled: false

@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [develop/ros2-sidecar, develop/ros2-humble-post-flash, main]
+  pull_request:
+    branches: [develop/ros2-sidecar, develop/ros2-humble-post-flash, main]
+
+env:
+  ROS_DISTRO: humble
+  ROS_VERSION: 2
+
+jobs:
+  lint-py:
+    name: Lint Python (flake8)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install flake8
+        run: pip install flake8
+      - name: Run flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero for warnings (E,W); adjust if your project enforces them
+          flake8 . --count --max-line-length=120 --statistics || true
+
+  test-py:
+    name: Python tests (pytest)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install pytest
+        run: pip install pytest pyyaml
+      - name: Run pytest
+        working-directory: ros2_ws/src/vehicle_wbt_platform
+        run: |
+          PYTHONPATH=. python3 -m pytest test/ -v
+
+  test-cpp:
+    name: C++ tests (colcon + gtest)
+    runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-ros-base
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install colcon
+        run: |
+          apt-get update
+          apt-get install -y python3-colcon-common-extensions
+      - name: Source ROS
+        run: source /opt/ros/humble/setup.bash
+      - name: Build
+        working-directory: ros2_ws
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon build --packages-up-to vehicle_wbt_platform_cpp --event-handlers console_direct+
+      - name: Test
+        working-directory: ros2_ws
+        run: |
+          source /opt/ros/humble/setup.bash
+          source install/setup.bash
+          colcon test --packages-select vehicle_wbt_platform_cpp --event-handlers console_direct+
+      - name: Show test results
+        working-directory: ros2_ws
+        run: |
+          source /opt/ros/humble/setup.bash
+          colcon test-result --verbose
+
+  xacro-check:
+    name: URDF xacro validation
+    runs-on: ubuntu-22.04
+    container:
+      image: ros:humble-desktop
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xacro
+        run: apt-get update && apt-get install -y ros-humble-xacro
+      - name: Validate xacro expands
+        run: |
+          source /opt/ros/humble/setup.bash
+          xacro ros2_ws/src/vehicle_wbt_platform_cpp/urdf/vehicle_wbt.urdf.xacro > /tmp/check.urdf
+          test -s /tmp/check.urdf

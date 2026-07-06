@@ -1,0 +1,255 @@
+<?xml version="1.0"?>
+<!--
+  vehicle_wbt robot URDF (xacro).
+
+  Physical layout per docs/hardware-port-mapping.md and hardware-comm.md:
+  - 4 mecanum wheels (M1-M4) in O layout
+  - 1 arm with 2 steppers (M6 horiz, stepper 3 vert) + 2 servos (S3 rotate, S7 grip)
+  - 1 vacuum pump (P2-B) + valve (P3) on gripper
+  - 1 LED (P2-A) on chassis
+  - 1 vert limit sensor (P6) on arm
+  - 2 IR sensors (P7, P8) on chassis sides
+  - 2 USB cameras (/dev/cam1, /dev/cam2)
+  - 4-按键 menu (P1) on chassis
+
+  ros2_control hardware interface: vehicle_wbt_platform_cpp/MC602HardwareInterface
+
+  Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §Chassis 抽象
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="vehicle_wbt">
+
+  <!-- ================= Constants ================= -->
+  <xacro:property name="chassis_length" value="0.30"/>
+  <xacro:property name="chassis_width"  value="0.20"/>
+  <xacro:property name="chassis_height" value="0.08"/>
+  <xacro:property name="chassis_mass"   value="3.0"/>
+  <xacro:property name="wheel_radius"   value="0.03"/>
+  <xacro:property name="wheel_thickness" value="0.02"/>
+  <xacro:property name="wheel_mass"     value="0.1"/>
+  <xacro:property name="arm_base_height" value="0.10"/>
+
+  <!-- ================= Base link ================= -->
+  <link name="base_link">
+    <visual>
+      <origin xyz="0 0 ${chassis_height/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+      <material name="white">
+        <color rgba="1 1 1 1"/>
+      </material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 ${chassis_height/2}" rpy="0 0 0"/>
+      <geometry>
+        <box size="${chassis_length} ${chassis_width} ${chassis_height}"/>
+      </geometry>
+    </collision>
+    <inertial>
+      <origin xyz="0 0 ${chassis_height/2}" rpy="0 0 0"/>
+      <mass value="${chassis_mass}"/>
+      <inertia ixx="${chassis_mass*(chassis_width**2 + chassis_height**2)/12}" ixy="0" ixz="0"
+               iyy="${chassis_mass*(chassis_length**2 + chassis_height**2)/12}" iyz="0"
+               izz="${chassis_mass*(chassis_length**2 + chassis_width**2)/12}"/>
+    </inertial>
+  </link>
+
+  <!-- ================= 4 mecanum wheels (M1-M4, O layout) ================= -->
+  <!-- Wheel macro: name = wheel_m<n>, side = front|rear, side_y = left|right -->
+  <xacro:macro name="mecanum_wheel" params="name x y">
+    <link name="${name}">
+      <visual>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
+        </geometry>
+        <material name="black">
+          <color rgba="0.1 0.1 0.1 1"/>
+        </material>
+      </visual>
+      <collision>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <geometry>
+          <cylinder radius="${wheel_radius}" length="${wheel_thickness}"/>
+        </geometry>
+      </collision>
+      <inertial>
+        <origin xyz="0 0 0" rpy="${pi/2} 0 0"/>
+        <mass value="${wheel_mass}"/>
+        <inertia ixx="${wheel_mass*wheel_radius**2/2}" ixy="0" ixz="0"
+                 iyy="${wheel_mass*wheel_radius**2/4}" iyz="0"
+                 izz="${wheel_mass*wheel_radius**2/4}"/>
+      </inertial>
+    </link>
+    <joint name="${name}_joint" type="continuous">
+      <parent link="base_link"/>
+      <child link="${name}"/>
+      <origin xyz="${x} ${y} ${wheel_radius}" rpy="0 0 0"/>
+      <axis xyz="0 1 0"/>
+    </joint>
+  </xacro:macro>
+  <xacro:mecanum_wheel name="wheel_m1" x="${chassis_length/2 - 0.04}" y="${-chassis_width/2 + 0.04}"/>
+  <xacro:mecanum_wheel name="wheel_m2" x="${chassis_length/2 - 0.04}" y="${chassis_width/2 - 0.04}"/>
+  <xacro:mecanum_wheel name="wheel_m3" x="${-chassis_length/2 + 0.04}" y="${chassis_width/2 - 0.04}"/>
+  <xacro:mecanum_wheel name="wheel_m4" x="${-chassis_length/2 + 0.04}" y="${-chassis_width/2 + 0.04}"/>
+
+  <!-- ================= Arm base (M6 + stepper 3 carrier) ================= -->
+  <link name="arm_base_link">
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.05 0.05 0.10"/>
+      </geometry>
+      <material name="gray">
+        <color rgba="0.5 0.5 0.5 1"/>
+      </material>
+    </visual>
+  </link>
+  <joint name="arm_base_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="arm_base_link"/>
+    <origin xyz="0 0 ${chassis_height}"/>
+  </joint>
+
+  <!-- M6: horizontal slide (prismatic) -->
+  <link name="arm_horiz_link">
+    <visual>
+      <origin xyz="0.075 0 0" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.15 0.02 0.02"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="arm_horiz_joint" type="prismatic">
+    <parent link="arm_base_link"/>
+    <child link="arm_horiz_link"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+    <axis xyz="1 0 0"/>
+    <limit lower="0" upper="0.3" effort="10" velocity="0.2"/>
+  </joint>
+
+  <!-- Stepper 3: vertical slide (prismatic) -->
+  <link name="arm_vert_link">
+    <visual>
+      <origin xyz="0.075 0 0.075" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.15 0.02 0.15"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="arm_vert_joint" type="prismatic">
+    <parent link="arm_horiz_link"/>
+    <child link="arm_vert_link"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="0.3" effort="10" velocity="0.04"/>
+  </joint>
+
+  <!-- S3: hand rotate (continuous) -->
+  <link name="arm_hand_rotate_link">
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+        <cylinder radius="0.02" length="0.04"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="arm_hand_rotate_joint" type="continuous">
+    <parent link="arm_vert_link"/>
+    <child link="arm_hand_rotate_link"/>
+    <origin xyz="0.15 0 0.15" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+  </joint>
+
+  <!-- S7: hand grip (continuous, 270 deg mode) -->
+  <link name="arm_hand_grip_link">
+    <visual>
+      <origin xyz="0 0 -0.02" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.04 0.04 0.04"/>
+      </geometry>
+    </visual>
+  </link>
+  <joint name="arm_hand_grip_joint" type="revolute">
+    <parent link="arm_hand_rotate_link"/>
+    <child link="arm_hand_grip_link"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="${-45*pi/180}" upper="${46*pi/180}" effort="1" velocity="1"/>
+  </joint>
+
+  <!-- ================= Sensors ================= -->
+  <!-- Front camera (P7 /dev/cam2) -->
+  <link name="camera_front_link"/>
+  <joint name="camera_front_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_front_link"/>
+    <origin xyz="${chassis_length/2 - 0.01} 0 ${chassis_height/2}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- Side camera (P8 /dev/cam1) -->
+  <link name="camera_side_link"/>
+  <joint name="camera_side_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="camera_side_link"/>
+    <origin xyz="0 ${chassis_width/2 - 0.01} ${chassis_height/2}" rpy="0 0 ${pi/2}"/>
+  </joint>
+
+  <!-- IR sensors (P7 left, P8 right in hardware-port-mapping.md) -->
+  <link name="ir_left_link"/>
+  <joint name="ir_left_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="ir_left_link"/>
+    <origin xyz="0 ${chassis_width/2 - 0.02} ${chassis_height/2}" rpy="0 0 0"/>
+  </joint>
+  <link name="ir_right_link"/>
+  <joint name="ir_right_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="ir_right_link"/>
+    <origin xyz="0 ${-chassis_width/2 + 0.02} ${chassis_height/2}" rpy="0 0 0"/>
+  </joint>
+
+  <!-- ================= ros2_control hardware interface ================= -->
+  <ros2_control name="MC602" type="system">
+    <hardware>
+      <plugin>vehicle_wbt_platform_cpp/MC602HardwareInterface</plugin>
+      <param name="serial_port">/dev/ttyUSB0</param>
+      <param name="baud">1000000</param>
+    </hardware>
+    <joint name="wheel_m1_joint">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="wheel_m2_joint">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="wheel_m3_joint">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="wheel_m4_joint">
+      <command_interface name="velocity"/>
+      <state_interface name="position"/>
+      <state_interface name="velocity"/>
+    </joint>
+    <joint name="arm_horiz_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+    </joint>
+    <joint name="arm_vert_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+    </joint>
+    <joint name="arm_hand_rotate_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+    </joint>
+    <joint name="arm_hand_grip_joint">
+      <command_interface name="position"/>
+      <state_interface name="position"/>
+    </joint>
+  </ros2_control>
+
+</robot>
