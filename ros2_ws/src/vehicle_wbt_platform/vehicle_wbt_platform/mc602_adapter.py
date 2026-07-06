@@ -13,6 +13,7 @@ class, add a new console_script entry in setup.py. No sidecar code changes.
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any, Optional
 
 from vehicle_wbt_platform.controller_base import (
@@ -106,6 +107,11 @@ class MC602Adapter(BaseControllerHardwareInterface):
                 f"unsupported sensor type {sensor_type!r}; "
                 f"supported: {sorted(_SENSOR_TYPE_TO_METHOD)}"
             )
+        # All P口 modes share the same physical port space (1..8).
+        if not (1 <= int(port_id) <= self._IO_MAX):
+            raise ControllerError(
+                f"port_id {port_id} out of range for sensor; must be in [1, {self._IO_MAX}]"
+            )
         method = getattr(self._mc602, method_name, None)
         if method is None:
             raise ControllerError(
@@ -120,6 +126,24 @@ class MC602Adapter(BaseControllerHardwareInterface):
             raise ControllerError(
                 f"unsupported actuator type {actuator_type!r}; "
                 f"supported: {sorted(_ACTUATOR_TYPE_TO_METHOD)}"
+            )
+        # Per-actuator-type port count caps from hardware-port-mapping.md.
+        max_ports_for_type = {
+            "motor": self._MOTOR_MAX,
+            "servo_bus": self._SERVO_MAX,
+            "servo_pwm": self._SERVO_MAX,
+            "stepper": self._STEPPER_MAX,
+            "dout": self._IO_MAX,
+        }
+        max_ports = max_ports_for_type[actuator_type]
+        if not (1 <= int(port_id) <= max_ports):
+            raise ControllerError(
+                f"port_id {port_id} out of range for actuator type {actuator_type!r}; "
+                f"must be in [1, {max_ports}]"
+            )
+        if not math.isfinite(float(value)):
+            raise ControllerError(
+                f"value must be a finite number, got {value!r}"
             )
         method = getattr(self._mc602, method_name, None)
         if method is None:

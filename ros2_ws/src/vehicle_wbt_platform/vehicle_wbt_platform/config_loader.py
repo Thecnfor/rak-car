@@ -5,6 +5,7 @@ Spec ref: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §配置系�
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,14 @@ import yaml
 # Topic namespace that every published topic MUST start with.
 # Hardcoded per spec §预留 Topic Namespace; v1 协议内不可改.
 V1_NAMESPACE_PREFIX = "/vehicle_wbt/v1/"
+
+# ROS2 message type format: <package>/<MessageName> where package is lowercase
+# snake_case and MessageName is UpperCamelCase. Single regex per spec convention.
+_MSG_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]*/[A-Z][A-Za-z0-9_]*$")
+
+# Sane upper bound for any periodic publish rate. Above this is almost certainly
+# a typo or a denial-of-service vector (saturating DDS bandwidth).
+_MAX_RATE_HZ = 1000.0
 
 
 class ConfigSchemaError(ValueError):
@@ -77,9 +86,29 @@ def _parse_entry(raw: dict[str, Any], kind: str) -> dict[str, Any]:
             f"{kind} entry {raw.get('id', '?')!r}: missing required fields: {missing}"
         )
 
-    if not str(raw["topic"]).startswith(V1_NAMESPACE_PREFIX):
+    topic = str(raw["topic"])
+    if not topic.startswith(V1_NAMESPACE_PREFIX):
         raise ConfigSchemaError(
-            f"{kind} entry {raw['id']!r}: topic {raw['topic']!r} must start with {V1_NAMESPACE_PREFIX}"
+            f"{kind} entry {raw['id']!r}: topic {topic!r} must start with {V1_NAMESPACE_PREFIX}"
+        )
+
+    msg_type = str(raw["msg_type"])
+    if not _MSG_TYPE_RE.match(msg_type):
+        raise ConfigSchemaError(
+            f"{kind} entry {raw['id']!r}: msg_type {msg_type!r} must match "
+            f"<package>/<MessageName> ROS2 format (e.g. std_msgs/Float32)"
+        )
+
+    port_id = int(raw["port_id"])
+    if port_id < 1:
+        raise ConfigSchemaError(
+            f"{kind} entry {raw['id']!r}: port_id must be >= 1, got {port_id}"
+        )
+
+    rate_hz = float(raw["rate_hz"])
+    if not (0.0 < rate_hz <= _MAX_RATE_HZ):
+        raise ConfigSchemaError(
+            f"{kind} entry {raw['id']!r}: rate_hz must be in (0, {_MAX_RATE_HZ}], got {rate_hz}"
         )
 
     # Type-specific fields are everything outside the required set + 'enabled'.
@@ -88,11 +117,11 @@ def _parse_entry(raw: dict[str, Any], kind: str) -> dict[str, Any]:
     return {
         "id": str(raw["id"]),
         "type": str(raw["type"]),
-        "port_id": int(raw["port_id"]),
+        "port_id": port_id,
         "port_physical": str(raw["port_physical"]),
-        "topic": str(raw["topic"]),
-        "msg_type": str(raw["msg_type"]),
-        "rate_hz": float(raw["rate_hz"]),
+        "topic": topic,
+        "msg_type": msg_type,
+        "rate_hz": rate_hz,
         "enabled": bool(raw.get("enabled", True)),
         "type_specific": type_specific,
     }

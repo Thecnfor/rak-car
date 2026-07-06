@@ -13,7 +13,42 @@ from pathlib import Path
 
 
 # Repo layout: sidecar lives in ros2_ws/, but config_sensors.yml is at repo root.
-_DEFAULT_CONFIG = str(Path(__file__).resolve().parents[3] / "config_sensors.yml")
+_DEFAULT_CONFIG = str(Path(__file__).resolve().parents[4] / "config_sensors.yml")
+_DEFAULT_CONFIG_DIR = str(Path(_DEFAULT_CONFIG).resolve().parent)
+_DEFAULT_SERIAL = "/dev/ttyUSB0"
+_DEFAULT_DOMAIN_ID = 42
+# ROS2 DDS domain id range is 0..232 (per ROS2 docs).
+_MIN_DOMAIN_ID = 0
+_MAX_DOMAIN_ID = 232
+
+
+def _env_int(name: str, default: int, *, lo: int, hi: int) -> int:
+    """Read an integer env var, validating range. Fail-CLOSED: bad value -> SystemExit."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        val = int(raw)
+    except ValueError:
+        raise SystemExit(f"{name} must be an integer, got {raw!r}")
+    if not (lo <= val <= hi):
+        raise SystemExit(f"{name} must be in [{lo}, {hi}], got {val}")
+    return val
+
+
+def _validate_config_path(p: str) -> str:
+    """Resolve the config path and reject anything outside the repo config dir.
+
+    Prevents VEHICLE_WBT_CONFIG=/etc/passwd style escapes.
+    """
+    resolved = Path(p).resolve()
+    if not str(resolved).startswith(_DEFAULT_CONFIG_DIR + os.sep):
+        raise SystemExit(
+            f"VEHICLE_WBT_CONFIG must be inside {_DEFAULT_CONFIG_DIR!r}, got {p!r}"
+        )
+    if not resolved.is_file():
+        raise SystemExit(f"VEHICLE_WBT_CONFIG file does not exist: {p!r}")
+    return str(resolved)
 
 
 def main() -> int:
@@ -30,9 +65,12 @@ def main() -> int:
 
     from vehicle_wbt_platform.orchestrator import SidecarOrchestrator
 
-    config_path = os.environ.get("VEHICLE_WBT_CONFIG", _DEFAULT_CONFIG)
-    serial_port = os.environ.get("VEHICLE_WBT_SERIAL", "/dev/ttyUSB0")
-    ros_domain_id = int(os.environ.get("ROS_DOMAIN_ID", "42"))
+    config_path = _validate_config_path(
+        os.environ.get("VEHICLE_WBT_CONFIG", _DEFAULT_CONFIG)
+    )
+    serial_port = os.environ.get("VEHICLE_WBT_SERIAL", _DEFAULT_SERIAL)
+    ros_domain_id = _env_int("ROS_DOMAIN_ID", _DEFAULT_DOMAIN_ID,
+                             lo=_MIN_DOMAIN_ID, hi=_MAX_DOMAIN_ID)
 
     orch = SidecarOrchestrator(
         config_path=config_path,

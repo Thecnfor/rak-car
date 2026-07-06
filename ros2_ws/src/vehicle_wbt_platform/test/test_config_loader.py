@@ -136,3 +136,154 @@ sensors:
     cfg_path.write_text(bad_topic)
     with pytest.raises(ConfigSchemaError, match="must start with /vehicle_wbt/v1/"):
         load_registry(str(cfg_path))
+
+
+# ----- Security: input range / format validation (from security review) -----
+
+
+@pytest.mark.parametrize(
+    "bad_msg_type,why",
+    [
+        ("std_msgs/float32", "lowercase message name not allowed"),
+        ("std_msgs/Float 32", "space in message name"),
+        ("std_msgs", "missing slash"),
+        ("std_msgs/Float32/extra", "too many slashes"),
+        ("Float32", "no package"),
+        ("", "empty"),
+    ],
+)
+def test_msg_type_format_rejected(tmp_path: Path, bad_msg_type: str, why: str) -> None:
+    yaml = f"""
+sensors:
+  - id: x
+    type: ir
+    port_id: 1
+    port_physical: P1
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: {bad_msg_type}
+    rate_hz: 10
+"""
+    cfg_path = tmp_path / "bad_msg.yml"
+    cfg_path.write_text(yaml)
+    with pytest.raises(ConfigSchemaError, match="must match"):
+        load_registry(str(cfg_path))
+
+
+def test_msg_type_format_accepted(tmp_path: Path) -> None:
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: 1
+    port_physical: P1
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: std_msgs/Float32
+    rate_hz: 10
+"""
+    cfg_path = tmp_path / "ok_msg.yml"
+    cfg_path.write_text(yaml)
+    reg = load_registry(str(cfg_path))
+    assert reg.sensors["x"].msg_type == "std_msgs/Float32"
+
+
+def test_msg_type_with_subnamespace_accepted(tmp_path: Path) -> None:
+    """vehicle_wbt_msgs/LaneResult is the spec's namespaced custom type."""
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: 1
+    port_physical: P1
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: vehicle_wbt_msgs/LaneResult
+    rate_hz: 10
+"""
+    cfg_path = tmp_path / "ok_subns.yml"
+    cfg_path.write_text(yaml)
+    reg = load_registry(str(cfg_path))
+    assert reg.sensors["x"].msg_type == "vehicle_wbt_msgs/LaneResult"
+
+
+def test_port_id_zero_rejected(tmp_path: Path) -> None:
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: 0
+    port_physical: P0
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: std_msgs/Float32
+    rate_hz: 10
+"""
+    cfg_path = tmp_path / "bad_port.yml"
+    cfg_path.write_text(yaml)
+    with pytest.raises(ConfigSchemaError, match="port_id must be >= 1"):
+        load_registry(str(cfg_path))
+
+
+def test_port_id_negative_rejected(tmp_path: Path) -> None:
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: -3
+    port_physical: P0
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: std_msgs/Float32
+    rate_hz: 10
+"""
+    cfg_path = tmp_path / "bad_neg_port.yml"
+    cfg_path.write_text(yaml)
+    with pytest.raises(ConfigSchemaError, match="port_id must be >= 1"):
+        load_registry(str(cfg_path))
+
+
+def test_rate_hz_zero_rejected(tmp_path: Path) -> None:
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: 1
+    port_physical: P1
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: std_msgs/Float32
+    rate_hz: 0
+"""
+    cfg_path = tmp_path / "bad_rate0.yml"
+    cfg_path.write_text(yaml)
+    with pytest.raises(ConfigSchemaError, match="rate_hz must be in"):
+        load_registry(str(cfg_path))
+
+
+def test_rate_hz_too_high_rejected(tmp_path: Path) -> None:
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: 1
+    port_physical: P1
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: std_msgs/Float32
+    rate_hz: 10000.0
+"""
+    cfg_path = tmp_path / "bad_rate_high.yml"
+    cfg_path.write_text(yaml)
+    with pytest.raises(ConfigSchemaError, match="rate_hz must be in"):
+        load_registry(str(cfg_path))
+
+
+def test_rate_hz_negative_rejected(tmp_path: Path) -> None:
+    yaml = """
+sensors:
+  - id: x
+    type: ir
+    port_id: 1
+    port_physical: P1
+    topic: /vehicle_wbt/v1/sensors/ir/x
+    msg_type: std_msgs/Float32
+    rate_hz: -5
+"""
+    cfg_path = tmp_path / "bad_rate_neg.yml"
+    cfg_path.write_text(yaml)
+    with pytest.raises(ConfigSchemaError, match="rate_hz must be in"):
+        load_registry(str(cfg_path))
