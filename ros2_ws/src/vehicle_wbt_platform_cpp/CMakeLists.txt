@@ -115,7 +115,22 @@ endif()
 
 install(TARGETS
   camera_node infrared_node mecanum_chassis_node arm_node safety_gate_node
+  mission_runner_node
   RUNTIME DESTINATION lib/${PROJECT_NAME}
+)
+
+# SeedingTask is a library linked into the mission_runner_node — it has
+# a REGISTER_TASK static initializer that registers itself at startup.
+add_library(seeding_task SHARED src/seeding_task.cpp)
+target_include_directories(seeding_task PUBLIC include)
+target_link_libraries(seeding_task PUBLIC
+  rclcpp::rclcpp
+  geometry_msgs::geometry_msgs
+  std_msgs::std_msgs
+)
+target_link_libraries(mission_runner_node seeding_task)
+install(TARGETS seeding_task
+  LIBRARY DESTINATION lib/${PROJECT_NAME}
 )
 
 # -----------------------------------------------------------------------------
@@ -165,6 +180,12 @@ if(BUILD_TESTING)
     test/test_safety_gate_logic.cpp
   )
   target_include_directories(test_safety_gate_logic PUBLIC include)
+
+  # Pure task framework tests — no rclcpp needed (uses nullptr sentinel)
+  ament_add_gmock(test_base_task
+    test/test_base_task.cpp
+  )
+  target_include_directories(test_base_task PUBLIC include)
 endif()
 
 ament_package()
