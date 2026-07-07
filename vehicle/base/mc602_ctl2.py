@@ -219,7 +219,10 @@ class Buzzer_2(DevCmdInterface):
 
     def rings(self, freq=262, duration=0.4):
         # 音调hz 时间s
-        res = super().set(int(freq/2), int(duration*20))
+        # 协议要求 0..255 (ubyte): freq/2 不能超 510 Hz, duration*20 不能超 12.75s
+        freq_arg = max(0, min(255, int(freq / 2)))
+        dur_arg = max(1, min(255, int(duration * 20)))
+        res = super().set(freq_arg, dur_arg)
         return res
     
 class Motor_2(DevCmdInterface):
