@@ -4,7 +4,8 @@
 Launch file: full sidecar system on Jetson Orin (real hardware).
 
 Brings up:
-- 2 cameras (front + side)
+- 2 cameras (front + arm) — each publishing 5 streams: image_raw,
+  image_compressed, camera_info, camera_status, camera_meta
 - 2 IR sensors (left + right)
 - mecanum chassis node (subscribes /cmd/vel_safe, publishes /state/odom)
 - arm node (subscribes /cmd/arm/trajectory, publishes /state/actuators)
@@ -12,6 +13,11 @@ Brings up:
 
 Usage:
   ros2 launch vehicle_wbt_platform_cpp full_system.launch.py
+
+Note on camera device paths: this launch file uses the device symlinks
+produced by /etc/udev/rules.d/99-usbvideo.rules. The mapping (devpath ->
+symlink) is hardware-specific; if you move the physical cables, remap via
+the udev rules before relaunching. See docs/hardware-port-mapping.md.
 
 Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §生命周期
 """
@@ -29,8 +35,26 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "baud", default_value="1000000",
             description="MC602 baud rate"),
+        DeclareLaunchArgument(
+            "front_device", default_value="/dev/cam2",
+            description="Front camera device path. Competition target: /dev/cam2. "
+            "Override per machine, e.g. on this dev box the front cam is at /dev/cam4."),
+        DeclareLaunchArgument(
+            "arm_device", default_value="/dev/cam1",
+            description="Arm camera device path. Competition target: /dev/cam1. "
+            "Override per machine, e.g. on this dev box the arm cam is at /dev/cam3."),
+        DeclareLaunchArgument(
+            "image_rate_hz", default_value="10.0",
+            description="Camera frame rate (Hz)"),
+        DeclareLaunchArgument(
+            "jpeg_quality", default_value="85",
+            description="JPEG quality for image_compressed (0..100)"),
 
-        # Front camera
+        # ---- Cameras: one node per physical camera. Each publishes 5 streams
+        # under /vehicle_wbt/v1/sensors/camera/<camera_id>/{image_raw,
+        # image_compressed, camera_info, camera_status, camera_meta}. ----
+
+        # Front camera — device overridable via front_device launch arg.
         Node(
             package="vehicle_wbt_platform_cpp",
             executable="camera_node",
@@ -38,24 +62,27 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[{
                 "camera_id": "front",
-                "device": "/dev/cam2",
+                "device": LaunchConfiguration("front_device"),
                 "image_width": 640,
                 "image_height": 480,
-                "rate_hz": 10.0,
+                "rate_hz": LaunchConfiguration("image_rate_hz"),
+                "jpeg_quality": LaunchConfiguration("jpeg_quality"),
             }],
         ),
-        # Side camera
+
+        # Arm (mechanical-arm wrist) camera — device overridable via arm_device.
         Node(
             package="vehicle_wbt_platform_cpp",
             executable="camera_node",
-            name="camera_side",
+            name="camera_arm",
             output="screen",
             parameters=[{
-                "camera_id": "side",
-                "device": "/dev/cam1",
+                "camera_id": "arm",
+                "device": LaunchConfiguration("arm_device"),
                 "image_width": 640,
                 "image_height": 480,
-                "rate_hz": 10.0,
+                "rate_hz": LaunchConfiguration("image_rate_hz"),
+                "jpeg_quality": LaunchConfiguration("jpeg_quality"),
             }],
         ),
 

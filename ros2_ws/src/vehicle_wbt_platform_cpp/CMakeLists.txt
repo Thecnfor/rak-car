@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(vehicle_wbt_platform_cpp LANGUAGES CXX)
+project(vehicle_wbt_platform_cpp LANGUAGES C CXX)
 
 # -----------------------------------------------------------------------------
 # C++ standard + warnings
@@ -37,21 +37,35 @@ find_package(nav_msgs REQUIRED)
 find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(diagnostic_msgs REQUIRED)
+find_package(OpenCV REQUIRED)
 find_package(hardware_interface QUIET)
 find_package(pluginlib QUIET)
 find_package(rcpputils REQUIRED)
+
+# Re-enabled: Humble's rosidl_default_generators is fixed (was disabled
+# in commit 9e11fd7 due to a Lyrical 2.8.7 bug that no longer applies).
+find_package(rosidl_default_generators REQUIRED)
 
 # -----------------------------------------------------------------------------
 # rclcpp nodes — each includes its needed core sources directly.
 # We avoid a shared library to keep the CMake name space simple.
 # -----------------------------------------------------------------------------
-# camera_node
+# camera_node — publishes 5 streams per camera: image_raw, image_compressed,
+# camera_info, camera_status, camera_meta. Uses OpenCV for synthetic frame
+# generation + JPEG encoding (cv::imencode). Listens to the cv_bridge-extras
+# pattern: link component-level targets (no `OpenCV::opencv4` aggregate).
 add_executable(camera_node src/camera_node.cpp)
 target_include_directories(camera_node PUBLIC include)
 target_link_libraries(camera_node PUBLIC
   rclcpp::rclcpp
   sensor_msgs::sensor_msgs
   std_msgs::std_msgs
+  diagnostic_msgs::diagnostic_msgs
+  ${PROJECT_NAME}__rosidl_typesupport_cpp
+  opencv_core
+  opencv_imgcodecs
+  opencv_imgproc
 )
 
 # infrared_node
@@ -167,6 +181,13 @@ install(
 
 # Note: .msg files are installed as documentation (not generated)
 install(DIRECTORY msg/ DESTINATION share/${PROJECT_NAME}/msg)
+
+# ---- Generate C++/Python interfaces from .msg files (Humble — re-enabled
+#      after the Lyrical 2.8.7 workaround in commit 9e11fd7 is no longer needed) ----
+rosidl_generate_interfaces(${PROJECT_NAME}
+  "msg/CameraMeta.msg"
+  DEPENDENCIES builtin_interfaces std_msgs
+)
 
 # -----------------------------------------------------------------------------
 # Testing
