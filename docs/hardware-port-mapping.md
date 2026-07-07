@@ -16,7 +16,6 @@
 | M3 | 左后轮（麦克纳姆） | 同上 | 同上 |
 | M4 | 右后轮（麦克纳姆） | 同上 | 同上 |
 | M5 | 弹射推进电机 | `MotorWrap(5, reverse=-1)` | `task_func.py:9` |
-| M6 | 机械臂水平丝杆 | `MotorWrap(6, reverse=-1)` | `arm_cfg.yaml:17` → `arm_base.py:112` |
 | S2 | 展示牌舵机（总线） | `ServoBus(2)` | `task_func.py:58` |
 | S3 | 手爪旋转舵机（总线） | `ServoBus(3)` | `arm_cfg.yaml:5-8` |
 | S7 | 手爪开合舵机（PWM, 270°） | `ServoPwm(7, mode=270)` | `arm_cfg.yaml:9-13` |
@@ -48,6 +47,7 @@
     M2(左前) ←──→ M1(右前)
     M3(左后) ←──→ M4(右后)
 ```
+| M6 | 机械臂水平丝杆 | `MotorWrap(6, reverse=-1)` | `arm_cfg.yaml:17` → `arm_base.py:112` |
 
 - 每个轮子半径 3cm
 - 电机类型 `motor_280`，减速比 `(28/11)^4 ≈ 41.98`

@@ -25,6 +25,14 @@ python important_car.py
 # HRI robot face display (PySide2/QML)
 python main/hri/main.py
 
+# Monitor service — Flask MJPEG + keypress relay on port 5000.
+# The persistent frontend in /home/jetson/workspace/rak-hri is
+# manifest-driven: it fetches /api/panels and renders whatever the
+# backend declares. Self-contained, no import from vehicle/ or car_wrap.
+python3 -m tools.streamer
+# RAK_CAMERA_FORCE_MOCK=1 python3 -m tools.streamer  # no hardware needed
+# RAK_STREAMER_PORT=5000 python3 -m tools.streamer   # default
+
 # Install systemd auto-start service
 sudo bash main/boot_py.sh
 ```
@@ -68,6 +76,11 @@ Six-layer design, bottom-up:
 - `ClintInterface` (`infer_cs/base/infer_front.py`) — ZMQ inference client. Auto-launches `infer_back_end.py` if not running.
 - `InferServer` (`infer_cs/base/infer_back_end.py`) — ZMQ inference server hosting models
 - `Camera` (`camera/base/camera.py`) — Threaded USB camera capture (daemon thread, no lock on `self.frame`)
+- `Camera` (`tools/base/camera.py`) — Lightweight cv2-only Camera used by `tools/streamer.py`. Auto-falls-back to synthetic frames when `/dev/cam*` is missing. Deliberately does NOT import the rest of rak-car.
+- `Streamer` (`tools/streamer.py`) — Flask service on port 5000. Exposes a *manifest-driven* panel surface. Endpoints: `GET /api/panels` (manifest), `GET /api/health`, `GET /api/cameras/<front|side>/{mjpeg,snapshot}`, `GET /api/cameras/<front|side>/detections/{mjpeg,snapshot.jpg}` (with boxes drawn server-side), `GET /api/state/{pose,velocity,battery}`, `GET /api/sensors/all`, `GET /api/detections`, `POST/GET/DELETE /api/keypress`. Standalone — `python3 -m tools.streamer`.
+- `Panel` + `PanelRegistry` (`tools/panels.py`) — Self-describing panel model. The frontend fetches `/api/panels` and renders the grid from the manifest. Adding a new feature is `REGISTRY.register(Panel(...))` in `_register_panels` of `Streamer`.
+- `MockDetector` + `draw_detections` (`tools/detector.py`) — Synthesizes plausible detection tracks (PERSON/VEHICLE/SIGN/PLANT/PEST/QR with smooth motion + confidence oscillation + trails) and draws them on frames. Replace with a real ZMQ-backed detector (using `MyCar`'s `ClintInterface.task_det`) to switch to real inference.
+- `RobotState` (`tools/state.py`) — Synthetic in-memory robot state (pose, velocity, battery, IR, last key) that animates over time so the UI has data when no real commands are coming in.
 - `ErnieBotWrap` / `OpenAiWrap` (`ernie_bot/`) — LLM integration with JSON schema prompts
 
 ## The `ctl_id` Global Dispatch Pattern
