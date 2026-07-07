@@ -65,3 +65,7 @@ ros2_ws/log/
 *.gcda
 *.gcno
 coverage.xml
+
+# Calibration session artifacts (operator-only, regenerated each run)
+calibration_session/
+
