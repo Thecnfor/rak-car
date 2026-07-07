@@ -45,13 +45,15 @@ public:
   // Return port-type -> count, e.g. {{"motor", 6}, {"servo", 7}, ...}.
   virtual std::map<std::string, uint32_t> enumerate_ports() const = 0;
 
-protected:
   // Per-controller port caps; used by derived classes to validate port_id.
   // These constants match hardware-port-mapping.md §MC602 控制器.
   static constexpr uint8_t MOTOR_MAX = 6;
   static constexpr uint8_t SERVO_MAX = 7;
   static constexpr uint8_t STEPPER_MAX = 3;
   static constexpr uint8_t IO_MAX = 8;
-};
+
+protected:
+
+};  // class BaseController
 
 }  // namespace vehicle_wbt_platform_cpp

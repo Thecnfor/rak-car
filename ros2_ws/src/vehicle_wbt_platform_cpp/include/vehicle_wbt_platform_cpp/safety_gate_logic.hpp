@@ -55,6 +55,18 @@ struct GateDecision
   } reason{Reason::NONE};
 };
 
+// Bitwise operators for Reason bitfield
+inline GateDecision::Reason operator&(GateDecision::Reason a, GateDecision::Reason b)
+{
+  return static_cast<GateDecision::Reason>(
+    static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+}
+inline GateDecision::Reason & operator&=(GateDecision::Reason & a, GateDecision::Reason b)
+{
+  a = a & b;
+  return a;
+}
+
 // Apply the 4-layer safety gate. Pure function, no side effects.
 //
 // in_cmd:  linear.x, linear.y, angular.z are the requested velocities

@@ -95,7 +95,7 @@ hardware_interface::CallbackReturn MC602HardwareInterface::on_deactivate(
 std::vector<hardware_interface::StateInterface> MC602HardwareInterface::export_state_interfaces()
 {
   std::vector<hardware_interface::StateInterface> out;
-  for (const auto & [name, js] : joints_) {
+  for (auto & [name, js] : joints_) {
     out.emplace_back(name, hardware_interface::HW_IF_POSITION, &js.pos);
     out.emplace_back(name, hardware_interface::HW_IF_VELOCITY, &js.vel);
   }
@@ -105,7 +105,7 @@ std::vector<hardware_interface::StateInterface> MC602HardwareInterface::export_s
 std::vector<hardware_interface::CommandInterface> MC602HardwareInterface::export_command_interfaces()
 {
   std::vector<hardware_interface::CommandInterface> out;
-  for (const auto & [name, js] : joints_) {
+  for (auto & [name, js] : joints_) {
     out.emplace_back(name, hardware_interface::HW_IF_VELOCITY, &js.cmd_velocity);
   }
   return out;

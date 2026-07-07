@@ -16,6 +16,7 @@
 #include "vehicle_wbt_platform_cpp/base_controller.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <string>
 

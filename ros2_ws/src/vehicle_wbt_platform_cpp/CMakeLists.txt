@@ -97,6 +97,14 @@ target_link_libraries(safety_gate_node PUBLIC
   std_msgs::std_msgs
 )
 
+# mission_runner_node
+add_executable(mission_runner_node src/mission_runner_node.cpp)
+target_include_directories(mission_runner_node PUBLIC include)
+target_link_libraries(mission_runner_node PUBLIC
+  rclcpp::rclcpp
+  std_msgs::std_msgs
+)
+
 # Optional ros2_control hardware interface plugin
 if(hardware_interface_FOUND AND pluginlib_FOUND)
   add_library(_vehicle_wbt_platform_cpp_plugin SHARED src/mc602_hardware_interface.cpp)
@@ -128,8 +136,19 @@ target_link_libraries(seeding_task PUBLIC
   geometry_msgs::geometry_msgs
   std_msgs::std_msgs
 )
-target_link_libraries(mission_runner_node seeding_task)
+target_link_libraries(mission_runner_node PUBLIC seeding_task)
 install(TARGETS seeding_task
+  LIBRARY DESTINATION lib/${PROJECT_NAME}
+)
+
+# TaskRegistry singleton — used by mission_runner_node to look up tasks by name.
+add_library(task_registry SHARED src/task_registry.cpp)
+target_include_directories(task_registry PUBLIC include)
+target_link_libraries(task_registry PUBLIC
+  rclcpp::rclcpp
+)
+target_link_libraries(mission_runner_node PUBLIC task_registry)
+install(TARGETS task_registry
   LIBRARY DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -186,6 +205,7 @@ if(BUILD_TESTING)
     test/test_base_task.cpp
   )
   target_include_directories(test_base_task PUBLIC include)
+  target_link_libraries(test_base_task task_registry)
 endif()
 
 ament_package()
