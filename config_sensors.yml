@@ -26,6 +26,37 @@ sensors:
     rate_hz: 20
     enabled: true
 
+  # ---- Cameras (added 2026-07-08) ----
+  # Two Aveo SP2812 UVC cams wired on USB 2.x. Each publishes 5 streams
+  # under /vehicle_wbt/v1/sensors/camera/<id>/ — see camera_node.cpp
+  # for the full topic schema. Calibration YAMLs in
+  #   ros2_ws/src/vehicle_wbt_platform_cpp/params/camera_{front,arm}.yaml
+  # are loaded by camera_info_manager at camera_node startup.
+
+  - id: camera_front
+    type: camera
+    port_id: 1  # config-list ordinal; cameras don't have an MC602 port — the
+    # actual USB path is in port_physical ("/dev/cam4") and is overridable
+    # via the launch-arg `front_device` in full_system.launch.py.
+    port_physical: "/dev/cam4"
+    topic: /vehicle_wbt/v1/sensors/camera/front/image_raw  # + image_compressed, camera_info, camera_status, camera_meta
+    msg_type: sensor_msgs/Image  # raw; CompressedImage / CameraInfo / DiagnosticArray / CameraMeta also published
+    rate_hz: 10
+    resolution: [640, 480]
+    pixel_format: MJPG  # UVC forced via CAP_PROP_FOURCC=1196444237
+    enabled: true
+
+  - id: camera_arm
+    type: camera
+    port_id: 2  # see note above
+    port_physical: "/dev/cam3"
+    topic: /vehicle_wbt/v1/sensors/camera/arm/image_raw
+    msg_type: sensor_msgs/Image
+    rate_hz: 10
+    resolution: [640, 480]
+    pixel_format: MJPG
+    enabled: true
+
   - id: vert_limit
     type: analog_input
     port_id: 6

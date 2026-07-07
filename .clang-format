@@ -1,0 +1,41 @@
+# C++ style for vehicle_wbt Platform
+# Used by ament_clang_format (test_depend in CMakeLists). Run:
+#   colcon lint --package-select vehicle_wbt_platform_cpp
+# to check; `clang-format -i <file>` to fix.
+
+---
+Language: Cpp
+BasedOnStyle: Google
+ColumnLimit: 100
+IndentWidth: 2
+TabWidth: 2
+UseTab: Never
+
+# Pointers: align right
+DerivePointerAlignment: false
+PointerAlignment: Right
+
+# Functions
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: Never
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Never
+
+# Braces: attach
+BreakBeforeBraces: Attach
+
+# Includes
+IncludeBlocks: Preserve
+SortIncludes: false
+
+# Namespaces
+NamespaceIndentation: None
+
+# Indent case labels
+IndentCaseLabels: false
+
+# Comments
+ReflowComments: true
+
+# Includes / macros
+ForEachMacPenalty: 1000  # discourage for_each (we use range-for)

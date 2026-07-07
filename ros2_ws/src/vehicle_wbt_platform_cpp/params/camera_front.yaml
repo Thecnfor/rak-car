@@ -1,0 +1,62 @@
+# Front camera calibration — Aveo SP2812 at /dev/cam4
+#
+# This file is loaded by `camera_info_manager::CameraInfoManager` and
+# consumed by `camera_node` (front_camera). The standard ROS2 / OpenCV
+# YAML schema is used so any calibration tool (e.g. `camera_calibration`,
+# Kalibr, OpenCV `calibrateCamera`) can populate it.
+#
+# ⚠️  K (intrinsics), D (distortion), R (rectification), and P
+# (projection) matrices MUST be measured by a calibration pass on the
+# real hardware before downstream nodes that depend on geometry — e.g.
+# arm_node (world-to-camera transform), lane_node (image-rect), or any
+# pixel↔3D conversion — can run. camera_node refuses to publish
+# camera_info until K has at least one nonzero focal-length entry.
+#
+# To calibrate:
+#   1. Print a chessboard (8x6 or 9x7 inner corners recommended)
+#   2. Hold it in view of the front camera; capture 20+ frames from
+#      various angles
+#   3. Run `ros2 run camera_calibration cameracalibrator.py --size 8x6
+#      --square 0.025 image:=/vehicle_wbt/v1/sensors/camera/front/image_raw`
+#   4. Click Calibrate → Save → point the dialog at THIS file
+#   5. Restart camera_node: it will detect non-zero K and begin
+#      publishing camera_info with TRANSIENT_LOCAL
+#
+# Until calibrated, camera_status reports WARN with code=NO_CALIBRATION.
+
+image_width: 640
+image_height: 480
+camera_name: front
+distortion_model: plumb_bob
+
+# Intrinsic matrix K. Leave at all zeros as a "not calibrated" sentinel.
+# camera_node checks for all-zero and gates camera_info publishing.
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0]
+
+# Distortion coefficients (plumb_bob: k1, k2, p1, p2, k3).
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+# Rectification (R). Identity unless this is a stereo pair.
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+# Projection matrix (P). Left zero until calibration; filled in with
+# K | [0,0,0]^T once focal lengths + principal point are known.
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0]

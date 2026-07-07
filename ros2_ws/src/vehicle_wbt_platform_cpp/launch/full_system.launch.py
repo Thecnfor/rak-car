@@ -22,13 +22,22 @@ the udev rules before relaunching. See docs/hardware-port-mapping.md.
 Spec: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §生命周期
 """
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument
+from launch.actions import (
+  DeclareLaunchArgument, SetEnvironmentVariable, GroupAction
+)
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
+        # ---- Environment ----
+        # ROS_DOMAIN_ID=42 is the convention this project uses for DDS
+        # discovery so dev machines on the same LAN auto-see Jetson topics
+        # (and vice versa). See docs/development/README.md.
+        SetEnvironmentVariable("ROS_DOMAIN_ID", "42"),
+
+        # ---- Launch args (all camera / robot params overridable) ----
         DeclareLaunchArgument(
             "serial_port", default_value="/dev/ttyUSB0",
             description="MC602 controller serial device"),
@@ -49,6 +58,17 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument(
             "jpeg_quality", default_value="85",
             description="JPEG quality for image_compressed (0..100)"),
+        DeclareLaunchArgument(
+            "front_calibration_url", default_value="",
+            description="URL/path for camera_front camera_info_manager load. "
+            "Empty = no calibration, camera_info NOT published. "
+            "Default paths after install: "
+            "'file:///opt/ros/.../share/.../params/camera_front.yaml' "
+            "or 'package://vehicle_wbt_platform_cpp/params/camera_front.yaml'."),
+        DeclareLaunchArgument(
+            "arm_calibration_url", default_value="",
+            description="URL/path for camera_arm camera_info_manager load. "
+            "See front_calibration_url."),
 
         # ---- Cameras: one node per physical camera. Each publishes 5 streams
         # under /vehicle_wbt/v1/sensors/camera/<camera_id>/{image_raw,
@@ -67,6 +87,7 @@ def generate_launch_description() -> LaunchDescription:
                 "image_height": 480,
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
                 "jpeg_quality": LaunchConfiguration("jpeg_quality"),
+                "calibration_url": LaunchConfiguration("front_calibration_url"),
             }],
         ),
 
@@ -83,6 +104,7 @@ def generate_launch_description() -> LaunchDescription:
                 "image_height": 480,
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
                 "jpeg_quality": LaunchConfiguration("jpeg_quality"),
+                "calibration_url": LaunchConfiguration("arm_calibration_url"),
             }],
         ),
 

@@ -39,6 +39,7 @@ find_package(tf2_ros REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(camera_info_manager REQUIRED)   # camera_node loads YAML calibration
 find_package(hardware_interface QUIET)
 find_package(pluginlib QUIET)
 find_package(rcpputils REQUIRED)
@@ -52,9 +53,9 @@ find_package(rosidl_default_generators REQUIRED)
 # We avoid a shared library to keep the CMake name space simple.
 # -----------------------------------------------------------------------------
 # camera_node — publishes 5 streams per camera: image_raw, image_compressed,
-# camera_info, camera_status, camera_meta. Uses OpenCV for synthetic frame
-# generation + JPEG encoding (cv::imencode). Listens to the cv_bridge-extras
-# pattern: link component-level targets (no `OpenCV::opencv4` aggregate).
+# camera_info, camera_status, camera_meta. Live V4L2 capture via OpenCV
+# (no synthetic fallback). camera_info loaded from YAML via
+# camera_info_manager. Publishes /tf_static for camera optical frame.
 add_executable(camera_node src/camera_node.cpp)
 target_include_directories(camera_node PUBLIC include)
 target_link_libraries(camera_node PUBLIC
@@ -62,6 +63,10 @@ target_link_libraries(camera_node PUBLIC
   sensor_msgs::sensor_msgs
   std_msgs::std_msgs
   diagnostic_msgs::diagnostic_msgs
+  tf2_ros::tf2_ros
+  tf2::tf2
+  geometry_msgs::geometry_msgs
+  camera_info_manager::camera_info_manager
   ${PROJECT_NAME}__rosidl_typesupport_cpp
   opencv_core
   opencv_imgcodecs

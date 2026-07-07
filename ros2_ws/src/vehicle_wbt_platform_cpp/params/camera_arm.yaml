@@ -1,0 +1,38 @@
+# Arm camera calibration — Aveo SP2812 at /dev/cam3
+#
+# Same schema as camera_front.yaml. See that file for the calibration
+# procedure. This file is loaded by camera_info_manager inside
+# camera_node (arm_camera) when the node starts; until K has real
+# measured values, camera_info is NOT published and camera_status
+# reports WARN with NO_CALIBRATION.
+
+image_width: 640
+image_height: 480
+camera_name: arm
+distortion_model: plumb_bob
+
+camera_matrix:
+  rows: 3
+  cols: 3
+  data: [0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0]
+
+distortion_coefficients:
+  rows: 1
+  cols: 5
+  data: [0.0, 0.0, 0.0, 0.0, 0.0]
+
+rectification_matrix:
+  rows: 3
+  cols: 3
+  data: [1.0, 0.0, 0.0,
+         0.0, 1.0, 0.0,
+         0.0, 0.0, 1.0]
+
+projection_matrix:
+  rows: 3
+  cols: 4
+  data: [0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0,
+         0.0, 0.0, 0.0, 0.0]
