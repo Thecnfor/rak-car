@@ -66,6 +66,7 @@ target_link_libraries(camera_node PUBLIC
   opencv_core
   opencv_imgcodecs
   opencv_imgproc
+  opencv_videoio
 )
 
 # infrared_node

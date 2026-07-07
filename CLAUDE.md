@@ -74,6 +74,7 @@ The following still apply even after the rewrite:
 3. **Never `while True: time.sleep(1)`** to mask errors — raise or return error codes.
 4. **Never hardcode API keys** — use env vars or `.env`.
 5. **Never `eval(chassis_type)`** — use dict lookup.
+6. **Never ship mock/placeholder data as if it were real.** — see `.claude/projects/-home-xrak-workspace-rak-car/memory/coding-rules-no-mocks.md`. If a sensor source is missing, the node must crash with a clear error — never silently publish synthetic frames or fabricated readings. No hardcoded absolute paths (`/home/<user>/...`), usernames, IPs, or "competition target" device paths in node code (acceptable: as launch-arg defaults the user can override, never as the only way to configure).
 
 ## Build / test commands
 

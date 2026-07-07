@@ -11,8 +11,13 @@
 //
 // See docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §Camera 抽象
 //
-// Phase 1.5: stub. Real V4L2 frame capture in Plan B. Synthetic gradient frames
-// are emitted so the topic shape, QoS, and encoding are testable end-to-end.
+// REAL HARDWARE ONLY — no synthetic / placeholder frames. If the V4L2 device
+// cannot be opened at construction, this node throws std::runtime_error and
+// the process dies (let ros2 launch / systemd restart it). If a per-tick
+// capture() fails (USB cable yanked, transient device error), the tick is
+// skipped — nothing is published. Never publish a fake frame to "keep the
+// pipeline alive"; consumers must be able to trust that every image_raw
+// message came from the real hardware.
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
@@ -25,12 +30,15 @@
 #include <vehicle_wbt_platform_cpp/msg/camera_meta.hpp>
 
 #include <chrono>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 
 using namespace std::chrono_literals;
 
@@ -101,6 +109,47 @@ public:
 
     const std::string ns = "/vehicle_wbt/v1/sensors/camera/" + camera_id_;
 
+    // --- Open V4L2 capture up-front. NO FALLBACK. If the device isn't there
+    // or isn't readable, throw and let the process die — the operator /
+    // launch system is responsible for taking the system offline until the
+    // hardware is fixed. Publishing synthetic frames as if the camera were
+    // alive would silently corrupt downstream perception (lane following,
+    // OCR, detection) with garbage the rest of the pipeline trusts. ---
+    cap_ = std::make_unique<cv::VideoCapture>();
+    // The Aveo SP2812 (and most cheap UVC cams) only advertises MJPG in
+    // --list-formats-ext. If we don't tell OpenCV we want MJPG, it tries
+    // uncompressed YUYV by default and the device never sends frames
+    // (select() times out). Set FOURCC before open() to force MJPG.
+    const int mjpg_fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    if (!cap_->open(device_, cv::CAP_V4L2)) {
+      throw std::runtime_error(
+        "CameraNode[" + camera_id_ + "]: cannot open V4L2 device '" + device_ +
+        "'. Real hardware is required — refusing to publish synthetic frames. "
+        "Check (1) USB cable, (2) udev rules in /etc/udev/rules.d/99-usbvideo.rules, "
+        "(3) the `device` launch arg in full_system.launch.py.");
+    }
+    cap_->set(cv::CAP_PROP_FOURCC, static_cast<double>(mjpg_fourcc));
+    cap_->set(cv::CAP_PROP_FRAME_WIDTH, static_cast<double>(width_));
+    cap_->set(cv::CAP_PROP_FRAME_HEIGHT, static_cast<double>(height_));
+    cap_->set(cv::CAP_PROP_CONVERT_RGB, 1.0);  // ask OpenCV to deliver BGR
+    // Note: do NOT set CAP_PROP_FPS — most UVC cams honor only the formats
+    // they advertised and ignore FPS hints, while setting it can cause
+    // negotiation stalls on some drivers.
+
+    // Camera drivers often accept a width/height/FPS request but deliver
+    // something different. Capture the actual values from the device so
+    // publishers' encoding/header fields match the real frames.
+    const int actual_w = static_cast<int>(cap_->get(cv::CAP_PROP_FRAME_WIDTH));
+    const int actual_h = static_cast<int>(cap_->get(cv::CAP_PROP_FRAME_HEIGHT));
+    if (actual_w != width_ || actual_h != height_) {
+      RCLCPP_WARN(
+        this->get_logger(),
+        "CameraNode[%s]: requested %dx%d but device gave %dx%d — using device's values",
+        camera_id_.c_str(), width_, height_, actual_w, actual_h);
+      width_ = actual_w > 0 ? actual_w : width_;
+      height_ = actual_h > 0 ? actual_h : height_;
+    }
+
     // --- Publishers — one per stream, each with its own QoS ---
     pub_raw_ = this->create_publisher<sensor_msgs::msg::Image>(
       ns + "/image_raw", vwpc_cam::image_qos());
@@ -129,37 +178,47 @@ public:
 
     RCLCPP_INFO(
       this->get_logger(),
-      "CameraNode[%s] up: 5 streams @ %s (raw %dx%d @ %.1f Hz, jpeg q=%d, device=%s)",
-      camera_id_.c_str(), ns.c_str(), width, height, rate, jpeg_q, device.c_str());
+      "CameraNode[%s] up (live V4L2): 5 streams @ %s (raw %dx%d @ %.1f Hz, "
+      "jpeg q=%d, device=%s, backend=%s)",
+      camera_id_.c_str(), ns.c_str(), width_, height_, rate, jpeg_q, device_.c_str(),
+      cap_->getBackendName().c_str());
   }
 
 private:
-  // ---- Frame producer (stub) ----
-  // Phase 1.5: render a synthetic gradient so we can visually verify the
-  // pipeline without real hardware. Plan B replaces this with V4L2 capture.
-  cv::Mat synthetic_frame()
+  // ---- Frame producer: V4L2 capture, NO SYNTHETIC FALLBACK ----
+  // Pulls one frame from /dev/cam<N>. If the read fails (USB cable yank,
+  // transient timeout, decoder error) the function returns false and
+  // tick_frames() SKIPS publishing — consumers can trust that every
+  // image_raw / image_compressed they receive came from real hardware.
+  bool capture(cv::Mat & out)
   {
-    cv::Mat frame(height_, width_, CV_8UC3, cv::Scalar(0, 0, 0));
-    // Vertical gradient: pixel(x, y) = (y/H * 255, x/W * 255, 0).
-    for (int y = 0; y < height_; ++y) {
-      uint8_t g = static_cast<uint8_t>((y * 255) / std::max(1, height_));
-      for (int x = 0; x < width_; ++x) {
-        uint8_t r = static_cast<uint8_t>((x * 255) / std::max(1, width_));
-        frame.at<cv::Vec3b>(y, x) = cv::Vec3b(g, r, 64 /* blue offset */);
-      }
+    if (!cap_ || !cap_->isOpened()) {
+      return false;
     }
-    // Stamp a corner rectangle so orientation is unambiguous in viewers.
-    cv::rectangle(frame, cv::Rect(0, 0, 80, 30), cv::Scalar(0, 0, 255), -1);
-    cv::putText(
-      frame, camera_id_, cv::Point(5, 22), cv::FONT_HERSHEY_SIMPLEX, 0.6,
-      cv::Scalar(255, 255, 255), 1);
-    return frame;
+    // grab() decodes + retrieves a frame; returns false on I/O failure.
+    // retrieve() copies into the output Mat.
+    if (!cap_->grab()) {
+      return false;
+    }
+    return cap_->retrieve(out);
   }
 
   // ---- Per-frame: publish raw + compressed ----
   void tick_frames(int jpeg_q)
   {
-    cv::Mat frame = synthetic_frame();
+    cv::Mat frame;
+    if (!capture(frame) || frame.empty()) {
+      // Real capture failed this tick. SKIP publishing — never substitute
+      // a previous or synthetic frame. Warn at most every 5s to avoid
+      // drowning the log when the camera is unplugged.
+      RCLCPP_WARN_THROTTLE(
+        this->get_logger(), *this->get_clock(), 5000,
+        "CameraNode[%s]: V4L2 capture returned no frame on device %s; "
+        "skipping this tick (NOT publishing a placeholder)",
+        camera_id_.c_str(), device_.c_str());
+      return;
+    }
+
     const auto stamp = this->now();
 
     // image_raw — bgr8 (3 bytes/pixel)
@@ -204,7 +263,7 @@ private:
       diagnostic_msgs::msg::DiagnosticStatus s;
       s.level = diagnostic_msgs::msg::DiagnosticStatus::OK;
       s.name = "camera_node/" + camera_id_;
-      s.message = "synthetic; no hardware capture";
+      s.message = "live V4L2 capture";
       s.hardware_id = device_;
       array.status.push_back(std::move(s));
       pub_status_->publish(std::move(array));
@@ -278,6 +337,11 @@ private:
   double fx_{600.0}, fy_{600.0}, cx_{320.0}, cy_{240.0};
 
   sensor_msgs::msg::CameraInfo camera_info_template_;
+
+  // V4L2 capture handle. Opened in the constructor; if it can't open the
+  // configured device, the constructor throws and the process dies
+  // (no synthetic frames ever enter the publisher pipeline).
+  std::unique_ptr<cv::VideoCapture> cap_;
 
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr pub_raw_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr pub_compressed_;
