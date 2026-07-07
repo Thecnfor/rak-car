@@ -464,7 +464,16 @@ def draw_detections(frame: np.ndarray, detections: List[Detection]) -> np.ndarra
             label = CLASSES[cls_id]["label"]
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(out, (lx - tw - 18, ly - 2), (lx, ly + th + 6), color, -1)
-            cv2.putText(out, label, (lx - tw - 4, ly + th), (10, 10, 10), 1, cv2.LINE_AA)
+            cv2.putText(
+                out,
+                label,
+                (lx - tw - 4, ly + th),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (10, 10, 10),
+                1,
+                cv2.LINE_AA,
+            )
             ly += th + 10
 
     return out
