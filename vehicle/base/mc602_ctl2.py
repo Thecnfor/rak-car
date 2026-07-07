@@ -205,7 +205,9 @@ class DevListWrap:
                 data = self.dev_list[i].get_result(res, index)
                 index += self.dev_list[i].data_struct.size
                 data_ret.append(data)
-
+        else:
+            # 无应答时返回零值列表, 避免下游 encoders[0] IndexError (回移植自 baidu baseline)
+            return [0, 0, 0, 0]
         return data_ret
 
     def __getattr__(self, name):
@@ -446,6 +448,8 @@ class Motors_2():
     
     def get_encoder(self):
         encoders = self.encoders_wrap.get_all(self.args_none, mode=1)
+        if isinstance(encoders[0], list):
+            encoders = encoders[0]  # 解开嵌套列表 (回移植自 baidu baseline)
         if not self.reverse:
             encoders = [-i for i in encoders]
         return encoders

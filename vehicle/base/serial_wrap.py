@@ -57,14 +57,12 @@ class SerialWrap(serial.Serial):
 
         self.lock = Lock()
         self.timeout = 0.01
-        while True:
-            self.dev:CotrollerInfo =  self.ping_port()
-            if self.dev is not None:
-                logger.info("port is {}, controller is {}, mode {}".format(self.port, self.dev.name, self.dev.connect_mode))
-                break
+        # 不再无限挂死: ping_port 有限重试后仍无控制器则抛出, 让 systemd/调用方感知
+        self.dev:CotrollerInfo = self.ping_port()
+        if self.dev is None:
             logger.critical("未接控制器或者控制器没有开机,或者程序运行错误!")
-            while True:
-                time.sleep(1)
+            raise RuntimeError("no supported controller found on any serial port")
+        logger.info("port is {}, controller is {}, mode {}".format(self.port, self.dev.name, self.dev.connect_mode))
         self.timeout = 0.1
         
     def get_anwser(self, cmd:bytes, time_out=0.1)->bytes:
@@ -114,8 +112,13 @@ class SerialWrap(serial.Serial):
         serial_list = self.get_serial_list()
         if len(serial_list) == 0:
             logger.error("未找到串口,查看是否插入了串口,或者查看下位机是否开机")
+        retry = 0
         while len(serial_list) == 0:
-            # logger.error("未找到串口,查看是否插入了串口,或者查看下位机是否开机")
+            # 有限重试(5 次 x 1s), 仍无则返回 None 由上层抛出, 不再永久挂死
+            if retry >= 5:
+                logger.error("未找到串口(重试 5 次仍无), 放弃")
+                return None
+            retry += 1
             time.sleep(1)
             serial_list = self.get_serial_list()
         for serial in serial_list:
@@ -153,8 +156,7 @@ class SerialWrap(serial.Serial):
             return True
         else:
             logger.error(f"dev is not {name_test}")
-            while True:
-                time.sleep(1)
+            raise RuntimeError("controller mismatch: expected {}, got {}".format(name_test, name_dev))
 
 class MC601(CotrollerInfo):
     def __init__(self, baudrate=380400, timeout=0.1, mode="USB") -> None:

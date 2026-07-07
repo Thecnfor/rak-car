@@ -7,6 +7,11 @@ dist/
 build/
 *.egg
 
+# Secrets / credentials (do not commit)
+.env
+.env.*
+!.env.example
+
 # Logs
 log_info/base/logs/
 *.log

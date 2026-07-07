@@ -243,7 +243,16 @@ class QuadricycleChassis(ChassisBase):
         self.transform_inverse = np.array([[s_th, -s_th, -s_th,  s_th],
                                            [s_th,  s_th, -s_th, -s_th],
                                            [   r,     r,     r,     r]])
-        
+
+# 底盘类型注册表(替代 eval(chassis_type), 消除任意代码执行风险)
+CHASSIS_REGISTRY = {
+    "TricycleChassis": TricycleChassis,
+    "Diff2Chassis": Diff2Chassis,
+    "Diff4Chassis": Diff4Chassis,
+    "MecanumChassis": MecanumChassis,
+    "QuadricycleChassis": QuadricycleChassis,
+}
+
 class MapWrap():
     def __init__(self) -> None:
         pass
@@ -277,8 +286,46 @@ class Pos2VelPid():
     def __init__(self):
         self.pid_x = 0
         self.pid_y = 0
-        
-        
+
+
+class _Offset:
+    """单轴偏移代理: 支持 car.offset.x += 100 (mm) 触发底盘移动。移植自 baidu mecanum.py。"""
+    def __init__(self, driver, axis):
+        object.__setattr__(self, "_driver", driver)
+        object.__setattr__(self, "_axis", axis)
+
+    def _make_offset(self, delta):
+        return {"x": [delta, 0, 0], "y": [0, delta, 0], "z": [0, 0, delta]}[self._axis]
+
+    def __iadd__(self, delta):
+        self._driver.offset_by(self._make_offset(delta))
+        return self
+
+    def __isub__(self, delta):
+        self._driver.offset_by(self._make_offset(-delta))
+        return self
+
+
+class _OffsetGroup:
+    """car.offset.{x,y,z} += mm/deg 的语法糖容器。"""
+    def __init__(self, driver):
+        object.__setattr__(self, "_x", _Offset(driver, "x"))
+        object.__setattr__(self, "_y", _Offset(driver, "y"))
+        object.__setattr__(self, "_z", _Offset(driver, "z"))
+
+    def __getattr__(self, name):
+        if name in ("x", "y", "z"):
+            return object.__getattribute__(self, "_" + name)
+        raise AttributeError(name)
+
+    def __setattr__(self, name, value):
+        # 仅允许 += / -= 回写 _Offset 实例; 阻止直接标量赋值
+        if name in ("x", "y", "z") and isinstance(value, _Offset):
+            object.__setattr__(self, "_" + name, value)
+        else:
+            raise AttributeError("use car.offset.{}.+= / -= (mm/deg)".format(name))
+
+
 class CarBase():
     def __init__(self):
         path = get_path_relative("cfg_vehicle.yaml")
@@ -289,12 +336,22 @@ class CarBase():
 
         # self.motor_convert = MotorConvert(math.pi * cfg["vehicle_cfg"]["wheel_diameter"])
         self.end_flag = False
+        # 里程计读写锁: 守护 chassis.odom.pose 免于 daemon 线程与主线程的撕裂读
+        self._pose_lock = threading.Lock()
+        # 单位友好偏移 DSL: car.offset.x += 100 (mm)
+        self.offset = _OffsetGroup(self)
         self.odom_process = Thread(target=self.odomery_update)
         self.odom_process.daemon = True
         self.odom_process.start()
 
     def reset_pose(self):
-        self.chassis.odom.reset()
+        with self._pose_lock:
+            self.chassis.odom.reset()
+
+    def _read_pose(self):
+        # 加锁读取世界系位姿, 返回副本
+        with self._pose_lock:
+            return np.array(self.chassis.odom.pose)
 
     def chassis_init(self, cfg):
         try:
@@ -305,8 +362,12 @@ class CarBase():
             logger.info(chassis_type)
             chassis_params = cfg["vehicle_cfg"][chassis_type]["size"]
             motor_ports = cfg["vehicle_cfg"][chassis_type]["wheel"]["port_list"]
-            # 获取底盘参数
-            self.chassis:ChassisBase = eval(chassis_type)(**chassis_params)
+            # 获取底盘参数(查表替代 eval, 避免任意代码执行)
+            if chassis_type not in CHASSIS_REGISTRY:
+                raise KeyError(
+                    "unknown chassis_type {!r}; known: {}".format(
+                        chassis_type, list(CHASSIS_REGISTRY)))
+            self.chassis:ChassisBase = CHASSIS_REGISTRY[chassis_type](**chassis_params)
             # 获取电机接口
             # self.motors_chassis = Motors(cfg["vehicle_cfg"][chassis_type]["motor_ports"])
             self.wheels_chassis = WheelWrap(motor_ports, **wheel_params1)
@@ -314,10 +375,10 @@ class CarBase():
             self.pid_x = PID(**cfg["pid_vel_params"]["pid_x"])
             self.pid_y = PID(**cfg["pid_vel_params"]["pid_y"])
             self.pid_yaw = PID(**cfg["pid_vel_params"]["pid_yaw"])
-        except:
-            logger.error("chassis cfg error")
-            while True:
-                time.sleep(1)
+        except Exception as e:
+            # 不再 while True: time.sleep(1) 挂死, 抛出让 systemd / 调用方感知
+            logger.error("chassis cfg error: {}".format(e))
+            raise RuntimeError("chassis init failed: {}".format(e)) from e
 
     @staticmethod
     def sp_world2car(vel_world, angle_car):
@@ -391,12 +452,13 @@ class CarBase():
                 linear_wheel_d = np.zeros(4)
             # print(linear_wheel_last)
             # 里程计根据轮子的位置变化更新
-            self.chassis.updata_odom(linear_wheel_d)
+            with self._pose_lock:
+                self.chassis.updata_odom(linear_wheel_d)
             # print(self.chassis.odom.pose)
             time.sleep(0.05)
-        
+
     def get_odometry(self):
-        return self.chassis.odom.pose
+        return self._read_pose()
     
     def get_dis_traveled(self):
         return self.chassis.odom.dis_traveled
@@ -409,8 +471,9 @@ class CarBase():
         self.odom_process.join()
     
     
-    def set_pose(self, pose, during=None, vel=[0.15, 0.15, math.pi/3], threshold=[0.002, 0.002, 0.01]):
-        
+    def set_pose(self, pose, during=None, vel=[0.15, 0.15, math.pi/3], threshold=[0.002, 0.002, 0.01],
+                 timeout=None, max_iterations=None, loop_sleep=0.0):
+        # timeout / max_iterations / loop_sleep 默认 None/0 => 与历史行为完全一致(不限时/不限次/不休眠)
         # 计算当前位置和目标位置的差值
         # 根据差值和小车的位置和角度计算小车到目标的位置和角度
         # 根据函数参数来计算或者设置小车的速度限制
@@ -418,7 +481,7 @@ class CarBase():
         if during is None:
             during = float((np.array(pose) / np.array(vel)).max())
 
-        vel = (np.abs(np.array(pose) - self.chassis.odom.pose)) / during
+        vel = (np.abs(np.array(pose) - self._read_pose())) / during
  
         # print(vel)
         self.pid_x.setpoint = pose[0]
@@ -435,8 +498,18 @@ class CarBase():
         vel_thresh = limit_val(vel[2], 0.1, 1.5)
         self.pid_yaw.output_limits = (-vel_thresh, vel_thresh)
         count_exit = 0
+        iter_count = 0
+        time_start = time.time()
         while True:
-            pose_now = np.array(self.chassis.odom.pose)
+            if timeout is not None and time.time() - time_start > timeout:
+                logger.warning("set_pose timeout {}s, target={}".format(timeout, list(pose)))
+                break
+            if max_iterations is not None:
+                iter_count += 1
+                if iter_count > max_iterations:
+                    logger.warning("set_pose exceeded max_iterations={}".format(max_iterations))
+                    break
+            pose_now = self._read_pose()
             err = np.abs(pose_now - pose)
             # print("err:{}, threshold:{}".format(err, pose_threshold))
             err_ret = (err < pose_threshold)
@@ -447,7 +520,7 @@ class CarBase():
                     break
             else:
                 count_exit = 0
-            
+
             # print(pose)
             vel_x_pid = self.pid_x(pose_now[0])
             vel_y_pid = self.pid_y(pose_now[1])
@@ -459,16 +532,51 @@ class CarBase():
             self.set_velocity(*vel_out)
             # print(vel_out)
             # self.set_velocity(vel_x_pid, vel_y_pid, vel_yaw_out)
+            if loop_sleep:
+                time.sleep(loop_sleep)
         self.set_velocity(0, 0, 0)
 
-    def set_pose_offset(self, pose, during=None, vel=[0.2, 0.2, math.pi/3], threshold=[0.002, 0.002, 0.01]):
-        start_pos = self.chassis.odom.pose
+    def set_pose_offset(self, pose, during=None, vel=[0.2, 0.2, math.pi/3], threshold=[0.002, 0.002, 0.01],
+                        timeout=None, max_iterations=None, loop_sleep=0.0):
+        start_pos = self._read_pose()
         tar_pos = [0, 0, 0]
         tar_pos[0] = start_pos[0] + pose[0]*math.cos(start_pos[2]) - pose[1]*math.sin(start_pos[2])
         tar_pos[1] = start_pos[1] + pose[1]*math.cos(start_pos[2]) + pose[0]*math.sin(start_pos[2])
         tar_pos[2] = start_pos[2] + pose[2]
         # print(tar_pos)
-        self.set_pose(tar_pos, during, vel, threshold)
+        self.set_pose(tar_pos, during, vel, threshold,
+                      timeout=timeout, max_iterations=max_iterations, loop_sleep=loop_sleep)
+
+    # ---- 吸收自 baidu mecanum.py 的路点 API(薄封装 set_pose/set_pose_offset, 加超时/有界循环) ----
+    def move_to_position(self, pose, duration=None, max_velocities=(0.2, 0.2, math.pi/3),
+                         tolerance=(0.002, 0.002, 0.01), timeout=30.0):
+        """驶向世界系目标位姿 [x, y, theta](米/弧度)。带 30s 超时 + 1000 次迭代上限, 不可达不再挂死。"""
+        self.set_pose(list(pose), during=duration, vel=list(max_velocities),
+                      threshold=list(tolerance), timeout=timeout,
+                      max_iterations=1000, loop_sleep=0.01)
+
+    def move_for(self, offset, duration=None, max_velocities=(0.2, 0.2, math.pi/3),
+                 tolerance=(0.002, 0.002, 0.02), timeout=30.0):
+        """相对当前位姿的机体系偏移 [dx, dy, dtheta](米/弧度)。"""
+        self.set_pose_offset(list(offset), during=duration, vel=list(max_velocities),
+                             threshold=list(tolerance), timeout=timeout,
+                             max_iterations=1000, loop_sleep=0.01)
+
+    def offset_by(self, offset, duration=None, max_velocities=(0.2, 0.2, math.pi/3),
+                  tolerance=(0.002, 0.002, 0.02), timeout=30.0):
+        """单位友好偏移: offset=[mm, mm, deg] -> 内部换算为 [m, m, rad]。"""
+        offset_si = [offset[0] / 1000.0, offset[1] / 1000.0, math.radians(offset[2])]
+        self.move_for(offset_si, duration=duration, max_velocities=max_velocities,
+                      tolerance=tolerance, timeout=timeout)
+
+    def move_x(self, mm):
+        self.offset_by([mm, 0, 0])
+
+    def move_y(self, mm):
+        self.offset_by([0, mm, 0])
+
+    def move_z(self, deg):
+        self.offset_by([0, 0, deg])
 
 
 if __name__ == '__main__':

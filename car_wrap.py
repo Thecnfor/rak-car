@@ -824,6 +824,20 @@ class MyCar(CarBase):
            
            
             
+    def move_to_detection_target(self, speed=0.2, targets=None, side=-1,
+                                 dis_out=0.4, confidence_threshold=0.80):
+        """薄封装 lane_det_location_plant: 让底盘对齐到指定检测类别/位置。
+        这是 baidu move_to_detection_target 的 rak-car 适配器(参见 docs/chassis-control-review.md)。
+        targets=None 时使用 lane_det_location_v4 的默认模板 (pedestrian)。
+        返回 pose_dict (sid -> (x,y,theta)) 或 False/None 表示超时/未找到。
+        """
+        if targets is None:
+            # 与 lane_det_location_v4 的默认 pt_tar 保持一致
+            targets = [[0, 1, 'pedestrian', 0, -0.15, -0.48, 0.24, 0.82]]
+        return self.lane_det_location_plant(
+            speed=speed, targets=targets, dis_out=dis_out,
+            side=side, confidence_threshold=confidence_threshold)
+
     def lane_base(self, speed, end_fuction, stop=STOP_PARAM):
         while True:
             if self._stop_flag:
@@ -946,9 +960,24 @@ class MyCar(CarBase):
             :return: access_token，或是None(如果错误)
             """
             url = "https://aip.baidubce.com/oauth/2.0/token"
-            
-            API_KEY = "js7RZ6BHSIKygBpUp990PNyq"
-            SECRET_KEY = "vSxUjmCB4UIaHaPHd5pH0vZG4N7T88g6"
+
+            # 凭据不再硬编码: 从环境变量读取, 缺失时回退到仓库根 .env (A5)
+            API_KEY = os.environ.get("BAIDU_OCR_API_KEY")
+            SECRET_KEY = os.environ.get("BAIDU_OCR_SECRET_KEY")
+            if not API_KEY or not SECRET_KEY:
+                env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+                if os.path.exists(env_path):
+                    with open(env_path, "r", encoding="utf-8") as f:
+                        for line in f:
+                            line = line.strip()
+                            if not line or line.startswith("#") or "=" not in line:
+                                continue
+                            k, v = line.split("=", 1)
+                            os.environ.setdefault(k.strip(), v.strip())
+                    API_KEY = os.environ.get("BAIDU_OCR_API_KEY")
+                    SECRET_KEY = os.environ.get("BAIDU_OCR_SECRET_KEY")
+            if not API_KEY or not SECRET_KEY:
+                raise RuntimeError("BAIDU_OCR_API_KEY / BAIDU_OCR_SECRET_KEY 未设置 (放入 rak-car/.env)")
             params = {"grant_type": "client_credentials", "client_id": API_KEY, "client_secret": SECRET_KEY}
             result = requests.post(url, params=params).json()
             return result.get("access_token")
@@ -1019,7 +1048,8 @@ class MyCar(CarBase):
                         # text = self.ocr_rec(img_txt)
                         try:
                             text=MyCar.ocr(img_txt)
-                        except:
+                        except Exception as e:
+                            logger.error("ocr failed: {}".format(e))
                             continue
                         # print(text)
                         texts.append(text)
@@ -1067,9 +1097,9 @@ class MyCar(CarBase):
                         try:
                             text = MyCar.ocr(img_txt)
                             texts.append(text)
-                        except:
+                        except Exception as e:
                             # 捕获异常后标记帧出错，并跳出 for 循环
-                            print('ocr识别错误！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！')
+                            logger.error('ocr识别错误: {}'.format(e))
                             frame_error = True
                             break  # 跳出 for 循环
     

@@ -614,7 +614,9 @@ def seeding_task(task: 'MyTask', car: 'MyCar', stations: list = None) -> dict:
     station_ids = ["seed_1", "seed_2", "seed_3"]
     poses = {}
 
-    task.arm.set_arm_pose(x=0.0, y=0.2, arm="LEFT", hand="DOWN")
+    # rak-car ArmBase 无 set_arm_pose(x,y,arm,hand): 用 set() + set_hand_angle() 组合
+    task.arm.set(task.arm.horiz_mid, 0.20)
+    task.arm.set_hand_angle(90)  # 掌心向下
     car.lane_dis_offset(speed=0.3, dis_hold=0.85)  # 巡线到基地
     time.sleep(0.5)
 
@@ -640,7 +642,8 @@ def pest_scout_task(car: 'MyCar', scan_passes: int = 2) -> list:
     pests = []
     for _ in range(scan_passes):
         car.lane_dis_offset(speed=0.25, dis_hold=2.0)
-        det = car.move_to_detection_target()  # 用 YOLOE 模型
+        det = car.move_to_detection_target(
+            targets=[[0, 1, 'pest', 0, 0, -0.15, -0.48, 0.24, 0.82]])  # 用 YOLOE 模型
         if det and det.get('class_name', '').lower() in ('pest', 'aphid', 'caterpillar'):
             pests.append({
                 'class_id': det['class_id'],
@@ -691,11 +694,12 @@ def harvest_task(task: 'MyTask', car: 'MyCar', crop_stations: list = None) -> in
     picked = 0
     for (x, y, theta) in crop_stations:
         car.move_to_position([x, y, theta])
-        car.move_to_detection_target(crop_class='crop')
-        task.arm.set(horiz=task.arm.horiz_mid, vert=0.0)  # 下降到抓取高度
-        task.arm.grasp()  # 真空泵吸住
+        car.move_to_detection_target(
+            targets=[[0, 1, 'crop', 0, 0, -0.15, -0.48, 0.24, 0.82]])
+        task.arm.set(task.arm.horiz_mid, 0.0)  # 下降到抓取高度
+        task.arm.grap(1)  # 真空泵吸住 (rak-car API 是 grap(val), val=1=吸)
         car.lane_base(speed=0.2, end_fuction=lambda: False)  # 回基地
-        task.arm.set(horiz=task.arm.horiz_mid, vert=0.15)  # 抬起
+        task.arm.set(task.arm.horiz_mid, 0.15)  # 抬起
         picked += 1
     return picked
 
@@ -764,8 +768,8 @@ def delivery_task(task: 'MyTask', car: 'MyCar', order_items: list,
         if dest is None:
             continue
         car.move_to_position(list(dest))
-        task.arm.set(horiz=task.arm.horiz_mid, vert=0.10)  # 放下高度
-        task.arm.release()  # 释放真空
+        task.arm.set(task.arm.horiz_mid, 0.10)  # 放下高度
+        task.arm.grap(0)  # 释放真空 (rak-car API: grap(0))
         task.ring.rings()
         delivered += 1
     return delivered
@@ -781,7 +785,8 @@ def mission_main(task: 'MyTask', car: 'MyCar', run_seeding: bool = True,
         dict 各任务的结果统计
     """
     results = {}
-    car.arm.reset()
+    # MyCar 没有 .arm 属性; 臂在 car.task.arm 下
+    task.arm.reset()
 
     if run_seeding:
         try:
@@ -791,7 +796,10 @@ def mission_main(task: 'MyTask', car: 'MyCar', run_seeding: bool = True,
             raise  # 比赛当天失败立即停止,不掩盖
     if run_watering:
         try:
-            task.lane_det_location_plant(speed=0.3)  # 已有 legacy 实现
+            # lane_det_location_plant 是 car 的方法, 不在 task 上; 需传 targets
+            car.lane_det_location_plant(
+                speed=0.3,
+                targets=task.planting(side=-1, arm_set=True))
             results['watering'] = 'OK'
         except Exception as e:
             results['watering'] = f'FAILED: {e}'
@@ -822,6 +830,7 @@ def mission_main(task: 'MyTask', car: 'MyCar', run_seeding: bool = True,
         try:
             order = read_order_task(car)
             results['read_order'] = f'{len(order)} items'
+            results['read_order_obj'] = order  # 修 mission_main: 把列表真正传给 delivery_task
         except Exception as e:
             results['read_order'] = f'FAILED: {e}'
             raise

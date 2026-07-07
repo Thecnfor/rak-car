@@ -90,9 +90,9 @@ class NoneDev:
         pass
     
     def not_support(self):
-        logger.info("dev not support")
-        while True:
-            time.sleep(1)
+        # 不再 while True: time.sleep(1) 挂死; 明确抛出让调用方感知不支持
+        logger.error("dev not support")
+        raise NotImplementedError("device not supported on this controller")
     
     def read(self, *args, **kwargs):
         self.not_support()
