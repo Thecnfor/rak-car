@@ -53,19 +53,19 @@ struct GateDecision
     RATE_LIMITED = 1 << 2,   // velocity was clamped
     PASS_THROUGH = 1 << 3,  // message passed unchanged
   } reason{Reason::NONE};
-};
 
-// Bitwise operators for Reason bitfield
-inline GateDecision::Reason operator&(GateDecision::Reason a, GateDecision::Reason b)
-{
-  return static_cast<GateDecision::Reason>(
-    static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
-}
-inline GateDecision::Reason & operator&=(GateDecision::Reason & a, GateDecision::Reason b)
-{
-  a = a & b;
-  return a;
-}
+  // Bitwise operators so callers can test `if (d.reason & Reason::ESTOP)`.
+  // friend constexpr keeps the operators in the struct's scope and allows
+  // compile-time evaluation; matches the bitfield-style usage in safety_gate_node.
+  friend constexpr Reason operator|(Reason a, Reason b) noexcept
+  {
+    return static_cast<Reason>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+  }
+  friend constexpr Reason operator&(Reason a, Reason b) noexcept
+  {
+    return static_cast<Reason>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+  }
+};
 
 // Apply the 4-layer safety gate. Pure function, no side effects.
 //
