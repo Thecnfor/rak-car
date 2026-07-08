@@ -1,0 +1,119 @@
+"""MC602 串口封装。
+
+源码 1:1 对齐 baidu_smartcar_2026/smartcar/whalesbot/vehicle/base/serial_wrap.py
+的 MC602 class + ping_port 逻辑。删除 MC601/MC602Wireness 不需要的部分,
+保留 SDK 风格的全局单例 + lock + 自动端口扫描。
+"""
+from __future__ import annotations
+
+import time
+from threading import Lock
+
+import serial
+from serial.tools import list_ports
+
+
+class MC602(serial.Serial):
+    """MC602 串口包装,SDK 风格(继承 pyserial)。
+
+    Args:
+        port: 串口设备路径,默认 None(由 ping_port 自动扫描)。
+        baud: 波特率,默认 1_000_000(SDK 默认)。
+        timeout: 串口读超时,默认 0.03s。
+    """
+
+    HEADER = bytes.fromhex('77 68')
+    TAIL = bytes.fromhex('0A')
+
+    def __init__(self, port=None, baud=1_000_000, timeout=0.03):
+        super().__init__(
+            port=port, baudrate=baud,
+            bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE, timeout=timeout,
+            xonxoff=False, rtscts=False, dsrdtr=False,
+        )
+        self.lock = Lock()
+        self.connect_flag = False
+
+    def send_cmd(self, cmd: bytes) -> None:
+        """发送完整帧(已含头尾)。SDK 行为:写一次不读返回(由 get_anwser 单独读)。"""
+        self.write(cmd)
+
+    def get_anwser(self, time_out: float = 0.1) -> bytes | None:
+        """读 MC602 响应。
+
+        协议:读 3 字节 → 解 dst_len = res[2] → 读剩余 → 校验头尾 → 返回 res[3:-1]。
+        完全对齐 SDK `serial_wrap.py:222-245`。
+        """
+        time_start = time.time()
+        res = self.read(3)
+        if len(res) != 3:
+            return None
+        dst_len = res[2]
+        res = res + self.read(dst_len - 3)
+        while True:
+            if time.time() - time_start > time_out:
+                return None
+            if len(res) == dst_len:
+                if res[0] == self.HEADER[0] and res[-1] == self.TAIL[0]:
+                    return res[3:-1]
+                return None
+            res = res + self.read(dst_len - len(res))
+
+    def ping_rx(self, time_out: float = 0.05) -> bool:
+        """探测 MC602 是否在响应。SDK `serial_wrap.py:248-257`。
+
+        用 `02 01 10`(dev=0x10, mode=0, port=0)试探(SDK 用的内置 ping)。
+        """
+        time_start = time.time()
+        while time.time() - time_start < time_out:
+            self.reset_input_buffer()
+            self.reset_output_buffer()
+            # SDK 风格的 ping 帧(已含头尾和长度)
+            self.write(bytes.fromhex('77 68 04 00 01 CA 01 0A'))  # SDK 头部用 0xCA01 探测
+            res = self.get_anwser(0.02)
+            if res is not None:
+                return True
+        return False
+
+    def ping_port(self, baud: int = 1_000_000) -> str | None:
+        """扫描 CH340/USB 串口,找到第一个能 ping 通的端口并打开。
+
+        对齐 SDK `serial_wrap.py:113-142`。返回打开的端口名,失败 None。
+        """
+        port_list = list_ports.comports()
+        port_list = [p for p in port_list if 'CH340' in p[1] or 'USB' in p[1]]
+        port_list.sort(key=lambda x: 'CH340' not in x[1])  # CH340 优先
+        for p in port_list:
+            try:
+                self.port = p[0]
+                self.baudrate = baud
+                self.open()
+                self.connect_flag = True
+                if self.ping_rx(time_out=0.05):
+                    return p[0]
+                self.close()
+                self.connect_flag = False
+            except Exception:
+                try:
+                    self.close()
+                except Exception:
+                    pass
+                self.connect_flag = False
+        return None
+
+    def open(self) -> bool:
+        """打开串口,带状态记录。"""
+        try:
+            if self.port is None:
+                return False
+            self.connect_flag = True
+            super().open()
+            return True
+        except Exception:
+            self.connect_flag = False
+            return False
+
+
+# 全局单例(SDK 风格,所有设备类共享)
+serial_mc602 = MC602()
