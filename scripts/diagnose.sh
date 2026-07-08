@@ -106,9 +106,13 @@ check_dev() {
     add_result "01" "dev:cyclonedds.xml" "WARN" "missing — run: bash scripts/start_team_rviz.sh"
   fi
 
-  # 02: ROS distro
+  # 02: ROS distro (Jetson is humble; dev can be any ROS2 — see docs/team-constants.md)
   if [[ "$ROS_DISTRO" != "none" ]]; then
-    add_result "02" "dev:ros_distro" "PASS" "$ROS_DISTRO"
+    if [[ "$ROS_DISTRO" == "humble" ]]; then
+      add_result "02" "dev:ros_distro" "PASS" "$ROS_DISTRO (matches Jetson)"
+    else
+      add_result "02" "dev:ros_distro" "WARN" "$ROS_DISTRO (Jetson is humble — fine for source-only dev)"
+    fi
   else
     add_result "02" "dev:ros_distro" "FAIL" "no /opt/ros/<distro> — see docs/development/dev-machine-setup.md"
   fi

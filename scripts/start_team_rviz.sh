@@ -32,8 +32,9 @@ DDS_CONFIG_SRC="${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclone
 export ROS_DOMAIN_ID=42
 
 # 2. ROS2 distro auto-detect
-# Order matters: prefer humble (Jetson default) → jazzy → lyrical (dev box) → older
-# See docs/development/dev-target-architecture.md for distro choice rationale.
+# Order matters: prefer humble (matches Jetson, safest for ABI) → jazzy → lyrical → iron
+# Falls back to scanning /opt/ros/ for any distro not in the preferred list.
+# See docs/team-constants.md.
 ros_active=0
 for distro in humble jazzy lyrical iron foxy galactic; do
   if [ -f "/opt/ros/${distro}/setup.bash" ]; then
@@ -43,15 +44,36 @@ for distro in humble jazzy lyrical iron foxy galactic; do
     set +u
     source "/opt/ros/${distro}/setup.bash"
     set -u
+    ROS_DISTRO="$distro"
     echo "✅ ROS2 ${distro} loaded"
     ros_active=1
     break
   fi
 done
+# Fallback: scan /opt/ros/ for any distro not in the preferred list
 if [ "$ros_active" = 0 ]; then
-  echo "❌ No /opt/ros/{humble,jazzy,lyrical,iron,foxy,galactic}/setup.bash found." >&2
-  echo "   Install ROS2 first (https://docs.ros.org/en/${distro:-humble}/Installation.html)" >&2
+  for setup_bash in /opt/ros/*/setup.bash; do
+    [ -f "$setup_bash" ] || continue
+    distro=$(basename "$(dirname "$setup_bash")")
+    set +u
+    source "$setup_bash"
+    set -u
+    ROS_DISTRO="$distro"
+    echo "⚠️  ROS2 ${distro} loaded (auto-detected from /opt/ros/, not in preferred list)"
+    ros_active=1
+    break
+  done
+fi
+if [ "$ros_active" = 0 ]; then
+  echo "❌ No ROS2 installation found in /opt/ros/." >&2
+  echo "   Install ROS2 first (https://docs.ros.org/en/humble/Installation.html)" >&2
   exit 1
+fi
+# Warn if dev distro != Jetson's humble (still works, just FYI)
+if [ "$ROS_DISTRO" != "humble" ]; then
+  echo "ℹ️  dev ROS2 is '$ROS_DISTRO' (Jetson is humble). Fine for source-only dev;"
+  echo "    Jetson builds its own install under Humble. See docs/team-constants.md."
+fi
 fi
 
 # 3. CycloneDDS config — install once per laptop

@@ -22,6 +22,7 @@ set -euo pipefail
 SCRIPT_NAME="onboard.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO=""
+export ROS_DISTRO  # so child processes (colcon, pytest) inherit the choice
 # Hard-coded team constant: Jetson is always at 192.168.3.69.
 # See docs/team-constants.md.
 JETSON_HOST="${JETSON_HOST:-192.168.3.69}"
@@ -81,7 +82,9 @@ phase1_probe() {
     warn "  OS: /etc/os-release not found (not Ubuntu?)"
   fi
 
-  # ROS2 distro
+  # ROS2 distro — Jetson side is fixed at humble; dev side accepts ANY distro.
+  # Preference order: humble (matches Jetson, safest for ABI compat) → jazzy → lyrical → iron.
+  # Falls back to scanning /opt/ros/ for any installed distro not in the list.
   for d in humble jazzy lyrical iron; do
     if [[ -f "/opt/ros/${d}/setup.bash" ]]; then
       ROS_DISTRO="$d"
@@ -90,7 +93,20 @@ phase1_probe() {
     fi
   done
   if [[ -z "$ROS_DISTRO" ]]; then
+    # Fallback: scan /opt/ros/ for any installed distro
+    for d in /opt/ros/*/setup.bash; do
+      [[ -f "$d" ]] || continue
+      local candidate; candidate=$(basename "$(dirname "$d")")
+      ROS_DISTRO="$candidate"
+      warn "  ROS2 distro: ${candidate} (auto-detected from /opt/ros/, not in preferred list)"
+      break
+    done
+  fi
+  if [[ -z "$ROS_DISTRO" ]]; then
     warn "  ROS2 distro: not installed. See docs/development/dev-machine-setup.md"
+  elif [[ "$ROS_DISTRO" != "humble" ]]; then
+    warn "  dev ROS2 is '$ROS_DISTRO' (Jetson is humble). Usually fine for source-only dev"
+    log "       (Jetson builds its own install under Humble — see docs/team-constants.md)"
   fi
 
   # Tools
