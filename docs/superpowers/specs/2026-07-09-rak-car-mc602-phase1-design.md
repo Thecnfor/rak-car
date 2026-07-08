@@ -19,17 +19,36 @@
 
 ---
 
-## 2. 团队分工
+## 2. 团队分工 & 拓扑
 
-| 人 | 负责 | 工作分支 | 包 |
+**拓扑**:Jetson(机器人端)+ 同事 dev boxes(开发端),同一 LAN(`192.168.3.x`),同一 `ROS_DOMAIN_ID=42`,CycloneDDS 自动发现。**同事不 SSH Jetson、不部署代码到 Jetson、Jetson 端由我独占维护**。
+
+| 角色 | 位置 | 工作分支 | 负责 |
 |---|---|---|---|
-| 我(底层) | 协议层 + 唯一串口所有者 + 部署件 + API 文档 | `robot-stable` | `vehicle_wbt_smartcar_{hw,msgs,bridge}` |
-| 同事 A | 底盘业务节点(订阅 cmd_vel、计算 odom、发布 TF、PID move_to_position) | `develop` | `vehicle_wbt_smartcar_chassis` |
-| 同事 B | 机械臂业务节点(订阅 cmd_arm_pose、PID 闭环、发布 arm_state) | `develop` | `vehicle_wbt_smartcar_arm` |
-| 同事 C | 枪业务节点(订阅视觉/事件、调 PoutD 控制发射/泵/阀) | `develop` | `vehicle_wbt_smartcar_shooter` |
-| 同事 D | LLM/ERNIE 推理(订阅摄像头、任务规划) | `develop` | `vehicle_wbt_smartcar_perception` |
+| 我(底层) | **Jetson 端**(本仓库 `robot-stable`) | `robot-stable` | 协议层 + 唯一串口所有者 + systemd 部署 + API 文档 |
+| 同事 A | **自己的 dev box** | `develop` | 底盘业务节点(`vehicle_wbt_smartcar_chassis`) |
+| 同事 B | **自己的 dev box** | `develop` | 机械臂业务节点(`vehicle_wbt_smartcar_arm`) |
+| 同事 C | **自己的 dev box** | `develop` | 枪业务节点(`vehicle_wbt_smartcar_shooter`) |
+| 同事 D | **自己的 dev box** | `develop` | LLM/视觉业务节点(`vehicle_wbt_smartcar_perception`) |
 
-**约束**:上层同事只调 `/mc602/*` service + 订阅 `/mc602/state/raw`,**不 SSH Jetson**,**不碰 MC602 协议代码**。他们写完自己的节点,在开发机上 colcon build,启动后通过 LAN DDS 自动发现 Jetson 端,跨机器协作。
+**dev box 工作流**(同事每天做的事):
+1. `git clone` + `git pull`(只拉他们自己的分支,顶层分支只读)
+2. `colcon build --packages-up-to vehicle_wbt_smartcar_msgs`(只需要 msgs,不需要 hw/bridge)
+3. `source install/setup.bash && export ROS_DOMAIN_ID=42`
+4. **快速验证**:`./scripts/quick_beep.sh` → 听到 Jetson 蜂鸣 → 信任建立 ✅
+5. 写自己的业务节点,只调 `/vehicle_wbt/v1/mc602/*` service + 订阅 `/vehicle_wbt/v1/mc602/state/raw`
+6. `colcon build --packages-select vehicle_wbt_smartcar_<自己>` + `ros2 run ...` → DDS 自动连 Jetson
+
+**Jetson 端工作流**(我做的事):
+1. 一次部署:`sudo cp deploy/* /etc/... && sudo systemctl enable --now vehicle-wbt-mc602`
+2. 之后不再动,Jetson 上 `mc602_node.py` 独占 `/dev/ttyUSB*` 常驻
+3. 同事开发期间不动 Jetson,他们 pull 自己的代码在 dev box 上 build
+
+**约束**:
+- 同事 **不 SSH Jetson**(除了我紧急 debug)
+- 同事 **不部署代码到 Jetson**(hw/bridge 是我的领地)
+- 同事 **不碰 MC602 协议字节**(只用 SDK wrapper `vehicle_wbt_smartcar_sdk` 或 ROS service)
+- Jetson 上 `mc602_node.py` 是**唯一**拥有 `/dev/ttyUSB*` 的进程
 
 ---
 
@@ -56,25 +75,25 @@ ros2_ws/src/
 
 | Service | 类型 | 字段 | 谁用 |
 |---|---|---|---|
-| `/mc602/set_wheels` | `SetWheels.srv` | `v0,v1,v2,v3: int8[-100..100]` | 底盘 |
-| `/mc602/read_encoders` | `ReadEncoders.srv` | → `{v: int32[4]}` | 底盘 |
-| `/mc602/reset_encoders` | `Trigger.srv` | → `{success: bool}` | 底盘 |
-| `/mc602/set_servo_pwm` | `SetServoPwm.srv` | `{port: uint8, angle: int16}` | 机械臂(手爪) |
-| `/mc602/set_servo_bus` | `SetServoBus.srv` | `{port: uint8, angle: int16, speed: int16}` | 机械臂(腕部) |
-| `/mc602/set_stepper` | `SetStepper.srv` | `{port: uint8, freq: int16}` | 机械臂(Y 轴) |
-| `/mc602/set_dc_motor` | `SetDcMotor.srv` | `{port: uint8, speed: int8}` | 机械臂(X 轴) |
-| `/mc602/set_pout` | `SetDout.srv` | `{port: uint8, state: bool}` | 枪/机械臂(grasp) |
-| `/mc602/read_ir` | `ReadIR.srv` | `{port: uint8} → {distance_m: float32}` | 底盘/枪 |
-| `/mc602/read_battery` | `ReadBattery.srv` | `{} → {voltage_v: float32}` | 任何人 |
-| `/mc602/read_analog` | `ReadAnalog.srv` | `{port: uint8} → {value: int16}` | 机械臂(限位) |
-| `/mc602/buzzer` | `Buzzer.srv` | `{freq_hz: uint16, duration_ms: uint16}` | 任何人 |
+| `/vehicle_wbt/v1/mc602/set_wheels` | `SetWheels.srv` | `v0,v1,v2,v3: int8[-100..100]` | 底盘 |
+| `/vehicle_wbt/v1/mc602/read_encoders` | `ReadEncoders.srv` | → `{v: int32[4]}` | 底盘 |
+| `/vehicle_wbt/v1/mc602/reset_encoders` | `Trigger.srv` | → `{success: bool}` | 底盘 |
+| `/vehicle_wbt/v1/mc602/set_servo_pwm` | `SetServoPwm.srv` | `{port: uint8, angle: int16}` | 机械臂(手爪) |
+| `/vehicle_wbt/v1/mc602/set_servo_bus` | `SetServoBus.srv` | `{port: uint8, angle: int16, speed: int16}` | 机械臂(腕部) |
+| `/vehicle_wbt/v1/mc602/set_stepper` | `SetStepper.srv` | `{port: uint8, freq: int16}` | 机械臂(Y 轴) |
+| `/vehicle_wbt/v1/mc602/set_dc_motor` | `SetDcMotor.srv` | `{port: uint8, speed: int8}` | 机械臂(X 轴) |
+| `/vehicle_wbt/v1/mc602/set_pout` | `SetDout.srv` | `{port: uint8, state: bool}` | 枪/机械臂(grasp) |
+| `/vehicle_wbt/v1/mc602/read_ir` | `ReadIR.srv` | `{port: uint8} → {distance_m: float32}` | 底盘/枪 |
+| `/vehicle_wbt/v1/mc602/read_battery` | `ReadBattery.srv` | `{} → {voltage_v: float32}` | 任何人 |
+| `/vehicle_wbt/v1/mc602/read_analog` | `ReadAnalog.srv` | `{port: uint8} → {value: int16}` | 机械臂(限位) |
+| `/vehicle_wbt/v1/mc602/buzzer` | `Buzzer.srv` | `{freq_hz: uint16, duration_ms: uint16}` | 任何人 |
 
 ### 4.2 Topic 接口(2 个)
 
 | Topic | 类型 | Rate | 字段 |
 |---|---|---|---|
-| `/mc602/state/raw` | `RawState.msg` | 50 Hz | `encoders: int32[4]`, `ir_left_m: float32`, `ir_right_m: float32`, `battery_v: float32`, `arm_y_pos: int32`, `arm_x_pos: int32`, `pump_on: bool`, `valve_on: bool` |
-| `/mc602/heartbeat` | `std_msgs/Header` | 1 Hz | `stamp` |
+| `/vehicle_wbt/v1/mc602/state/raw` | `RawState.msg` | 20 Hz | `header`, `encoders: int32[4]`, `ir_left_m: float32`, `ir_right_m: float32`, `battery_v: float32`, `arm_y_pos: int32`, `arm_x_pos: int32`, `pump_on: bool`, `valve_on: bool` |
+| `/vehicle_wbt/v1/mc602/heartbeat` | `std_msgs/Header` | 1 Hz | `stamp` |
 
 ### 4.3 设计原则
 
@@ -170,9 +189,9 @@ class MC602Node(Node):
     def _on_buzzer(self, req, resp): ...
 
     def _tick_50hz(self):
-        # 读 encoders/IR/battery/analog,发布 /mc602/state/raw
+        # 读 encoders/IR/battery/analog,发布 /vehicle_wbt/v1/mc602/state/raw
     def _tick_1hz(self):
-        # 发布 /mc602/heartbeat
+        # 发布 /vehicle_wbt/v1/mc602/heartbeat
 ```
 
 ### 6.2 设备路由表(config/mc602_ports.yaml)
@@ -310,24 +329,24 @@ ROS_DOMAIN_ID=42 ros2 run vehicle_wbt_smartcar_bridge mc602_node \
     --ros-args -p serial_port:=/dev/ttyUSB1 -p baud:=1000000
 
 # 3. CLI 验证
-ROS_DOMAIN_ID=42 ros2 service call /mc602/buzzer \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/buzzer \
     vehicle_wbt_smartcar_msgs/srv/Buzzer "{freq_hz: 440, duration_ms: 200}"
 # → 应该听到 0.2 秒 440Hz 蜂鸣
 
-ROS_DOMAIN_ID=42 ros2 topic echo /mc602/state/raw --once
+ROS_DOMAIN_ID=42 ros2 topic echo /vehicle_wbt/v1/mc602/state/raw --once
 # → 应该有合理的 encoders (可能全是 0)、battery_v (如 11.8V)、ir_*_m (如 1.2m)
 
-ROS_DOMAIN_ID=42 ros2 service call /mc602/read_battery \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/read_battery \
     vehicle_wbt_smartcar_msgs/srv/ReadBattery {}
 # → voltage_v: 11.85 左右
 
-ROS_DOMAIN_ID=42 ros2 service call /mc602/set_wheels \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/set_wheels \
     vehicle_wbt_smartcar_msgs/srv/SetWheels "{v0: 30, v1: 30, v2: 30, v3: 30}"
 # → 4 轮应该以中等速度转;推一下车
-ROS_DOMAIN_ID=42 ros2 service call /mc602/read_encoders \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/read_encoders \
     vehicle_wbt_smartcar_msgs/srv/ReadEncoders {}
 # → encoder 数值应该有变化
-ROS_DOMAIN_ID=42 ros2 service call /mc602/set_wheels \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/set_wheels \
     vehicle_wbt_smartcar_msgs/srv/SetWheels "{v0: 0, v1: 0, v2: 0, v3: 0}"
 ```
 
@@ -350,7 +369,7 @@ ROS_DOMAIN_ID=42 ros2 service call /mc602/set_wheels \
 - **R1**:字节必须 1:1 对齐 SDK(评审已发现现有实现错位)。**决策**:抄 SDK 原文,不重写。
 - **R2**:真硬件 24h 内冒烟必须全过。**缓解**:今晚跑通所有 service;Phase 1 失败的设备类不进 bridge。
 - **R3**:上层同事的需求可能变化(如 `set_wheels` 想带 PID 模式)。**缓解**:Service 接口预留 `mode` 字段;Phase 1 先无 PID,Phase 2 加。
-- **R4**:多个同事同时调用 `/mc602/set_wheels` 会冲突。**缓解**:`MC602Node` 内部串行化(sdk MC602 单例 + lock 已保证);**上层**负责节流(不要 1kHz 调)。
+- **R4**:多个同事同时调用 `/vehicle_wbt/v1/mc602/set_wheels` 会冲突。**缓解**:`MC602Node` 内部串行化(sdk MC602 单例 + lock 已保证);**上层**负责节流(不要 1kHz 调)。
 - **R5**:CycloneDDS 在 Wi-Fi (`wlP1p1s0`) 上发现慢。**缓解**:ROS_DOMAIN_ID=42 已硬编码;Network 文档说明端口放行。
 
 ---
@@ -389,21 +408,21 @@ colcon build --packages-up-to vehicle_wbt_smartcar_bridge
 source install/setup.bash
 
 # 1. 验证能连通 Jetson
-ROS_DOMAIN_ID=42 ros2 service call /mc602/read_battery \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/read_battery \
     vehicle_wbt_smartcar_msgs/srv/ReadBattery {}
 
 # 2. 看数据流
-ROS_DOMAIN_ID=42 ros2 topic echo /mc602/state/raw
+ROS_DOMAIN_ID=42 ros2 topic echo /vehicle_wbt/v1/mc602/state/raw
 
 # 3. 试着发个指令
-ROS_DOMAIN_ID=42 ros2 service call /mc602/buzzer \
+ROS_DOMAIN_ID=42 ros2 service call /vehicle_wbt/v1/mc602/buzzer \
     vehicle_wbt_smartcar_msgs/srv/Buzzer "{freq_hz: 440, duration_ms: 200}"
 
 # 4. 创建你自己的 package
 ros2 pkg create --build-type ament_python vehicle_wbt_smartcar_chassis \
     --dependencies vehicle_wbt_smartcar_msgs rclpy
 
-# 5. 在 setup.py 里加 entry_point,在包目录下写你的节点,调 /mc602/* service
+# 5. 在 setup.py 里加 entry_point,在包目录下写你的节点,调 /vehicle_wbt/v1/mc602/* service
 ```
 
 ---
