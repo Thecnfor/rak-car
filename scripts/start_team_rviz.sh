@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
-# start_team_rviz.sh — one-click RViz viewing of the Jetson's cameras.
+# start_team_rviz.sh — one-click RViz VIEWING of the Jetson's cameras.
+#
+# This script is for **viewing only**. Teammates never SSH from here.
+# Control (if you ever need it for debugging) is done separately with
+# `ros2 topic pub` over DDS — same channel RViz uses.
 #
 # Run from any teammate's laptop on the same LAN as the Jetson
 # (Jetson is hard-coded at 192.168.3.69 — see docs/team-constants.md):
@@ -10,10 +14,10 @@
 #   1. Sets ROS_DOMAIN_ID=42 (team-wide convention; matches what
 #      full_system.launch.py enforces on the Jetson side).
 #   2. Detects ROS2 distro (humble/jazzy/iron) and sources its setup.bash.
-#   3. Installs CycloneDDS config on first run (sudo), so DDS discovery
-#      uses the same XML across all machines.
+#   3. Copies CycloneDDS config to ~/.ros/ on first run (no sudo),
+#      so DDS discovery uses the same XML across all machines.
 #   4. Sources this repo's install/setup.bash if already built.
-#   5. Sanity-checks that Jetson's camera nodes are visible.
+#   5. Sanity-checks that Jetson's camera nodes are visible (DDS only).
 #   6. Launches RViz2 with a pre-built layout pointing at the live
 #      image_compressed topics.
 #
@@ -96,22 +100,30 @@ if [ -f "${WORKSPACE}/install/setup.bash" ]; then
   source "${WORKSPACE}/install/setup.bash"
 fi
 
-# 5. Sanity-check discovery
+# 5. Sanity-check discovery (DDS only — no SSH from this script)
 echo ""
 echo "🔎 Hunting for Jetson camera nodes on ROS_DOMAIN_ID=$ROS_DOMAIN_ID ..."
 if timeout 6 ros2 node list 2>/dev/null | grep -E "camera_(arm|front)" >/dev/null; then
   echo "✅ Found:"
   timeout 4 ros2 node list 2>/dev/null | grep -E "camera|mecanum|arm_main" | sed 's/^/   /'
 else
-  echo "⚠️  Couldn't see camera nodes within 6s. Check:"
-  echo "   - Same WiFi/LAN as the Jetson (e.g. ping 192.168.3.69)"
-  echo "   - Jetson is running:   ssh xrak@192.168.3.69 'ros2 node list'"
+  echo "⚠️  No camera nodes seen via DDS within 6s."
+  echo "   (This script never SSHes — diagnosing further is *your* call,"
+  echo "    not required to view cameras.)"
   echo ""
-  read -rp "Open RViz2 anyway? [y/N] " yn
-  case "$yn" in
-    [yY]*) ;;
-    *) echo "Aborted."; exit 1 ;;
-  esac
+  echo "   Common causes — none of them need SSH from your laptop:"
+  echo "   - Not on the team LAN / wrong subnet:"
+  echo "       ping 192.168.3.69          # 0% loss = OK"
+  echo "   - CycloneDDS config not in ~/.ros/cyclonedds.xml"
+  echo "   - Firewall blocking UDP 7400-7500 on the Jetson"
+  echo "   - Jetson sidecar may not be running — ask whoever is at the"
+  echo "     car to verify. (Starting sidecar is the operator's job,"
+  echo "     not the viewer's. Viewers never SSH — they just look.)"
+  echo ""
+  echo "   For the full 15-item health check (does SSH internally), run:"
+  echo "       bash scripts/diagnose.sh"
+  echo ""
+  echo "   Opening RViz2 anyway — empty topic list is itself a useful clue."
 fi
 
 echo ""
