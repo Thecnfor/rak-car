@@ -7,8 +7,8 @@
 
 - [ ] **dev 机器**：Ubuntu 22.04 / 24.04 / 26.04 之一，已装好系统
 - [ ] **GitHub 访问**：被加入 `Thecnfor/rak-car` collaborators
-- [ ] **Jetson 信息**：知道 Jetson IP（默认 `192.168.3.69`）和用户名（默认 `xrak`）
-- [ ] **同 LAN**：dev 机跟 Jetson 在同一路由器下
+- [ ] **Jetson 信息**：Jetson IP **硬编码 `192.168.3.69`**（团队约定，不能改），用户名 `xrak`
+- [ ] **同 LAN**：dev 机跟 Jetson 在同一路由器下（`ping 192.168.3.69`）
 
 > 如果你的 dev 机器没装 Ubuntu，看 [`dev-machine-setup.md`](../development/dev-machine-setup.md)。
 
@@ -100,7 +100,7 @@ bash scripts/start_team_rviz.sh
 | SSH 连不上 Jetson | `Permission denied (publickey)` 或 `Connection refused` | 找 Thecnfor 配 / 检查网线 |
 | ROS_DOMAIN_ID 不一致 | 看不到 Jetson topic | `export ROS_DOMAIN_ID=42` + 重启 shell |
 | CycloneDDS 配置没拷 | 看不到 Jetson topic | `cp ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml ~/.ros/` |
-| Ping orin 不通 | 找不到 Jetson | 检查网线 / 静态 IP / 在 `~/.ssh/config` 加 `Host orin HostName 192.168.3.69` |
+| Ping orin 不通 | 找不到 Jetson | `ping 192.168.3.69` — 检查网线 / 路由器 / 你在不在内网 |
 | colcon build 失败 | 缺依赖 / 缺包 | 看错误信息，缺什么装什么；不要忘了 `source /opt/ros/<distro>/setup.bash` |
 
 完整排错见 [`../operations/troubleshooting.md`](../operations/troubleshooting.md)。

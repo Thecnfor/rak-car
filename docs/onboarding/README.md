@@ -9,7 +9,7 @@ git clone git@github.com:Thecnfor/rak-car.git
 cd rak-car
 bash scripts/onboard.sh              # 一键装依赖 + build
 bash scripts/diagnose.sh             # 全套健康检查
-bash scripts/start_team_rviz.sh      # 一键通过 RViz 看 Jetson 实时 cameras
+bash scripts/start_team_rviz.sh      # 一键通过 RViz 看 Jetson (192.168.3.69) cameras
 ```
 
 跑完上面 4 行，你就跟老成员一样能看了。
@@ -18,7 +18,7 @@ bash scripts/start_team_rviz.sh      # 一键通过 RViz 看 Jetson 实时 camer
 
 1. **vehicle_wbt** 是 2026 百度智能车比赛的小车，NVIDIA Jetson Orin Nano + ROS2 Humble
 2. **架构**：Jetson 跑 sidecar（采集/控制），dev 桌面负责 RViz 监控 + 算法开发
-3. **网络**：Jetson 固定 `192.168.3.69`，团队 `192.168.3.0/24` 内网
+3. **网络**：Jetson **硬编码 192.168.3.69**，团队 `192.168.3.0/24` 内网（详见 [team-constants.md](../team-constants.md)）
 4. **DDS**：项目用 `ROS_DOMAIN_ID=42`，多机自动发现
 5. **比赛日期**：2026-08-10 ~ 08-12（开发窗口 7.13 进入冻结期）
 

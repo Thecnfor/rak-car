@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # start_team_rviz.sh — one-click RViz viewing of the Jetson's cameras.
 #
-# Run from any teammate's laptop on the same LAN as the Jetson:
+# Run from any teammate's laptop on the same LAN as the Jetson
+# (Jetson is hard-coded at 192.168.3.69 — see docs/team-constants.md):
 #
 #   ./scripts/start_team_rviz.sh
 #

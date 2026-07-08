@@ -13,7 +13,7 @@
 #   bash scripts/onboard.sh --skip-ros-install   # skip apt ROS2 install
 #
 # Environment:
-#   JETSON_HOST   default: orin
+#   JETSON_HOST   default: 192.168.3.69 (team constant, see docs/team-constants.md)
 #   JETSON_USER   default: xrak
 #
 # Press Ctrl-C to abort at any time.
@@ -22,7 +22,9 @@ set -euo pipefail
 SCRIPT_NAME="onboard.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ROS_DISTRO=""
-JETSON_HOST="${JETSON_HOST:-orin}"
+# Hard-coded team constant: Jetson is always at 192.168.3.69.
+# See docs/team-constants.md.
+JETSON_HOST="${JETSON_HOST:-192.168.3.69}"
 JETSON_USER="${JETSON_USER:-xrak}"
 
 # ─── flags ────────────────────────────────────────────────────────────────

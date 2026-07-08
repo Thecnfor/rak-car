@@ -7,7 +7,7 @@
 | 症状 | 根因 | 一键命令 | 修法 |
 |------|------|----------|------|
 | `bash scripts/start_team_rviz.sh` 启 RViz 但 GUI 没图像 | TF / topic / QoS 问题 | `bash scripts/diagnose.sh` | 看下面 5 个常见原因 |
-| `ping orin` 不通 | 网络 / Jetson 没电 | `ping -c 3 192.168.3.69` | 检查网线 / Jetson 电源 / 内网 |
+| `ping 192.168.3.69` 不通 | 网络 / Jetson 没电 | `ping -c 3 192.168.3.69` | 检查网线 / Jetson 电源 / 内网 |
 | `ros2 topic list` 看不到 Jetson topic | DDS discovery 没通 | `cat ~/.ros/cyclonedds.xml` | 拷贝 config + 防火墙 UDP 7400-7500 |
 | 看到 topic 但 RViz "no image" | 字段名错 / QoS 不匹配 | 看下面 § "RViz 'no image' 怎么办" | 改 `Topic:` + 改 `RELIABLE` |
 | `ros2 node list` 空但 `topic list` 有 topics | daemon cache stale | `ros2 daemon stop && ros2 daemon start` | 重新跑 `diagnose.sh` |

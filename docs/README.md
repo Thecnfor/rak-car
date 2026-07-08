@@ -43,6 +43,7 @@
 |------|------|:---:|
 | [onboarding/README.md](onboarding/README.md) | 30 秒 TL;DR + 文档地图 + 工具速查 | ⭐⭐⭐ |
 | [onboarding/day-one.md](onboarding/day-one.md) | Day 1 详细 7 步（装 ROS2 → onboard → 看到 cameras） | ⭐⭐⭐ |
+| [team-constants.md](team-constants.md) | **团队硬约定**（Jetson IP、ROS_DOMAIN_ID、CycloneDDS 等） | ⭐⭐⭐ |
 
 ### 运维 & 现场（Operations）
 

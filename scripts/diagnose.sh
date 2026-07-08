@@ -21,7 +21,10 @@ set -euo pipefail
 
 SCRIPT_NAME="diagnose.sh"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-JETSON_HOST="${JETSON_HOST:-orin}"
+# Hard-coded team constant: Jetson is always at 192.168.3.69 on the
+# team LAN. See docs/team-constants.md. Override via --target or env
+# only if your local Jetson has a different IP.
+JETSON_HOST="${JETSON_HOST:-192.168.3.69}"
 TARGET="${TARGET_HOST:-}"
 DO_REMOTE=1
 JSON=0
@@ -40,7 +43,7 @@ Options:
   -h, --help           Show this help
 
 Environment:
-  JETSON_HOST          default: orin
+  JETSON_HOST          default: 192.168.3.69 (team constant)
 EOF
 }
 
