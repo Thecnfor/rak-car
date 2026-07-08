@@ -1,0 +1,11 @@
+#!/usr/bin/env python3
+"""Entry-point wrapper for the smartcar_bridge_node console script.
+
+Lives at install/lib/vehicle_wbt_smartcar_bridge/smartcar_bridge_node so
+that `ros2 launch` and `ros2 run` can find it. Delegates to the
+package's main() in vehicle_wbt_smartcar_bridge.smartcar_bridge_node.
+"""
+from vehicle_wbt_smartcar_bridge.smartcar_bridge_node import main
+
+if __name__ == '__main__':
+    main()

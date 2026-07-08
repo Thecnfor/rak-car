@@ -1,0 +1,4 @@
+# Buzzer. Mirrors car_wrap_2026.MyCar.beep.
+---
+bool success
+string message

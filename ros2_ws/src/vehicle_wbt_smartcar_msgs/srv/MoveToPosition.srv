@@ -1,0 +1,8 @@
+# Absolute waypoint: drive to (x, y, z) in odom frame using location_pid.
+# Mirrors car_wrap_2026.MyCar.move_to_position.
+float32 x
+float32 y
+float32 z
+---
+bool success
+string message

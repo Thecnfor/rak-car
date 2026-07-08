@@ -1,0 +1,4 @@
+# Reset odometry to (0, 0, 0). Mirrors car_wrap_2026.MyCar.reset_position.
+---
+bool success
+string message

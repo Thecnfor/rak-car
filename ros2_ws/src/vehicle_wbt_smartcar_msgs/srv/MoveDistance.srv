@@ -1,0 +1,8 @@
+# Open-loop motion for a fixed distance. Mirrors car_wrap_2026.MyCar.move_distance.
+# direction: 0=forward, 1=backward (most common case is straight line)
+float32 speed
+int32 direction
+float32 distance
+---
+bool success
+string message

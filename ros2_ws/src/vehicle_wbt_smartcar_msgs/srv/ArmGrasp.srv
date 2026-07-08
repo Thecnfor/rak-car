@@ -1,0 +1,5 @@
+# Vacuum pump on/off. Mirrors car_wrap_2026.ArmController.grasp.
+bool state
+---
+bool success
+string message

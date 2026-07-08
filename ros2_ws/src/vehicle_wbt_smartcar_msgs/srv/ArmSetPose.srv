@@ -1,0 +1,12 @@
+# Set arm pose. Mirrors car_wrap_2026.ArmController.set_arm_pose.
+# arm_id: -180..180 (rotation about base)
+# pitch: vertical pitch
+# arm_dir: "LEFT" or "RIGHT" (left/right arm selection)
+# hand_dir: "UP" or "DOWN" (gripper orientation)
+int32 arm_id
+float32 pitch
+string arm_dir
+string hand_dir
+---
+bool success
+string message

@@ -1,0 +1,10 @@
+# Relative motion: chassis moves by [dx, dy, dz] in body frame.
+# dx = forward (+) / backward (-) in meters
+# dy = left (+) / right (-) in meters
+# dz = rotation (+ counter-clockwise) in radians
+float32 dx
+float32 dy
+float32 dz
+---
+bool success
+string message

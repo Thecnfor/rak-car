@@ -1,0 +1,6 @@
+# Storage rack up/down (servo_1). Mirrors MyCar.set_storage.
+# state=true raises, false lowers.
+bool state
+---
+bool success
+string message

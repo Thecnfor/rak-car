@@ -1,0 +1,5 @@
+# Set hand (gripper) joint angle. Mirrors ArmController.set_hand_angle.
+int32 angle
+---
+bool success
+string message

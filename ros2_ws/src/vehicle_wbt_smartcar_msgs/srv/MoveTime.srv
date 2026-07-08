@@ -1,0 +1,9 @@
+# Open-loop motion for a fixed duration. speed = [vx, vy, wz] in m/s, rad/s.
+# Mirrors car_wrap_2026.MyCar.move_time.
+float32 vx
+float32 vy
+float32 wz
+float32 duration
+---
+bool success
+string message

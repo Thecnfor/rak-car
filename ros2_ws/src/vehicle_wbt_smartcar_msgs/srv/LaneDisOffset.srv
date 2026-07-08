@@ -1,0 +1,7 @@
+# Lane-follow then stop after dis_hold meters of forward travel.
+# Mirrors car_wrap_2026.MyCar.lane_dis_offset (the most-used lane API).
+float32 speed
+float32 dis_hold
+---
+bool success
+string message

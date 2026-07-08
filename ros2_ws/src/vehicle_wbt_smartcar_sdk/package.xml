@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vehicle_wbt_smartcar_sdk</name>
+  <version>0.1.0</version>
+  <description>
+    Python SDK for the dev box. Mirrors the official Baidu SmartCar 2026
+    car_wrap_2026.py MyCar API surface 1:1 — task scripts written for the
+    official code (e.g. car_task_function.py) port to this SDK with
+    near-zero changes. The SDK is a thin ROS2 client; it does NOT touch
+    hardware directly. All operations route through the
+    vehicle_wbt_smartcar_bridge services on the Jetson.
+
+    Usage on dev box:
+      from vehicle_wbt_smartcar_sdk import MyCar
+      my_car = MyCar()              # connects to ROS_DOMAIN_ID=42
+      my_car.beep()
+      my_car.move_for([0.1, 0, 0])
+      my_car.arm.grasp(True)
+      # lane/detection/OCR/NLP: same as official API surface but the
+      # inference backend lives on the dev box (subscribe to
+      # /vehicle_wbt/v1/sensors/camera/*/image_compressed there).
+  </description>
+  <maintainer email="w5555wdnmd@gmail.com">Thecnfor</maintainer>
+  <license>Proprietary</license>
+
+  <depend>rclpy</depend>
+  <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>vehicle_wbt_smartcar_msgs</depend>
+  <depend>vehicle_wbt_smartcar_bridge</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

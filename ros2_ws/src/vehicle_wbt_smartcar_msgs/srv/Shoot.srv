@@ -1,0 +1,4 @@
+# Trigger shooter (PoutD pin 4). Mirrors MyCar.shooting.
+---
+bool success
+string message

@@ -1,0 +1,6 @@
+# Lane-follow for fixed distance. Mirrors car_wrap_2026.MyCar.lane_dis.
+float32 speed
+float32 distance
+---
+bool success
+string message

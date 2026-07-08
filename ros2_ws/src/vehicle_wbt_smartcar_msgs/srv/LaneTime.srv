@@ -1,0 +1,6 @@
+# Lane-follow for fixed duration. Mirrors car_wrap_2026.MyCar.lane_time.
+float32 speed
+float32 duration
+---
+bool success
+string message

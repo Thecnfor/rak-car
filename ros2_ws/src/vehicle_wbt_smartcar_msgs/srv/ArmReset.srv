@@ -1,0 +1,4 @@
+# Reset arm to home pose. Mirrors car_wrap_2026.ArmController.reset_position.
+---
+bool success
+string message

@@ -1,0 +1,6 @@
+# Lane-follow until cancelled (no return). Mirrors car_wrap_2026.MyCar.lane_base.
+# speed in m/s.
+float32 speed
+---
+bool success
+string message

@@ -1,0 +1,41 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>vehicle_wbt_smartcar_bridge</name>
+  <version>0.1.0</version>
+  <description>
+    ROS2 service bridge that exposes the official Baidu SmartCar 2026
+    MyCar API surface (car_wrap_2026.py) as ROS2 primitives. Runs on the
+    Jetson side; wraps existing rclcpp nodes (mecanum_chassis_node,
+    arm_node) instead of duplicating hardware control.
+
+    Topic namespace: /vehicle_wbt/v1/cmd/... (services) and
+    /vehicle_wbt/v1/state/... (state topics).
+
+    The perception/lane/OCR/NLP backends live on the dev box (subscribe
+    to /vehicle_wbt/v1/sensors/camera/*/image_compressed, run inference
+    there, send motion commands back via these services). This matches
+    the user's intent: robot side = dumb hardware layer, dev side = smart
+    perception/planning/control.
+  </description>
+  <maintainer email="w5555wdnmd@gmail.com">Thecnfor</maintainer>
+  <license>Proprietary</license>
+
+  <depend>rclpy</depend>
+  <depend>std_srvs</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>vehicle_wbt_platform_cpp</depend>
+
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <depend>vehicle_wbt_smartcar_msgs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

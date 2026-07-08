@@ -1,0 +1,5 @@
+# Set arm joint angle directly. Mirrors ArmController.set_arm_angle.
+int32 angle
+---
+bool success
+string message

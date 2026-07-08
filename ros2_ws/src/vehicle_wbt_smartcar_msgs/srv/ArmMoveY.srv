@@ -1,0 +1,6 @@
+# Move arm Y-axis to absolute position. Mirrors ArmController.move_y_position.
+float32 y
+float32 out_time
+---
+bool success
+string message
