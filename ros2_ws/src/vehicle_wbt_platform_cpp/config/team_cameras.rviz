@@ -1,5 +1,5 @@
 Panels:
-  - Class: rviz/Displays
+  - Class: rviz_common/Displays
     Help Height: 78
     Name: Displays
     Property Tree Widget:
@@ -7,32 +7,32 @@ Panels:
         - /Global Options1
       Splitter Ratio: 0.5
     Tree Height: 462
-  - Class: rviz/Selection
+  - Class: rviz_common/Selection
     Name: Selection
-  - Class: rviz/Tool Properties
+  - Class: rviz_common/Tool Properties
     Expanded:
       - /2D Pose Estimate1
       - /2D Nav Goal1
     Name: Tool Properties
     Splitter Ratio: 0.625
-  - Class: rviz/Views
+  - Class: rviz_common/Views
     Expanded:
       - /Current View1
     Name: Views
     Splitter Ratio: 0.5
-  - Class: rviz/Time
+  - Class: rviz_common/Time
     Name: Time
     SyncMode: 0
     SyncSource: ""
 
 Displays:
-  - Class: rviz/Axes
+  - Class: rviz_default_plugins/Axes
     Enabled: false
     Name: Axes
     Reference Frame: base_link
   - Alpha: 0.5
     Cell Size: 1
-    Class: rviz/Grid
+    Class: rviz_default_plugins/Grid
     Color: 160; 160; 164
     Enabled: true
     Name: Grid
@@ -42,7 +42,7 @@ Displays:
     Offset: 0; 0; 0
     Pose Color: 255; 255; 255
     Plane Color: 255; 255; 255
-  - Class: rviz/TF
+  - Class: rviz_default_plugins/TF
     Enabled: true
     Name: TF
     Show Axes: true
@@ -65,7 +65,7 @@ Displays:
           {}
         arm_camera_optical_frame:
           {}
-  - Class: rviz/Image
+  - Class: rviz_default_plugins/Image
     Enabled: true
     Image Topic: /vehicle_wbt/v1/sensors/camera/front/image_compressed
     Max Value: 255
@@ -77,7 +77,7 @@ Displays:
     Transport Hint: raw
   - Alpha: 1
     Autocompress: false
-    Class: rviz/Image
+    Class: rviz_default_plugins/Image
     Enabled: true
     Image Topic: /vehicle_wbt/v1/sensors/camera/arm/image_compressed
     Max Value: 255
@@ -95,29 +95,29 @@ Global Options:
   Frame Rate: 30
   Name: root
   Tools:
-    - Class: rviz/MoveCamera
-    - Class: rviz/Selection
-    - Class: rviz/FocusCamera
-    - Class: rviz/Measure
-    - Class: rviz/SetInitialPose
-    - Class: rviz/SetGoal
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_common/Selection
+    - Class: rviz_default_plugins/FocusCamera
+    - Class: rviz_default_plugins/Measure
+    - Class: rviz_default_plugins/SetInitialPose
+    - Class: rviz_default_plugins/SetGoal
   Use Sim Time: 0
   Time:
     SyncMode: 0
     SyncSource: ""
 
 Tools:
-  - Class: rviz/Interact
+  - Class: rviz_default_plugins/Interact
     Hide On Disabled: false
-  - Class: rviz/MoveCamera
-  - Class: rviz/Select
-  - Class: rviz/FocusCamera
-  - Class: rviz/Measure
-  - Class: rviz/SetInitialPose
+  - Class: rviz_default_plugins/MoveCamera
+  - Class: rviz_default_plugins/Select
+  - Class: rviz_default_plugins/FocusCamera
+  - Class: rviz_default_plugins/Measure
+  - Class: rviz_default_plugins/SetInitialPose
     Theta std deviation: 0.05
     X std deviation: 0.05
     Y std deviation: 0.05
-  - Class: rviz/SetGoal
+  - Class: rviz_default_plugins/SetGoal
     Theta std deviation: 0.05
     X std deviation: 0.05
     Y std deviation: 0.05
@@ -125,7 +125,7 @@ Tools:
 Views:
   Current:
     Angle: -2.0
-    Class: rviz/TopDownOrtho
+    Class: rviz_default_plugins/TopDownOrtho
     Enable Stereo Rendering:
       Stereo Eye Separation: 0.05999999865889549
       Stereo Focal Distance: 1
@@ -144,7 +144,7 @@ Views:
   Saved: ~
 
 Window:
-  Class: rviz/RVizApp
+  Class: rviz_default_plugins/RVizApp
   Geometry:
     Height: 720
     Width: 1280

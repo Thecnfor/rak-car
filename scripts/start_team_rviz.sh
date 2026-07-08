@@ -31,17 +31,24 @@ DDS_CONFIG_SRC="${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclone
 export ROS_DOMAIN_ID=42
 
 # 2. ROS2 distro auto-detect
+# Order matters: prefer humble (Jetson default) → jazzy → lyrical (dev box) → older
+# See docs/development/dev-target-architecture.md for distro choice rationale.
 ros_active=0
-for distro in humble jazzy iron foxy galactic; do
+for distro in humble jazzy lyrical iron foxy galactic; do
   if [ -f "/opt/ros/${distro}/setup.bash" ]; then
+    # Temporarily disable `set -u`: Lyrical's setup.bash checks
+    # $AMENT_TRACE_SETUP_FILES without an explicit default, which trips
+    # `set -u` (unbound variable) even when the variable is intentionally empty.
+    set +u
     source "/opt/ros/${distro}/setup.bash"
+    set -u
     echo "✅ ROS2 ${distro} loaded"
     ros_active=1
     break
   fi
 done
 if [ "$ros_active" = 0 ]; then
-  echo "❌ No /opt/ros/{humble,jazzy,iron,foxy,galactic}/setup.bash found." >&2
+  echo "❌ No /opt/ros/{humble,jazzy,lyrical,iron,foxy,galactic}/setup.bash found." >&2
   echo "   Install ROS2 first (https://docs.ros.org/en/${distro:-humble}/Installation.html)" >&2
   exit 1
 fi
