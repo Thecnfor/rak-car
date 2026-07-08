@@ -22,6 +22,12 @@ import serial
 HEADER = b'\x77\x68'
 TAIL = b'\x0A'
 
+# Device IDs and mode opcodes (per SDK mc602_ctl2.py).
+# DEV_BEEP = the buzzer peripheral.  MODE_SET = "write set value".
+# Task 5 will add DEV_SERVO_PWM and DEV_DOUT alongside these.
+DEV_BEEP = 0x0a
+MODE_SET = 2
+
 
 class MC602Serial:
     """pyserial-backed wrapper for the MC602 USB serial link.
@@ -114,3 +120,27 @@ class _DevCmdInterface:
         frame = HEADER + bytes([length]) + payload + TAIL
         ok = self.serial.write_frame(frame)
         return list(frame) if ok else []
+
+# ---------------------------------------------------------------------------
+# Device classes (mirror baidu_smartcar_2026 SDK names)
+# ---------------------------------------------------------------------------
+
+class Buzzer_2(_DevCmdInterface):
+    """MC602 buzzer. Mirrors SDK Buzzer_2.
+
+    Frame: dev=0x0a, mode=set, port=0, args=(freq//2, dur*20, 0).
+    freq_hz: audible frequency (max raw byte = 510, so fundamental
+        up to ~1020 Hz - above hearing, clipped).
+    duration_sec: how long the buzzer sounds.
+    """
+
+    def __init__(self, serial_obj: 'MC602Serial') -> None:
+        super().__init__(serial_obj, dev_id=DEV_BEEP, mode=MODE_SET,
+                         port_id=0, fmt='BBB')
+
+    def rings(self, freq_hz: int, duration_sec: float) -> list[int]:
+        return self._send_cmd(
+            int(freq_hz) // 2 & 0xff,
+            int(duration_sec * 20) & 0xff,
+            0,
+        )

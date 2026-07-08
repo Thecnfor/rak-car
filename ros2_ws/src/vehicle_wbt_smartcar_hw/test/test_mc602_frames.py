@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from vehicle_wbt_smartcar_hw.mc602 import MC602Serial  # noqa: E402
 from vehicle_wbt_smartcar_hw.mc602 import _DevCmdInterface  # noqa: E402
+from vehicle_wbt_smartcar_hw.mc602 import Buzzer_2  # noqa: E402
 
 
 class FakeSerial:
@@ -115,3 +116,32 @@ def test_dev_cmd_interface_length_includes_overhead() -> None:
     fake = ser._ser
     assert fake.written[-1][2] == 9   # index 2 = length
     ser.close()
+
+
+def test_buzzer_rings_emits_correct_frame() -> None:
+    ser = _make_serial()
+    ser.open()
+    try:
+        b = Buzzer_2(ser)
+        # freq=262 Hz → arg[0]=131, dur=0.4 → arg[1]=8
+        result = b.rings(262, 0.4)
+        # payload = [0x0a, 0x02, 0x00, 131, 8, 0]
+        # frame   = [0x77, 0x68, 0x0a, 0x0a, 0x02, 0x00, 131, 8, 0, 0x0a]
+        assert result == [0x77, 0x68, 0x0a, 0x0a, 0x02, 0x00, 131, 8, 0, 0x0a]
+    finally:
+        ser.close()
+
+
+def test_buzzer_rings_truncates_high_freq() -> None:
+    # freq=1024 Hz → arg[0] = 512 → & 0xff = 0 (wraps)
+    # This is by-design in the SDK (single-byte freq field).
+    ser = _make_serial()
+    ser.open()
+    try:
+        b = Buzzer_2(ser)
+        result = b.rings(1024, 0.1)
+        # arg[1] = int(0.1 * 20) = 2
+        assert result[6] == 0   # freq/2 truncated
+        assert result[7] == 2   # dur * 20
+    finally:
+        ser.close()
