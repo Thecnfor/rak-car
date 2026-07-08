@@ -24,6 +24,7 @@
   <depend>rclpy</depend>
   <depend>std_srvs</depend>
   <depend>std_msgs</depend>
+  <depend>vehicle_wbt_smartcar_hw</depend>
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>sensor_msgs</depend>
