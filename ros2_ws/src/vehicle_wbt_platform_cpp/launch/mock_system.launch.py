@@ -3,9 +3,15 @@
 """
 Launch file: dev/desktop sidecar system with mock hardware.
 
-Same node set as full_system.launch.py but with all hardware parameters
-overridden to mock /dev/null-style devices so it runs on a dev machine
-without Jetson. Used for:
+This is the **dev-side counterpart** of `full_system.launch.py` (which ships
+in `origin/robot-stable` and runs on the Jetson). It satisfies the same
+`/vehicle_wbt/v1/...` topic contract — every node here publishes / subscribes
+the same topics as the real thing — but with all hardware parameters
+overridden to mock /dev/null-style devices so each team member can test
+app code locally without the Jetson. The two-branches + this-mock-as-stub
+pattern is documented in `docs/driver-app-interface.md`.
+
+Same node set as full_system.launch.py. Used for:
 - Local dev iteration (no ssh to Jetson — runs locally)
 - CI integration tests
 - New team member onboarding
@@ -13,7 +19,7 @@ without Jetson. Used for:
 Usage:
   ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
 
-Spec: docs/development/test-matrix.md
+Spec: docs/development/test-matrix.md, docs/driver-app-interface.md
 """
 from launch import LaunchDescription
 from launch_ros.actions import Node

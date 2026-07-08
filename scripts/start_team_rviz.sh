@@ -95,9 +95,15 @@ if [ ! -f "$DDS_USER_CFG" ] && [ ! -f "$DDS_SYSTEM_CFG" ]; then
 fi
 
 # 4. Project workspace (if installed)
+# Same `set +u` workaround as the distro source above: colcon-generated
+# install/setup.bash references $COLCON_TRACE without a default, which
+# trips `set -u` on distros (e.g. Lyrical) that don't pre-set that var.
 WORKSPACE="${REPO_ROOT}/ros2_ws"
 if [ -f "${WORKSPACE}/install/setup.bash" ]; then
+  set +u
+  # shellcheck disable=SC1091
   source "${WORKSPACE}/install/setup.bash"
+  set -u
 fi
 
 # 5. Sanity-check discovery (DDS only — no SSH from this script)

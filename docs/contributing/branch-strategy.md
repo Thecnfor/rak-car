@@ -19,20 +19,31 @@
                             │   develop/ros2-sidecar       │
                             │  当前测试线 · 可破坏         │
                             │  ROS2 sidecar + 重构 + 新功能 │
-                            └──────────────▲───────────────┘
-                                           │ PR via gh pr create
-                            ┌──────────────┴───────────────┐
+                            │  + dev docs / CI / scripts   │
+                            └──────▲────────────▲──────────┘
+                                   │            │
+                       PR via gh   │            │ merge after
+                        pr create  │            │ real-HW smoke
+                                   │            ▼
+                            ┌──────┴───────────────────────┐
                             │   feat/*  fix/*  refactor/*  │
                             │   个人开发分支 (短命)        │
                             └──────────────────────────────┘
 
-未来 (JetPack 6 刷机后):
                             ┌──────────────────────────────┐
-                            │ develop/ros2-humble-post-    │
-                            │ flash (从 develop/ros2-      │
-                            │ sidecar 当前 commit 切出)     │
+                            │   robot-stable (Jetson)      │
+                            │  在 Jetson 上跑的精简 runtime │
+                            │  仅 ros2_ws + config + urdf  │
+                            │  + scripts/calibrate_camera  │
+                            │  30f9620 从 develop 剥离而成 │
+                            │  接受 develop 合入 (sparse)  │
                             └──────────────────────────────┘
 ```
+
+> **机器人侧的真相**：`robot-stable` 是 Jetson 上 git checkout 的那个分支。
+> `develop/ros2-sidecar` 在 dev 机上。这俩通过 `ROS_DOMAIN_ID=42` 上的
+> `/vehicle_wbt/v1/...` topic schema 通信（见 [`docs/driver-app-interface.md`](../driver-app-interface.md)）。
+> 之前的 `develop/ros2-humble-post-flash` 占位分支已经被 `robot-stable` 取代，**不要再切**。
 
 ## main 分支约定
 
@@ -68,24 +79,38 @@
 
 **典型场景**:ROS2 sidecar 节点实现、MyCar God Object 拆分、新增 PaddlePaddle 模型适配——这些都进 develop/ros2-sidecar。
 
+## robot-stable 约定(在 Jetson 上跑的精简 runtime)
+
+`robot-stable` 是 **Jetson 上 git checkout 的那个分支**。`30f9620 chore(robot-stable): strip dev-only docs/scripts/CI for robot-side runtime` 把所有 dev-only 的东西(完整 `docs/`、`scripts/{onboard,dev,diagnose,start_team_rviz}.sh`、`.github/` CI、`.devcontainer/`、`CONTRIBUTING.md`)剥掉,只留:
+
+- `ros2_ws/` (runtime 代码,driver + 最小 app)
+- `config_sensors.yml` (硬件 source of truth)
+- `urdf/` (机器人模型)
+- `scripts/calibrate_camera.py` (operator 工具,镜头更换时用一次)
+
+**为什么单独一个分支**:Jetson 不需要 dev docs / CI / 多脚本——它只需要"能跑 sidecar + 能被 remote colcon build/update"。剥离后 `git clone` 在 Jetson 上更快、磁盘更省、心智更干净。
+
+**跟 develop 的关系**:Jetson 端 publish `/vehicle_wbt/v1/...` 这一组 topic;dev 端订阅这一组 topic 做应用层工作。**这组 topic schema 是两边的契约**,详见 [`docs/driver-app-interface.md`](../driver-app-interface.md)。
+
+**承诺**:
+- robot-stable 上的代码**必须在真车上跑通过**(发布 topic 给 dev 的 RViz 能看到)。
+- 永远保持"最小可运行 subset"——不要把 `docs/`、`onboard.sh` 之类回填进来。
+
+**规则**:
+- **禁止直接 commit**:所有改动走"feat/* → develop/ros2-sidecar → 测过 → cherry-pick 到 robot-stable",或者由 Thecnfor 显式做 sparse-checkout 同步。
+- **新成员请到 `develop/ros2-sidecar` 工作**:除非你正在 Jetson 现场修 hardware bug。
+- **不要在 robot-stable 上跑 dev 脚本**:`onboard.sh` / `diagnose.sh` / `start_team_rviz.sh` 在这个分支里**不存在**,因为它们不需要。
+
+**典型场景**:
+- dev 上 PR 合入 `develop/ros2-sidecar` → Thecnfor 在 Jetson 上 cherry-pick → 重 build → 验证 cameras 仍 publish
+- Jetson 现场紧急 hardware fix → 现场人直接改 robot-stable → 事后同步回 develop(避免丢失修复)
+
+## 个人开发分支
+
 ## 未来 develop/ros2-humble-post-flash
 
-这是一个**占位章节**,等以下条件全部满足后才会启用:
-
-1. Jetson 完成 JetPack 6 (L4T R36.x) 刷机
-2. ROS2 Humble / Jazzy 在新系统上装好并通过 smoke test
-3. 旧 `develop/ros2-sidecar` 的 sidecar 代码迁移到 Humble 兼容版本
-
-**启用流程**:
-```bash
-# 在 develop/ros2-sidecar 当前 HEAD 切出新分支
-git checkout develop/ros2-sidecar
-git pull origin develop/ros2-sidecar
-git checkout -b develop/ros2-humble-post-flash
-git push origin develop/ros2-humble-post-flash
-```
-
-在那之前,所有 ROS2 工作仍然在 `develop/ros2-sidecar` 上推进。
+> **本节已废弃**。原本作为"Jetson 刷机后"的占位分支,但 `30f9620` 之后真正的"Jetson runtime 分支"已经命名为 `robot-stable`(见上节 + [`docs/driver-app-interface.md`](../driver-app-interface.md))。
+> 本节保留作为历史记录;**新工作不要切 `develop/ros2-humble-post-flash`**。
 
 ## 个人开发分支
 
@@ -152,8 +177,10 @@ main (LTS, 比赛线)
 | critical hotfix(比赛前 3 天发现) | main | 仅 Thecnfor | 可口头同步后补 PR |
 | 新功能 / 重构 | develop/ros2-sidecar | 任一 reviewer 批准 + 作者 push | 必须 |
 | ROS2 sidecar 实验 | develop/ros2-sidecar | 任一 reviewer | 必须 |
+| Driver / hardware bug fix(Jetson 现场) | robot-stable | 仅 Thecnfor(带真机验证截图/log) | 必须,1 reviewer,合后同步回 develop |
+| 跨分支的 `/vehicle_wbt/v1/...` schema 变更 | develop/ros2-sidecar + robot-stable | 仅 Thecnfor | 必须,**breaking change**——见 [`docs/driver-app-interface.md`](../driver-app-interface.md) §"Interface changes are breaking" |
 | 实验性 spike | experiment/* | 仅自己 | 不需要 PR(直接 push) |
-| 文档更新 | 直接 PR 到 main | 任一 reviewer | 必须 |
+| 文档更新 | develop/ros2-sidecar(robot-stable 不带 docs/) | 任一 reviewer | 必须 |
 | 配置调参(PID、阈值) | develop/ros2-sidecar | 任一 reviewer | 必须,真机验证后再合 main |
 
 ## 比赛前 4 周的冻结规则

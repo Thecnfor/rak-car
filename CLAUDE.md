@@ -21,6 +21,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two active branches:
 - `main` — frozen for 2026-08-10 → 08-12 competition. Legacy Python+ZMQ stack.
 - `develop/ros2-sidecar` — the ROS2 future. Pure rclcpp/rclpy implementation. **Most development happens here.** After 2026-08-12 this branch merges to main per `docs/contributing/branch-strategy.md`.
+- `robot-stable` — slim runtime that lives **on the Jetson itself** (IP `192.168.3.69`). Stripped of all dev-only stuff at commit `30f9620`. Keeps only `ros2_ws/`, `config_sensors.yml`, `urdf/`, and `scripts/calibrate_camera.py`. Drivers + minimal app that publishes the `/vehicle_wbt/v1/...` contract to dev desktops over DDS. **New contributors: never commit here directly — push to `develop/ros2-sidecar` first**, then Thecnfor cherry-picks to robot-stable after a real-hardware smoke test. Full split rationale and merge rules: [`docs/driver-app-interface.md`](docs/driver-app-interface.md) and [`docs/contributing/branch-strategy.md`](docs/contributing/branch-strategy.md).
 
 The full platform rationale (why move from ZMQ to DDS) is in the root `README.md`. The 1885-line architecture spec is in `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md`.
 
