@@ -1,0 +1,45 @@
+# MC602 硬件端口路由表(集中管理,服务 handler 路由到这里查表)
+# 底盘同事不知道硬件 dev_id,只通过 service 字段 port
+
+chassis:
+  motors: [1, 2, 3, 4]      # Motor_2 端口列表(用 Motors_2 包装)
+  encoders_dev: 0x03          # EncoderMotors4_2 的 dev_id
+
+arm:
+  stepper_y:                  # Y 轴步进电机
+    dev_id: 0x11
+    port: 1
+  dc_motor_x:                 # X 轴直流电机
+    dev_id: 0x02
+    port: 2
+  servo_pwm_hand:             # 手部 PWM 舵机
+    dev_id: 0x05
+    port: 3
+  servo_bus_wrist:            # 腕部总线舵机
+    dev_id: 0x06
+    port: 4
+  pump:                       # 真空泵
+    dev_id: 0x10
+    port: 1
+  valve:                      # 真空阀
+    dev_id: 0x10
+    port: 2
+  limit_switch_y:             # Y 轴磁限位
+    dev_id: 0x07
+    mode: 0
+    port: 6
+
+shooter:
+  barrel:                     # 发射器
+    dev_id: 0x10
+    port: 4
+  pump_reload:                # 装填泵(可选,Phase 5+)
+    dev_id: 0x10
+    port: 5
+
+ir:
+  left: 7
+  right: 8
+
+beep:
+  dev_id: 0x0a                # Buzzer_2,无 port
