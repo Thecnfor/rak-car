@@ -181,3 +181,23 @@ ros2 node info /camera_front
 # Stop everything:
 pkill -f full_system.launch.py
 ```
+
+## Song playback (Happy Birthday on MC602 buzzer)
+
+```bash
+# Terminal A — launch bridge + mc602 peripheral node:
+source /opt/ros/humble/setup.bash
+cd ~/workspace/rak-car/ros2_ws
+source install/setup.bash
+ROS_DOMAIN_ID=42 ros2 launch vehicle_wbt_smartcar_bridge \
+    smartcar_bridge.launch.py \
+    serial_port:=/dev/ttyUSB1 baud:=1000000
+
+# Terminal B — trigger (ROS_DOMAIN_ID must match):
+ROS_DOMAIN_ID=42 ros2 topic pub --once \
+    /vehicle_wbt/v1/cmd/peripheral/beep_event std_msgs/Empty
+
+# Expected: ~17 s of Happy Birthday through the MC602 buzzer.
+# Node logs show `melody[0..24] f=NNNHz d=0.Ns: sent 77 68 ...`.
+# Override `serial_port` if your MC602 is at /dev/ttyUSB0 (or other).
+```
