@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""Entry-point wrapper for software_beep_node console script.
+
+Lives at install/lib/vehicle_wbt_smartcar_bridge/software_beep_node so
+ros2 run / ros2 launch can find it.
+"""
+from vehicle_wbt_smartcar_bridge.software_beep_node import main
+
+if __name__ == '__main__':
+    main()
