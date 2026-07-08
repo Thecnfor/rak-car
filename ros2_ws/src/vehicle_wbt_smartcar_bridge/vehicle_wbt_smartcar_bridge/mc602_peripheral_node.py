@@ -12,6 +12,11 @@ CTL frame, closes. This mirrors car_wrap_2026.MyCar:
   set_storage-> ServoPwm(1).set_angle([-42, 165][flag]) -> MC602 servo pin 1
   shooting   -> PoutD(4).set(1) for 0.3s               -> MC602 dout pin 4
 
+The beep_event handler plays a pre-canned melody ("Happy Birthday")
+by sequencing Buzzer frames on the MC602. Total duration ~12s at
+400ms-per-note pacing. The melody plays asynchronously via rclpy
+timers so rclpy.spin is never blocked.
+
 MC602 USB frame format (per WhalesBot SDK serial_wrap.py + mc602_ctl2.py):
   Header: 0x77 0x68
   Length: 1 byte (= payload length + 4)
@@ -65,6 +70,24 @@ MC602_TAIL       = bytes.fromhex('0A')
 # Serial config
 DEFAULT_BAUD = 1_000_000  # MC602 default baud per official SDK
 DEFAULT_PORT = '/dev/ttyUSB0'  # per full_system.launch.py default
+
+# Happy Birthday melody (freq_hz, duration_sec).
+# Equal-temperament A4=440. Notes chosen so the entire sequence fits
+# comfortably within MC602 Buzzer_2's freq/2 byte (max raw freq = 510 Hz
+# which gives a fundamental of 1020 Hz — above human hearing so safe).
+# 0.4s per note + 0.05s gap ≈ 0.45s/note × 26 notes ≈ 12 seconds total.
+HAPPY_BIRTHDAY_MELODY = [
+    # "Happy birthday to you"
+    (262, 0.40), (262, 0.40), (294, 0.80),
+    (262, 0.80), (349, 0.80), (330, 0.80),
+    # "Happy birthday to you"
+    (262, 0.40), (262, 0.40), (294, 0.80),
+    (262, 0.80), (392, 0.80), (349, 0.80),
+    # "Happy birthday dear [name]"
+    (262, 0.40), (262, 0.40), (523, 0.80), (440, 0.80), (349, 0.80), (330, 0.80), (294, 0.80),
+    # "Happy birthday to you"
+    (466, 0.40), (466, 0.40), (440, 0.80), (349, 0.80), (392, 0.80), (349, 0.80),
+]
 
 
 def _build_mc602_frame(dev_id: int, mode: int, port_id: int, args: bytes) -> bytes:
@@ -246,9 +269,14 @@ class MC602PeripheralNode(Node):
         self.shoot_sub = self.create_subscription(
             Empty, cfg.TRIGGER_SHOOT, self._on_shoot, 10)
 
+        self._melody_timer = None  # rclpy.Timer or None
+        self._melody_index = 0
+        self._melody_cumulative_time = 0.0
+
         self.get_logger().info(
             f'mc602_peripheral_node ready: '
-            f'beep={cfg.TRIGGER_BEEP}, storage={cfg.TRIGGER_STORAGE}, shoot={cfg.TRIGGER_SHOOT}')
+            f'beep={cfg.TRIGGER_BEEP}, storage={cfg.TRIGGER_STORAGE}, shoot={cfg.TRIGGER_SHOOT} '
+            f'(beep plays Happy Birthday melody, ~{sum(d for _,d in HAPPY_BIRTHDAY_MELODY):.1f}s)')
 
     def _send_or_log(self, frame: bytes, label: str) -> None:
         if self._serial_ok:
@@ -262,12 +290,47 @@ class MC602PeripheralNode(Node):
                 f'{label}: would have sent {frame.hex(" ")} (no MC602 link)')
 
     def _on_beep(self, _msg: Empty) -> None:
-        # Mirrors MyCar.beep -> Beep.rings -> Buzzer_2.rings(200, 0.2)
-        # Official default: freq=200, duration=0.2 (per controller_wrap.py:151)
-        frame = build_beep_frame(freq=200, duration=0.2)
-        self._send_or_log(frame, 'beep')
-        # Match official time.sleep(0.2) in MyCar.beep (not strictly needed
-        # since we don't block on the response — keeps semantics parallel)
+        """Plays the Happy Birthday melody on the MC602 buzzer.
+
+        Schedules one timer per note at cumulative offsets so rclpy.spin
+        stays responsive. Each timer fires once and writes one beep frame.
+        Total melody time ~= sum(note durations) + small inter-note gaps.
+
+        Note: ROS2 Humble's create_timer() doesn't support one_shot=True —
+        we create a recurring timer and self-destroy it inside the
+        callback once the melody is done.
+        """
+        if self._melody_timer is not None:
+            # Cancel any in-flight melody (one at a time for now).
+            self.destroy_timer(self._melody_timer)
+            self._melody_timer = None
+            self.get_logger().info('cancelled previous melody')
+
+        self._melody_index = 0
+        self.get_logger().info(
+            f'playing Happy Birthday ({len(HAPPY_BIRTHDAY_MELODY)} notes, '
+            f'~{sum(d for _,d in HAPPY_BIRTHDAY_MELODY):.1f}s)')
+
+        def _play_next():
+            if self._melody_index >= len(HAPPY_BIRTHDAY_MELODY):
+                # Melody complete: destroy self, drop reference.
+                if self._melody_timer is not None:
+                    self.destroy_timer(self._melody_timer)
+                    self._melody_timer = None
+                return
+            freq, dur = HAPPY_BIRTHDAY_MELODY[self._melody_index]
+            frame = build_beep_frame(freq=freq, duration=dur)
+            self._send_or_log(
+                frame, f'melody[{self._melody_index}] f={freq}Hz d={dur}s')
+            self._melody_index += 1
+
+        # Use a recurring timer at note+gap cadence; the callback
+        # self-destroys when index goes past the end.
+        first_dur = HAPPY_BIRTHDAY_MELODY[0][1]
+        self._melody_timer = self.create_timer(
+            first_dur + 0.05,
+            _play_next,
+        )
 
     def _on_storage(self, msg: Bool) -> None:
         # Mirrors MyCar.set_storage -> ServoPwm(1).set_angle([-42, 165][flag])
