@@ -66,7 +66,11 @@ namespace vwpc_cam
 constexpr const char * kEncodingRaw = "bgr8";
 constexpr const char * kEncodingCompressed = "jpeg";
 
-inline rclcpp::QoS image_qos() { return rclcpp::QoS(1).best_effort(); }
+// image QoS: RELIABLE depth=1 (LAN has no packet loss, RELIABLE matches
+// RViz2 ImageDisplay's default and avoids QoS-incompat warnings that
+// prevent subscribers from receiving data). Was BEST_EFFORT (commit
+// b1eecdc) but RViz2 ImageDisplay defaults to RELIABLE → "no image" bug.
+inline rclcpp::QoS image_qos() { return rclcpp::QoS(1).reliable(); }
 inline rclcpp::QoS info_qos() { return rclcpp::QoS(1).transient_local(); }
 inline rclcpp::QoS status_qos() { return rclcpp::QoS(10).reliable(); }
 
