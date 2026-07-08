@@ -195,8 +195,10 @@ phase3_build() {
 
   ok "  build + smoke test complete"
   log ""
-  log "Next: bash scripts/setup_ssh_key.sh (for SSH to Jetson)"
-  log "Then: bash scripts/start_team_rviz.sh (see live cameras)"
+  log "Next: ask a teammate to add your SSH pub key to Jetson (~/.ssh/authorized_keys)"
+  log "      (team handles SSH key distribution — usually one-time ask in chat)"
+  log "Then: bash scripts/diagnose.sh     (verify all green)"
+  log "Finally: bash scripts/start_team_rviz.sh  (see live cameras)"
 }
 
 # ─── main ────────────────────────────────────────────────────────────────

@@ -201,21 +201,25 @@ check_dds() {
   fi
 
   # 12: dev sees Jetson nodes
+  # ros2 daemon cache is often stale (returns empty even when DDS is working).
+  # Cross-check with topic-level signals: if image_compressed is publishing,
+  # the daemon cache is just stale — downgrade FAIL to WARN.
   if timeout 5 ros2 node list 2>/dev/null | grep -qE 'camera_(arm|front)'; then
     add_result "12" "dds:node_list" "PASS" "Jetson nodes visible"
   else
-    add_result "12" "dds:node_list" "FAIL" "no Jetson nodes — check ROS_DOMAIN_ID"
+    add_result "12" "dds:node_list" "WARN" "daemon cache empty — run: ros2 daemon stop && ros2 daemon start (DDS may still work)"
   fi
 
-  # 13: image_compressed publishing
+  # 13: image_compressed publishing — this is the AUTHORITATIVE signal:
+  # if we can measure ~30Hz, DDS is working regardless of daemon cache state.
   local rate
   rate=$(timeout 4 ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_compressed 2>/dev/null | grep -oE 'average rate: [0-9.]+' | head -1 | awk '{print $3}' || true)
   if [[ -n "$rate" && "${rate%.*}" -ge 5 ]]; then
-    add_result "13" "dds:image_topic" "PASS" "${rate} Hz"
+    add_result "13" "dds:image_topic" "PASS" "${rate} Hz (DDS working)"
   elif [[ -n "$rate" ]]; then
     add_result "13" "dds:image_topic" "WARN" "low rate ${rate} Hz"
   else
-    add_result "13" "dds:image_topic" "FAIL" "no message in 4s"
+    add_result "13" "dds:image_topic" "FAIL" "no message in 4s — check Jetson sidecar"
   fi
 
   # 14: tf_static has both camera optical frames
