@@ -1,0 +1,4 @@
+uint16 freq_hz
+uint16 duration_ms
+---
+bool success

@@ -1,0 +1,4 @@
+uint8 port
+bool state
+---
+bool success

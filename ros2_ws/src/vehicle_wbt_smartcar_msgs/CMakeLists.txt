@@ -27,12 +27,27 @@ set(SRV_FILES
   "srv/Beep.srv"
   "srv/SetStorage.srv"
   "srv/Shoot.srv"
+  # Phase 1 additive (DO NOT REMOVE existing entries above)
+  "srv/SetWheels.srv"
+  "srv/ReadEncoders.srv"
+  "srv/ResetEncoders.srv"
+  "srv/SetServoPwm.srv"
+  "srv/SetServoBus.srv"
+  "srv/SetStepper.srv"
+  "srv/SetDcMotor.srv"
+  "srv/SetDout.srv"
+  "srv/ReadIR.srv"
+  "srv/ReadBattery.srv"
+  "srv/ReadAnalog.srv"
+  "srv/Buzzer.srv"
 )
 
 set(MSG_FILES
   "msg/ArmPose.msg"
   "msg/ChassisState.msg"
   "msg/BridgeStatus.msg"
+  # Phase 1 additive
+  "msg/RawState.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}
