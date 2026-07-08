@@ -56,7 +56,7 @@ test -f ~/.ros/cyclonedds.xml || \
 ```bash
 echo $ROS_DOMAIN_ID   # 应该是 42
 # Jetson 端和 dev 端必须都是 42
-ssh orin "source /opt/ros/humble/setup.bash && printenv ROS_DOMAIN_ID"
+ssh xrak@192.168.3.69 "source /opt/ros/humble/setup.bash && printenv ROS_DOMAIN_ID"
 ```
 
 ## 怎么 report bug
@@ -68,7 +68,7 @@ ssh orin "source /opt/ros/humble/setup.bash && printenv ROS_DOMAIN_ID"
 bash scripts/diagnose.sh > /tmp/diag.txt 2>&1
 
 # 2. Jetson 端 launch log
-ssh orin "tail -50 /tmp/team_view*.log 2>/dev/null"
+ssh xrak@192.168.3.69 "tail -50 /tmp/team_view*.log 2>/dev/null"
 
 # 3. 本机 dev 端 RViz2 log（如有）
 tail -50 /tmp/rviz_*.log 2>/dev/null

@@ -5,17 +5,17 @@
 ## 当前 Jetson 状态（2026-07-05）
 
 ```
-Hostname:        orin  (ssh xrak@orin)
-OS:              Ubuntu 22.04.5 LTS (jammy)
-Jetson:          R36 (JetPack 6.x), aarch64
-RAM:             3.5 GB usable (4 GB with ~500 MB reserved)
-Disk:            184 GB free on /
-ROS2:            ✅ Humble installed (ros-humble-action-msgs, ros-humble-ament-cmake, ...)
-colcon:          ❌ NOT installed (需要装)
-RViz2:           ❌ NOT installed (内存不够)
-Gazebo:          ❌ NOT installed (内存不够)
-User:            xrak
-SSH:             ✅ works from dev (ssh xrak@orin or ssh orin)
+Jetson IP:        192.168.3.69  (ssh xrak@192.168.3.69)
+OS:               Ubuntu 22.04.5 LTS (jammy)
+Jetson:           R36 (JetPack 6.x), aarch64
+RAM:              3.5 GB usable (4 GB with ~500 MB reserved)
+Disk:             184 GB free on /
+ROS2:             ✅ Humble installed (ros-humble-action-msgs, ros-humble-ament-cmake, ...)
+colcon:           ❌ NOT installed (需要装)
+RViz2:            ❌ NOT installed (内存不够)
+Gazebo:           ❌ NOT installed (内存不够)
+User:             xrak
+SSH:              ✅ works from dev (ssh xrak@192.168.3.69)
 ```
 
 **结论**：Jetson **已经是目标状态**（JetPack 6 + Ubuntu 22.04 + Humble），**不需要刷机**。下一步只需要装 colcon 就能 build。
@@ -25,7 +25,7 @@ SSH:             ✅ works from dev (ssh xrak@orin or ssh orin)
 ## Step 1: 装 colcon（一次性）
 
 ```bash
-ssh xrak@orin
+ssh xrak@192.168.3.69
 sudo apt update
 sudo apt install -y python3-colcon-common-extensions
 # 这一步会拉 ~50MB 依赖，包含 colcon-ros / colcon-cmake / colcon-python
@@ -42,7 +42,7 @@ colcon --version
 ## Step 2: 创建 ros2_ws（一次性）
 
 ```bash
-ssh xrak@orin
+ssh xrak@192.168.3.69
 mkdir -p ~/ros2_ws/src
 cd ~/ros2_ws
 # Clone 或 rsync 代码（见 ssh-workflow.md）
@@ -53,7 +53,7 @@ cd ~/ros2_ws
 ## Step 3: 拉代码 + build
 
 ```bash
-ssh xrak@orin
+ssh xrak@192.168.3.69
 cd ~/ros2_ws
 # Option A: 从 dev 拉 (rsync) — 详见 ssh-workflow.md
 rsync -avz --exclude='build/' --exclude='install/' --exclude='.git/' \
@@ -77,7 +77,7 @@ colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform
 ## Step 4: 跑 sidecar 节点
 
 ```bash
-ssh xrak@orin
+ssh xrak@192.168.3.69
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash
 source install/setup.bash
@@ -135,23 +135,23 @@ rviz2
 
 ```bash
 # 1. ROS 环境
-ssh xrak@orin "source /opt/ros/humble/setup.bash && ros2 --help | head -3"
+ssh xrak@192.168.3.69 "source /opt/ros/humble/setup.bash && ros2 --help | head -3"
 # 期望: usage: ros2 ...
 
 # 2. colcon
-ssh xrak@orin "colcon --version"
+ssh xrak@192.168.3.69 "colcon --version"
 # 期望: colcon-common-extensions X.Y.Z
 
-# 3. 网络：dev 能 ping orin
-ping orin  # 期望: 0% packet loss
+# 3. 网络：dev 能 ping Jetson (192.168.3.69)
+ping 192.168.3.69  # 期望: 0% packet loss
 
 # 4. DDS 发现: dev 端能看到 Jetson 节点
 # Dev 端:
 ros2 node list
-# → 应看到 orin 上的 sidecar_xxx 节点
+# → 应看到 Jetson (192.168.3.69) 上的 sidecar_xxx 节点
 
 # 5. 内存
-ssh xrak@orin "free -h | head -2"
+ssh xrak@192.168.3.69 "free -h | head -2"
 # 期望: available > 1GB (build/run 时留余量)
 ```
 

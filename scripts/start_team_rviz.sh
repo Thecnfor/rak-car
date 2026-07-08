@@ -74,7 +74,6 @@ if [ "$ROS_DISTRO" != "humble" ]; then
   echo "ℹ️  dev ROS2 is '$ROS_DISTRO' (Jetson is humble). Fine for source-only dev;"
   echo "    Jetson builds its own install under Humble. See docs/team-constants.md."
 fi
-fi
 
 # 3. CycloneDDS config — install once per laptop
 DDS_USER_CFG=~/.ros/cyclonedds.xml
@@ -105,8 +104,8 @@ if timeout 6 ros2 node list 2>/dev/null | grep -E "camera_(arm|front)" >/dev/nul
   timeout 4 ros2 node list 2>/dev/null | grep -E "camera|mecanum|arm_main" | sed 's/^/   /'
 else
   echo "⚠️  Couldn't see camera nodes within 6s. Check:"
-  echo "   - Same WiFi/LAN as the Jetson (e.g. ping orin)"
-  echo "   - Jetson is running:   ssh xrak@orin 'ros2 node list'"
+  echo "   - Same WiFi/LAN as the Jetson (e.g. ping 192.168.3.69)"
+  echo "   - Jetson is running:   ssh xrak@192.168.3.69 'ros2 node list'"
   echo ""
   read -rp "Open RViz2 anyway? [y/N] " yn
   case "$yn" in

@@ -7,8 +7,8 @@
 
 ## Prerequisites (one-time per dev machine)
 
-1. **Same LAN subnet.** Jetson `orin` and dev desktop must be on the same
-   IPv4 subnet (multicast routing is unblocked). `ping orin` from the dev
+1. **Same LAN subnet.** Jetson (`192.168.3.69`) and dev desktop must be on the same
+   IPv4 subnet (multicast routing is unblocked). `ping 192.168.3.69` from the dev
    desktop should work.
 
 2. **Same DDS** — we use **CycloneDDS** so config is identical across

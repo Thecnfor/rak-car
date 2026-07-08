@@ -85,7 +85,7 @@ Claude Code 在 `~/.claude/projects/-home-xrak-Desktop-rak-car/memory/` 存**用
 ## 关键约定（写 CLAUDE.md / commit message 时）
 
 - **永远用 `set -euo pipefail`**（shell 脚本）
-- **改 Jetson 端前**：先 ssh orin 备份，`pkill -f <node>` 再启
+- **改 Jetson 端前**：先 ssh xrak@192.168.3.69 备份，`pkill -f <node>` 再启
 - **新成员**先跑 `bash scripts/onboard.sh`
 - **出问题**：先 `bash scripts/diagnose.sh`
 - **DDS 配置**：不动 `cyclonedds.xml` 除非同步更新全队

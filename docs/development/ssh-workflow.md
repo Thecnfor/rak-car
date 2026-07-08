@@ -5,31 +5,32 @@
 ## SSH 接入
 
 ```bash
-# 标准方式
-ssh xrak@orin
-# 或（如果 ~/.ssh/config 配了)
-ssh orin
+# 标准方式（团队约定：永远用 IP，不用 hostname）
+ssh xrak@192.168.3.69
 
 # 配置 SSH 免密 (一次性, dev 机执行)
-ssh-copy-id xrak@orin
-# 之后 ssh orin 即可免密
+ssh-copy-id xrak@192.168.3.69
+# 之后 ssh xrak@192.168.3.69 即可免密
 
 # 测试连通性
-ssh orin "echo connected; uname -m"
+ssh xrak@192.168.3.69 "echo connected; uname -m"
 # 期望: connected; aarch64
 ```
 
-## ~/.ssh/config 模板（推荐配置在 dev 机）
+## ~/.ssh/config 模板（可选,推荐配置在 dev 机）
 
 ```sshconfig
-# ~/.ssh/config on dev
-Host orin
-    HostName orin
+# ~/.ssh/config on dev（可选 — 用了之后可以用 `ssh jetson` 代替完整 IP）
+Host jetson
+    HostName 192.168.3.69
     User xrak
     ForwardX11 yes        # X11 forward for RViz over SSH
     ServerAliveInterval 60
     IdentityFile ~/.ssh/id_ed25519
 ```
+
+> **重要**：不要把 `HostName` 写成 hostname / mDNS 名字 — 必须写 IP `192.168.3.69`，否则换个网络就断了。
+> 这里的 `Host jetson` 是 dev 本机起的 SSH 别名，跟 hostname / mDNS 无关 — 用别的名字都行（但建议也别叫容易跟 hostname 混淆的名字）。
 
 `ForwardX11 yes` 让 Jetson 上的 GUI 程序（虽然我们不用）能 forward 回 dev 显示。
 
@@ -40,19 +41,19 @@ Host orin
 ### 方式 A：rsync 单向（推荐 — 频繁改代码时）
 
 ```bash
-# Dev 机: 推送代码到 Jetson
+# Dev 机: 推送代码到 Jetson (192.168.3.69)
 rsync -avz --exclude='build/' --exclude='install/' --exclude='.git/' \
   --exclude='__pycache__/' --exclude='*.pyc' --exclude='.pytest_cache/' \
-  ~/work/rak-car/ xrak@orin:~/work/rak-car/
+  ~/work/rak-car/ xrak@192.168.3.69:~/work/rak-car/
 
 # 注意: 单独 rsync .git 目录
-rsync -avz ~/work/rak-car/.git xrak@orin:~/work/rak-car/
+rsync -avz ~/work/rak-car/.git xrak@192.168.3.69:~/work/rak-car/
 ```
 
-**alias 化**（dev ~/.bashrc）：
+**alias 化**（dev ~/.bashrc，可选）：
 
 ```bash
-alias push2orin='rsync -avz --exclude="build/" --exclude="install/" --exclude=".git/" --exclude="__pycache__/" --exclude="*.pyc" --exclude=".pytest_cache/" --exclude="logs/" ~/work/rak-car/ xrak@orin:~/work/rak-car/ && rsync -avz ~/work/rak-car/.git xrak@orin:~/work/rak-car/'
+alias push2jetson='rsync -avz --exclude="build/" --exclude="install/" --exclude=".git/" --exclude="__pycache__/" --exclude="*.pyc" --exclude=".pytest_cache/" --exclude="logs/" ~/work/rak-car/ xrak@192.168.3.69:~/work/rak-car/ && rsync -avz ~/work/rak-car/.git xrak@192.168.3.69:~/work/rak-car/'
 ```
 
 ### 方式 B：git push + pull（推荐 — 团队协作时）
@@ -62,7 +63,7 @@ alias push2orin='rsync -avz --exclude="build/" --exclude="install/" --exclude=".
 git push origin develop/ros2-sidecar
 
 # Jetson 机
-ssh orin
+ssh xrak@192.168.3.69
 cd ~/work/rak-car  # 或 src/rak-car 在 ros2_ws/src/
 git pull
 ```
@@ -71,9 +72,9 @@ git pull
 
 ```bash
 # Dev 机: mount Jetson 工作目录到本地
-sshfs xrak@orin:~/work/rak-car ~/work/rak-car-orin
+sshfs xrak@192.168.3.69:~/work/rak-car ~/work/rak-car-jetson
 
-# 编辑 ~/work/rak-car-orin/... 实际在 Jetson 上
+# 编辑 ~/work/rak-car-jetson/... 实际在 Jetson 上
 # 缺点: sshfs 慢,IDE 大项目会卡
 ```
 
@@ -85,17 +86,17 @@ sshfs xrak@orin:~/work/rak-car ~/work/rak-car-orin
 
 ```bash
 # Dev 触发 Jetson build（无需登录)
-ssh orin "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && colcon build --packages-up-to vehicle_wbt_platform_cpp"
+ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && colcon build --packages-up-to vehicle_wbt_platform_cpp"
 
 # 看 build 输出
-ssh orin "cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp --event-handlers console_direct+"
+ssh xrak@192.168.3.69 "cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp --event-handlers console_direct+"
 
 # 长时间 build（30+ 分钟）— 用 tmux 防止断连
-ssh orin
+ssh xrak@192.168.3.69
 tmux new -s build
 cd ~/ros2_ws && colcon build ...
 # Ctrl-b d  detach
-# ssh orin -t "tmux attach -t build"  # 重新连上看进度
+# ssh xrak@192.168.3.69 -t "tmux attach -t build"  # 重新连上看进度
 ```
 
 ---
@@ -104,12 +105,12 @@ cd ~/ros2_ws && colcon build ...
 
 ```bash
 # 在 Jetson 上跑 Python 单元测试
-ssh orin "cd ~/ros2_ws && PYTHONPATH=src/vehicle_wbt_platform python3 -m pytest src/vehicle_wbt_platform/test/ -v"
+ssh xrak@192.168.3.69 "cd ~/ros2_ws && PYTHONPATH=src/vehicle_wbt_platform python3 -m pytest src/vehicle_wbt_platform/test/ -v"
 # 注意: Jetson 上跑测试是浪费 cycles,通常 dev 跑就够了
 # 但 gtest 必须在 Jetson 上跑 (因为 Jetson 才有 rclcpp)
 
 # 远程 gtest (Phase 1.5+)
-ssh orin "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/setup.bash && colcon test --packages-select vehicle_wbt_platform_cpp"
+ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/setup.bash && colcon test --packages-select vehicle_wbt_platform_cpp"
 ```
 
 ---
@@ -119,7 +120,7 @@ ssh orin "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/se
 ### Step 1: Jetson 跑 sidecar
 
 ```bash
-ssh orin
+ssh xrak@192.168.3.69
 cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/setup.bash
 export ROS_DOMAIN_ID=42
 ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
@@ -184,8 +185,8 @@ export CYCLONEDDS_URI='<CycloneDDS><Network><Interfaces><NetworkInterface autode
 
 | 症状 | 原因 | 解决 |
 |------|------|------|
-| `ssh: Could not resolve hostname orin` | dev 没配 hosts | `echo "192.168.x.x orin" \| sudo tee -a /etc/hosts` |
-| `Permission denied (publickey)` | 没配 SSH key | `ssh-copy-id xrak@orin` |
+| `ssh: connect to host 192.168.3.69 port 22: Connection refused` | Jetson 没开机 / SSH 服务挂了 / IP 变了 | 检查 Jetson 电源 + `ping 192.168.3.69` |
+| `Permission denied (publickey)` | 没配 SSH key | `ssh-copy-id xrak@192.168.3.69` |
 | rsync 极慢 | 在 Jetson 上 build 后又 rsync `build/` | 加 `--exclude='build/'`（默认已加）|
 | dev 上看不到 Jetson topic | ROS_DOMAIN_ID 不一致 | 都 `export ROS_DOMAIN_ID=42` |
 | RViz 看到 topic 但无数据 | 防火墙拦 UDP | `sudo ufw allow 7400-7500/udp` |
@@ -200,11 +201,14 @@ export CYCLONEDDS_URI='<CycloneDDS><Network><Interfaces><NetworkInterface autode
 # ~/.bashrc (dev 机) 推荐加
 export ROS_DOMAIN_ID=42
 export ROS_LOCALHOST_ONLY=0  # 0=接受跨机器, 1=仅本机 (调试时用 1)
-alias orin='ssh xrak@orin'
-alias push2orin='rsync -avz --exclude="build/" --exclude="install/" --exclude=".git/" --exclude="__pycache__/" --exclude="*.pyc" --exclude=".pytest_cache/" --exclude="logs/" ~/work/rak-car/ xrak@orin:~/work/rak-car/ && rsync -avz ~/work/rak-car/.git xrak@orin:~/work/rak-car/'
-alias build2orin='ssh orin "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && colcon build --packages-up-to vehicle_wbt_platform_cpp"'
+# 团队约定：用 IP，不用任何 hostname/别名指向 Jetson
+alias jetson='ssh xrak@192.168.3.69'
+alias push2jetson='rsync -avz --exclude="build/" --exclude="install/" --exclude=".git/" --exclude="__pycache__/" --exclude="*.pyc" --exclude=".pytest_cache/" --exclude="logs/" ~/work/rak-car/ xrak@192.168.3.69:~/work/rak-car/ && rsync -avz ~/work/rak-car/.git xrak@192.168.3.69:~/work/rak-car/'
+alias build2jetson='ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && colcon build --packages-up-to vehicle_wbt_platform_cpp"'
 alias rviz='dev-ros2 rviz2'
 ```
+
+> 别用容易跟 Jetson hostname 混淆的名字当 alias —— 团队规则：所有连接走 IP `192.168.3.69`，不要让任何 SSH 别名指向 hostname。
 
 之后工作循环：
 
@@ -213,10 +217,10 @@ alias rviz='dev-ros2 rviz2'
 $EDITOR ~/work/rak-car/...
 
 # 2. 推 Jetson
-push2orin
+push2jetson
 
 # 3. 远程 build
-build2orin
+build2jetson
 
 # 4. dev 上跑测试 (秒回)
 dev-ros2 pytest ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform/test/
@@ -225,7 +229,7 @@ dev-ros2 pytest ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform/test/
 rviz
 
 # 6. SSH 上启动 sidecar
-ssh orin
+jetson
 cd ~/ros2_ws && source install/setup.bash
 ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
 ```

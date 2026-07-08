@@ -26,7 +26,7 @@
 │  │  • 跑 sidecar 节点 (PUBLISH 传感器 + 接收控制)               │  │
 │  │  • 不跑 GUI/Gazebo/RViz (内存不够)                            │  │
 │  │  • 不跑单元测试 (cycle 宝贵)                                  │  │
-│  │  • SSH 接入: ssh xrak@orin                                    │  │
+│  │  • SSH 接入: ssh xrak@192.168.3.69                            │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 │                                                                    │
 └────────────────────────────────────────────────────────────────────┘
@@ -38,7 +38,7 @@
 |------|------|
 | [dev-machine-setup.md](dev-machine-setup.md) | Dev 桌面 ROS2 全安装（Jazzy/Humble + RViz + Gazebo + 工具链） |
 | [jetson-target-setup.md](jetson-target-setup.md) | Jetson Orin Nano 最小安装（Humble base + 验证已装） |
-| [ssh-workflow.md](ssh-workflow.md) | SSH 到 orin + 文件同步 + 远程 colcon build + 远程测试 |
+| [ssh-workflow.md](ssh-workflow.md) | SSH 到 Jetson (192.168.3.69) + 文件同步 + 远程 colcon build + 远程测试 |
 | [test-matrix.md](test-matrix.md) | 哪些测试在 dev 跑、哪些在 target 跑、原因 |
 
 ## 关键设计原则
@@ -57,6 +57,6 @@
 
 ## 快速链接
 
-- 刷机相关: [../migration/jetpack6-ros2-humble.md](../migration/jetpack6-ros2-humble.md) (orin 当前已 JetPack 6 + Humble，**不需要刷机**)
+- 刷机相关: [../migration/jetpack6-ros2-humble.md](../migration/jetpack6-ros2-humble.md) (Jetson 当前已 JetPack 6 + Humble，**不需要刷机**)
 - 分支策略: [../contributing/branch-strategy.md](../contributing/branch-strategy.md)
 - 决策记录: [../adr/ADR-003-ros2-sidecar-integration.md](../adr/ADR-003-ros2-sidecar-integration.md)

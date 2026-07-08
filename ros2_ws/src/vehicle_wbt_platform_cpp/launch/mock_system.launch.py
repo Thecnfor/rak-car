@@ -6,7 +6,7 @@ Launch file: dev/desktop sidecar system with mock hardware.
 Same node set as full_system.launch.py but with all hardware parameters
 overridden to mock /dev/null-style devices so it runs on a dev machine
 without Jetson. Used for:
-- Local dev iteration (no ssh to orin)
+- Local dev iteration (no ssh to Jetson — runs locally)
 - CI integration tests
 - New team member onboarding
 

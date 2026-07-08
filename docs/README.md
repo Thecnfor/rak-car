@@ -32,7 +32,7 @@
 | [development/README.md](development/README.md) | 双机开发架构总览（thick client + thin server） | ⭐⭐⭐ |
 | [development/dev-machine-setup.md](development/dev-machine-setup.md) | 桌面开发机 ROS2 全安装（Jazzy/Humble 容器或裸机） | ⭐⭐⭐ |
 | [development/jetson-target-setup.md](development/jetson-target-setup.md) | Jetson Orin Nano 4GB 最小安装（Humble base） | ⭐⭐⭐ |
-| [development/ssh-workflow.md](development/ssh-workflow.md) | SSH 到 orin + 文件同步 + 远程 build | ⭐⭐⭐ |
+| [development/ssh-workflow.md](development/ssh-workflow.md) | SSH 到 Jetson (192.168.3.69) + 文件同步 + 远程 build | ⭐⭐⭐ |
 | [development/test-matrix.md](development/test-matrix.md) | dev vs target 测试分工矩阵 | ⭐⭐⭐ |
 | [development/no-hw-dev.md](development/no-hw-dev.md) | 无真机开发（dev-sidecar stub 节点） | ⭐⭐⭐ |
 | [development/lan-rviz-camera.md](development/lan-rviz-camera.md) | LAN 上 RViz 看 Jetson cameras（DDS / CycloneDDS） | ⭐⭐⭐ |

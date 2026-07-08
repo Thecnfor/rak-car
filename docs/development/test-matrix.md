@@ -56,7 +56,7 @@ ros2 run rviz2 rviz2 -d config/sidecar.rviz
 ### ✅ Jetson 跑（必须真硬件）
 
 ```bash
-ssh xrak@orin
+ssh xrak@192.168.3.69
 cd ~/ros2_ws
 source /opt/ros/humble/setup.bash && source install/setup.bash
 
@@ -80,15 +80,15 @@ ros2 topic pub /vehicle_wbt/v1/cmd/vel_safe geometry_msgs/Twist "{...}"
 
 ```bash
 # 短时 ros2 bag (1-2 分钟)
-ssh orin
+ssh xrak@192.168.3.69
 ros2 bag record -a -o debug_run -b 100  # 100 MB 限制
 # → 拷到 dev 上回放
-rsync -avz xrak@orin:~/ros2_ws/debug_run/ ~/work/debug_run/
+rsync -avz xrak@192.168.3.69:~/ros2_ws/debug_run/ ~/work/debug_run/
 # dev 上:
 ros2 bag play debug_run/  # RViz 重放
 
 # 集成测试 (端到端)
-ssh orin
+ssh xrak@192.168.3.69
 cd ~/ros2_ws && colcon test --packages-select vehicle_wbt_platform_cpp --event-handlers console_direct+
 # → gtest 在 Jetson 跑,验证 rclcpp 节点正常工作
 ```
@@ -97,17 +97,17 @@ cd ~/ros2_ws && colcon test --packages-select vehicle_wbt_platform_cpp --event-h
 
 ```bash
 # ❌ 在 Jetson 上跑 Python 单元测试 (浪费)
-ssh orin "cd ~/ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/"
+ssh xrak@192.168.3.69 "cd ~/ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/"
 # 错误理由: Jetson 跑得一样慢(甚至更慢),但占用了真机 cycles
 # 正解: dev 跑,Jetson 不跑
 
 # ❌ 在 Jetson 上装 RViz (内存不够)
-ssh orin "sudo apt install -y ros-humble-rviz2"
+ssh xrak@192.168.3.69 "sudo apt install -y ros-humble-rviz2"
 # 错误理由: rviz2 + ogre + gl 至少 1.5GB,Jetson 4GB 跑会频繁 OOM
 # 正解: dev 桌面跑 RViz,通过 DDS 订阅 Jetson 的 topic
 
 # ❌ 在 Jetson 上跑 Gazebo
-ssh orin "sudo apt install -y ros-humble-ros-gz"
+ssh xrak@192.168.3.69 "sudo apt install -y ros-humble-ros-gz"
 # 错误理由: Gazebo + physics + rendering 至少 2-4GB RAM + 独立 GPU
 # 正解: dev 桌面跑 Gazebo,Jetson 不参与仿真
 ```
@@ -147,11 +147,11 @@ Jetson **不进 CI**（4GB 内存跑 CI job 太慢、太贵）。Jetson 只在 P
 ├──────────────────────────────────────────────────────────────┤
 │  真硬件验证 (Jetson)                                          │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │ ssh orin "cd ~/ros2_ws && git pull"                      │  │
-│  │ ssh orin "colcon build --packages-up-to vehicle_wbt_*"   │  │
-│  │ ssh orin "ros2 launch ... vehicle_wbt_platform.launch.py"│  │
+│  │ ssh xrak@192.168.3.69 "cd ~/ros2_ws && git pull"                      │  │
+│  │ ssh xrak@192.168.3.69 "colcon build --packages-up-to vehicle_wbt_*"   │  │
+│  │ ssh xrak@192.168.3.69 "ros2 launch ... vehicle_wbt_platform.launch.py"│  │
 │  │ dev 上: RViz 看真实数据                                  │  │
-│  │ ssh orin "ros2 topic hz ..."  # 性能基准                  │  │
+│  │ ssh xrak@192.168.3.69 "ros2 topic hz ..."  # 性能基准                  │  │
 │  └────────────────────────────────────────────────────────┘  │
 │                          ↓ 都通过                            │
 ├──────────────────────────────────────────────────────────────┤

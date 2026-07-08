@@ -37,7 +37,7 @@ usage() {
 
 Options:
   --no-remote          Skip Jetson checks (dev box only)
-  --target=HOST        Jetson host (default: $JETSON_HOST or 'orin')
+  --target=HOST        Jetson host (default: $JETSON_HOST or 192.168.3.69)
   --json               Output as JSON
   -q, --quiet          Only show failures + summary
   -h, --help           Show this help
@@ -138,7 +138,7 @@ check_jetson() {
     return 0
   fi
 
-  # 05: orin user
+  # 05: jetson user
   local who
   who=$(remote "whoami" 2>/dev/null | head -1 | tr -d '\r' || true)
   if [[ -n "$who" ]]; then
@@ -166,14 +166,14 @@ check_jetson() {
   if remote "test -f ~/ros2_ws/install/setup.bash" >/dev/null 2>&1; then
     add_result "08" "jetson:workspace" "PASS" "built"
   else
-    add_result "08" "jetson:workspace" "WARN" "not built — ssh orin 'cd ros2_ws && colcon build'"
+    add_result "08" "jetson:workspace" "WARN" "not built — ssh xrak@192.168.3.69 'cd ros2_ws && colcon build'"
   fi
 
   # 09: full_system running
   if remote "pgrep -f full_system.launch.py" >/dev/null 2>&1; then
     add_result "09" "jetson:sidecar" "PASS" "running"
   else
-    add_result "09" "jetson:sidecar" "WARN" "not running — ssh orin 'ros2 launch vehicle_wbt_platform_cpp full_system.launch.py ...'"
+    add_result "09" "jetson:sidecar" "WARN" "not running — ssh xrak@192.168.3.69 'ros2 launch vehicle_wbt_platform_cpp full_system.launch.py ...'"
   fi
 
   # 10: Jetson disk

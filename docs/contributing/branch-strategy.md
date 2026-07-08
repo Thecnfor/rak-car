@@ -127,7 +127,7 @@ feat/<name>-<feature>
 develop/ros2-sidecar  (测试线,可包含多个 feat 合并)
     │  gh pr create --base main
     │  Thecnfor 单独 review + merge
-    │  必跑: ssh orin 上 colcon build + ros2 launch (真硬件冒烟)
+    │  必跑: ssh xrak@192.168.3.69 上 colcon build + ros2 launch (真硬件冒烟)
     │  (仅 bug fix 与 critical patch 可走这条)
     ▼
 main (LTS, 比赛线)

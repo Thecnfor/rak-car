@@ -24,6 +24,36 @@ Two active branches:
 
 The full platform rationale (why move from ZMQ to DDS) is in the root `README.md`. The 1885-line architecture spec is in `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md`.
 
+## 团队开发约定 (any Claude must internalize)
+
+> **这 3 条是整个团队的开发模式。** 任何 dev 机和 Jetson 都在同一个局域网下；任何 team member 都在自己 dev 机上开发。
+
+1. **LAN 共享 + Jetson IP 永远是 `192.168.3.69`**
+   - 全队硬约定，dev 机 / Jetson / 文档 / 脚本同步维护（改它 = 改全队）
+   - dev 机连上团队 Wi-Fi/路由器，DHCP 自动落在 `192.168.3.50 ~ 192.168.3.200`
+   - 验证：`ping -c 3 192.168.3.69` 通即可
+   - 详 [`docs/team-constants.md`](docs/team-constants.md)
+
+2. **Jetson 端实际在发什么话题 → team member 自己用 RViz 看（不假设）**
+   - **不要凭 spec / 代码推断**话题名、类型、频率、QoS
+   - 标准做法（让 team member 跑）：
+     ```bash
+     bash scripts/start_team_rviz.sh    # 一键 RViz2 看相机 + 列所有 /vehicle_wbt/v1/... 话题
+     # 或纯 CLI：
+     ros2 topic list
+     ros2 topic info /vehicle_wbt/v1/sensors/camera/front/image_compressed --verbose
+     ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_compressed
+     ```
+   - `config_sensors.yml` 是话题的"权威清单"，但**实时状态**（是否在发、实际频率、QoS 兼容性）必须现场查
+   - 帮 team member 加新功能前，先确认 Jetson 端对应话题已发 + QoS 兼容
+
+3. **开发 + 测试永远在自己 dev 机上做（不直接动 Jetson）**
+   - 代码改完 → dev 端 `colcon build`（Jetson 端 ABI 不兼容，**不要 push install/**）
+   - 无硬件 smoke test → dev 端 `ros2 launch ... mock_system.launch.py`
+   - 真机联调 → dev 端订阅 Jetson 的话题（同 `ROS_DOMAIN_ID=42` 自动发现），dev 端发指令、Jetson 端节点执行
+   - 真机部署 → `git push` + ssh Jetson `colcon build` + ssh Jetson launch
+   - 详下文 "Daily dev workflow"
+
 ## Architecture: dev/target dual-machine
 
 | Dev desktop (Ubuntu 22.04+ + ROS2 Humble) | Target (Jetson Orin Nano 4GB) |

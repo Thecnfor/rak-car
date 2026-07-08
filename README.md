@@ -40,7 +40,7 @@ rviz2
 ### Target machine (Jetson Orin Nano 4GB, real hardware)
 
 ```bash
-ssh xrak@orin
+ssh xrak@192.168.3.69
 sudo apt install -y python3-colcon-common-extensions  # one-time
 cd ~/ros2_ws/src  # rsync or git clone from dev
 cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp
