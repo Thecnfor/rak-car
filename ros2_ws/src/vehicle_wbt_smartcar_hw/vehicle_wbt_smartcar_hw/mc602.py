@@ -16,6 +16,12 @@ from typing import Callable, Optional
 
 import serial
 
+# MC602 frame constants (per SDK serial_wrap.py).
+# Header marks the start of every frame; tail marks the end. Both
+# are added automatically by `_DevCmdInterface._send_cmd`.
+HEADER = b'\x77\x68'
+TAIL = b'\x0A'
+
 
 class MC602Serial:
     """pyserial-backed wrapper for the MC602 USB serial link.
@@ -70,3 +76,41 @@ class MC602Serial:
             return True
         except (OSError, serial.SerialException):
             return False
+
+
+# ---------------------------------------------------------------------------
+# Frame assembly base class (mirrors SDK mc602_ctl2._DevCmdInterface)
+# ---------------------------------------------------------------------------
+
+import struct  # noqa: E402  (placed here so struct isn't needed for serial-only tests)
+
+
+class _DevCmdInterface:
+    """Builds MC602 frames per device-class spec.
+
+    Mirrors `mc602_ctl2._DevCmdInterface` from baidu_smartcar_2026.
+    Subclasses set `dev_id`, `mode`, `port_id`, and `fmt` (struct
+    format string for the args after port_id).
+    """
+
+    def __init__(
+        self,
+        serial_obj: 'MC602Serial',
+        dev_id: int,
+        mode: int,
+        port_id: int,
+        fmt: str,
+    ) -> None:
+        self.serial = serial_obj
+        self.dev_id = dev_id
+        self.mode = mode
+        self.port_id = port_id
+        self.fmt = fmt
+
+    def _send_cmd(self, *args) -> list[int]:
+        args_bytes = struct.pack('<' + self.fmt, *args) if self.fmt else b''
+        payload = bytes([self.dev_id, self.mode, self.port_id]) + args_bytes
+        length = len(payload) + 4  # 2 header + 1 length + 1 tail
+        frame = HEADER + bytes([length]) + payload + TAIL
+        ok = self.serial.write_frame(frame)
+        return list(frame) if ok else []

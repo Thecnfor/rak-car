@@ -14,6 +14,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
 from vehicle_wbt_smartcar_hw.mc602 import MC602Serial  # noqa: E402
+from vehicle_wbt_smartcar_hw.mc602 import _DevCmdInterface  # noqa: E402
 
 
 class FakeSerial:
@@ -86,3 +87,31 @@ def test_mc602serial_factory_receives_port_and_baud() -> None:
     s.open()
     assert captured['port'] == '/dev/ttyUSB1'
     assert captured['baud'] == 500_000
+
+
+def _make_iface(fmt='BBB', dev_id=0x0a, mode=2, port_id=0):
+    ser = _make_serial()
+    ser.open()
+    return ser, _DevCmdInterface(ser, dev_id=dev_id, mode=mode,
+                                 port_id=port_id, fmt=fmt)
+
+
+def test_dev_cmd_interface_emits_correct_frame() -> None:
+    # Buzzer frame: dev=0x0a, mode=2 (set), port=0, args=(freq/2, dur*20, 0)
+    ser, iface = _make_iface(fmt='BBB', dev_id=0x0a, mode=2, port_id=0)
+    written = iface._send_cmd(100, 4, 0)
+    # payload = [0x0a, 0x02, 0x00, 100, 4, 0] = 6 bytes
+    # frame   = [0x77, 0x68, 0x0a, 0x0a, 0x02, 0x00, 100, 4, 0, 0x0a]
+    expected = bytes([0x77, 0x68, 0x0a, 0x0a, 0x02, 0x00, 100, 4, 0, 0x0a])
+    assert written == list(expected)
+    ser.close()
+
+
+def test_dev_cmd_interface_length_includes_overhead() -> None:
+    # Verify length byte = len(payload) + 4
+    ser, iface = _make_iface(fmt='bb', dev_id=0x10, mode=2, port_id=4)
+    iface._send_cmd(1, 0)
+    # payload = [0x10, 0x02, 0x04, 1, 0] = 5 bytes → length byte = 9
+    fake = ser._ser
+    assert fake.written[-1][2] == 9   # index 2 = length
+    ser.close()
