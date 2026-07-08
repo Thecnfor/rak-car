@@ -1,0 +1,55 @@
+# 机械臂配置(简化版,从 SDK arm_base.py 推断)
+arm_length: 0.30
+
+vert_cfg:
+  motor:
+    name: "stepper_y"
+    dev_id: 0x11
+    port_id: 1
+    reverse: 1
+  limit_port: 6  # AnalogInput port
+  pid:
+    Kp: 5
+    Ki: 0.1
+    Kd: 0.05
+    setpoint: 0
+    output_limits: [-0.05, 0.05]
+  threshold: [-0.05, 0.30]
+
+horiz_cfg:
+  motor:
+    name: "dc_motor_x"
+    dev_id: 0x02
+    port_id: 2
+    reverse: 1
+  pid:
+    Kp: 5
+    Ki: 0.1
+    Kd: 0.05
+    setpoint: 0
+    output_limits: [-0.06, 0.06]
+  threshold: [-0.35, 0.0]
+
+hand_cfg:
+  hand:  # 腕部总线舵机 (dev_id=0x06)
+    port: 4
+    angle_list:
+      LEFT: 60
+      MID: 90
+      RIGHT: 120
+  hand2:  # 手部 PWM 舵机 (dev_id=0x05)
+    port: 3
+    mode: 1
+    angle_list:
+      UP: 30
+      MID: 60
+      DOWN: 90
+  grap:
+    port_pump: 1
+    port_valve: 2
+
+pos_cfg:
+  pose_enable: true
+  pose_horiz: 0.0
+  pose_vert: 0.0
+  side: "MID"
