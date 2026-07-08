@@ -21,8 +21,6 @@ fabricates a successful beep.
 """
 from __future__ import annotations
 
-from typing import Optional
-
 import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Bool, Empty
@@ -98,6 +96,7 @@ class MC602PeripheralNode(Node):
 
         self._melody_timer = None  # rclpy.Timer or None
         self._melody_index = 0
+        self._shoot_off_timer = None  # rclpy.Timer or None
 
         self.get_logger().info(
             f'mc602_peripheral_node ready: '
@@ -165,12 +164,18 @@ class MC602PeripheralNode(Node):
         # Mirrors MyCar.shooting -> PoutD(4).set(1); sleep 0.3; set(0)
         frame_on = self._shooter.set(1)
         self._hw_or_log(frame_on, 'shoot(on)')
-        # Schedule the off frame via a one-shot-ish timer.
-        self.create_timer(
-            0.3,
-            lambda: self._hw_or_log(self._shooter.set(0), 'shoot(off)'),
-            one_shot=False,
-        )
+
+        def _off_shoot() -> None:
+            frame_off = self._shooter.set(0)
+            self._hw_or_log(frame_off, 'shoot(off)')
+            if self._shoot_off_timer is not None:
+                self.destroy_timer(self._shoot_off_timer)
+                self._shoot_off_timer = None
+
+        # Cancel any in-flight off-timer before scheduling a new one.
+        if self._shoot_off_timer is not None:
+            self.destroy_timer(self._shoot_off_timer)
+        self._shoot_off_timer = self.create_timer(0.3, _off_shoot)
 
 
 def main(args=None) -> None:
