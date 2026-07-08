@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from vehicle_wbt_smartcar_hw.mc602 import MC602Serial  # noqa: E402
 from vehicle_wbt_smartcar_hw.mc602 import _DevCmdInterface  # noqa: E402
 from vehicle_wbt_smartcar_hw.mc602 import Buzzer_2  # noqa: E402
+from vehicle_wbt_smartcar_hw.mc602 import ServoPwm, PoutD  # noqa: E402
 
 
 class FakeSerial:
@@ -143,5 +144,45 @@ def test_buzzer_rings_truncates_high_freq() -> None:
         # arg[1] = int(0.1 * 20) = 2
         assert result[6] == 0   # freq/2 truncated
         assert result[7] == 2   # dur * 20
+    finally:
+        ser.close()
+
+
+def test_servo_pwm_set_angle_90_emits_correct_frame() -> None:
+    ser = _make_serial()
+    ser.open()
+    try:
+        s = ServoPwm(ser, port_id=1)
+        result = s.set_angle(90)
+        # 90° → raw = (90/180)*9000 = 4500 = 0x1194 → bytes [0x94, 0x11]
+        # payload = [0x05, 0x02, 0x01, 0x94, 0x11, 0, 0]   (7 bytes)
+        # length byte = len(payload) + 4 = 11 = 0x0b  (per _DevCmdInterface)
+        # frame   = [0x77, 0x68, 0x0b, 0x05, 0x02, 0x01, 0x94, 0x11, 0, 0, 0x0a]
+        assert result == [0x77, 0x68, 0x0b, 0x05, 0x02, 0x01,
+                          0x94, 0x11, 0, 0, 0x0a]
+    finally:
+        ser.close()
+
+
+def test_poutd_set_high_emits_correct_frame() -> None:
+    ser = _make_serial()
+    ser.open()
+    try:
+        d = PoutD(ser, port_id=4)
+        result = d.set(1)
+        # payload = [0x10, 0x02, 0x04, 1, 0, 0]
+        # frame   = [0x77, 0x68, 0x0a, 0x10, 0x02, 0x04, 1, 0, 0, 0x0a]
+        assert result == [0x77, 0x68, 0x0a, 0x10, 0x02, 0x04, 1, 0, 0, 0x0a]
+    finally:
+        ser.close()
+
+
+def test_poutd_set_low_emits_correct_frame() -> None:
+    ser = _make_serial()
+    ser.open()
+    try:
+        d = PoutD(ser, port_id=4)
+        result = d.set(0)
+        assert result[6] == 0   # state byte
     finally:
         ser.close()

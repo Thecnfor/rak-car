@@ -2,9 +2,14 @@
 
 Re-exports the MC602 device classes from .mc602.
 
-Task 2 introduces MC602Serial only. Buzzer_2, ServoPwm, and PoutD
-are added in Tasks 3-5.
+All four device classes (MC602Serial, Buzzer_2, ServoPwm, PoutD)
+are now landed (Tasks 2-5).
 """
-from vehicle_wbt_smartcar_hw.mc602 import MC602Serial
+from vehicle_wbt_smartcar_hw.mc602 import (
+    MC602Serial,
+    Buzzer_2,
+    ServoPwm,
+    PoutD,
+)
 
-__all__ = ['MC602Serial']
+__all__ = ['MC602Serial', 'Buzzer_2', 'ServoPwm', 'PoutD']

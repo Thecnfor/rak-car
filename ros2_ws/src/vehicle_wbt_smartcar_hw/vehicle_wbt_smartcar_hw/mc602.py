@@ -24,8 +24,11 @@ TAIL = b'\x0A'
 
 # Device IDs and mode opcodes (per SDK mc602_ctl2.py).
 # DEV_BEEP = the buzzer peripheral.  MODE_SET = "write set value".
-# Task 5 will add DEV_SERVO_PWM and DEV_DOUT alongside these.
+# Task 5 adds DEV_SERVO_PWM (storage servo) and DEV_DOUT (digital
+# output, used by the shooter GPIO line).
 DEV_BEEP = 0x0a
+DEV_SERVO_PWM = 0x05
+DEV_DOUT = 0x10
 MODE_SET = 2
 
 
@@ -144,3 +147,35 @@ class Buzzer_2(_DevCmdInterface):
             int(duration_sec * 20) & 0xff,
             0,
         )
+
+
+class ServoPwm(_DevCmdInterface):
+    """MC602 servo PWM. Mirrors SDK ServoPwm.
+
+    Frame: dev=0x05, mode=set, fmt='BBBB' (4 unsigned bytes after
+    port_id: raw_low, raw_high, 0, 0). Encodes angle_deg (0..180) as
+    raw 0..9000 (little-endian u16).
+    """
+
+    def __init__(self, serial_obj: 'MC602Serial', port_id: int) -> None:
+        super().__init__(serial_obj, dev_id=DEV_SERVO_PWM,
+                         mode=MODE_SET, port_id=port_id, fmt='BBBB')
+
+    def set_angle(self, angle_deg: int) -> list[int]:
+        raw = int((int(angle_deg) / 180.0) * 9000) & 0xffff
+        return self._send_cmd(raw & 0xff, (raw >> 8) & 0xff, 0, 0)
+
+
+class PoutD(_DevCmdInterface):
+    """MC602 digital output. Mirrors SDK PoutD.
+
+    Frame: dev=0x10, mode=set, fmt='bbb'.
+    state: 0 or 1.
+    """
+
+    def __init__(self, serial_obj: 'MC602Serial', port_id: int) -> None:
+        super().__init__(serial_obj, dev_id=DEV_DOUT,
+                         mode=MODE_SET, port_id=port_id, fmt='bbb')
+
+    def set(self, state: int) -> list[int]:
+        return self._send_cmd(int(state) & 0xff, 0, 0)
