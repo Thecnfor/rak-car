@@ -53,8 +53,10 @@ def generate_launch_description() -> LaunchDescription:
             description="Arm camera device path. Competition target: /dev/cam1. "
             "Override per machine, e.g. on this dev box the arm cam is at /dev/cam3."),
         DeclareLaunchArgument(
-            "image_rate_hz", default_value="10.0",
-            description="Camera frame rate (Hz)"),
+            "image_rate_hz", default_value="30.0",
+            description="Camera frame rate (Hz). SP2812 supports up to 30 fps at "
+            "640x480 in MJPG mode. image_raw at this rate; image_compressed "
+            "at the same rate (downsamples gracefully for low-bandwidth subscribers)"),
         DeclareLaunchArgument(
             "jpeg_quality", default_value="85",
             description="JPEG quality for image_compressed (0..100)"),

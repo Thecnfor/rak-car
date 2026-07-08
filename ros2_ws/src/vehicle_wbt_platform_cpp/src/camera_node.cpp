@@ -88,7 +88,7 @@ public:
     this->declare_parameter<std::string>("device", "/dev/cam2");
     this->declare_parameter<int>("image_width", 640);
     this->declare_parameter<int>("image_height", 480);
-    this->declare_parameter<double>("rate_hz", 10.0);
+    this->declare_parameter<double>("rate_hz", 30.0);
     this->declare_parameter<int>("jpeg_quality", 85);
     this->declare_parameter<std::string>("calibration_url", "");
     // camera_optical_frame pose in robot base_link (radians, meters).
@@ -202,6 +202,12 @@ private:
     cap_->set(cv::CAP_PROP_FOURCC, static_cast<double>(mjpg));
     cap_->set(cv::CAP_PROP_FRAME_WIDTH, static_cast<double>(width_requested_));
     cap_->set(cv::CAP_PROP_FRAME_HEIGHT, static_cast<double>(height_requested_));
+    // FPS: ask the device explicitly. Default without this call is
+    // driver-dependent — Aveo SP2812 defaults to ~10 fps when not
+    // requested, even though --list-formats-ext advertises 30. We
+    // request the rate_hz launch arg (clamped to what the device
+    // supports; cap_->set tolerates unsupported values by ignoring).
+    cap_->set(cv::CAP_PROP_FPS, rate_hz_);
     cap_->set(cv::CAP_PROP_CONVERT_RGB, 1.0);
 
     actual_width_ = static_cast<int>(cap_->get(cv::CAP_PROP_FRAME_WIDTH));
@@ -336,7 +342,18 @@ private:
         std::to_string(actual_height_));
       add_kv(ds.values, "rate_hz_target", std::to_string(rate_hz_));
       add_kv(ds.values, "jpeg_quality", std::to_string(jpeg_q_));
+      // Achieved FPS: delta since last status (1 Hz timer), bumped per
+      // captured frame above. Should match rate_hz_target when the
+      // device is keeping up; lower means the V4L2 pipeline is
+      // struggling (USB saturation or decoder hiccup).
+      const uint64_t delta =
+        frames_published_ - frames_published_last_status_;
+      frames_published_last_status_ = frames_published_;
       add_kv(ds.values, "frames_published", std::to_string(frames_published_));
+      add_kv(
+        ds.values, "achieved_rate_hz", std::to_string(
+          static_cast<double>(delta)));
+      add_kv(ds.values, "rate_hz_target", std::to_string(rate_hz_));
       add_kv(ds.values, "total_drops", std::to_string(total_drop_count_));
       add_kv(ds.values, "consecutive_failures",
         std::to_string(consecutive_failures_));
@@ -527,7 +544,7 @@ private:
   int height_requested_{480};
   int actual_width_{640};
   int actual_height_{480};
-  double rate_hz_{10.0};
+  double rate_hz_{30.0};
   int jpeg_q_{85};
 
   std::unique_ptr<cv::VideoCapture> cap_;
@@ -535,6 +552,7 @@ private:
   std::unique_ptr<tf2_ros::StaticTransformBroadcaster> static_tf_broadcaster_;
 
   uint64_t frames_published_{0};
+  uint64_t frames_published_last_status_{0};
   uint64_t total_drop_count_{0};
   int consecutive_failures_{0};
 

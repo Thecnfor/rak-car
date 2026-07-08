@@ -1,0 +1,154 @@
+Panels:
+  - Class: rviz/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+      Splitter Ratio: 0.5
+    Tree Height: 462
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Expanded:
+      - /2D Pose Estimate1
+      - /2D Nav Goal1
+    Name: Tool Properties
+    Splitter Ratio: 0.625
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: ""
+
+Displays:
+  - Class: rviz/Axes
+    Enabled: false
+    Name: Axes
+    Reference Frame: base_link
+  - Alpha: 0.5
+    Cell Size: 1
+    Class: rviz/Grid
+    Color: 160; 160; 164
+    Enabled: true
+    Name: Grid
+    Plane Cell Count: 10
+    Reference Frame: base_link
+    Normal Cell Count: 0
+    Offset: 0; 0; 0
+    Pose Color: 255; 255; 255
+    Plane Color: 255; 255; 255
+  - Class: rviz/TF
+    Enabled: true
+    Name: TF
+    Show Axes: true
+    Show Arrows: true
+    Axes Length: 0.3
+    Frames:
+      All Enabled: true
+      base_link:
+        Value: true
+      front_camera_optical_frame:
+        Value: true
+      arm_camera_optical_frame:
+        Value: true
+    Marker Scale: 1
+    Name: TF
+    Show Names: true
+    Tree:
+      base_link:
+        front_camera_optical_frame:
+          {}
+        arm_camera_optical_frame:
+          {}
+  - Class: rviz/Image
+    Enabled: true
+    Image Topic: /vehicle_wbt/v1/sensors/camera/front/image_compressed
+    Max Value: 255
+    Median window: 5
+    Min Value: 0
+    Normalize Range: true
+    Name: front_camera
+    Queue Size: 2
+    Transport Hint: raw
+  - Alpha: 1
+    Autocompress: false
+    Class: rviz/Image
+    Enabled: true
+    Image Topic: /vehicle_wbt/v1/sensors/camera/arm/image_compressed
+    Max Value: 255
+    Median window: 5
+    Min Value: 0
+    Normalize Range: true
+    Name: arm_camera
+    Queue Size: 2
+    Transport Hint: raw
+
+Global Options:
+  Background Color: 48; 48; 48
+  Default Light: 50; 50; 50
+  Fixed Frame: base_link
+  Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz/MoveCamera
+    - Class: rviz/Selection
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+    - Class: rviz/SetGoal
+  Use Sim Time: 0
+  Time:
+    SyncMode: 0
+    SyncSource: ""
+
+Tools:
+  - Class: rviz/Interact
+    Hide On Disabled: false
+  - Class: rviz/MoveCamera
+  - Class: rviz/Select
+  - Class: rviz/FocusCamera
+  - Class: rviz/Measure
+  - Class: rviz/SetInitialPose
+    Theta std deviation: 0.05
+    X std deviation: 0.05
+    Y std deviation: 0.05
+  - Class: rviz/SetGoal
+    Theta std deviation: 0.05
+    X std deviation: 0.05
+    Y std deviation: 0.05
+
+Views:
+  Current:
+    Angle: -2.0
+    Class: rviz/TopDownOrtho
+    Enable Stereo Rendering:
+      Stereo Eye Separation: 0.05999999865889549
+      Stereo Focal Distance: 1
+      Swap Stereo Eyes: false
+      Value: false
+    Invert Z Axis: false
+    Name: Current View
+    Near Clip Distance: 0.01
+    Scale: 50
+    Target Frame: base_link
+    Value: TopDownOrtho (rviz)
+    X:
+      0
+    Y:
+      0
+  Saved: ~
+
+Window:
+  Class: rviz/RVizApp
+  Geometry:
+    Height: 720
+    Width: 1280
+  Name: RViz Team Cameras (Jetson)
+  QMainWindow State: AAADAAAAQAAAAABAAAAVCAUAAACEABkAAACAA/wCAAAAANoAAACAA/AEAAAAAAGUAAAB7AQAAABkAYAAAAK0AYAAAAAGYAAAB7AQAAABkAYAAAAKgAAAAAYAAAAUAAAAABYAVklz
+  Show Left Dock: false
+  Show Right Dock: true
