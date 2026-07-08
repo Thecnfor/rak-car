@@ -100,4 +100,14 @@ echo "     /vehicle_wbt/v1/sensors/camera/{front,arm}/camera_meta"
 echo "     /vehicle_wbt/v1/sensors/camera/{front,arm}/camera_status"
 echo "     /tf_static (base_link → *_camera_optical_frame)"
 echo ""
+# Workaround for XWayland bug: hardware OpenGL context creation fails
+# with "Failed to create an OpenGL context - BadWindow" on many modern
+# Linux desktops (GNOME Wayland + XWayland). Software OpenGL works
+# everywhere but uses more CPU. Override with HW_OPENGL=1 to force
+# hardware (only do this on a real X11 session, not XWayland).
+HW_OPENGL="${HW_OPENGL:-0}"
+if [[ "$HW_OPENGL" != "1" ]]; then
+  echo "   (using software OpenGL — set HW_OPENGL=1 to force hardware)"
+  export LIBGL_ALWAYS_SOFTWARE=1
+fi
 exec rviz2 -d "$RVIZ_CONFIG"
