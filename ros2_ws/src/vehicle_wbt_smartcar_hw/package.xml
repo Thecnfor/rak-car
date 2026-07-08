@@ -1,18 +1,20 @@
 <?xml version="1.0"?>
-<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<?xml-model
+  href="http://download.ros.org/schema/package_format3.xsd"
+  schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>vehicle_wbt_smartcar_hw</name>
   <version>0.1.0</version>
   <description>
-    Hardware protocol layer for rak-car MC602 controller. Pure Python,
-    pyserial-backed. Mirrors the official Baidu SmartCar 2026 SDK
-    mc602_ctl2.py API surface 1:1 (Buzzer_2, ServoPwm, PoutD).
+    MC602 下位机协议层。pyserial 包装 + 20 个设备类 + 里程计纯计算。
+    所有字节 1:1 对齐 baidu_smartcar_2026 SDK。
   </description>
-  <maintainer email="w5555wdnmd@gmail.com">Thecnfor</maintainer>
-  <license>Proprietary</license>
+  <maintainer email="rak-car@todo.todo">RAK-Car Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>  <!-- 只是 buildtool 依赖,运行时无 ROS 依赖;保留以便跨进程共享时方便 -->
 
   <exec_depend>pyserial</exec_depend>
-  <exec_depend>python3-serial</exec_depend>
 
   <export>
     <build_type>ament_python</build_type>

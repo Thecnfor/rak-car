@@ -1,22 +1,22 @@
-"""Setup script for vehicle_wbt_smartcar_hw."""
-from setuptools import find_packages, setup
+from setuptools import setup
 
-PACKAGE_NAME = 'vehicle_wbt_smartcar_hw'
+package_name = 'vehicle_wbt_smartcar_hw'
 
 setup(
-    name=PACKAGE_NAME,
+    name=package_name,
     version='0.1.0',
-    packages=find_packages(exclude=['test']),
+    packages=[package_name],
     data_files=[
         ('share/ament_index/resource_index/packages',
-            [f'resource/{PACKAGE_NAME}']),
-        ('share/' + PACKAGE_NAME, ['package.xml']),
+            ['resource/' + package_name]),
+        ('share/' + package_name, ['package.xml']),
     ],
     install_requires=['pyserial'],
     zip_safe=True,
-    maintainer='Thecnfor',
-    maintainer_email='w5555wdnmd@gmail.com',
-    description='Hardware protocol layer: MC602 controller over pyserial',
-    license='Proprietary',
+    maintainer='RAK-Car Team',
+    maintainer_email='rak-car@todo.todo',
+    description='MC602 下位机协议层,SDK 字节 1:1 对齐',
+    license='Apache-2.0',
     tests_require=['pytest'],
+    entry_points={},
 )
