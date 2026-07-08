@@ -1,3 +1,48 @@
+# scripts/ — Operator & Team Tooling
+
+One-stop reference for every script in this directory. New members
+should read [docs/onboarding/README.md](../docs/onboarding/README.md)
+first.
+
+## Script index
+
+| 脚本 | 用途 | 何时用 |
+|------|------|--------|
+| `onboard.sh` | 第一次 setup（新成员 / 换 dev 机） | 克隆后跑一次 |
+| `start_team_rviz.sh` | 一键通过 RViz 看 Jetson 实时 cameras | 日常调试 / 监控 |
+| `dev.sh` | 无真机开发（dev-sidecar stub 节点） | 改代码但没硬件 |
+| `diagnose.sh` | 15 项健康检查（dev + Jetson + DDS） | 出问题 / 赛前 |
+| `calibrate_camera.py` | 相机内参标定（OpenCV） | 换镜头后一次 |
+
+**统一格式**：`bash scripts/<name>.sh --help` 都有详细选项。
+
+## Quick start
+
+```bash
+# 新成员（day 1）
+bash scripts/onboard.sh              # 装依赖 + build + verify
+bash scripts/diagnose.sh             # 验证
+
+# 老成员（日常）
+bash scripts/start_team_rviz.sh      # 一键通过 RViz 看 Jetson cameras
+bash scripts/dev.sh --with-rviz      # 无真机开发
+
+# 出问题
+bash scripts/diagnose.sh             # 15 项检查
+# 输出贴团队群，看 docs/operations/troubleshooting.md 修
+```
+
+## Style conventions
+
+所有新脚本遵循：
+- `set -euo pipefail`
+- 日志前缀 `[script-name.sh] message`（便于 grep）
+- `--help` 必带
+- 退出码：`0` 成功 / `1` 用户错 / `2` 环境错 / `3` 网络错
+- 状态符号 ✅ ❌ ⚠️
+
+---
+
 # Calibration workflow — vehicle_wbt Platform
 
 This directory contains the operator-facing tools for camera intrinsic

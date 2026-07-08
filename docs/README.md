@@ -34,6 +34,21 @@
 | [development/jetson-target-setup.md](development/jetson-target-setup.md) | Jetson Orin Nano 4GB 最小安装（Humble base） | ⭐⭐⭐ |
 | [development/ssh-workflow.md](development/ssh-workflow.md) | SSH 到 orin + 文件同步 + 远程 build | ⭐⭐⭐ |
 | [development/test-matrix.md](development/test-matrix.md) | dev vs target 测试分工矩阵 | ⭐⭐⭐ |
+| [development/no-hw-dev.md](development/no-hw-dev.md) | 无真机开发（dev-sidecar stub 节点） | ⭐⭐⭐ |
+| [development/lan-rviz-camera.md](development/lan-rviz-camera.md) | LAN 上 RViz 看 Jetson cameras（DDS / CycloneDDS） | ⭐⭐⭐ |
+
+### 团队成员 Onboarding（新成员必看）
+
+| 文档 | 内容 | 重要程度 |
+|------|------|:---:|
+| [onboarding/README.md](onboarding/README.md) | 30 秒 TL;DR + 文档地图 + 工具速查 | ⭐⭐⭐ |
+| [onboarding/day-one.md](onboarding/day-one.md) | Day 1 详细 7 步（装 ROS2 → onboard → 看到 cameras） | ⭐⭐⭐ |
+
+### 运维 & 现场（Operations）
+
+| 文档 | 内容 | 重要程度 |
+|------|------|:---:|
+| [operations/troubleshooting.md](operations/troubleshooting.md) | 症状速查表（**RViz 连不上 Jetson 怎么办**） | ⭐⭐⭐ |
 
 ### 架构决策记录 (ADR)
 

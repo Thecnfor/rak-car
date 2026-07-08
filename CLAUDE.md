@@ -139,6 +139,20 @@ ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
 #             --out /path/to/install/.../params/camera_front.yaml
 ```
 
+## Onboarding & diagnostics scripts
+
+> 团队成员日常工具。详见 [scripts/README.md](scripts/README.md) 和 [docs/onboarding/README.md](docs/onboarding/README.md)。
+
+```bash
+# 新成员 onboarding（克隆后跑一次）
+bash scripts/onboard.sh                  # 一键装依赖 + build + 验证
+
+# 现场健康检查（出问题 / 赛前）
+bash scripts/diagnose.sh                 # 15 项检查（dev + Jetson + DDS）
+bash scripts/diagnose.sh --json         # JSON 输出（CI 用）
+bash scripts/diagnose.sh --no-remote    # 只查 dev 端
+```
+
 ## Daily dev workflow
 
 ```bash
