@@ -36,29 +36,45 @@ class MC602(serial.Serial):
         self.connect_flag = False
 
     def send_cmd(self, cmd: bytes) -> None:
-        """发送完整帧(已含头尾)。SDK 行为:写一次不读返回(由 get_anwser 单独读)。"""
-        self.write(cmd)
+        """发送一帧数据,自动加头/长/尾。
 
-    def get_anwser(self, time_out: float = 0.1) -> bytes | None:
-        """读 MC602 响应。
-
-        协议:读 3 字节 → 解 dst_len = res[2] → 读剩余 → 校验头尾 → 返回 res[3:-1]。
-        完全对齐 SDK `serial_wrap.py:222-245`。
+        对齐 SDK MC602.send_cmd(serial_wrap.py:215-219):cmd_len = len(cmd)+4,
+        frame = HEADER + cmd_len + cmd + TAIL。
         """
-        time_start = time.time()
-        res = self.read(3)
-        if len(res) != 3:
-            return None
-        dst_len = res[2]
-        res = res + self.read(dst_len - 3)
-        while True:
-            if time.time() - time_start > time_out:
+        cmd_len = (len(cmd) + 4).to_bytes(1, 'big')
+        frame = self.HEADER + cmd_len + cmd + self.TAIL
+        self.write(frame)
+
+    def get_anwser(self, cmd: bytes | None = None, time_out: float = 0.1) -> bytes | None:
+        """发送 cmd(可选)+ 读 MC602 响应。
+
+        对齐 SDK SerialWrap.get_anwser(serial_wrap.py:70-80):lock 保护下,如
+        cmd 不为 None 先 send_cmd,再读响应。
+        协议:读 3 字节 → 解 dst_len = res[2] → 读剩余 → 校验头尾 → 返回 res[3:-1]。
+        完全对齐 SDK MC602.get_anwser(serial_wrap.py:222-245)。
+        """
+        with self.lock:
+            try:
+                if cmd is not None:
+                    self.reset_input_buffer()
+                    self.reset_output_buffer()
+                    self.send_cmd(cmd)
+                time_start = time.time()
+                res = self.read(3)
+                if len(res) != 3:
+                    return None
+                dst_len = res[2]
+                res = res + self.read(dst_len - 3)
+                while True:
+                    if time.time() - time_start > time_out:
+                        return None
+                    if len(res) == dst_len:
+                        if res[0] == self.HEADER[0] and res[-1] == self.TAIL[0]:
+                            return res[3:-1]
+                        return None
+                    res = res + self.read(dst_len - len(res))
+            except Exception:
                 return None
-            if len(res) == dst_len:
-                if res[0] == self.HEADER[0] and res[-1] == self.TAIL[0]:
-                    return res[3:-1]
-                return None
-            res = res + self.read(dst_len - len(res))
 
     def ping_rx(self, time_out: float = 0.05) -> bool:
         """探测 MC602 是否在响应。SDK `serial_wrap.py:248-257`。
