@@ -262,7 +262,9 @@ class MC602Node(Node):
                 resp.voltage_v = 0.0
                 resp.success = False
             else:
-                resp.voltage_v = float(v) / 1000.0
+                # Battry_2.read() 内部已经 /1000 转伏(mc602_ctl2.py:509),
+                # 返回值已经是伏,不要再除
+                resp.voltage_v = float(v)
                 self._last_battery = resp.voltage_v
                 resp.success = True
         except Exception as e:
@@ -303,7 +305,8 @@ class MC602Node(Node):
                 self._last_encoders = list(encs[:4])
             v = self._battery.read()
             if v is not None:
-                self._last_battery = float(v) / 1000.0
+                # Battry_2.read() 内部已经 /1000 转伏,不要再除
+                self._last_battery = float(v)
             ir_l = self._ir_left.no_act()
             if ir_l and isinstance(ir_l, list) and ir_l:
                 self._last_ir_left = float(ir_l[0]) / 1000.0
