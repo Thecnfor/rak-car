@@ -51,17 +51,30 @@ class MC602(serial.Serial):
         对齐 SDK SerialWrap.get_anwser(serial_wrap.py:70-80):lock 保护下,如
         cmd 不为 None 先 send_cmd,再读响应。
         协议:读 3 字节 → 解 dst_len = res[2] → 读剩余 → 校验头尾 → 返回 res[3:-1]。
-        完全对齐 SDK MC602.get_anwser(serial_wrap.py:222-245)。
+
+        Real-hardware recovery:真硬件密集测试中(>100 calls),pyserial 内部
+        buffer 状态偶尔 corruption,导致 read(3) 立即返回 0 字节。SDK-direct
+        (每次新建 SerialWrap) 不受影响,但 singleton 受污染。Fix:
+        连续 N 次 read 0 字节后,自动 close + reopen 重置 OS state。
         """
         with self.lock:
             try:
                 if cmd is not None:
-                    self.reset_input_buffer()
-                    self.reset_output_buffer()
+                    # 注意:SDK 的 reset_buffer() 是 INPUT+OUTPUT 一起清;
+                    # 我们的 reset_input_buffer + reset_output_buffer 在
+                    # 连续 send+read 序列里偶尔会破坏 pyserial 内部 wait state。
+                    # 保守起见,只在 cmd 不为 None 时清 output(避免丢 write),
+                    # 永远不清 input(让旧的响应有机会被读到)。
+                    try:
+                        self.reset_output_buffer()
+                    except Exception:
+                        pass
                     self.send_cmd(cmd)
                 time_start = time.time()
                 res = self.read(3)
                 if len(res) != 3:
+                    # Auto-recovery:port state corruption,close + reopen
+                    self._recover_port()
                     return None
                 dst_len = res[2]
                 res = res + self.read(dst_len - 3)
@@ -75,6 +88,24 @@ class MC602(serial.Serial):
                     res = res + self.read(dst_len - len(res))
             except Exception:
                 return None
+
+    def _recover_port(self) -> None:
+        """close + reopen port 以重置 pyserial 内部状态。
+
+        真硬件密集测试中,singleton 偶尔进入"read 立即返回 0 字节"状态。
+        SDK-direct(每次新 SerialWrap)无此问题。重开 port 是最便宜的恢复方式。
+        """
+        try:
+            saved_port = self.port
+            saved_baud = self.baudrate
+            if self.is_open:
+                self.close()
+            time.sleep(0.05)
+            self.port = saved_port
+            self.baudrate = saved_baud
+            self.open()
+        except Exception:
+            pass  # best-effort recovery
 
     def ping_rx(self, time_out: float = 0.05) -> bool:
         """探测 MC602 是否在响应。SDK `serial_wrap.py:248-257`。
@@ -100,6 +131,8 @@ class MC602(serial.Serial):
         """扫描 CH340/USB 串口,找到第一个能 ping 通的端口并打开。
 
         对齐 SDK `serial_wrap.py:113-142`。返回打开的端口名,失败 None。
+        真硬件测试:SDK 的 ping time_out=0.05 太短,首字节经常迟到 100ms+。
+        这里用 0.3s 兜底,确保不误判端口为"未响应"。
         """
         port_list = list_ports.comports()
         port_list = [p for p in port_list if 'CH340' in p[1] or 'USB' in p[1]]
@@ -110,10 +143,15 @@ class MC602(serial.Serial):
                 self.baudrate = baud
                 self.open()
                 self.connect_flag = True
-                if self.ping_rx(time_out=0.05):
+                if self.ping_rx(time_out=0.3):
                     return p[0]
-                self.close()
-                self.connect_flag = False
+                # 没 ping 通:不要关 port(可能 caller 还想用),让 is_open 留 True
+                # 但要 reset 一下 buffer 给下次机会
+                try:
+                    self.reset_input_buffer()
+                    self.reset_output_buffer()
+                except Exception:
+                    pass
             except Exception:
                 try:
                     self.close()
