@@ -1,5 +1,10 @@
 # MC602 硬件端口路由表(集中管理,服务 handler 路由到这里查表)
 # 底盘同事不知道硬件 dev_id,只通过 service 字段 port
+#
+# 2026-07-09 真实硬件确认:
+#   - IR 传感器在 P1, P2 (a1, a2)
+#   - PWM 舵机在 P1 (d1, 与 IR-left 共用 P1,dev_id 0x05 区分)
+#   - 智能总线舵机 ID=1 (独立总线,dev_id 0x06)
 
 chassis:
   motors: [1, 2, 3, 4]      # Motor_2 端口列表(用 Motors_2 包装)
@@ -12,12 +17,12 @@ arm:
   dc_motor_x:                 # X 轴直流电机
     dev_id: 0x02
     port: 2
-  servo_pwm_hand:             # 手部 PWM 舵机
+  servo_pwm_hand:             # 手部 PWM 舵机 (P1, 与 IR-left 共享 port)
     dev_id: 0x05
-    port: 3
-  servo_bus_wrist:            # 腕部总线舵机
+    port: 1
+  servo_bus_wrist:            # 腕部总线舵机 (总线 ID 1)
     dev_id: 0x06
-    port: 4
+    bus_id: 1
   pump:                       # 真空泵
     dev_id: 0x10
     port: 1
@@ -38,8 +43,8 @@ shooter:
     port: 5
 
 ir:
-  left: 7
-  right: 8
+  left: 1                     # A1 = P1
+  right: 2                    # A2 = P2
 
 # P 口 4 键按键板(机械臂手动调试:上/下/左/右)
 # 实硬件确认:Key4Btn 板在 P1(原 arm_base.py 文档说 port=4 不对)
