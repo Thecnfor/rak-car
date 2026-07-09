@@ -51,6 +51,7 @@ set(MSG_FILES
   "msg/RawState.msg"
   "msg/MelodyNote.msg"
   "msg/Melody.msg"
+  "msg/ButtonEvent.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

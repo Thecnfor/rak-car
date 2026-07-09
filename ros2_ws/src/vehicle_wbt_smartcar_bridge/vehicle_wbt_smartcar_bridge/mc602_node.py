@@ -22,6 +22,7 @@ from std_msgs.msg import Header
 from vehicle_wbt_smartcar_hw import (
     ArmController,
     Battry_2,
+    BoardKey_2,
     Buzzer_2,
     EncoderMotors4_2,
     Infrared_2,
@@ -33,7 +34,7 @@ from vehicle_wbt_smartcar_hw import (
     Stepper_2,
     serial_mc602,
 )
-from vehicle_wbt_smartcar_msgs.msg import Melody, MelodyNote, RawState
+from vehicle_wbt_smartcar_msgs.msg import ButtonEvent, Melody, MelodyNote, RawState
 from vehicle_wbt_smartcar_msgs.srv import (
     Buzzer,
     PlayPredefined,
@@ -140,6 +141,7 @@ class MC602Node(Node):
 
         self._battery = Battry_2()
         self._buzzer = Buzzer_2()
+        self._board_key = BoardKey_2()
 
         # 状态缓存
         self._last_encoders = [0, 0, 0, 0]
@@ -148,6 +150,7 @@ class MC602Node(Node):
         self._last_battery = 0.0
         self._pump_state = False
         self._valve_state = False
+        self._last_board_key: bool | None = None  # None = 未初始化,等第一次读
 
         # 12 service server,路径前缀 /vehicle_wbt/v1/mc602/*
         self.create_service(SetWheels, f'{SERVICE_PREFIX}/set_wheels', self._on_set_wheels)
@@ -166,6 +169,8 @@ class MC602Node(Node):
         # 2 topic publisher
         self._raw_pub = self.create_publisher(RawState, f'{SERVICE_PREFIX}/state/raw', 10)
         self._heartbeat_pub = self.create_publisher(Header, f'{SERVICE_PREFIX}/heartbeat', 10)
+        self._button_event_pub = self.create_publisher(
+            ButtonEvent, f'{SERVICE_PREFIX}/board/button_events', 10)
 
         # 旋律播放(topic + service):不在 callback 线程里阻塞
         self._play_lock = Lock()
@@ -359,6 +364,16 @@ class MC602Node(Node):
             ir_r = self._ir_right.no_act()
             if ir_r and isinstance(ir_r, list) and ir_r:
                 self._last_ir_right = float(ir_r[0]) / 1000.0
+            # 板载按钮:检测 false→true 边沿 → publish 一次 ButtonEvent
+            k = self._board_key.no_act()
+            current_key = bool(k) if k is not None else False
+            if self._last_board_key is not None and current_key != self._last_board_key:
+                # 边沿事件:变化时发
+                ev = ButtonEvent()
+                ev.pressed = current_key  # true=按下, false=松开
+                self._button_event_pub.publish(ev)
+                self.get_logger().info(f'board key edge: pressed={current_key}')
+            self._last_board_key = current_key
         except Exception as e:
             self.get_logger().warn(f'sensor tick: {e}')
 
@@ -372,6 +387,7 @@ class MC602Node(Node):
         msg.arm_x_pos = 0
         msg.pump_on = self._pump_state
         msg.valve_on = self._valve_state
+        msg.board_key = bool(self._last_board_key) if self._last_board_key is not None else False
         self._raw_pub.publish(msg)
 
     def _tick_control(self):

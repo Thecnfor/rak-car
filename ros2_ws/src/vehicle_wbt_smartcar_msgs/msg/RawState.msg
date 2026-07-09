@@ -8,3 +8,4 @@ int32 arm_y_pos
 int32 arm_x_pos
 bool pump_on
 bool valve_on
+bool board_key
