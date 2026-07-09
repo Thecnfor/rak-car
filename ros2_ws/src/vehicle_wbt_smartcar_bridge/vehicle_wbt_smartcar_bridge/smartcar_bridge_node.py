@@ -16,7 +16,13 @@ from rclpy.node import Node
 from vehicle_wbt_smartcar_bridge import config as cfg
 from vehicle_wbt_smartcar_bridge.chassis_service import ChassisService
 from vehicle_wbt_smartcar_bridge.arm_service import ArmService
-from vehicle_wbt_smartcar_bridge.peripheral_service import PeripheralService
+# peripheral_service.py was removed 2026-07-09 (Phase 1 covers buzzer/storage/shooter).
+# Keep optional import so smartcar_bridge_node still loads if someone re-adds it.
+try:
+    from vehicle_wbt_smartcar_bridge.peripheral_service import PeripheralService
+    _HAS_PERIPHERAL = True
+except ImportError:
+    _HAS_PERIPHERAL = False
 from vehicle_wbt_smartcar_bridge.state_publisher import StatePublisher
 
 

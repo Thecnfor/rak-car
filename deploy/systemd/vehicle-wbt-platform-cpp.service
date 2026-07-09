@@ -1,0 +1,25 @@
+[Unit]
+Description=RAK-Car Platform C++ 7-Node Stack (legacy: camera/IR/chassis/arm/safety/mission)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=120
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=xrak
+Group=dialout
+EnvironmentFile=/etc/vehicle-wbt/ros.env
+
+ExecStartPre=/bin/bash -c 'for i in 1 2 3 4 5; do [ -e /dev/cam3 ] && [ -e /dev/cam4 ] && exit 0; sleep 1; done; echo "cameras /dev/cam3 or /dev/cam4 not found"; exit 1'
+
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source ${VEHICLE_WBT_REPO}/ros2_ws/install/setup.bash && exec ros2 launch vehicle_wbt_platform_cpp full_system.launch.py front_device:=/dev/cam4 arm_device:=/dev/cam3'
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
