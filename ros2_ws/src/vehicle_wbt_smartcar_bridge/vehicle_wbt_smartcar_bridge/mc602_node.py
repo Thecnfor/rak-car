@@ -396,11 +396,13 @@ class MC602Node(Node):
             self._last_ir_left = float(int(ir_l) if ir_l is not None else 0) / 1000.0
             ir_r = self._ir_right.no_act()
             self._last_ir_right = float(int(ir_r) if ir_r is not None else 0) / 1000.0
-            # 板载按钮:SDK BoardKey_2.no_act() 返回 int ADC 值
-            # no-press 基线 ~3974,按键时 355/1366/2137/2988
-            # threshold: ADC < 3500 = 有键按下
+            # 板载按钮:SDK BoardKey_2.no_act() 返回 [mode, value] 2-tuple
+            # no-press value=0,按下 value>0
             k = self._board_key.no_act()
-            current_key = (k < 3500) if k is not None else False
+            if k is not None and isinstance(k, (list, tuple)) and len(k) >= 2:
+                current_key = bool(k[1])  # value byte, 0/1
+            else:
+                current_key = False
             if self._last_board_key is not None and current_key != self._last_board_key:
                 ev = ButtonEvent()
                 ev.pressed = current_key
