@@ -24,6 +24,7 @@ from vehicle_wbt_smartcar_hw import (
     ArmController,
     Battry_2,
     BluetoothPad_2,
+    BoardKey_2,
     Buzzer_2,
     EncoderMotors4_2,
     Infrared_2,

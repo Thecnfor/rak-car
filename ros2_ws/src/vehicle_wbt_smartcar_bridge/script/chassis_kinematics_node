@@ -1,0 +1,10 @@
+#!/usr/bin/env python3
+"""chassis_kinematics_node 启动 wrapper。
+
+走 project 约定的 script/ → lib/<pkg>/ 路径(ament 可发现),
+而不是 setuptools console_scripts 路径(bin/,ament 不可发现)。
+"""
+from vehicle_wbt_smartcar_bridge.chassis_kinematics_node import main
+
+if __name__ == '__main__':
+    main()

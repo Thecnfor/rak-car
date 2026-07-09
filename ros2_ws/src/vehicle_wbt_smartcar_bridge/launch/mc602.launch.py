@@ -45,6 +45,18 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'sensor_rate_hz', default_value='20.0',
             description='传感器发布频率(Hz)'),
+        DeclareLaunchArgument(
+            'enable_chassis_kinematics', default_value='true',
+            description='是否启动 chassis_kinematics_node(/cmd_vel /odom /tf)'),
+        DeclareLaunchArgument(
+            'chassis_track', default_value='0.30',
+            description='麦纳姆轮距 (m)'),
+        DeclareLaunchArgument(
+            'chassis_wheel_base', default_value='0.28',
+            description='麦纳姆轴距 (m)'),
+        DeclareLaunchArgument(
+            'chassis_wheel_radius', default_value='0.03',
+            description='麦纳姆轮半径 (m)'),
 
         Node(
             package='vehicle_wbt_smartcar_bridge',
@@ -56,6 +68,22 @@ def generate_launch_description():
                 'baud': LaunchConfiguration('baud'),
                 'control_rate_hz': LaunchConfiguration('control_rate_hz'),
                 'sensor_rate_hz': LaunchConfiguration('sensor_rate_hz'),
+            }],
+        ),
+
+        # 麦纳姆运动学子节点:Twist → 4 轮 + encoder → /odom + /tf
+        # 默认开启;不需要时传 enable_chassis_kinematics:=false
+        Node(
+            condition=IfCondition(LaunchConfiguration('enable_chassis_kinematics')),
+            package='vehicle_wbt_smartcar_bridge',
+            executable='chassis_kinematics_node',
+            name='chassis_kinematics',
+            output='screen',
+            parameters=[{
+                'track': LaunchConfiguration('chassis_track'),
+                'wheel_base': LaunchConfiguration('chassis_wheel_base'),
+                'wheel_radius': LaunchConfiguration('chassis_wheel_radius'),
+                'control_rate_hz': LaunchConfiguration('control_rate_hz'),
             }],
         ),
     ])
