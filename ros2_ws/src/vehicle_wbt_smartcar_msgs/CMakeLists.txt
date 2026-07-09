@@ -40,6 +40,7 @@ set(SRV_FILES
   "srv/ReadBattery.srv"
   "srv/ReadAnalog.srv"
   "srv/Buzzer.srv"
+  "srv/PlayPredefined.srv"
 )
 
 set(MSG_FILES
@@ -48,6 +49,8 @@ set(MSG_FILES
   "msg/BridgeStatus.msg"
   # Phase 1 additive
   "msg/RawState.msg"
+  "msg/MelodyNote.msg"
+  "msg/Melody.msg"
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

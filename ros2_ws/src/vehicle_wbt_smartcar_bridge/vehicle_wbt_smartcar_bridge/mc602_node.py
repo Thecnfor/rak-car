@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
+from threading import Lock, Thread
 
 import rclpy
 import yaml
@@ -31,9 +33,10 @@ from vehicle_wbt_smartcar_hw import (
     Stepper_2,
     serial_mc602,
 )
-from vehicle_wbt_smartcar_msgs.msg import RawState
+from vehicle_wbt_smartcar_msgs.msg import Melody, MelodyNote, RawState
 from vehicle_wbt_smartcar_msgs.srv import (
     Buzzer,
+    PlayPredefined,
     ReadAnalog,
     ReadBattery,
     ReadEncoders,
@@ -56,6 +59,35 @@ DEFAULT_PORTS_YAML = os.path.join(
 
 NODE_NAME = 'mc602_io'
 SERVICE_PREFIX = '/vehicle_wbt/v1/mc602'
+
+# 预置旋律(freq_hz, duration_ms)。用 (note, dur) 元组方便编辑。
+PREDEFINED_MELODIES: dict[str, list[tuple[int, int]]] = {
+    # C C G G A A G*  F F E E D D C*  (14 notes, ~7s)
+    'twinkle': [
+        (262, 400), (262, 400), (392, 400), (392, 400),
+        (440, 400), (440, 400), (392, 600),
+        (349, 400), (349, 400), (330, 400), (330, 400),
+        (294, 400), (294, 400), (262, 800),
+    ],
+    # Mary Had a Little Lamb (24 notes, ~12s)
+    'mary': [
+        (330, 500), (294, 500), (262, 500), (294, 500), (330, 500), (330, 500), (330, 800),
+        (294, 500), (294, 500), (294, 800),
+        (330, 500), (392, 500), (392, 800),
+        (330, 500), (294, 500), (262, 500), (294, 500),
+        (330, 500), (330, 500), (330, 500), (330, 500),
+        (294, 500), (294, 500), (330, 500), (294, 500), (262, 1000),
+    ],
+    # Happy Birthday (22 notes, ~10s)
+    'birthday': [
+        (262, 300), (262, 300), (294, 800),
+        (262, 300), (349, 300), (330, 800),
+        (262, 300), (262, 300), (294, 800),
+        (262, 300), (392, 300), (349, 800),
+        (262, 300), (440, 300), (392, 300), (349, 300), (330, 800),
+        (466, 300), (466, 300), (440, 300), (392, 300), (349, 800),
+    ],
+}
 
 
 class MC602Node(Node):
@@ -134,6 +166,14 @@ class MC602Node(Node):
         # 2 topic publisher
         self._raw_pub = self.create_publisher(RawState, f'{SERVICE_PREFIX}/state/raw', 10)
         self._heartbeat_pub = self.create_publisher(Header, f'{SERVICE_PREFIX}/heartbeat', 10)
+
+        # 旋律播放(topic + service):不在 callback 线程里阻塞
+        self._play_lock = Lock()
+        self._play_thread: Thread | None = None
+        self.create_subscription(
+            Melody, f'{SERVICE_PREFIX}/play_melody', self._on_play_melody, 10)
+        self.create_service(
+            PlayPredefined, f'{SERVICE_PREFIX}/play_predefined', self._on_play_predefined)
 
         # 3 timer
         sensor_dt = 1.0 / self.get_parameter('sensor_rate_hz').value
@@ -341,6 +381,55 @@ class MC602Node(Node):
         msg = Header()
         msg.stamp = self.get_clock().now().to_msg()
         self._heartbeat_pub.publish(msg)
+
+    # ---- 旋律播放(topic + service) ----
+
+    def _on_play_melody(self, msg: Melody) -> None:
+        """Topic callback: 收到 Melody 后 spawn 一个 Thread 顺序播放。
+        不阻塞 rclpy executor 线程。
+        """
+        notes = [(int(n.freq_hz), int(n.duration_ms)) for n in msg.notes]
+        if not notes:
+            return
+        if self._play_thread and self._play_thread.is_alive():
+            self.get_logger().warn('melody already playing, dropping new request')
+            return
+        self._play_thread = Thread(
+            target=self._play_notes_thread, args=(notes, 'topic'),
+            daemon=True)
+        self._play_thread.start()
+
+    def _on_play_predefined(self, req, resp) -> PlayPredefined.Response:
+        """Service: 收到旋律名 → 查表 → spawn 线程播。返回 success 表示已启动(不等播完)。"""
+        name = req.name.strip().lower()
+        if name not in PREDEFINED_MELODIES:
+            resp.success = False
+            resp.message = f'unknown melody "{name}". available: {sorted(PREDEFINED_MELODIES.keys())}'
+            return resp
+        if self._play_thread and self._play_thread.is_alive():
+            resp.success = False
+            resp.message = 'melody already playing'
+            return resp
+        notes = PREDEFINED_MELODIES[name]
+        self._play_thread = Thread(
+            target=self._play_notes_thread, args=(notes, name),
+            daemon=True)
+        self._play_thread.start()
+        resp.success = True
+        resp.message = f'playing "{name}" ({len(notes)} notes, ~{sum(d for _, d in notes)/1000:.1f}s)'
+        return resp
+
+    def _play_notes_thread(self, notes: list[tuple[int, int]], source: str) -> None:
+        """实际播放(在线程里跑):每个音 SDK rings() + time.sleep(duration/1000)。"""
+        with self._play_lock:
+            self.get_logger().info(f'[{source}] playing {len(notes)} notes')
+            for i, (freq, dur_ms) in enumerate(notes, 1):
+                try:
+                    self._buzzer.rings(freq, dur_ms / 1000.0)
+                except Exception as e:
+                    self.get_logger().warn(f'[{source}] note {i} {freq}Hz fail: {e}')
+                time.sleep(dur_ms / 1000.0)  # 等当前音播完再发下一个
+            self.get_logger().info(f'[{source}] done')
 
 
 def main(args=None):

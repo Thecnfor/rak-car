@@ -1,0 +1,5 @@
+# 预置旋律名(支持: twinkle, mary, birthday)
+string name
+---
+bool success
+string message
