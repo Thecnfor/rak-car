@@ -13,6 +13,7 @@ from pathlib import Path
 
 import rclpy
 import yaml
+from ament_index_python.packages import get_package_share_directory
 from rclpy.node import Node
 from std_msgs.msg import Header
 
@@ -46,7 +47,12 @@ from vehicle_wbt_smartcar_msgs.srv import (
     SetWheels,
 )
 
-DEFAULT_PORTS_YAML = Path(__file__).parent.parent / 'config' / 'mc602_ports.yaml'
+# Default path: ament-managed share dir (where data_files installs the YAML).
+# Override via the `ports_config` parameter.
+DEFAULT_PORTS_YAML = os.path.join(
+    get_package_share_directory('vehicle_wbt_smartcar_bridge'),
+    'config', 'mc602_ports.yaml',
+)
 
 NODE_NAME = 'mc602_io'
 SERVICE_PREFIX = '/vehicle_wbt/v1/mc602'

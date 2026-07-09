@@ -14,7 +14,8 @@ Run:
 """
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, SetEnvironmentVariable
-from launch.substitutions import LaunchConfiguration
+from launch.conditions import IfCondition
+from launch.substitutions import LaunchConfiguration, PythonExpression, EnvironmentVariable
 from launch_ros.actions import Node
 
 
@@ -22,8 +23,15 @@ def generate_launch_description():
     return LaunchDescription([
         # 强制 ROS_DOMAIN_ID 让 dev box 通过 LAN DDS 自动发现本节点
         SetEnvironmentVariable('ROS_DOMAIN_ID', '42'),
-        # 强制 CycloneDDS(对齐 Jetson env file)
-        SetEnvironmentVariable('RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp'),
+        # 强制 CycloneDDS(对齐 Jetson env file);如果 RMW_OVERRIDE 已设(Jetson 端
+        # 装了 Fast DDS / Connext 等),跳过强制,让本机 dev 也能跑 launch
+        # Set env var only if RMW_OVERRIDE is unset
+        SetEnvironmentVariable(
+            'RMW_IMPLEMENTATION', 'rmw_cyclonedds_cpp',
+            condition=IfCondition(
+                PythonExpression(["'", EnvironmentVariable('RMW_OVERRIDE', default_value=''), "' == ''"])
+            ),
+        ),
 
         DeclareLaunchArgument(
             'serial_port', default_value='/dev/ttyUSB1',
