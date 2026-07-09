@@ -41,5 +41,10 @@ ir:
   left: 7
   right: 8
 
+# P 口 4 键按键板(机械臂手动调试:上/下/左/右)
+# 实硬件确认:Key4Btn 板在 P1(原 arm_base.py 文档说 port=4 不对)
+key4_btn:
+  port: 1
+
 beep:
   dev_id: 0x0a                # Buzzer_2,无 port
