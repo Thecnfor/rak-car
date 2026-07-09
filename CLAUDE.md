@@ -60,7 +60,18 @@ at startup; all-zero K means "no calibration yet" → `camera_info` is
 rak-car/  (you are here, on robot-stable)
 ├── ros2_ws/src/
 │   ├── vehicle_wbt_platform_cpp/    # C++: 7 rclcpp nodes + ros2_control plugin + custom msgs
-│   └── vehicle_wbt_platform/        # Python: config_loader, SidecarOrchestrator, ENABLE_ROS2 gate
+│   ├── vehicle_wbt_platform/        # Python: config_loader, SidecarOrchestrator, ENABLE_ROS2 gate
+│   ├── vehicle_wbt_smartcar_hw/         # Phase 1: MC602 protocol layer (pure Python lib; 14 device classes SDK 1:1)
+│   ├── vehicle_wbt_smartcar_msgs/        # Phase 1: 12 new .srv + 1 new .msg (additive; legacy 19 .srv + 3 .msg preserved)
+│   ├── vehicle_wbt_smartcar_bridge/      # Phase 1: mc602_node (12 service + 2 topic gateway) + smartcar_bridge_node (legacy compat)
+│   ├── vehicle_wbt_smartcar_sdk/         # Legacy: high-level MyCar API for old chassis/arm/shooter code
+│   └── vehicle_wbt_smartcar_chassis/     # Phase 1.5+: 4-colleague dev (chassis)
+│       ├── vehicle_wbt_smartcar_arm/         # 4-colleague dev (arm)
+│       ├── vehicle_wbt_smartcar_shooter/     # 4-colleague dev (shooter)
+│       └── vehicle_wbt_smartcar_perception/  # 4-colleague dev (LLM/vision)
+├── deploy/                              # Phase 1: systemd unit + env + DDS + udev (T16 installs to /etc/...)
+├── docs/integration/                    # Phase 1: LOWLEVEL_API.md + DEV_QUICKSTART.md
+├── scripts/                             # Phase 1: quick_beep.sh + check_link.sh (dev-box verification)
 ├── config_sensors.yml               # hardware source of truth
 ├── urdf/vehicle_wbt.urdf.xacro      # robot description
 ├── scripts/calibrate_camera.py      # operator-only: lens swap → re-calibrate
@@ -123,7 +134,36 @@ ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
 
 # Mock launch (sensor side real, motor side stubbed)
 ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
+
+# Phase 1: MC602 IO gateway (under development; runs alongside above)
+# systemd unit `vehicle-wbt-mc602` will start this on boot
+# To start manually: ros2 launch vehicle_wbt_smartcar_bridge mc602.launch.py serial_port:=/dev/ttyUSB1 baud:=1000000
 ```
+
+## API for dev boxes (LAN collaborators)
+
+Phase 1: Jetson exposes 12 generic services + 2 topics via `/vehicle_wbt/v1/mc602/*` for 4 colleagues (chassis/arm/shooter/perception) developing on LAN dev boxes. They DO NOT SSH Jetson or deploy code here — they:
+
+1. `git clone` + `colcon build --packages-up-to vehicle_wbt_smartcar_msgs` (only msgs needed; no hw/bridge)
+2. `export ROS_DOMAIN_ID=42`
+3. `./scripts/quick_beep.sh` (trust signal: hear beep on Jetson → bridge works)
+4. Develop their own business package under `ros2_ws/src/vehicle_wbt_smartcar_<their>/`
+5. `colcon build --packages-select <theirs>` + `ros2 run ...` → DDS auto-discovers Jetson's `/vehicle_wbt/v1/mc602/*`
+
+Full API + Python rclpy examples: `docs/integration/LOWLEVEL_API.md`
+5-min onboarding: `docs/integration/DEV_QUICKSTART.md`
+
+**Key invariants:**
+- Dev boxes MUST `export ROS_DOMAIN_ID=42` (or set in `~/.bashrc`)
+- Dev boxes use CycloneDDS: `export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`
+- Service/topic paths are under `/vehicle_wbt/v1/mc602/*` (NOT bare `/mc602/*`)
+- Old C++ `ros2_control` stack (`vehicle_wbt_platform_cpp`) still runs in parallel during transition — colleagues should ignore `/cmd/vel_safe`, `/state/odom`, etc. and use only `/vehicle_wbt/v1/mc602/*` during Phase 1. Old stack will be retired in Phase 4.
+
+Two launch files coexist:
+- `smartcar_bridge.launch.py` (legacy) — runs `smartcar_bridge_node` for `vehicle_wbt_smartcar_sdk` users
+- `mc602.launch.py` (Phase 1) — runs `mc602_io` for the new gateway
+
+Both can run simultaneously (different node names, no conflicts).
 
 ## Daily workflow on this robot
 
@@ -200,4 +240,12 @@ ROS_DOMAIN_ID=42 ros2 topic pub --once \
 # Expected: ~17 s of Happy Birthday through the MC602 buzzer.
 # Node logs show `melody[0..24] f=NNNHz d=0.Ns: sent 77 68 ...`.
 # Override `serial_port` if your MC602 is at /dev/ttyUSB0 (or other).
+
+# Phase 1 alternative: use the new mc602_node gateway (also supports beep via /vehicle_wbt/v1/mc602/buzzer)
+# Terminal A:
+ROS_DOMAIN_ID=42 ros2 launch vehicle_wbt_smartcar_bridge mc602.launch.py \
+    serial_port:=/dev/ttyUSB1 baud:=1000000
+# Terminal B (or any dev box with ROS_DOMAIN_ID=42):
+./scripts/quick_beep.sh 880 300
+# Expected: 0.3 s 880Hz beep (single tone, not the full melody)
 ```
