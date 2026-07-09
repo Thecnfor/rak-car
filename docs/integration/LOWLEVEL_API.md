@@ -179,5 +179,40 @@ await client_bus.call_async(req)
 
 - ❌ 底盘 PID `move_to_position`:Phase 1 不实现,底盘同事自己写
 - ❌ 机械臂 PID 闭环:Phase 1 不实现,机械臂同事自己写
-- ❌ LED 屏 / 蓝牙手柄 / 数码管:Phase 5+
 - ❌ 老 C++ `ros2_control` 栈仍在运行:Phase 4 退役,**注意 chassis/arm 服务可能被双向消费**——同事开发时暂时不用老 C++ 的话题(`/cmd/vel_safe` 等),只调 `/vehicle_wbt/v1/mc602/*`
+
+## 完整 21 个 service 列表
+
+| Service | 字段 in/out | 物理意义 |
+|---|---|---|
+| `/set_wheels` | v0,v1,v2,v3 (int8) → success | 麦纳姆轮 4 路速度 |
+| `/read_encoders` | → v[4] (int32) + success | 4 路编码器原始脉冲 |
+| `/reset_encoders` | → success | 编码器清零 |
+| `/set_servo_pwm` | port, angle → success | PWM 舵机(机械臂手爪) |
+| `/set_servo_bus` | port, angle, speed → success | 总线舵机(机械臂腕部) |
+| `/set_stepper` | port, freq → success | 步进电机(机械臂 Y 轴) |
+| `/set_dc_motor` | port, speed → success | 直流电机(机械臂 X 轴) |
+| `/set_pout` | port, state → success | 数字输出(泵/阀/枪) |
+| `/read_ir` | port → distance_m + success | 红外测距 (m) |
+| `/read_battery` | → voltage_v + success | 电池电压 (V) |
+| `/read_analog` | port → value + success | 通用 ADC (0~4095) |
+| `/buzzer` | freq_hz, duration_ms → success | 蜂鸣器单音 |
+| `/read_touch` | port → pressed + success | 触摸按键 (P 口 mode=2) |
+| `/read_ultrasonic` | port → distance_m + success | 超声波测距 (P 口 mode=3) |
+| `/read_ambient` | port → value + success | 环境光 (P 口 mode=4) |
+| `/read_bluetooth` | → lx,ly,rx,ry,btn + success | 蓝牙手柄(dev_id=0x09) |
+| `/read_key4` | port → key (1-4/0) + success | 4 键按键板 (P 口) |
+| `/set_led` | led_id,r,g,b,port → success | RGB LED 灯条(dev_id=0x0e) |
+| `/set_nixie` | port, num → success | 数码管整数显示(dev_id=0x0f) |
+| `/show_screen` | text → success | 屏幕 ASCII(dev_id=0x0b) |
+| `/play_predefined` | name → success + message | 预置旋律 (twinkle/mary/birthday) |
+
+**Topic**:
+- `/play_melody` (Melody.msg): 任意 melody pub
+- `/state/raw` (RawState.msg, 20Hz): encoders + IR + battery + arm pose + pump/valve + board_key
+- `/board/button_events` (ButtonEvent.msg, edge): 板载按钮按下/松开
+- `/heartbeat` (std_msgs/Header, 1Hz): alive
+
+## 硬件协议参考
+
+完整 MC602 帧格式 + dev_id/mode/port_id 速查表,见 [MC602_HARDWARE_REFERENCE.md](MC602_HARDWARE_REFERENCE.md)。
