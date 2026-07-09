@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!-- /etc/cyclonedds.xml - CycloneDDS 配置 for LAN auto-discovery -->
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="42">
+    <General>
+      <Interfaces>
+        <NetworkInterface autodetermine="true" priority="default" />
+      </Interfaces>
+      <AllowMulticast>true</AllowMulticast>
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <SocketReceiveBufferSize>2MiB</SocketReceiveBufferSize>
+      <Watermark>256KiB</Watermark>
+    </Internal>
+  </Domain>
+</CycloneDDS>

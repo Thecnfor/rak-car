@@ -1,0 +1,7 @@
+# Aveo SP2812 cameras (vendor 1871:0110) - 通过 devpath 区分前后
+# /etc/udev/rules.d/99-usbvideo.rules
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1871", ATTRS{idProduct}=="0110", ENV{ID_PATH}=="*usb-3*", SYMLINK+="cam3"
+SUBSYSTEM=="video4linux", ATTRS{idVendor}=="1871", ATTRS{idProduct}=="0110", ENV{ID_PATH}=="*usb-4*", SYMLINK+="cam4"
+
+# 警告:USB devpath 在 Jetson 上需实际确认,先用这个占位,T15 hw smoke 时根据
+# `udevadm info /dev/videoX` 调整
