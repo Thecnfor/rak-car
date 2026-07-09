@@ -79,16 +79,20 @@ class MC602(serial.Serial):
     def ping_rx(self, time_out: float = 0.05) -> bool:
         """探测 MC602 是否在响应。SDK `serial_wrap.py:248-257`。
 
-        用 `02 01 10`(dev=0x10, mode=0, port=0)试探(SDK 用的内置 ping)。
+        SDK 关键细节:ping 帧 `77 68 04 00 01 CA 01 0A` 必须通过 send_cmd() 再
+        包一层(变成 `77 68 0C 77 68 04 00 01 CA 01 0A 0A`),不能直接 write。
+        真硬件验证:SDK 1:1 字节通过 3 次 beep 测试。
         """
         time_start = time.time()
         while time.time() - time_start < time_out:
             self.reset_input_buffer()
             self.reset_output_buffer()
-            # SDK 风格的 ping 帧(已含头尾和长度)
-            self.write(bytes.fromhex('77 68 04 00 01 CA 01 0A'))  # SDK 头部用 0xCA01 探测
-            res = self.get_anwser(0.02)
+            # 通过 send_cmd() 包装 ping 帧(SDK serial_wrap.py:201 行为)
+            self.send_cmd(bytes.fromhex('77 68 04 00 01 CA 01 0A'))
+            res = self.get_anwser(cmd=None, time_out=0.03)
             if res is not None:
+                # 关闭 MC601 省电模式(SDK 行为,serial_wrap.py:205)
+                self.send_cmd(bytes.fromhex('77 68 03 00 02 67 0A'))
                 return True
         return False
 
