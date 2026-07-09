@@ -41,6 +41,14 @@ set(SRV_FILES
   "srv/ReadAnalog.srv"
   "srv/Buzzer.srv"
   "srv/PlayPredefined.srv"
+  "srv/ReadTouch.srv"
+  "srv/ReadUltrasonic.srv"
+  "srv/ReadAmbient.srv"
+  "srv/ReadBluetooth.srv"
+  "srv/ReadKey4.srv"
+  "srv/SetLed.srv"
+  "srv/SetNixie.srv"
+  "srv/ShowScreen.srv"
 )
 
 set(MSG_FILES

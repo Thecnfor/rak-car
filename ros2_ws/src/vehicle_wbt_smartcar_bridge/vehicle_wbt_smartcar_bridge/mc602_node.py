@@ -20,35 +20,52 @@ from rclpy.node import Node
 from std_msgs.msg import Header
 
 from vehicle_wbt_smartcar_hw import (
+    Ambient_2,
     ArmController,
     Battry_2,
+    BluetoothPad_2,
     BoardKey_2,
     Buzzer_2,
     EncoderMotors4_2,
     Infrared_2,
+    Key4Btn_2,
+    LedLight_2,
     Motor_2,
     Motors_2,
+    NixieTube_2,
     PoutD_2,
+    ScreenShow_2,
+    Sensor_Analog2_2,
     ServoBus_2,
     ServoPwm_2,
     Stepper_2,
+    Touch_2,
+    Ultrasonic_2,
     serial_mc602,
 )
 from vehicle_wbt_smartcar_msgs.msg import ButtonEvent, Melody, MelodyNote, RawState
 from vehicle_wbt_smartcar_msgs.srv import (
     Buzzer,
     PlayPredefined,
+    ReadAmbient,
     ReadAnalog,
     ReadBattery,
+    ReadBluetooth,
     ReadEncoders,
     ReadIR,
+    ReadKey4,
+    ReadTouch,
+    ReadUltrasonic,
     ResetEncoders,
     SetDcMotor,
     SetDout,
+    SetLed,
+    SetNixie,
     SetServoBus,
     SetServoPwm,
     SetStepper,
     SetWheels,
+    ShowScreen,
 )
 
 # Default path: ament-managed share dir (where data_files installs the YAML).
@@ -142,6 +159,17 @@ class MC602Node(Node):
         self._battery = Battry_2()
         self._buzzer = Buzzer_2()
         self._board_key = BoardKey_2()
+        # 新增设备:port-id keyed caches(避免每个 call 都新建实例)
+        self._touch_cache: dict[int, Touch_2] = {}
+        self._ultrasonic_cache: dict[int, Ultrasonic_2] = {}
+        self._ambient_cache: dict[int, Ambient_2] = {}
+        self._analog2_cache: dict[int, Sensor_Analog2_2] = {}
+        self._key4_cache: dict[int, Key4Btn_2] = {}
+        self._nixie_cache: dict[int, NixieTube_2] = {}
+        self._led_cache: dict[int, LedLight_2] = {}
+        # 全局单例类(无 port)
+        self._bluetooth = BluetoothPad_2()
+        self._screen = ScreenShow_2()
 
         # 状态缓存
         self._last_encoders = [0, 0, 0, 0]
@@ -165,6 +193,15 @@ class MC602Node(Node):
         self.create_service(ReadBattery, f'{SERVICE_PREFIX}/read_battery', self._on_read_battery)
         self.create_service(ReadAnalog, f'{SERVICE_PREFIX}/read_analog', self._on_read_analog)
         self.create_service(Buzzer, f'{SERVICE_PREFIX}/buzzer', self._on_buzzer)
+        # 新增 8 个 service(P 口 3 类 + 全局类 3 + 数字输出 1 + 屏幕 1)
+        self.create_service(ReadTouch, f'{SERVICE_PREFIX}/read_touch', self._on_read_touch)
+        self.create_service(ReadUltrasonic, f'{SERVICE_PREFIX}/read_ultrasonic', self._on_read_ultrasonic)
+        self.create_service(ReadAmbient, f'{SERVICE_PREFIX}/read_ambient', self._on_read_ambient)
+        self.create_service(ReadBluetooth, f'{SERVICE_PREFIX}/read_bluetooth', self._on_read_bluetooth)
+        self.create_service(ReadKey4, f'{SERVICE_PREFIX}/read_key4', self._on_read_key4)
+        self.create_service(SetLed, f'{SERVICE_PREFIX}/set_led', self._on_set_led)
+        self.create_service(SetNixie, f'{SERVICE_PREFIX}/set_nixie', self._on_set_nixie)
+        self.create_service(ShowScreen, f'{SERVICE_PREFIX}/show_screen', self._on_show_screen)
 
         # 2 topic publisher
         self._raw_pub = self.create_publisher(RawState, f'{SERVICE_PREFIX}/state/raw', 10)
@@ -290,10 +327,11 @@ class MC602Node(Node):
                 val = self._ir_right.no_act()
             else:
                 val = None
-            if val is None or not isinstance(val, list) or not val:
+            # SDK no_act() returns [dev_id, mode, port, value]; value is index 3
+            if val is None or not isinstance(val, list) or len(val) < 4:
                 raw = 0
             else:
-                raw = val[0]
+                raw = val[3]
             resp.distance_m = float(raw) / 1000.0
             if port == self.ports_cfg['ir']['left']:
                 self._last_ir_left = resp.distance_m
@@ -329,10 +367,11 @@ class MC602Node(Node):
             from vehicle_wbt_smartcar_hw import AnalogInput_2
             sensor = AnalogInput_2(port_id=int(req.port))
             val = sensor.no_act()
-            if val is None or not isinstance(val, list) or not val:
+            # SDK no_act() returns [dev_id, mode, port, value]; value is index 3
+            if val is None or not isinstance(val, list) or len(val) < 4:
                 resp.value = 0
             else:
-                resp.value = int(val[0])
+                resp.value = int(val[3])
             resp.success = True
         except Exception as e:
             self.get_logger().error(f'read_analog: {e}')
@@ -359,18 +398,17 @@ class MC602Node(Node):
                 # Battry_2.read() 内部已经 /1000 转伏,不要再除
                 self._last_battery = float(v)
             ir_l = self._ir_left.no_act()
-            if ir_l and isinstance(ir_l, list) and ir_l:
-                self._last_ir_left = float(ir_l[0]) / 1000.0
+            if ir_l and isinstance(ir_l, list) and len(ir_l) >= 4:
+                self._last_ir_left = float(ir_l[3]) / 1000.0
             ir_r = self._ir_right.no_act()
-            if ir_r and isinstance(ir_r, list) and ir_r:
-                self._last_ir_right = float(ir_r[0]) / 1000.0
-            # 板载按钮:检测 false→true 边沿 → publish 一次 ButtonEvent
+            if ir_r and isinstance(ir_r, list) and len(ir_r) >= 4:
+                self._last_ir_right = float(ir_r[3]) / 1000.0
+            # 板载按钮:SDK BoardKey_2.no_act() 返回 [mode, value],value is index 1
             k = self._board_key.no_act()
-            current_key = bool(k) if k is not None else False
+            current_key = bool(k[1]) if (k is not None and isinstance(k, list) and len(k) >= 2) else False
             if self._last_board_key is not None and current_key != self._last_board_key:
-                # 边沿事件:变化时发
                 ev = ButtonEvent()
-                ev.pressed = current_key  # true=按下, false=松开
+                ev.pressed = current_key
                 self._button_event_pub.publish(ev)
                 self.get_logger().info(f'board key edge: pressed={current_key}')
             self._last_board_key = current_key
@@ -397,6 +435,110 @@ class MC602Node(Node):
         msg = Header()
         msg.stamp = self.get_clock().now().to_msg()
         self._heartbeat_pub.publish(msg)
+
+    # ---- 新增 8 个 service handler ----
+
+    def _get_or_create(self, cache: dict, cls, port: int):
+        """per-port device cache(避免每个 service call 新建实例)"""
+        if port not in cache:
+            cache[port] = cls(port_id=port)
+        return cache[port]
+
+    def _on_read_touch(self, req, resp):
+        try:
+            dev = self._get_or_create(self._touch_cache, Touch_2, int(req.port))
+            val = dev.no_act()
+            pressed = bool(val[3]) if (val and len(val) >= 4) else False
+            resp.pressed = pressed
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'read_touch: {e}')
+            resp.pressed = False
+            resp.success = False
+        return resp
+
+    def _on_read_ultrasonic(self, req, resp):
+        try:
+            dev = self._get_or_create(self._ultrasonic_cache, Ultrasonic_2, int(req.port))
+            val = dev.no_act()
+            raw_mm = val[3] if (val and len(val) >= 4) else 0
+            resp.distance_m = float(raw_mm) / 1000.0  # mm → m
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'read_ultrasonic: {e}')
+            resp.distance_m = 0.0
+            resp.success = False
+        return resp
+
+    def _on_read_ambient(self, req, resp):
+        try:
+            dev = self._get_or_create(self._ambient_cache, Ambient_2, int(req.port))
+            val = dev.no_act()
+            resp.value = int(val[3]) if (val and len(val) >= 4) else 0
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'read_ambient: {e}')
+            resp.value = 0
+            resp.success = False
+        return resp
+
+    def _on_read_bluetooth(self, req, resp):
+        try:
+            data = self._bluetooth.get_stick()
+            if data is None or len(data) < 5:
+                resp.lx = resp.ly = resp.rx = resp.ry = 0.0
+                resp.btn = 0
+                resp.success = False
+            else:
+                resp.lx, resp.ly, resp.rx, resp.ry, resp.btn = data[0], data[1], data[2], data[3], data[4]
+                resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'read_bluetooth: {e}')
+            resp.lx = resp.ly = resp.rx = resp.ry = 0.0
+            resp.btn = 0
+            resp.success = False
+        return resp
+
+    def _on_read_key4(self, req, resp):
+        try:
+            dev = self._get_or_create(self._key4_cache, Key4Btn_2, int(req.port))
+            key = dev.read()
+            resp.key = int(key) if key is not None else 0
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'read_key4: {e}')
+            resp.key = 0
+            resp.success = False
+        return resp
+
+    def _on_set_led(self, req, resp):
+        try:
+            dev = self._get_or_create(self._led_cache, LedLight_2, int(req.port))
+            dev.set_light(int(req.led_id), int(req.r), int(req.g), int(req.b))
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'set_led: {e}')
+            resp.success = False
+        return resp
+
+    def _on_set_nixie(self, req, resp):
+        try:
+            dev = self._get_or_create(self._nixie_cache, NixieTube_2, int(req.port))
+            dev.set_number(int(req.num))
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'set_nixie: {e}')
+            resp.success = False
+        return resp
+
+    def _on_show_screen(self, req, resp):
+        try:
+            self._screen.show(req.text)
+            resp.success = True
+        except Exception as e:
+            self.get_logger().error(f'show_screen: {e}')
+            resp.success = False
+        return resp
 
     # ---- 旋律播放(topic + service) ----
 

@@ -1,0 +1,5 @@
+# P 口触摸按键读
+uint8 port
+---
+bool pressed
+bool success

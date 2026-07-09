@@ -254,9 +254,164 @@ class Sensor_Analog2_2(DevCmdInterface):
 class BoardKey_2(DevCmdInterface):
     def __init__(self) -> None:
         super().__init__(**ctl602_dev_list["board_key"])
-    
+
     def no_act(self):
         return super().no_act()[1:]
+
+
+# === P 口 0x07 不同 mode 的子类(触摸/超声/环境光) ===
+class Touch_2(DevCmdInterface):
+    """P 口触摸按键 mode=2。读返回 0/1。"""
+    def __init__(self, port_id=None) -> None:
+        super().__init__(**ctl602_dev_list["sensor_touch"], port_id=port_id)
+
+
+class Ultrasonic_2(DevCmdInterface):
+    """P 口超声波测距 mode=3。返回 mm(0~65535)。"""
+    def __init__(self, port_id=None) -> None:
+        super().__init__(**ctl602_dev_list["sensor_ultrasonic"], port_id=port_id)
+
+
+class Ambient_2(DevCmdInterface):
+    """P 口环境光传感器 mode=4。返回 0~4095 亮度值。"""
+    def __init__(self, port_id=None) -> None:
+        super().__init__(**ctl602_dev_list["sensor_ambient_light"], port_id=port_id)
+
+
+# === 第二路模拟 0x08 ===
+class Sensor_Analog2_2(DevCmdInterface):
+    """dev_id=0x08 第二路通用 ADC 输入(0~4095)。"""
+    def __init__(self, port_id=None) -> None:
+        super().__init__(**ctl602_dev_list["sensor_analog_a"], port_id=port_id)
+
+    def read(self):
+        return self.no_act()
+
+
+# === 4 键按键板 Key4Btn_2(继承 AnalogInput_2,带查表 + 状态机) ===
+KEY_MAP_4BTN = {3: 355, 1: 1366, 2: 2137, 4: 2988}  # ADC 中值 → 按键编号
+
+
+class Key4Btn_2(AnalogInput_2):
+    """P 口 4 键按键板。继承 AnalogInput_2,读 ADC 后查表返回按键编号 1~4/0。
+
+    实硬件测试中用作人工调试(机械臂上下左右)。
+    """
+    btn_sta = []  # class-level state,SDK 也有
+    state = []
+
+    def __init__(self, port_id=4) -> None:
+        super().__init__(port_id=port_id)
+        self.threshold = 300  # ADC 偏差容差
+
+    def _closest_key(self, adc: int) -> int:
+        """ADC → 按键编号 1~4,误差大返回 0。"""
+        if abs(adc) < 100:  # 没按
+            return 0
+        for key_id, mid in KEY_MAP_4BTN.items():
+            if abs(adc - mid) < self.threshold:
+                return key_id
+        return 0
+
+    def no_act(self, port_id=None) -> list:
+        raw = super().no_act(port_id=port_id)
+        # raw = [dev_id, mode, port, value]
+        if raw is None or len(raw) < 4:
+            return [0, 0]
+        # 返回 [key1, key2] 模拟 SDK 行为(2 键 bit field)
+        v = raw[3]
+        return [(v >> 0) & 1, (v >> 1) & 1]
+
+    def read(self) -> int:
+        """返回 1/2/3/4 表示按下了哪个键,0 表示松开。"""
+        raw = super().no_act()
+        if raw is None or len(raw) < 4:
+            return 0
+        return self._closest_key(raw[3])
+
+
+# === 蓝牙手柄 BluetoothPad_2(dev_id=0x09) ===
+class BluetoothPad_2(DevCmdInterface):
+    """蓝牙手柄。读返回 [left_x, left_y, right_x, right_y, btn_bitmask](归一化到 [-1, 1])。
+
+    SDK 协议:format='BBBBi' = 4 byte sticks + 4 byte button bitmask (int32)。
+    """
+    def __init__(self) -> None:
+        super().__init__(**ctl602_dev_list["bluetooth"])
+        self.throsheld_mid = [97, 97, 97, 97, 0]
+        self.stick_min = 40
+        self.stick_max = 160
+        self.divisor_min = [42, 42, 42, 42]
+        self.divisor_max = [56, 56, 56, 56]
+        self.margin = 6
+
+    def calibrate(self):
+        info = self.no_act()
+        if info is None or len(info) < 4:
+            return
+        for i in range(4):
+            if abs(info[i] - self.throsheld_mid[i]) < 10:
+                self.throsheld_mid[i] = info[i]
+        for i in range(4):
+            self.divisor_max[i] = self.stick_max - self.throsheld_mid[i] - self.margin
+            self.divisor_min[i] = self.throsheld_mid[i] - self.stick_min - self.margin
+
+    def get_stick(self) -> list:
+        """返回 [lx, ly, rx, ry, btn_int32] (归一化 -1~1 + 按键 bitmask)。"""
+        data = self.no_act()
+        if data is None or len(data) < 5:
+            return [0.0, 0.0, 0.0, 0.0, 0]
+        re_data = []
+        for i in range(4):
+            tmp = float(data[i] - self.throsheld_mid[i])
+            if abs(tmp) < self.margin:
+                tmp = 0.0
+            elif tmp > 0:
+                tmp = (tmp - self.margin) / max(self.divisor_max[i], 1)
+            else:
+                tmp = (tmp + self.margin) / max(self.divisor_min[i], 1)
+            tmp = max(-1.0, min(1.0, tmp))
+            re_data.append(tmp)
+        re_data.append(int(data[4]))
+        return re_data
+
+
+# === LED 灯条 LedLight_2(dev_id=0x0e) ===
+class LedLight_2(DevCmdInterface):
+    """LED 灯条。set_light(led_id, r, g, b) 设置单个 LED 颜色(RGB 0~255)。"""
+    def __init__(self, port_id=None) -> None:
+        super().__init__(**ctl602_dev_list["led_light"], port_id=port_id)
+
+    def set_light(self, led_id: int, r: int, g: int, b: int, port_id: int | None = None):
+        return super().set(led_id, int(r), int(g), int(b), port_id=port_id)
+
+    def set(self, *args, port_id: int | None = None):  # noqa: A003
+        return super().set(*args, port_id=port_id)
+
+
+# === 数码管 NixieTube_2(dev_id=0x0f) ===
+class NixieTube_2(DevCmdInterface):
+    """数码管显示整数(0~9999)。"""
+    def __init__(self, port_id=None) -> None:
+        super().__init__(**ctl602_dev_list["nixietube"], port_id=port_id)
+
+    def set_number(self, num: int, port_id: int | None = None):
+        return super().set(int(num), port_id=port_id)
+
+
+# === 屏幕 ScreenShow_2(dev_id=0x0b) ===
+class ScreenShow_2(DevCmdInterface):
+    """屏幕显示 ASCII 字符串(最多 100 字符)。"""
+    def __init__(self) -> None:
+        super().__init__(**ctl602_dev_list["led_show"])
+
+    def show(self, text):
+        if not isinstance(text, str):
+            text = str(text)
+        # 截断到 100 字符(ScreenShow 协议是 101 字节 = 1 dev_id + 100 ASCII)
+        text = text[:100]
+        int_values = tuple(ord(c) for c in text)
+        self.set(*int_values)
 
 class Motor4_2(DevCmdInterface):
     def __init__(self) -> None:

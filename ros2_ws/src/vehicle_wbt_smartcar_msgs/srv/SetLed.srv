@@ -1,0 +1,8 @@
+# LED 灯条设置单个 LED 颜色
+uint8 led_id
+uint8 r
+uint8 g
+uint8 b
+uint8 port
+---
+bool success

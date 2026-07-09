@@ -1,0 +1,8 @@
+# 蓝牙手柄读(归一化 -1~1 + 按键 bitmask)
+---
+float32 lx
+float32 ly
+float32 rx
+float32 ry
+int32 btn
+bool success

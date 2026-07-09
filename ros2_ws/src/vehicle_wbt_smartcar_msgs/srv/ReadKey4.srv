@@ -1,0 +1,5 @@
+# 4 键按键板读(0=松开,1/2/3/4=按下的键)
+uint8 port
+---
+int8 key
+bool success

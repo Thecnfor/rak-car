@@ -1,0 +1,5 @@
+# P 口超声波测距(返回米)
+uint8 port
+---
+float32 distance_m
+bool success

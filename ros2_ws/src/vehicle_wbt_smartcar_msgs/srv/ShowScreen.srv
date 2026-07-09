@@ -1,0 +1,4 @@
+# 屏幕显示 ASCII 文本
+string text
+---
+bool success

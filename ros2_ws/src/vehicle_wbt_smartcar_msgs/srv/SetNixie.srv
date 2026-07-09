@@ -1,0 +1,5 @@
+# 数码管显示整数
+uint8 port
+int32 num
+---
+bool success
