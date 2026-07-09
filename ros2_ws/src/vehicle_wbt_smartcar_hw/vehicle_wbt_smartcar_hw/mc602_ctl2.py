@@ -313,21 +313,14 @@ class Key4Btn_2(AnalogInput_2):
                 return key_id
         return 0
 
-    def no_act(self, port_id=None) -> list:
+    def no_act(self, port_id=None) -> int:
         raw = super().no_act(port_id=port_id)
-        # raw = [dev_id, mode, port, value]
-        if raw is None or len(raw) < 4:
-            return [0, 0]
-        # 返回 [key1, key2] 模拟 SDK 行为(2 键 bit field)
-        v = raw[3]
-        return [(v >> 0) & 1, (v >> 1) & 1]
+        # SDK 实际 no_act() 返回 int (value 字段),不是 [dev_id, mode, port, value]
+        return int(raw) if raw is not None else 0
 
     def read(self) -> int:
         """返回 1/2/3/4 表示按下了哪个键,0 表示松开。"""
-        raw = super().no_act()
-        if raw is None or len(raw) < 4:
-            return 0
-        return self._closest_key(raw[3])
+        return self._closest_key(self.no_act())
 
 
 # === 蓝牙手柄 BluetoothPad_2(dev_id=0x09) ===

@@ -327,12 +327,9 @@ class MC602Node(Node):
                 val = self._ir_right.no_act()
             else:
                 val = None
-            # SDK no_act() returns [dev_id, mode, port, value]; value is index 3
-            if val is None or not isinstance(val, list) or len(val) < 4:
-                raw = 0
-            else:
-                raw = val[3]
-            resp.distance_m = float(raw) / 1000.0
+            # SDK no_act() for bbH format returns the unpacked value (int mm)
+            raw_mm = int(val) if val is not None else 0
+            resp.distance_m = float(raw_mm) / 1000.0
             if port == self.ports_cfg['ir']['left']:
                 self._last_ir_left = resp.distance_m
             else:
@@ -367,11 +364,8 @@ class MC602Node(Node):
             from vehicle_wbt_smartcar_hw import AnalogInput_2
             sensor = AnalogInput_2(port_id=int(req.port))
             val = sensor.no_act()
-            # SDK no_act() returns [dev_id, mode, port, value]; value is index 3
-            if val is None or not isinstance(val, list) or len(val) < 4:
-                resp.value = 0
-            else:
-                resp.value = int(val[3])
+            # SDK no_act() for bbH format returns the unpacked value (int ADC 0-4095)
+            resp.value = int(val) if val is not None else 0
             resp.success = True
         except Exception as e:
             self.get_logger().error(f'read_analog: {e}')
@@ -398,14 +392,15 @@ class MC602Node(Node):
                 # Battry_2.read() 内部已经 /1000 转伏,不要再除
                 self._last_battery = float(v)
             ir_l = self._ir_left.no_act()
-            if ir_l and isinstance(ir_l, list) and len(ir_l) >= 4:
-                self._last_ir_left = float(ir_l[3]) / 1000.0
+            # SDK no_act() for bbH format returns int (mm). Convert to meters.
+            self._last_ir_left = float(int(ir_l) if ir_l is not None else 0) / 1000.0
             ir_r = self._ir_right.no_act()
-            if ir_r and isinstance(ir_r, list) and len(ir_r) >= 4:
-                self._last_ir_right = float(ir_r[3]) / 1000.0
-            # 板载按钮:SDK BoardKey_2.no_act() 返回 [mode, value],value is index 1
+            self._last_ir_right = float(int(ir_r) if ir_r is not None else 0) / 1000.0
+            # 板载按钮:SDK BoardKey_2.no_act() 返回 int ADC 值
+            # no-press 基线 ~3974,按键时 355/1366/2137/2988
+            # threshold: ADC < 3500 = 有键按下
             k = self._board_key.no_act()
-            current_key = bool(k[1]) if (k is not None and isinstance(k, list) and len(k) >= 2) else False
+            current_key = (k < 3500) if k is not None else False
             if self._last_board_key is not None and current_key != self._last_board_key:
                 ev = ButtonEvent()
                 ev.pressed = current_key
@@ -448,8 +443,8 @@ class MC602Node(Node):
         try:
             dev = self._get_or_create(self._touch_cache, Touch_2, int(req.port))
             val = dev.no_act()
-            pressed = bool(val[3]) if (val and len(val) >= 4) else False
-            resp.pressed = pressed
+            # SDK no_act() returns int (0/1)
+            resp.pressed = bool(int(val)) if val is not None else False
             resp.success = True
         except Exception as e:
             self.get_logger().error(f'read_touch: {e}')
@@ -461,8 +456,9 @@ class MC602Node(Node):
         try:
             dev = self._get_or_create(self._ultrasonic_cache, Ultrasonic_2, int(req.port))
             val = dev.no_act()
-            raw_mm = val[3] if (val and len(val) >= 4) else 0
-            resp.distance_m = float(raw_mm) / 1000.0  # mm → m
+            # SDK no_act() returns int (mm)
+            raw_mm = int(val) if val is not None else 0
+            resp.distance_m = float(raw_mm) / 1000.0
             resp.success = True
         except Exception as e:
             self.get_logger().error(f'read_ultrasonic: {e}')
@@ -474,7 +470,8 @@ class MC602Node(Node):
         try:
             dev = self._get_or_create(self._ambient_cache, Ambient_2, int(req.port))
             val = dev.no_act()
-            resp.value = int(val[3]) if (val and len(val) >= 4) else 0
+            # SDK no_act() returns int (ADC 0-4095)
+            resp.value = int(val) if val is not None else 0
             resp.success = True
         except Exception as e:
             self.get_logger().error(f'read_ambient: {e}')
