@@ -1,0 +1,19 @@
+[Unit]
+Description=RAK-Car MC602 IO Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jetson
+EnvironmentFile=/etc/vehicle-wbt/ros.env
+# 等待 /dev/ttyUSB* 出现(USB CH340 串口模块冷启动可能慢)
+ExecStartPre=/bin/bash -c 'for i in 1 2 3 4 5 6 7 8 9 10; do [ -e /dev/ttyUSB1 ] && exit 0; sleep 1; done; exit 1'
+ExecStart=/bin/bash -c 'source /opt/ros/humble/setup.bash && source /home/jetson/workspace/rak-car/ros2_ws/install/setup.bash && exec ros2 launch vehicle_wbt_smartcar_bridge mc602.launch.py serial_port:=/dev/ttyUSB1 baud:=1000000'
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
