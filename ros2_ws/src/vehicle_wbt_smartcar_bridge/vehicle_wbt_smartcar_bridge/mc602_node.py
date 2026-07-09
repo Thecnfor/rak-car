@@ -24,11 +24,11 @@ from vehicle_wbt_smartcar_hw import (
     ArmController,
     Battry_2,
     BluetoothPad_2,
-    BoardKey_2,
     Buzzer_2,
     EncoderMotors4_2,
     Infrared_2,
     Key4Btn_2,
+    Sensor_Analog2_2,
     LedLight_2,
     Motor_2,
     Motors_2,
@@ -153,8 +153,9 @@ class MC602Node(Node):
         self._shooter = PoutD_2(port_id=shooter_cfg['barrel']['port'])
 
         ir_cfg = self.ports_cfg['ir']
-        self._ir_left = Infrared_2(port_id=ir_cfg['left'])
-        self._ir_right = Infrared_2(port_id=ir_cfg['right'])
+        # IR sensors wired to A1/A2 (Sensor_Analog2_2, dev_id 0x08, raw ADC)
+        self._ir_left = Sensor_Analog2_2(port_id=ir_cfg['left'])
+        self._ir_right = Sensor_Analog2_2(port_id=ir_cfg['right'])
 
         self._battery = Battry_2()
         self._buzzer = Buzzer_2()
@@ -175,6 +176,8 @@ class MC602Node(Node):
         self._last_encoders = [0, 0, 0, 0]
         self._last_ir_left = 0.0
         self._last_ir_right = 0.0
+        self._last_ir_left_adc = 0
+        self._last_ir_right_adc = 0
         self._last_battery = 0.0
         self._pump_state = False
         self._valve_state = False
@@ -327,13 +330,12 @@ class MC602Node(Node):
                 val = self._ir_right.no_act()
             else:
                 val = None
-            # SDK no_act() for bbH format returns the unpacked value (int mm)
-            raw_mm = int(val) if val is not None else 0
-            resp.distance_m = float(raw_mm) / 1000.0
-            if port == self.ports_cfg['ir']['left']:
-                self._last_ir_left = resp.distance_m
-            else:
-                self._last_ir_right = resp.distance_m
+            # Sensor_Analog2_2 returns raw ADC int (0-4095). Service exposes it as
+            # distance_m (NOT actually meters) for backward-compat with old
+            # interface; application layer should convert ADC to distance
+            # using sensor-specific calibration curve.
+            adc = int(val) if val is not None else 0
+            resp.distance_m = float(adc)
             resp.success = True
         except Exception as e:
             self.get_logger().error(f'read_ir: {e}')
@@ -391,11 +393,18 @@ class MC602Node(Node):
             if v is not None:
                 # Battry_2.read() 内部已经 /1000 转伏,不要再除
                 self._last_battery = float(v)
-            ir_l = self._ir_left.no_act()
-            # SDK no_act() for bbH format returns int (mm). Convert to meters.
-            self._last_ir_left = float(int(ir_l) if ir_l is not None else 0) / 1000.0
-            ir_r = self._ir_right.no_act()
-            self._last_ir_right = float(int(ir_r) if ir_r is not None else 0) / 1000.0
+            # IR sensors (analog A1/A2): SDK Sensor_Analog2_2 returns raw ADC int.
+            # Application layer needs to convert ADC to distance (sensor-specific).
+            # For now: store raw ADC in ir_left_adc / ir_right_adc; ir_left_m / ir_right_m
+            # are 0 since raw ADC isn't in meters.
+            ir_l_raw = self._ir_left.no_act()
+            ir_l_adc = int(ir_l_raw) if ir_l_raw is not None else 0
+            self._last_ir_left_adc = ir_l_adc
+            self._last_ir_left = 0.0  # No calibration; set to 0 until app layer converts
+            ir_r_raw = self._ir_right.no_act()
+            ir_r_adc = int(ir_r_raw) if ir_r_raw is not None else 0
+            self._last_ir_right_adc = ir_r_adc
+            self._last_ir_right = 0.0
             # 板载按钮:SDK BoardKey_2.no_act() 返回 [mode, value] 2-tuple
             # no-press value=0,按下 value>0
             k = self._board_key.no_act()
@@ -417,6 +426,8 @@ class MC602Node(Node):
         msg.encoders = self._last_encoders
         msg.ir_left_m = self._last_ir_left
         msg.ir_right_m = self._last_ir_right
+        msg.ir_left_adc = self._last_ir_left_adc
+        msg.ir_right_adc = self._last_ir_right_adc
         msg.battery_v = self._last_battery
         msg.arm_y_pos = 0
         msg.arm_x_pos = 0
