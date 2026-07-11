@@ -24,8 +24,8 @@
 
 wbt_car: 0.1
 camera:
-  front: 4
-  side: 3
+  front: 2
+  side: 1
 io:
   left_sensor: 8
   right_sensor: 7

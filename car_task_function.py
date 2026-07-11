@@ -32,14 +32,16 @@ import math
 """
 
 
-def init():
+def init(reset_arm=False):
     time.sleep(1)
     global my_car
     my_car = MyCar()
     my_car.STOP_PARAM = False
     my_car.beep()
     time.sleep(1)
-    my_car.arm.reset_position()
+    # 安全起见，默认不做机械臂复位，避免零位/限位未校准时顶死舵机
+    if reset_arm:
+        my_car.arm.reset_position()
     my_car.reset_position()  #
 
 def auto_lane_tracing(speed=0.3, dis_hold=0.85):
