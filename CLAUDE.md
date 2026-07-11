@@ -2,129 +2,70 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Project Overview
+## What this repo is
 
-Python robotics project for an autonomous vehicle robot running on NVIDIA Jetson. The robot performs lane following, object detection, robotic arm manipulation, food sorting, and AI-powered natural language interaction. Runs as a systemd service (`py_boot.service`) at boot.
+Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (smart-agriculture) track — a Jetson Nano + MC602 controller running on a WhalesBot mecanum-wheel chassis. A single run executes **8 fixed-order tasks** (seed → scout pests → water → shoot pests → harvest → sort → read order via OCR → deliver). The repo is a frozen-for-competition codebase; per-track calibration happens in `config_car.yml` and the odometry offsets hardcoded inside `car_task_function.py`.
 
-## Running
+## Run / build commands
 
-No build step — pure Python. The inference backend must be running separately before task scripts.
+There are no build steps, no tests, no linter, and no `requirements.txt`. The runtime is Python 3.8+ on a Jetson Nano with PaddlePaddle Inference (CPU/CUDA or TensorRT, configured via `config_car.yml → infer_cfg[].run_mode`).
 
-```bash
-# Start inference server (must run first, serves ZMQ on ports 5001-5004)
-python infer_cs/base/infer_back_end.py
+- **Full mission**: `python car_start_2026.py`
+- **Single task**: comment out the other steps inside `car_start_2026.main()` (see README §"单独测试某个任务")
+- **Test lane-only traversal**: call `auto_lane_tracing(speed=0.3, dis_hold=99)` from a REPL after `init()` — `dis_hold=99` means "follow the lane until you lose it or hit the base"
+- **Data collection (two-cam over LAN)**: `python collect_data.py`, then browse `http://<car-ip>:5000/`. Bluetooth gamepad; key `3` collects lane frames into `./dataset/image_set_lane/`, key `4` collects object frames into `./dataset/image_set_object/`. Both dirs are gitignored (`**/dataset/`).
+- **Convert collected frames to COCO**: `smartcar/whalesbot/tools/x2coco.py`
 
-# Primary boot entry point (also the systemd service target)
-python main/qqq.py
+The four ZMQ inference backends (ports 5001–5004, see below) are **auto-spawned** the first time `MyCar()` is constructed — you should not start them by hand.
 
-# Competition entry points
-python main/main.py
-python car_start.py
-python important_car.py
+## Big-picture architecture
 
-# HRI robot face display (PySide2/QML)
-python main/hri/main.py
+### Three layers, top-down
 
-# Install systemd auto-start service
-sudo bash main/boot_py.sh
-```
+1. **Competition orchestration** (root-level scripts)
+   - `car_start_2026.py` — thin `main()` that calls `init()` then each task in sequence.
+   - `car_task_function.py` — the 8 task functions. Each is mostly a hand-tuned sequence of `my_car.move_to_position(...)`, `my_car.move_to_detection_target()`, `my_car.arm.grasp(...)`, etc. Coordinates here (e.g. `cylinder_loc` in `auto_seeding`) are *track-specific magic numbers* — they are the calibration surface when porting to a different venue.
+   - `car_wrap_2026.py` — defines `class MyCar(MecanumDriver)`. This is the single facade the task layer talks to. `init()` in `car_task_function.py` constructs it as the global `my_car`. Construction order is: chassis → screen → streamer → arm → sensor (`Key4Btn`, `ServoPwm` for storage, `BluetoothPad`, `PoutD` for shooter) → PID → cameras → paddle infer → ERNIE bot → key-press daemon thread.
 
-No formal test framework or linter configuration exists. Test files are in `vehicle/test/`.
+2. **WhalesBot hardware SDK** (`smartcar/whalesbot/`)
+   - `vehicle/driver/mecanum.py` + `vehicle_base.py` — `MecanumDriver` (base of `MyCar`), implements `move_for`, `move_to_position` (waypoint with `location_pid`), `get_odometry`, `lane_dis_offset` (follow lane for `dis_hold` meters), and chassis geometry from `cfg_vehicle.yaml` (`track=0.30`, `wheel_base=0.28`).
+   - `vehicle/arm/arm_base.py` — `ArmController`: `reset_position`, `set_arm_pose(arm_id, pitch, "LEFT"/"RIGHT", "UP"/"DOWN")`, `grasp(bool)` (vacuum on/off), `move_x_position`, `move_y_position`. Poses referenced by string direction constants, not by joint angles — look up enum in `arm_base.py` before adding joints.
+   - `vehicle/base/controller_wrap.py` — per-pin peripherals (`Beep`, `Key4Btn`, `Infrared`, `NixieTube`, `ServoPwm`, `BluetoothPad`, `PoutD`, `Motor4`, `Battry`, etc.) wired to MC602 serial via `serial_wrap.py` / `mc602_ctl2.py`.
+   - `tools/` — `Camera`, `Streamer` (Flask-based LAN preview on `:5000`), `logger` (write to `.remember/logs/`), `PID` / `PidWrap`, `CountRecord`, `IndexWrap`, `CollectControlCar`.
 
-## Critical Warnings
+3. **PaddlePaddle inference** (`smartcar/paddlebaidu/`)
+   - `paddle_jetson/base/infer_wrap.py` — *the local wrapper*. Three classes are what `MyCar` consumes: `YoloeInfer`, `LaneInfer`, `OCRReco`. Each loads Paddle weights from `smartcar/paddlebaidu/models/<dir>/` and supports `paddle` / `trt_fp32` / `trt_fp16` run modes.
+   - `paddle_jetson/base/deploy/` — **vendored upstream PaddleDetection**. Read-only. New inference code goes in the wrapper layer above, not here.
+   - `infer_cs/base/infer_back_end.py` — `InferServer`: spins up one ZMQ REQ/REP per entry in `config_car.yml → infer_cfg`, each in a daemon thread on its configured port.
+   - `infer_cs/base/infer_front.py` — `ClintInterface(name)`: ZMQ client. **First-time construction triggers `check_back_python()` → `subprocess.Popen("python3 infer_back_end.py &")`** if the backend isn't already running, then polls `get_state()` until ready.
+   - `ernie_bot/base/ernie_bot_wrap.py` — `ErnieBotWrap` with prompt subclasses `HumAttrPrompt`, `ActionPrompt`, `ImagePrompt`, `OrderPrompt`. Used by `get_order()` and other NLP-driven steps. Auth token is `config_car.yml → ernie_access_token`.
 
-**Never run `eval()` on LLM output.** `ernie_bot/base/answer.py` lines 95/122/144 use `eval(answer)` — this is a known security vulnerability. Use `json.loads()` instead.
+### Data-flow during a typical task
 
-**Never add bare `except:` clauses.** Several exist in the codebase — always use `except Exception as e:` with logging.
+`my_car.cap_side.read()` → image → `my_car.task_det(img)` (REQs `tcp://127.0.0.1:5002`) → JSON boxes back → `my_car.get_detection_results()` → `Bbox` objects with normalised `pos_from_center()` → used as the error signal for a PD loop that drives `move_to_detection_target()`. OCR uses port 5004 with no resize (`img_size: Null`). Lane following uses port 5001 (`img_size: [128,128]`) and is consumed by `lane_dis_offset` in the chassis layer.
 
-**Never replace error conditions with `while True: time.sleep(1)`.** This pattern appears in `serial_wrap.py`, `controller_wrap.py`, and `vehicle_base.py` — it hangs the program forever. Raise exceptions or return error codes instead.
+## Configuration surface
 
-**Never hardcode API keys/secrets in source.** Several exist — use environment variables or `.env` files.
+All knobs live in **`config_car.yml`** at repo root:
 
-**Never use `eval(chassis_type)` from config.** `vehicle_base.py:309` does this — use a dict lookup instead.
+| Block | What it controls | When to touch |
+| --- | --- | --- |
+| `camera.front/side` | OpenCV video indices for the two cams | Camera re-plug |
+| `speed.{x,y,angle}.limit` | Hard saturation on velocity commands in `m/s` or `rad/s` | Need to slow down for unstable tracking |
+| `lane_pid` / `det_pid` (cfg_pid_y, cfg_pid_angle) | PD gains used by `lane_dis_offset` and detection-following | Lighting/reflectivity changes the lane response |
+| `location_pid` (pid_x, pid_y) | Used by `move_to_position` waypoint control | Drift in odometry |
+| `infer_cfg[]` | One entry per model: `name`, `infer_type` (must match class name in `infer_wrap.py`), `model_dir` (relative to `models/`), `port`, `img_size`, `run_mode` | Adding a new model or switching to TensorRT |
+| `ernie_access_token` | Baidu ERNIE API bearer token | Rotating credentials |
 
-## Architecture
+For chassis geometry (`track`, `wheel_base`) and per-motor velocity PID, see `smartcar/whalesbot/vehicle/driver/cfg_vehicle.yaml` — these rarely change.
 
-Six-layer design, bottom-up:
+## Conventions and gotchas
 
-**Hardware Drivers** (`vehicle/base/`) — Serial communication with MC601/MC602 motor controllers via USB/CH340. `controller_wrap.py` wraps Motors, ServoBus, Infrared, LedLight, Beep, StepperWrap, etc. `serial_wrap.py` auto-detects controller type (MC601 at 380400 baud, MC602 at 1000000 baud, MC602 wireless at 115200 baud). MC601 encoders are **simulated** (velocity×time integration); MC602 encoders are **real hardware** values.
-
-**Vehicle Kinematics** (`vehicle/driver/`) — `CarBase` with pluggable chassis: Mecanum, Diff2, Diff4, Tricycle. Dead-reckoning odometry from wheel encoders. Forward/inverse kinematics. Velocity PID control.
-
-**Perception** (`camera/`, `infer_cs/`, `paddle_jetson/`) — Camera captures from `/dev/cam*`. ZMQ client-server inference: `ClintInterface` sends images to `InferServer` which hosts PaddlePaddle models (YOLOE detection, lane segmentation, OCR, human attributes, MOT tracking).
-
-**Task Execution** (`task_func.py`, `car_wrap.py`) — `MyTask` controls arm/ejection/servos. `MyCar` (extends `CarBase`) adds lane-following PID, object-detection navigation, sensor navigation, target localization.
-
-**Application Scripts** (top-level `.py`, `main/`) — Competition scripts combining driving, detection, arm manipulation. Tasks: Hanoi tower, food sorting, plant watering, BMI analysis, object fetching. AI integration via ErnieBot/OpenAI for NL understanding.
-
-**HRI** (`main/hri/`) — PySide2/QML robot face display.
-
-## Key Classes
-
-- `MyCar` (`car_wrap.py`) — Central orchestrator: driving + perception + tasks. **1438-line God Object** — see docs/ for decomposition plan.
-- `CarBase` (`vehicle/driver/vehicle_base.py`) — Chassis kinematics and motor control
-- `ArmBase` (`vehicle/arm/arm_base.py`) — Robotic arm with stepper motors, servos, vacuum pump
-- `MyTask` / `Ejection` (`task_func.py`) — Task-level primitives. Uses two-phase `arm_set` pattern.
-- `ClintInterface` (`infer_cs/base/infer_front.py`) — ZMQ inference client. Auto-launches `infer_back_end.py` if not running.
-- `InferServer` (`infer_cs/base/infer_back_end.py`) — ZMQ inference server hosting models
-- `Camera` (`camera/base/camera.py`) — Threaded USB camera capture (daemon thread, no lock on `self.frame`)
-- `ErnieBotWrap` / `OpenAiWrap` (`ernie_bot/`) — LLM integration with JSON schema prompts
-
-## The `ctl_id` Global Dispatch Pattern
-
-This is the most pervasive architectural pattern. Every hardware class in `controller_wrap.py` holds both MC601 and MC602 instances and dispatches via a global `ctl_id` (0 or 1):
-
-```python
-ctl_id = get_devid()  # Set at import time, never changes
-
-class Motors():
-    def __init__(self, port_id):
-        self.motor_1 = Motor_1(port=port_id)   # MC601 impl
-        self.motor_2 = Motor_2(port_id=port_id) # MC602 impl
-
-    def set_speed(self, speed):
-        fucs = [self.motor_1.rotate, self.motor_2.set_speed]
-        fucs[ctl_id](speed)  # Global dispatch
-```
-
-This pattern repeats in 20+ classes (Motors, ServoBus, Infrared, Key4Btn, etc.). `NoneDev` is used as a placeholder for unsupported features on MC601 — calling its methods hangs forever.
-
-## Import Mechanics
-
-The project uses `sys.path.append` extensively (30+ occurrences) instead of proper package structure. Many `*/base/` subdirectories lack `__init__.py`. When adding new modules, follow the existing `sys.path.append(os.path.abspath(...))` pattern rather than trying to fix the package structure.
-
-**Import-time side effects:** Importing `vehicle` triggers serial port scanning (`serial_wrap.py:352`), controller detection (`controller_wrap.py:37`), and potentially firmware download. This means `import vehicle` cannot run without hardware connected.
-
-## Configuration Files
-
-- `config_car.yml` — Camera indices, IO pins, speed limits, PID params (lane/detection/location)
-- `vehicle/driver/cfg_vehicle.yaml` — Chassis type, wheel dimensions, velocity PID
-- `vehicle/arm/arm_cfg.yaml` — Arm motor ports, stepper/servo config, PID, limits
-- `infer_cs/base/infer.yaml` — Inference service definitions (ports 5001-5004)
-- `vehicle/base/mc602_cfg.yaml` — MC602 controller calibration
-
-Config loading is inconsistent: `config_car.yml` and `infer.yaml` use `get_yaml()` from `tools/`; others use `yaml.load()` directly. When modifying config, match the existing pattern for that file.
-
-## Inference Services
-
-| Name  | Type       | Port | Model              | Purpose            |
-|-------|------------|------|--------------------|--------------------|
-| lane  | LaneInfer  | 5001 | (built-in)         | Lane segmentation  |
-| task  | YoloeInfer | 5002 | task_wbt2025       | Task object detect |
-| front | YoloeInfer | 5003 | front_model2       | Front detection    |
-| ocr   | OCRReco    | 5004 | ch_PP-OCRv3_rec    | Text recognition   |
-
-## Competition Script Duplication
-
-The `main/` directory contains many near-copies of competition scripts (`qqq.py`, `main.py`, `finalall.py`, `scripy1-5.py`). Only `main/qqq.py` (systemd boot target) and `main/main.py` (most complete) are active. Functions like `get_key_by_value()` and `index_form` are copy-pasted across 15+ files.
-
-## Dependencies
-
-Python packages (pre-installed on Jetson): opencv-python, numpy, pyserial, simple_pid, paddlepaddle, erniebot, pyzmq, PySide2, psutil, PyYAML, jsonschema.
-
-## Detailed Documentation
-
-Comprehensive project docs are in `docs/` — see `docs/README.md` for the full index. Key topics:
-- `docs/hardware-comm.md` — MC601/MC602 frame formats, full command tables, encoding/decoding formulas
-- `docs/vehicle-system.md` — Mecanum kinematics formulas, odometry update algorithm
-- `docs/known-issues.md` — All known bugs, security issues, and technical debt with severity ratings
+- **Module alias `my_car`**: `car_task_function.py` declares `global my_car` inside `init()` and assumes every task function is called after `init()`. Don't import `my_car` directly; invoke through the top-level task functions.
+- **`STOP_PARAM = True` is a class var on `MyCar`** that gates emergency-stop checks. `init()` sets it to `False` before each run.
+- **No unit tests**; verification is *observed behaviour on the physical track*. New code paths should be exercised via `car_start_2026.py` with the upstream tasks commented out (see README workflow).
+- **Chinese-only comments**: most module/function docstrings are in Chinese — match the style when adding new code.
+- **`config_car.yml` uses `infer_type` strings that must exactly equal class names** in `infer_wrap.py` (`YoloeInfer`, `LaneInfer`, `OCRReco`). A typo silently produces `KeyError` at first inference. Adding a new type requires both the class and the YAML entry.
+- **OCR is two-stage** (`det_model_dir` + `rec_model_dir`); detection models use `model_dir`. `infer_back_end.py` branches on `InferType == OCRReco`.
+- **`smartcar/paddlebaidu/paddle_jetson/base/deploy/`** is a frozen vendor copy — don't edit. If you need a Paddle upstream change, bump the vendored copy and re-validate all four model classes.
+- **Dataset dirs are gitignored** (`**/dataset/`); collected images never enter version control.
