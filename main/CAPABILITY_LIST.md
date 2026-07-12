@@ -43,10 +43,13 @@
   - 读取底盘当前位姿 `[x, y, theta]`
 - `car.get_distance`
   - 读取累计行驶距离
+- `car.set_chassis_velocity`
+  - 原始底盘速度控制，适合高频上层闭环
+- `car.get_lane_results`
+  - 读取前摄巡线误差和角度误差
 
 ### 1.2 底层已具备，但当前未直接暴露为 API
 
-- 原始速度控制 `set_velocity(x, y, z)`
 - 四轮线速度/角速度直接下发
 - 单电机速度控制
 - 编码器原始读数
@@ -85,6 +88,16 @@
   - 吸盘吸取/释放
 - `arm.x_get_position`
   - 读取横轴当前位置
+- `arm.y_get_position`
+  - 读取竖轴当前位置
+- `arm.goto_position`
+  - 直接按 `x / y` 移动到目标点
+- `arm.go_for`
+  - 按相对偏移移动机械臂
+- `arm.x_speed`
+  - 横轴原始速度控制
+- `arm.y_speed`
+  - 竖轴原始速度控制
 
 ### 2.2 机械臂组成
 
@@ -99,13 +112,10 @@
 - 手爪舵机
   - PWM 舵机，负责上下角度
 
-### 2.3 底层已具备，但当前未直接暴露为 API
+### 2.3 已 API 暴露的机械臂状态
 
-- `goto_position(x, y)`
-- `go_for(x_offset, y_offset)`
-- 原始 `x_speed()` / `y_speed()`
-- 机械臂当前 `y` 位置读取
-- 当前 `side`、最近角度状态等内部状态
+- `car.get_arm_state`
+  - 返回 `x / y / side / arm_angle / hand_angle / y_limit`
 
 ## 3. 枪
 
@@ -114,16 +124,18 @@
 - `car.shooting`
   - 单次射击触发
   - 当前逻辑是固定脉冲：先拉低，再高电平触发，再强制拉低收尾
+- `car.set_shoot_state`
+  - 原始枪口数字输出控制
 
 ### 3.2 底层实现
 
 - 使用数字输出口 `PoutD(4)`
 - 本质是继电器/数字口触发型枪口
 
-### 3.3 当前限制
+### 3.3 已扩展的原始控制
 
-- 现在只暴露“单次触发”
-- 还没有开放“原始数字口 set/reset API”
+- `car.set_digital_output`
+  - 任意数字输出口 set/reset
 
 ## 4. PWM 舵机
 
@@ -131,8 +143,12 @@
 
 - `car.set_storage`
   - 控储物仓 PWM 舵机开合
+- `car.set_storage_angle`
+  - 直接设置储物仓 PWM 角度
 - `arm.set_hand_angle`
   - 控机械臂末端 PWM 舵机角度
+- `car.set_pwm_servo_angle`
+  - 任意端口 PWM 舵机通用控制
 
 ### 4.2 已在代码中使用，但以业务动作形式暴露
 
@@ -141,11 +157,9 @@
 - 机械臂组合姿态 `arm.set_arm_pose`
   - 会同时联动舵机和电机
 
-### 4.3 底层已具备，但当前未直接暴露为 API
+### 4.3 底层仍未直接暴露为 API
 
-- 原始 `ServoPwm(port).set_angle(angle)`
 - 原始 `ServoBus(port).set_angle(angle, speed)`
-- 任意端口 PWM 舵机通用控制
 
 ## 5. 其他可检测/可交互能力
 
@@ -155,23 +169,33 @@
   - 侧摄目标检测结果
 - `car.get_ocr`
   - OCR 识别结果
+- `car.get_det_ocr`
+  - 对指定检测框做 OCR
 - `car.get_odometry`
   - 底盘位姿
 - `car.get_distance`
   - 累计距离
 - `car.beep`
   - 蜂鸣器
+- `car.get_ir_distance`
+  - 读取单侧 IR
+- `car.get_all_ir_distance`
+  - 同时读取左右 IR
+- `car.get_bluetooth_pad`
+  - 读取蓝牙手柄
+- `car.get_key_event`
+  - 读取物理按键事件
+- `car.get_key_state`
+  - 读取物理按键当前状态
+- `car.get_battery_voltage`
+  - 读取电池电压
+- `car.set_light_color`
+  - 控制灯带颜色
+- `car.show_text`
+  - 屏幕显示文本
 
 ### 5.2 底层已具备，但当前未直接暴露为 API
 
-- `IR / 红外`
-  - 有底层封装，但当前 `MyCar.sensor_init()` 没启用
-- `BluetoothPad`
-  - 蓝牙手柄可读摇杆和按键
-- `Key4Btn`
-  - 物理四键输入
-- `Battry.read()`
-  - 电池电压读取
 - `BoardKey`
   - 板载按键读取
 - `AnalogInput / AnalogInput2`
@@ -182,23 +206,53 @@
   - 超声类输入，协议层已有
 - `sensor_ambient_light`
   - 环境光输入，协议层已有
-- `get_lane_results()`
-  - 前摄巡线结果，当前未注册到 runtime API
 
 ### 5.3 可控输出，但当前未直接暴露为 API
 
-- `LedLight`
-  - 灯带/灯光
 - `NixieTube`
   - 数码管
-- `ScreenShow`
-  - 屏幕显示
-- `PoutD`
-  - 任意数字输出
-- `ServoPwm`
-  - 任意 PWM 舵机
 
-## 6. 直接给我提需求时怎么说
+## 6. 八个任务
+
+这 8 个比赛任务已经可以直接走 `target=task` 调用：
+
+- `auto_lane_tracing`
+- `auto_seeding`
+- `target_shooting_detection`
+- `water_tower_task`
+- `target_shooting`
+- `crop_harvesting`
+- `sort_and_store`
+- `get_order`
+- `order_delivery`
+
+其中两个任务会返回可继续编排的数据：
+
+- `target_shooting_detection`
+  - 返回 `animal_list`
+- `get_order`
+  - 返回 `order_list`
+
+这意味着上层业务已经可以这样编排：
+
+- 先调 `task.target_shooting_detection`
+- 再把返回值传给 `task.target_shooting`
+- 先调 `task.get_order`
+- 再把返回值传给 `task.order_delivery`
+
+## 7. WebSocket
+
+现在除了 HTTP，还支持 WebSocket 长连接：
+
+- `ws://192.168.3.60:5050/v1/ws`
+
+适合：
+
+- 高频底盘速度控制
+- 长连接状态轮询
+- 远端业务编排
+
+## 8. 直接给我提需求时怎么说
 
 以后如果你要提需求，建议直接按这张清单说：
 
@@ -231,7 +285,7 @@
   - 蓝牙手柄
   - 按键
 
-## 7. 现在最重要的一句
+## 9. 现在最重要的一句
 
 这台车当前已经稳定具备：
 
@@ -240,7 +294,10 @@
 - 枪
 - 储物仓 PWM
 - 蜂鸣器
+- IR / 电池 / 手柄 / 按键 / 灯 / 屏幕
 - 位姿/距离
 - 检测/OCR
+- WebSocket 长连接控制
+- 八任务 API 编排
 
 这几个已经足够支撑大部分真实业务开发。

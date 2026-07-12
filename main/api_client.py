@@ -9,7 +9,10 @@ except ModuleNotFoundError as exc:  # pragma: no cover
         "缺少 requests 依赖，请先执行: python3 -m pip install requests"
     ) from exc
 
-from settings import load_settings
+try:
+    from .settings import load_settings
+except ImportError:  # pragma: no cover
+    from settings import load_settings
 
 
 class RuntimeApiClient:

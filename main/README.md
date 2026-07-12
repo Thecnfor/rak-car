@@ -3,6 +3,14 @@
 `main/` 现在只保留最小可用集，目标就是一件事：
 
 - 不关心底层源码细节，只通过 HTTP API 做真实业务开发
+
+现在还额外提供了两个直接可用的脚本：
+
+- [car_start_api.py](file:///home/jetson/workspace/rak-car/main/car_start_api.py)
+  - 类似官方 `car_start_2026.py` 的 API 编排模板
+- [ws_monitor_tui.py](file:///home/jetson/workspace/rak-car/main/ws_monitor_tui.py)
+  - 基于 WebSocket 的极简实时监测 TUI
+
 ## 配置
 
 默认配置在 [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)：
@@ -18,6 +26,12 @@
 
 ```bash
 export RAK_CAR_API_BASE=http://192.168.3.60:5050
+```
+
+安装依赖：
+
+```bash
+python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
 ```
 
 ## Python 调用
@@ -51,6 +65,39 @@ client.call("car", "lane_dis_offset", timeout=80, speed=0.3, dis_hold=0.2)
 ```python
 client.call("arm", "move_x_position", 0.20, timeout=20)
 ```
+
+## 现成脚本
+
+官方流程风格的 API 模板：
+
+```bash
+python3 /home/jetson/workspace/rak-car/main/car_start_api.py
+```
+
+这个脚本默认不直接动小车，只保留和 `car_start_2026.py` 一样的任务顺序模板。
+你只要把需要的那几行取消注释，就能开始业务编排。
+
+WebSocket 实时监测 TUI：
+
+```bash
+python3 /home/jetson/workspace/rak-car/main/ws_monitor_tui.py
+```
+
+界面里支持：
+
+- `q` 退出
+- `r` 立即刷新
+- `c` 主动重连
+
+它会实时显示：
+
+- runtime 初始化状态
+- 控制器 session 状态
+- 当前任务
+- 电池电压
+- 左右 IR
+- 机械臂状态
+- 位姿与距离
 
 ## curl 调用
 

@@ -39,7 +39,7 @@ import sys
 from typing import List
 import re
 
-from smartcar.whalesbot.vehicle.base.controller_wrap import PoutD
+from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
 
 # 添加上本地目录
 sys.path.append(os.path.abspath(os.path.dirname(__file__)))
@@ -394,15 +394,16 @@ class MyCar(MecanumDriver):
         cfg_sensor = cfg["io"]
         # print(cfg_sensor)
         self.key = Key4Btn(cfg_sensor["key"])
-        # self.light = LedLight(cfg_sensor['light'])
-        # self.left_sensor = Infrared(cfg_sensor['left_sensor'])
-        # self.right_sensor = Infrared(cfg_sensor['right_sensor'])
+        self.light = LedLight(cfg_sensor["light"])
+        self.left_sensor = Infrared(cfg_sensor["left_sensor"])
+        self.right_sensor = Infrared(cfg_sensor["right_sensor"])
         self.servo_1_angle_list = [-42, 165]
         self.servo_1_flag = 0
         self.servo_1 = ServoPwm(1, 180)
         self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
         self.blue_pad = BluetoothPad()
         self.shoot = PoutD(4)
+        self.battery = Battry()
 
     def set_storage(self, state=False):
         """
@@ -426,6 +427,77 @@ class MyCar(MecanumDriver):
         finally:
             self.shoot.set(0)
         time.sleep(0.2)
+
+    def set_shoot_state(self, value):
+        self.shoot.set(1 if value else 0)
+        return bool(value)
+
+    def set_storage_angle(self, angle, speed=100):
+        self.servo_1_flag = None
+        self.servo_1.set_angle(angle, speed)
+        return angle
+
+    def set_pwm_servo_angle(self, port, angle, mode=180, speed=100):
+        servo = ServoPwm(port, mode)
+        servo.set_angle(angle, speed)
+        return {"port": port, "angle": angle, "mode": mode, "speed": speed}
+
+    def set_digital_output(self, port, value):
+        PoutD(port).set(1 if value else 0)
+        return {"port": port, "value": bool(value)}
+
+    def set_light_color(self, led_id, r, g, b):
+        self.light.set_light(led_id, r, g, b)
+        return {"led_id": led_id, "r": r, "g": g, "b": b}
+
+    def show_text(self, text):
+        content = str(text)
+        self.display.show(content)
+        return content
+
+    def set_chassis_velocity(self, x=0.0, y=0.0, z=0.0, duration=None):
+        x = float(x)
+        y = float(y)
+        z = float(z)
+        if duration is None:
+            self.set_velocity(x, y, z)
+        else:
+            self.set_velocity_for_duration(x, y, z, float(duration))
+        return {"x": x, "y": y, "z": z, "duration": duration}
+
+    def get_key_event(self):
+        return self.key.get_key()
+
+    def get_key_state(self):
+        return self.key.read()
+
+    def get_bluetooth_pad(self):
+        return self.blue_pad.read()
+
+    def get_battery_voltage(self):
+        return self.battery.read()
+
+    def get_ir_distance(self, side="left"):
+        sensor = self.left_sensor
+        if str(side).lower() in {"right", "r", "1"}:
+            sensor = self.right_sensor
+        return sensor.read()
+
+    def get_all_ir_distance(self):
+        return {
+            "left": self.left_sensor.read(),
+            "right": self.right_sensor.read(),
+        }
+
+    def get_arm_state(self):
+        return {
+            "x": self.arm.x_get_position(),
+            "y": self.arm.y_get_position(),
+            "side": getattr(self.arm, "side", None),
+            "arm_angle": getattr(self.arm, "angle", None),
+            "hand_angle": getattr(self.arm, "hand_angle", None),
+            "y_limit": self.arm.y_reset_check(),
+        }
 
     def car_pid_init(self, cfg):
         """

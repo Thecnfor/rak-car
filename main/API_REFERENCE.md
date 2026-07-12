@@ -760,6 +760,124 @@ curl -sS -X POST http://192.168.3.60:5050/v1/execute \
 - 单步业务开发优先用 `car` / `arm`
 - 成熟流程再收敛成 `task`
 
+### 9.1 两个可继续编排的任务返回值
+
+- `target_shooting_detection`
+  - 返回 `animal_list`
+- `get_order`
+  - 返回 `order_list`
+
+上层业务可以这样串：
+
+```python
+from main.api_client import RuntimeApiClient
+
+client = RuntimeApiClient()
+
+animal_job = client.execute("task", "target_shooting_detection", timeout=240)
+animal_list = animal_job["result"]
+client.execute("task", "target_shooting", kwargs={"animal_list": animal_list}, timeout=240)
+
+order_job = client.execute("task", "get_order", timeout=300)
+order_list = order_job["result"]
+client.execute("task", "order_delivery", kwargs={"order_list": order_list}, timeout=300)
+```
+
+### 9.2 原始控制和传感接口
+
+现在已经支持这些更底层的业务接口：
+
+- `car.set_chassis_velocity`
+- `car.get_lane_results`
+- `car.get_key_event`
+- `car.get_key_state`
+- `car.get_bluetooth_pad`
+- `car.get_battery_voltage`
+- `car.get_ir_distance`
+- `car.get_all_ir_distance`
+- `car.set_light_color`
+- `car.show_text`
+- `car.set_storage_angle`
+- `car.set_pwm_servo_angle`
+- `car.set_digital_output`
+- `car.set_shoot_state`
+- `car.get_arm_state`
+- `arm.goto_position`
+- `arm.go_for`
+- `arm.x_speed`
+- `arm.y_speed`
+- `arm.y_get_position`
+
+例子，原始底盘速度控制：
+
+```bash
+curl -sS -X POST http://192.168.3.60:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target":"car",
+    "name":"set_chassis_velocity",
+    "kwargs":{"x":0.10,"y":0.00,"z":0.00,"duration":0.20},
+    "timeout":20
+  }'
+```
+
+例子，读取左右 IR：
+
+```bash
+curl -sS -X POST http://192.168.3.60:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target":"car",
+    "name":"get_all_ir_distance",
+    "timeout":20
+  }'
+```
+
+例子，控制任意数字口：
+
+```bash
+curl -sS -X POST http://192.168.3.60:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "target":"car",
+    "name":"set_digital_output",
+    "kwargs":{"port":4,"value":true},
+    "timeout":20
+  }'
+```
+
+### 9.3 WebSocket 长连接
+
+如果上层要做高频控制、持续轮询或长连接编排，直接用：
+
+- `ws://192.168.3.60:5050/v1/ws`
+
+连接成功后，发送 JSON 消息即可。
+
+最常用 3 类消息：
+
+```json
+{"op":"health","request_id":"h1"}
+{"op":"execute","request_id":"e1","target":"car","name":"beep","timeout":20}
+{"op":"execute","request_id":"e2","target":"car","name":"set_chassis_velocity","kwargs":{"x":0.1,"y":0.0,"z":0.0}}
+```
+
+WebSocket 支持的 `op`：
+
+- `ping`
+- `health`
+- `runtime`
+- `actions`
+- `config`
+- `execute`
+- `create_job`
+- `get_job`
+- `init`
+- `stop_mode`
+- `reset_stop`
+- `close`
+- `emergency_stop`
+
 ## 10. 推荐写法
 
 ### 10.1 最推荐的 Python 写法

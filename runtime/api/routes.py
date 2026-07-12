@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 try:
-    from fastapi import APIRouter, Body, HTTPException, Query
+    from fastapi import APIRouter, Body, HTTPException, Query, WebSocket, WebSocketDisconnect
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError(
         "缺少 FastAPI 依赖，请先执行: /usr/bin/python3 -m pip install -r "
@@ -15,11 +15,13 @@ def get_public_links():
     api_base = settings.get_public_api_base()
     v1 = settings.get_api_v1_prefix()
     legacy = settings.get_legacy_api_prefix()
+    ws_base = api_base.replace("http://", "ws://").replace("https://", "wss://")
     return {
         "api_base": api_base,
         "docs": f"{api_base}/docs",
         "health_v1": f"{api_base}{v1}/health",
         "jobs_v1": f"{api_base}{v1}/jobs",
+        "ws_v1": f"{ws_base}{v1}/ws",
         "health_legacy": f"{api_base}{legacy}/health",
         "streamer": settings.get_public_stream_base(),
     }
@@ -122,6 +124,53 @@ def _submit_simple_system_job(service, name):
     return {"ok": True, "job": job}
 
 
+async def _handle_websocket_message(service, payload):
+    op = payload.get("op", "execute")
+    if op == "ping":
+        return {"ok": True, "op": "pong"}
+    if op == "health":
+        include_snapshot = bool(payload.get("snapshot"))
+        return {
+            "ok": True,
+            "op": "health",
+            "data": health_payload(service, include_snapshot=include_snapshot),
+        }
+    if op == "runtime":
+        return {"ok": True, "op": "runtime", "data": _build_runtime_snapshot(service)}
+    if op == "actions":
+        return {"ok": True, "op": "actions", "data": {"actions": service.list_actions()}}
+    if op == "config":
+        return {"ok": True, "op": "config", "data": {"config": settings.get_runtime_settings()}}
+    if op == "create_job":
+        return {"ok": True, "op": "create_job", "data": _create_job_from_payload(service, payload)}
+    if op == "get_job":
+        job_id = payload.get("job_id")
+        if not job_id:
+            raise HTTPException(status_code=400, detail="缺少 job_id")
+        return {"ok": True, "op": "get_job", "data": _get_job(service, job_id)}
+    if op == "execute":
+        return {"ok": True, "op": "execute", "data": _execute_from_payload(service, payload)}
+    if op == "init":
+        return {"ok": True, "op": "init", "data": _submit_init_job(service, payload)}
+    if op == "stop_mode":
+        return {
+            "ok": True,
+            "op": "stop_mode",
+            "data": _submit_stop_mode_job(service, payload),
+        }
+    if op == "reset_stop":
+        return {
+            "ok": True,
+            "op": "reset_stop",
+            "data": _submit_simple_system_job(service, "reset_stop_flag"),
+        }
+    if op == "close":
+        return {"ok": True, "op": "close", "data": _submit_simple_system_job(service, "close")}
+    if op == "emergency_stop":
+        return {"ok": True, "op": "emergency_stop", "data": {"stopped": service.emergency_stop()}}
+    raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
+
+
 def create_runtime_router(service):
     router_v1 = APIRouter(prefix=settings.get_api_v1_prefix(), tags=["runtime"])
 
@@ -176,6 +225,42 @@ def create_runtime_router(service):
     @router_v1.post("/control/emergency-stop")
     def v1_emergency_stop():
         return {"ok": True, "stopped": service.emergency_stop()}
+
+    @router_v1.websocket("/ws")
+    async def v1_ws(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_json(
+            {
+                "ok": True,
+                "op": "welcome",
+                "links": get_public_links(),
+                "usage": {
+                    "execute": {"op": "execute", "target": "car|arm|task|system", "name": "动作名"},
+                    "create_job": {"op": "create_job", "target": "task", "name": "任务名"},
+                    "health": {"op": "health", "snapshot": 0},
+                },
+            }
+        )
+        while True:
+            try:
+                payload = await websocket.receive_json()
+            except WebSocketDisconnect:
+                break
+            except Exception as exc:
+                await websocket.send_json(
+                    {"ok": False, "op": "invalid_json", "error": str(exc)}
+                )
+                continue
+            request_id = payload.get("request_id")
+            try:
+                result = await _handle_websocket_message(service, payload)
+            except HTTPException as exc:
+                result = {"ok": False, "op": payload.get("op"), "error": exc.detail}
+            except Exception as exc:  # pragma: no cover
+                result = {"ok": False, "op": payload.get("op"), "error": str(exc)}
+            if request_id is not None:
+                result["request_id"] = request_id
+            await websocket.send_json(result)
 
     return router_v1
 
