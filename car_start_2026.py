@@ -22,15 +22,15 @@ from car_task_function import (
 def main():
     
     init()                                          # 初始化
-    # auto_lane_tracing(speed=0.3, dis_hold=99)     # 巡线测试，99m可以保证巡线到基地
-    auto_seeding()                                  # 播种任务
-    animal_list = target_shooting_detection()       # 识别虫害
-    water_tower_task()                              # 灌溉任务
-    target_shooting(animal_list)                    # 射击除害
-    crop_harvesting()                               # 作物收集
-    sort_and_store()                                # 作物储存
-    order_list = get_order()                        # 订单获取
-    order_delivery(order_list)                      # 订单配送
+    auto_lane_tracing(speed=0.3, dis_hold=99)     # 巡线测试，99m可以保证巡线到基地
+    # auto_seeding()                                  # 播种任务
+    # animal_list = target_shooting_detection()       # 识别虫害
+    # water_tower_task()                              # 灌溉任务
+    # target_shooting(animal_list)                    # 射击除害
+    # crop_harvesting()                               # 作物收集
+    # sort_and_store()                                # 作物储存
+    # order_list = get_order()                        # 订单获取
+    # order_delivery(order_list)                      # 订单配送
 
 
 if __name__ == "__main__":

@@ -361,6 +361,17 @@ class MyCar(MecanumDriver):
 
         self.beep()
 
+    def resolve_stop(self, stop=None):
+        """
+        解析动作结束后的停车开关
+
+        参数:
+            stop: 显式传入的停车开关，None 时使用实例当前 STOP_PARAM
+        """
+        if stop is None:
+            return self.STOP_PARAM
+        return stop
+
     def beep(self):
         """
         发出蜂鸣音
@@ -406,16 +417,15 @@ class MyCar(MecanumDriver):
         self.servo_1.set_angle(self.servo_1_angle_list[flag])
 
     def shooting(self):
-        # 尝试方案1: 拉高保持较长时间（电磁铁吸合-保持-释放）
-        self.shoot.set(1)
-        time.sleep(0.5)
+        # 继电器触发型枪口：单次触发必须保证固定高电平脉冲，并可靠拉低收尾。
         self.shoot.set(0)
-        time.sleep(1.0)
-        # 尝试方案2: 拉低保持较长时间（断电弹射型）
-        self.shoot.set(0)
-        time.sleep(0.5)
-        self.shoot.set(1)
-        time.sleep(1.0)
+        time.sleep(0.05)
+        try:
+            self.shoot.set(1)
+            time.sleep(0.25)
+        finally:
+            self.shoot.set(0)
+        time.sleep(0.2)
 
     def car_pid_init(self, cfg):
         """
@@ -589,7 +599,7 @@ class MyCar(MecanumDriver):
                 return det
         return None
 
-    def move_base(self, sp, end_fuction, stop=STOP_PARAM):
+    def move_base(self, sp, end_fuction, stop=None):
         """
         基础移动方法
 
@@ -600,6 +610,7 @@ class MyCar(MecanumDriver):
             end_fuction: 结束条件函数，返回True时停止移动
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        stop = self.resolve_stop(stop)
         self.set_velocity(sp[0], sp[1], sp[2])
         while True:
             if self._stop_flag:
@@ -649,7 +660,7 @@ class MyCar(MecanumDriver):
     #     if stop:
     #         self.stop()
 
-    def move_time(self, sp, dur_time=1, stop=STOP_PARAM):
+    def move_time(self, sp, dur_time=1, stop=None):
         """
         按时间移动
 
@@ -660,11 +671,12 @@ class MyCar(MecanumDriver):
             dur_time: 移动时间（秒），默认为1
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        stop = self.resolve_stop(stop)
         self.set_velocity_for_duration(sp[0], sp[1], sp[2], dur_time)
         if stop:
             self.stop()
 
-    def move_distance(self, sp, dis=0.1, stop=STOP_PARAM):
+    def move_distance(self, sp, dis=0.1, stop=None):
         """
         按距离移动
 
@@ -675,6 +687,7 @@ class MyCar(MecanumDriver):
             dis: 移动距离，默认为0.1
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        stop = self.resolve_stop(stop)
         end_dis = self.get_distance() + dis
 
         def end_func():
@@ -903,7 +916,7 @@ class MyCar(MecanumDriver):
                 dis_count(False)
             self.set_velocity(out_x, out_y, 0)
 
-    def lane_base(self, speed, end_fuction, stop=STOP_PARAM):
+    def lane_base(self, speed, end_fuction, stop=None):
         """
         车道保持基础方法
 
@@ -914,6 +927,7 @@ class MyCar(MecanumDriver):
             end_fuction: 结束条件函数，返回True时停止
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        stop = self.resolve_stop(stop)
         while True:
             if self._stop_flag:
                 return
@@ -996,7 +1010,7 @@ class MyCar(MecanumDriver):
     #     end_fuction = lambda x: x < dis_end and x != 0
     #     self.lane_det_base(speed, end_fuction, stop=stop)
 
-    def lane_time(self, speed, time_dur, stop=STOP_PARAM):
+    def lane_time(self, speed, time_dur, stop=None):
         """
         车道保持定时方法
 
@@ -1007,6 +1021,7 @@ class MyCar(MecanumDriver):
             time_dur: 持续时间（秒）
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        stop = self.resolve_stop(stop)
         time_end = time.time() + time_dur
 
         def end_fuction():
@@ -1015,7 +1030,7 @@ class MyCar(MecanumDriver):
         self.lane_base(speed, end_fuction, stop=stop)
 
     # 巡航一段路程
-    def lane_dis(self, speed, dis_end, stop=STOP_PARAM):
+    def lane_dis(self, speed, dis_end, stop=None):
         """
         车道保持定距方法
 
@@ -1027,13 +1042,14 @@ class MyCar(MecanumDriver):
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
 
+        stop = self.resolve_stop(stop)
         # lambda重新endfunction
         def end_fuction():
             return self.get_distance() > dis_end
 
         self.lane_base(speed, end_fuction, stop=stop)
 
-    def lane_dis_offset(self, speed, dis_hold, stop=STOP_PARAM):
+    def lane_dis_offset(self, speed, dis_hold, stop=None):
         """
         车道保持距离偏移方法
 
@@ -1044,6 +1060,7 @@ class MyCar(MecanumDriver):
             dis_hold: 距离偏移量
             stop: 是否在结束后停止车辆，默认为STOP_PARAM
         """
+        stop = self.resolve_stop(stop)
         dis_start = self.get_distance()
         dis_stop = dis_start + dis_hold
         self.lane_dis(speed, dis_stop, stop=stop)

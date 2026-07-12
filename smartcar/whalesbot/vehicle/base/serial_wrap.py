@@ -21,6 +21,34 @@ from smartcar.whalesbot.vehicle.base.pydownload import Scratch_Download_MC602P
 from ...tools import logger
 # logger.info("start time:{}".format(time.time()))
 
+
+class ControllerTransportError(RuntimeError):
+    pass
+
+
+class ControllerNotReadyError(ControllerTransportError):
+    pass
+
+
+class ControllerNoResponseError(ControllerTransportError):
+    pass
+
+
+def _notify_runtime_session(method_name, detail=None):
+    try:
+        from runtime.hardware.controller_session import get_controller_session
+
+        session = get_controller_session()
+        method = getattr(session, method_name, None)
+        if method is None:
+            return
+        if detail is None:
+            method()
+        else:
+            method(detail)
+    except Exception:
+        pass
+
 class CotrollerInfo:
     def __init__(self, baudrate, timeout=0.1, mode="USB") -> None:
         self.baudrate = baudrate
@@ -56,28 +84,131 @@ class SerialWrap(serial.Serial):
         self.connect_flag = False
 
         self.lock = Lock()
+        self.generation = 0
+        self.last_ok_at = 0.0
+        self.last_error = None
         self.timeout = 0.01
-        while True:
-            self.dev:CotrollerInfo =  self.ping_port()
-            if self.dev is not None:
-                logger.info("port is {}, controller is {}, mode {}".format(self.port, self.dev.name, self.dev.connect_mode))
-                break
-            logger.critical("未接控制器或者控制器没有开机,或者程序运行错误!")
-            while True:
-                time.sleep(1)
+        self.connect_until_ready(timeout=None)
         self.timeout = 0.1
-        
-    def get_anwser(self, cmd:bytes, time_out=0.1)->bytes:
-        self.lock.acquire()
-        res = None
+
+    def _close_locked(self):
         try:
-            self.reset_buffer()
-            self.dev.send_cmd(self, cmd)
-            res = self.dev.get_anwser(self)
-        except Exception as e:
-            logger.error("get_anwser error:{}".format(e))
-        self.lock.release()
-        return res
+            if self.is_open:
+                super(SerialWrap, self).close()
+        except Exception:
+            pass
+        self.connect_flag = False
+
+    def _get_dev_candidates(self, controller_name=None):
+        if not controller_name:
+            return list(self.dev_list)
+        candidates = []
+        for ctl_dev in self.dev_list:
+            if controller_name.lower() in ctl_dev.name.lower():
+                candidates.append(ctl_dev)
+        for ctl_dev in self.dev_list:
+            if ctl_dev not in candidates:
+                candidates.append(ctl_dev)
+        return candidates
+
+    def _connect_candidate_locked(self, port_name, controller_name=None):
+        self.set_port(port_name)
+        time.sleep(0.01)
+        if not self.open():
+            return None
+        for ctl_dev in self._get_dev_candidates(controller_name):
+            self.set_ctl_serial(ctl_dev)
+            try:
+                if ctl_dev.ping_rx(self):
+                    return ctl_dev
+            except Exception:
+                pass
+        self._close_locked()
+        return None
+
+    def _finish_connect_locked(self, ctl_dev):
+        self.dev = ctl_dev
+        self.generation += 1
+        self.last_ok_at = time.time()
+        self.last_error = None
+        logger.info("port is {}, controller is {}, mode {}".format(self.port, self.dev.name, self.dev.connect_mode))
+        _notify_runtime_session("note_io_success")
+        return ctl_dev
+
+    def sync_with_probe(self, probe_result=None):
+        with self.lock:
+            self._close_locked()
+            ctl_dev = None
+            if probe_result is not None and getattr(probe_result, "port", None):
+                ctl_dev = self._connect_candidate_locked(
+                    probe_result.port,
+                    getattr(probe_result, "controller", None),
+                )
+            if ctl_dev is None:
+                ctl_dev = self.ping_port()
+            if ctl_dev is None:
+                self.last_error = "控制器未进入 program 模式"
+                _notify_runtime_session("mark_offline", self.last_error)
+                raise ControllerNotReadyError(self.last_error)
+            return self._finish_connect_locked(ctl_dev)
+
+    def reconnect(self, timeout=3.0, probe_result=None):
+        deadline = None if timeout is None else (time.time() + float(timeout))
+        last_error = "控制器未就绪"
+        while True:
+            try:
+                return self.sync_with_probe(probe_result=probe_result)
+            except Exception as exc:
+                last_error = str(exc)
+                if deadline is not None and time.time() >= deadline:
+                    raise ControllerNotReadyError(last_error)
+                logger.critical("控制器重连失败: {}".format(last_error))
+                time.sleep(0.5 if deadline is not None else 1.0)
+                probe_result = None
+
+    def connect_until_ready(self, timeout=None):
+        return self.reconnect(timeout=timeout, probe_result=None)
+
+    def get_anwser(self, cmd:bytes, time_out=0.1)->bytes:
+        with self.lock:
+            if self.dev is None or not self.connect_flag or not self.is_open:
+                self.last_error = "控制器未连接"
+                _notify_runtime_session("mark_offline", self.last_error)
+                raise ControllerNotReadyError(self.last_error)
+            try:
+                self.reset_buffer()
+                self.dev.send_cmd(self, cmd)
+                res = self.dev.get_anwser(self)
+            except serial.SerialException as exc:
+                self.last_error = "串口通信异常: {}".format(exc)
+                _notify_runtime_session("note_io_failure", self.last_error)
+                raise ControllerTransportError(self.last_error)
+            except Exception as exc:
+                self.last_error = "控制器通信异常: {}".format(exc)
+                _notify_runtime_session("note_io_failure", self.last_error)
+                raise ControllerTransportError(self.last_error)
+            if res is None:
+                self.last_error = "控制器无响应，可能已脱离 program 模式"
+                _notify_runtime_session("note_io_failure", self.last_error)
+                raise ControllerNoResponseError(self.last_error)
+            self.last_ok_at = time.time()
+            self.last_error = None
+            _notify_runtime_session("note_io_success")
+            return res
+
+    def ping_current(self, timeout=0.05):
+        with self.lock:
+            if self.dev is None or not self.connect_flag or not self.is_open:
+                return False
+            try:
+                self.reset_buffer()
+                ok = bool(self.dev.ping_rx(self, time_out=timeout))
+            except Exception:
+                return False
+            if ok:
+                self.last_ok_at = time.time()
+                self.last_error = None
+            return ok
 
     def set_bps(self, bps):
         self.baudrate = bps
@@ -114,13 +245,13 @@ class SerialWrap(serial.Serial):
         serial_list = self.get_serial_list()
         if len(serial_list) == 0:
             logger.error("未找到串口,查看是否插入了串口,或者查看下位机是否开机")
-        while len(serial_list) == 0:
-            # logger.error("未找到串口,查看是否插入了串口,或者查看下位机是否开机")
-            time.sleep(1)
-            serial_list = self.get_serial_list()
+            return None
         for serial in serial_list:
             try:
                 logger.info("try:{}".format(serial))
+                ctl_dev = self._connect_candidate_locked(serial[0])
+                if ctl_dev is not None:
+                    return ctl_dev
                 self.set_port(serial[0])
                 time.sleep(0.01)
                 self.open()
@@ -135,13 +266,15 @@ class SerialWrap(serial.Serial):
                     self.set_ctl_serial(ctl_dev)
                     if ctl_dev.download_bin(self):
                         return ctl_dev
-                self.close()
+                self._close_locked()
             except Exception as e:
                 logger.error(e)
         logger.error("未找到支持的设备")
         return None
     
     def reset_buffer(self):
+        if not self.is_open:
+            return
         self.reset_input_buffer()
         self.reset_output_buffer()
 

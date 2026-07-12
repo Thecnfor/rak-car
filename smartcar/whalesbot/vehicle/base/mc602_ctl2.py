@@ -16,7 +16,10 @@ sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 from ...tools import logger
 # from pydownload import Scratch_Download_MC602P
-from smartcar.whalesbot.vehicle.base.serial_wrap import serial_wrap
+from smartcar.whalesbot.vehicle.base.serial_wrap import (
+    ControllerNoResponseError,
+    serial_wrap,
+)
 
 serial_mc602 = serial_wrap
 # def set_serial_mc602(ser:SerialWrap):
@@ -149,8 +152,9 @@ class DevCmdInterface:
     
     def send_get(self, bytes_tmp:bytes):
         ret = self.ser.get_anwser(bytes_tmp, self.time_out)
-        if ret is not None:
-            self.last_data = self.get_result(ret)
+        if ret is None:
+            raise ControllerNoResponseError("控制器返回空数据")
+        self.last_data = self.get_result(ret)
         return self.last_data
     
     def act_mode(self, *args, mode=None, port_id=None):
@@ -206,7 +210,7 @@ class DevListWrap:
                 index += self.dev_list[i].data_struct.size
                 data_ret.append(data)
         else:
-            return [0,0,0,0]
+            raise ControllerNoResponseError("控制器批量读取失败")
         return data_ret
     def __getattr__(self, name):
         return getattr(self.dev_list, name)

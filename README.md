@@ -4,6 +4,35 @@
 
 本项目基于百度 PaddlePaddle 深度学习平台和 WhalesBot 智能车硬件平台开发，实现了完整的智慧农业赛道竞赛任务。智能车能够自主完成播种、灌溉、射击除害、作物采收、分类储存及订单配送等一系列农业自动化任务。
 
+## Runtime API 快速入口
+
+如果你是局域网内联调同学，优先看这几份文档:
+
+- [API_USAGE.md](file:///home/jetson/workspace/rak-car/API_USAGE.md)
+- [runtime/README.md](file:///home/jetson/workspace/rak-car/runtime/README.md)
+- [main/README.md](file:///home/jetson/workspace/rak-car/main/README.md)
+
+当前默认局域网地址:
+
+- API: `http://192.168.3.60:5050`
+- FastAPI 文档: `http://192.168.3.60:5050/docs`
+- 视频流: `http://192.168.3.60:5000/`
+
+如果要快速修改 IP/端口，只改:
+
+```python
+/home/jetson/workspace/rak-car/runtime/config.py
+```
+
+推荐启动方式:
+
+```bash
+cd /home/jetson/workspace/rak-car
+/usr/bin/python3 -m pip install -r runtime/requirements.txt
+pm2 start ecosystem.config.js
+pm2 save
+```
+
 ## 硬件平台
 
 | 组件 | 说明 |

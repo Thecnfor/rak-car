@@ -124,21 +124,35 @@ class ClintInterface:
     
     def __init__(self, name):
         self.configs = get_yaml('config_car.yml')['infer_cfg']
+        self.name = name
         logger.info("{}连接服务器...".format(name))
         model_cfg = self.get_config(name)
         self.img_size = model_cfg['img_size']
-        self.client = self.get_zmp_client(model_cfg['port'])
+        self.port = model_cfg['port']
+        self.client = self.get_zmp_client(self.port)
         
         infer_back_end_file = "infer_back_end.py"
         # 检查后台程序是否运行, 如果未开启, 则开启
         self.check_back_python(infer_back_end_file)
 
         flag = False
+        unhealthy_count = 0
         while True:
-            if self.get_state():
+            state = self.get_state()
+            if state:
                 if flag:
                     logger.info("")
                 break
+            if state is None:
+                unhealthy_count += 1
+                if unhealthy_count >= 3:
+                    logger.warning("{}服务器无响应，尝试重启后台推理".format(name))
+                    stop_process(infer_back_end_file)
+                    time.sleep(1)
+                    self.check_back_python(infer_back_end_file)
+                    unhealthy_count = 0
+            else:
+                unhealthy_count = 0
             # 输出一个提示信息，不换行
             print('.', end='', flush=True)
             # logger.info(".")
@@ -184,16 +198,35 @@ class ClintInterface:
     def get_zmp_client(port):
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
+        socket.setsockopt(zmq.LINGER, 0)
+        socket.setsockopt(zmq.RCVTIMEO, 2000)
+        socket.setsockopt(zmq.SNDTIMEO, 2000)
         socket.connect(f"tcp://127.0.0.1:{port}")
         return socket
+
+    def reset_client(self):
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = self.get_zmp_client(self.port)
 
     def __call__(self, *args, **kwds):
         return self.get_infer(*args, **kwds)
 
     def get_state(self):
         data = bytes('ATATA', encoding='utf-8')
-        self.client.send(data)
-        response = self.client.recv()
+        try:
+            self.client.send(data)
+            response = self.client.recv()
+        except zmq.Again:
+            logger.warning("{}服务器状态探测超时".format(self.name))
+            self.reset_client()
+            return None
+        except zmq.ZMQError as exc:
+            logger.warning("{}服务器状态探测失败: {}".format(self.name, exc))
+            self.reset_client()
+            return None
         response = json.loads(response)
         return response
 
@@ -202,8 +235,12 @@ class ClintInterface:
             img = cv2.resize(img, self.img_size)
         img = cv2.imencode('.jpg', img)[1].tobytes()
         data = bytes('image', encoding='utf-8') + img
-        self.client.send(data)
-        response = self.client.recv()
+        try:
+            self.client.send(data)
+            response = self.client.recv()
+        except (zmq.Again, zmq.ZMQError) as exc:
+            self.reset_client()
+            raise RuntimeError("{}推理请求失败: {}".format(self.name, exc))
         response = json.loads(response)
         return response
 

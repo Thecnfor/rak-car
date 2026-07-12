@@ -32,10 +32,18 @@ import math
 """
 
 
+my_car = None
+
+
+def bind_car(car):
+    global my_car
+    my_car = car
+    return my_car
+
+
 def init(reset_arm=False):
     time.sleep(1)
-    global my_car
-    my_car = MyCar()
+    bind_car(MyCar())
     my_car.STOP_PARAM = False
     my_car.beep()
     time.sleep(1)
@@ -43,6 +51,7 @@ def init(reset_arm=False):
     if reset_arm:
         my_car.arm.reset_position()
     my_car.reset_position()  #
+    return my_car
 
 def auto_lane_tracing(speed=0.3, dis_hold=0.85):
     my_car.lane_dis_offset(speed=speed, dis_hold=dis_hold)
