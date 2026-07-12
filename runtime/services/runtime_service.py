@@ -66,6 +66,35 @@ class CarRuntimeService:
         )
         self.auto_init_supervisor.start()
 
+    def _is_controller_related_error(self, detail):
+        if not detail:
+            return False
+        text = str(detail).lower()
+        keywords = (
+            "控制器",
+            "下位机",
+            "ttyusb",
+            "serial",
+            "controller",
+            "program 模式",
+            "program",
+            "bootloader",
+            "未找到控制器串口",
+            "控制器恢复超时",
+            "控制器探测失败",
+        )
+        return any(keyword in text for keyword in keywords)
+
+    def _sync_controller_health_state(self, snapshot=None):
+        snapshot = snapshot or self.controller_session.snapshot()
+        self.last_controller_probe = snapshot.get("last_probe")
+        if (
+            snapshot.get("state") == "PROGRAM_READY"
+            and self._is_controller_related_error(self.last_error)
+        ):
+            self.last_error = None
+        return snapshot
+
     def _trim_jobs(self, keep=None):
         if keep is None:
             keep = settings.JOB_HISTORY_LIMIT
@@ -97,16 +126,13 @@ class CarRuntimeService:
         self._get_task_module().bind_car(car)
 
     def _probe_controller(self):
-        snapshot = self.controller_session.snapshot()
-        self.last_controller_probe = snapshot.get("last_probe")
-        return snapshot
+        return self._sync_controller_health_state(self.controller_session.snapshot())
 
     def _ensure_controller_ready(self):
         snapshot = self.controller_session.ensure_ready(
             timeout=self.action_ready_timeout
         )
-        self.last_controller_probe = snapshot.get("last_probe")
-        return snapshot
+        return self._sync_controller_health_state(snapshot)
 
     def _mark_controller_offline(self, detail=None):
         self.controller_session.mark_offline(detail)
@@ -114,6 +140,7 @@ class CarRuntimeService:
             self._safe_close_locked()
         if detail:
             self.last_error = detail
+        self._sync_controller_health_state()
 
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
@@ -219,6 +246,7 @@ class CarRuntimeService:
             return self.stop_after_action
 
     def get_state(self):
+        controller_snapshot = self._sync_controller_health_state()
         with self.job_lock:
             jobs = list(self.jobs.values())
         queued_count = sum(job["status"] == "queued" for job in jobs)
@@ -233,7 +261,7 @@ class CarRuntimeService:
             "stop_flag": getattr(self.car, "_stop_flag", None) if self.car else None,
             "streamer_url": settings.get_public_stream_base(),
             "controller_probe": self.last_controller_probe,
-            "controller_session": self.controller_session.snapshot(),
+            "controller_session": controller_snapshot,
         }
 
     def get_runtime_snapshot(self):
@@ -392,11 +420,15 @@ class CarRuntimeService:
         snapshot = self.controller_session.ensure_ready(
             timeout=self.action_ready_timeout
         )
-        self.last_error = "{}; probe={}".format(
-            detail,
-            (snapshot.get("last_probe") or {}).get("detail") or snapshot.get("detail"),
-        )
-        return snapshot
+        if snapshot.get("state") == "PROGRAM_READY":
+            self.last_error = None
+        else:
+            self.last_error = "{}; probe={}".format(
+                detail,
+                (snapshot.get("last_probe") or {}).get("detail")
+                or snapshot.get("detail"),
+            )
+        return self._sync_controller_health_state(snapshot)
 
     def _dispatch_target_locked(self, target, name, args, kwargs):
         self._bind_task_car(self.car)

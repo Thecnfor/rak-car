@@ -3,27 +3,60 @@
 import os
 from dataclasses import dataclass
 
-DEFAULT_API_BASE = "http://127.0.0.1:5050"
+DEFAULT_SERVER_ORIGIN = "http://127.0.0.1"
+DEFAULT_API_PORT = 5050
+DEFAULT_STREAM_PORT = 5000
 DEFAULT_API_PREFIX = "/v1"
 DEFAULT_REQUEST_TIMEOUT = 10.0
 DEFAULT_WAIT_TIMEOUT = 300.0
 DEFAULT_POLL_INTERVAL = 0.5
-DEFAULT_STREAMER_URL = "http://127.0.0.1:5000/"
+
+
+def _strip_trailing_slash(value):
+    return str(value).rstrip("/")
+
+
+def _build_http_url(origin, port):
+    return f"{_strip_trailing_slash(origin)}:{int(port)}"
+
+
+def _build_streamer_url(origin, port):
+    return f"{_build_http_url(origin, port)}/"
 
 
 @dataclass(frozen=True)
 class BusinessSettings:
+    server_origin: str
     api_base: str
+    api_port: int
     api_prefix: str
     request_timeout: float
     wait_timeout: float
     poll_interval: float
     streamer_url: str
+    stream_port: int
 
 
 def load_settings():
+    server_origin = _strip_trailing_slash(
+        os.getenv("RAK_CAR_SERVER_ORIGIN", DEFAULT_SERVER_ORIGIN)
+    )
+    api_port = int(os.getenv("RAK_CAR_API_PORT", str(DEFAULT_API_PORT)))
+    stream_port = int(os.getenv("RAK_CAR_STREAM_PORT", str(DEFAULT_STREAM_PORT)))
+    api_base = _strip_trailing_slash(
+        os.getenv(
+            "RAK_CAR_API_BASE",
+            _build_http_url(server_origin, api_port),
+        )
+    )
+    streamer_url = os.getenv(
+        "RAK_CAR_STREAMER_URL",
+        _build_streamer_url(server_origin, stream_port),
+    )
     return BusinessSettings(
-        api_base=os.getenv("RAK_CAR_API_BASE", DEFAULT_API_BASE).rstrip("/"),
+        server_origin=server_origin,
+        api_base=api_base,
+        api_port=api_port,
         api_prefix=os.getenv("RAK_CAR_API_PREFIX", DEFAULT_API_PREFIX),
         request_timeout=float(
             os.getenv("RAK_CAR_REQUEST_TIMEOUT", str(DEFAULT_REQUEST_TIMEOUT))
@@ -40,8 +73,6 @@ def load_settings():
                 str(DEFAULT_POLL_INTERVAL),
             )
         ),
-        streamer_url=os.getenv(
-            "RAK_CAR_STREAMER_URL",
-            DEFAULT_STREAMER_URL,
-        ),
+        streamer_url=streamer_url,
+        stream_port=stream_port,
     )

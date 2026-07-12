@@ -4,35 +4,67 @@
 
 - 不关心底层源码细节，只通过 HTTP API 做真实业务开发
 
-现在还额外提供了两个直接可用的脚本：
+## 文件分工
 
+- [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)
+  - 统一配置入口，优先改这里或对应环境变量
+- [api_client.py](file:///home/jetson/workspace/rak-car/main/api_client.py)
+  - HTTP 同步调用客户端
+- [ws_client.py](file:///home/jetson/workspace/rak-car/main/ws_client.py)
+  - WebSocket 长连接客户端
+- [quick_start.py](file:///home/jetson/workspace/rak-car/main/quick_start.py)
+  - 开发自检脚本，先看配置，再测连通性
 - [car_start_api.py](file:///home/jetson/workspace/rak-car/main/car_start_api.py)
   - 类似官方 `car_start_2026.py` 的 API 编排模板
 - [ws_monitor_tui.py](file:///home/jetson/workspace/rak-car/main/ws_monitor_tui.py)
-  - 基于 WebSocket 的极简实时监测 TUI
+  - WebSocket 实时监测 + 底盘遥控 TUI
+- [CAPABILITY_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)
+  - 能力总表
+- [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)
+  - 速查手册
 
 ## 配置
 
 默认配置在 [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)：
 
-- `RAK_CAR_API_BASE` 默认 `http://192.168.3.60:5050`
+- `RAK_CAR_SERVER_ORIGIN` 默认 `http://127.0.0.1`
+- `RAK_CAR_API_PORT` 默认 `5050`
+- `RAK_CAR_STREAM_PORT` 默认 `5000`
 - `RAK_CAR_API_PREFIX` 默认 `/v1`
 - `RAK_CAR_REQUEST_TIMEOUT` 默认 `10`
 - `RAK_CAR_WAIT_TIMEOUT` 默认 `300`
 - `RAK_CAR_POLL_INTERVAL` 默认 `0.5`
-- `RAK_CAR_STREAMER_URL` 默认 `http://192.168.3.60:5000/`
+- `RAK_CAR_API_BASE`
+  - 兼容旧写法，会覆盖自动拼出来的 API 地址
+- `RAK_CAR_STREAMER_URL`
+  - 兼容旧写法，会覆盖自动拼出来的推流地址
 
-最常用的只有一个：
+最常用的只改一个：
 
 ```bash
-export RAK_CAR_API_BASE=http://192.168.3.60:5050
+export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
 ```
+
+这样会同时影响：
+
+- API: `http://192.168.3.60:5050`
+- Streamer: `http://192.168.3.60:5000/`
 
 安装依赖：
 
 ```bash
 python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
 ```
+
+## 建议开发顺序
+
+```bash
+export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+python3 /home/jetson/workspace/rak-car/main/quick_start.py
+python3 /home/jetson/workspace/rak-car/main/ws_monitor_tui.py
+```
+
+先确认联通和状态，再开始写自己的业务脚本。
 
 ## Python 调用
 
@@ -88,6 +120,12 @@ python3 /home/jetson/workspace/rak-car/main/ws_monitor_tui.py
 - `q` 退出
 - `r` 立即刷新
 - `c` 主动重连
+- `m` 连动/点动切换
+- `w/a/s/d` 或方向键控制底盘
+- `j/k` 左右旋转
+- `space/x` 急停
+- `+/-` 调线速度
+- `[/]` 调角速度
 
 它会实时显示：
 
@@ -104,7 +142,7 @@ python3 /home/jetson/workspace/rak-car/main/ws_monitor_tui.py
 最常用的就是 `POST /v1/execute`：
 
 ```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
+curl -sS -X POST http://127.0.0.1:5050/v1/execute \
   -H 'Content-Type: application/json' \
   -d '{"target":"car","name":"beep","timeout":40}'
 ```
