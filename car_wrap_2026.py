@@ -9,7 +9,7 @@ import threading
 import os
 import platform
 import signal
-from smartcar import Camera, Streamer
+from smartcar import Camera
 import numpy as np
 from smartcar.whalesbot.vehicle import (
     ArmController,
@@ -318,7 +318,7 @@ class MyCar(MecanumDriver):
 
     STOP_PARAM: bool = True
 
-    def __init__(self):
+    def __init__(self, cap_front=None, cap_side=None, streamer=None):
         """
         初始化智能车
 
@@ -331,7 +331,11 @@ class MyCar(MecanumDriver):
         # 显示
         self.display = ScreenShow()
 
-        self.streamer = Streamer()
+        self._shared_cap_front = cap_front
+        self._shared_cap_side = cap_side
+        self._owns_cameras = cap_front is None and cap_side is None
+        self._owns_streamer = streamer is None
+        self.streamer = streamer
         self.arm = ArmController()
 
         # 获取自己文件所在的目录路径
@@ -525,9 +529,15 @@ class MyCar(MecanumDriver):
             cfg: 配置字典，包含摄像头的配置信息
         """
         # 初始化前后摄像头设置
-        self.cap_front = Camera(cfg["camera"]["front"])
+        if self._shared_cap_front is not None:
+            self.cap_front = self._shared_cap_front
+        else:
+            self.cap_front = Camera(cfg["camera"]["front"])
         # 侧面摄像头
-        self.cap_side = Camera(cfg["camera"]["side"])
+        if self._shared_cap_side is not None:
+            self.cap_side = self._shared_cap_side
+        else:
+            self.cap_side = Camera(cfg["camera"]["side"])
 
     def paddle_infer_init(self):
         """
@@ -643,14 +653,22 @@ class MyCar(MecanumDriver):
         持续检测按键状态，当检测到按键3时设置停止标志。
         """
         while True:
-            if not self._stop_flag:
+            if self._end_flag:
+                return
+            if self._stop_flag:
+                time.sleep(0.05)
+                continue
+            try:
+                key_val = self.key.get_key()
+            except Exception as exc:
                 if self._end_flag:
                     return
-                key_val = self.key.get_key()
-                # print(key_val)
-                if key_val == 3:
-                    self._stop_flag = True
-                time.sleep(0.2)
+                logger.warning("按键线程退出，原因: {}".format(exc))
+                return
+            # print(key_val)
+            if key_val == 3:
+                self._stop_flag = True
+            time.sleep(0.2)
 
     # 根据某个值获取列表中匹配的结果
     @staticmethod
@@ -1743,10 +1761,17 @@ class MyCar(MecanumDriver):
         """
         self._stop_flag = False
         self._end_flag = True
-        self.thread_key.join()
-        self.cap_front.close()
-        self.cap_side.close()
-        self.streamer.stop()
+        if self.thread_key.is_alive():
+            self.thread_key.join(timeout=1.0)
+        try:
+            super(MyCar, self).close()
+        except Exception:
+            pass
+        if self._owns_cameras:
+            self.cap_front.close()
+            self.cap_side.close()
+        if self._owns_streamer and self.streamer is not None:
+            self.streamer.stop()
         # self.grap_cam.close()
 
     def manage(self, programs_list: list, order_index=0):

@@ -15,8 +15,6 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 # 添加上本地目录
 sys.path.append(os.path.abspath(os.path.dirname(__file__))) 
 
-from smartcar.whalesbot.vehicle.base.pydownload import Scratch_Download_MC602P
-
 # 导入自定义log模块
 from ...tools import logger
 # logger.info("start time:{}".format(time.time()))
@@ -88,7 +86,13 @@ class SerialWrap(serial.Serial):
         self.last_ok_at = 0.0
         self.last_error = None
         self.timeout = 0.01
-        self.connect_until_ready(timeout=None)
+        self.auto_connect_on_import = os.environ.get("RAK_CAR_SERIAL_AUTO_CONNECT", "1") not in {
+            "0",
+            "false",
+            "False",
+        }
+        if self.auto_connect_on_import:
+            self.connect_until_ready(timeout=None)
         self.timeout = 0.1
 
     def _close_locked(self):
@@ -412,14 +416,37 @@ class MC602(CotrollerInfo):
                 return True
 
         if is_mc602:
+            try:
+                from runtime.core import settings as runtime_settings
+
+                allow_download = runtime_settings.get_auto_download_on_bootloader()
+            except Exception:
+                allow_download = False
+            if not allow_download:
+                logger.info("skip auto download, waiting existing program to start")
+                return False
             # 下载程序并进入program程序
             logger.info("downloading program")
             serial_obj.close()
-            result, msg = Scratch_Download_MC602P("RunA", isrun=True)
+            from runtime.hardware.controller_download import download_mc602_program
 
-            serial_obj.open()
-            if self.ping_rx(serial_obj, time_out=1.5):
-                return True
+            result, _msg = download_mc602_program("RunA", isrun=True)
+            if result:
+                deadline = time.time() + 6.0
+                while time.time() < deadline:
+                    try:
+                        if not serial_obj.is_open:
+                            serial_obj.open()
+                    except Exception:
+                        time.sleep(0.2)
+                        continue
+                    if self.ping_rx(serial_obj, time_out=0.5):
+                        return True
+                    try:
+                        serial_obj.close()
+                    except Exception:
+                        pass
+                    time.sleep(0.2)
         return False
     
 class MC602Wireness(CotrollerInfo):

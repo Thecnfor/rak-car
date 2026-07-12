@@ -1,11 +1,15 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 import importlib
+import os
 import sys
 import threading
 import time
 
 from runtime.hardware.controller_probe import probe_controller
+
+
+os.environ.setdefault("RAK_CAR_SERIAL_AUTO_CONNECT", "0")
 
 
 STATE_DISCONNECTED = "DISCONNECTED"
@@ -69,6 +73,18 @@ class ControllerSessionManager:
             self._detail = "控制器 program 模式在线"
             self._failure_count = 0
             self._last_ok_at = time.time()
+            if serial_wrap is not None:
+                controller_name = None
+                dev = getattr(serial_wrap, "dev", None)
+                if dev is not None:
+                    controller_name = getattr(dev, "name", None)
+                self._last_probe = {
+                    "ready": True,
+                    "port": getattr(serial_wrap, "port", None),
+                    "controller": controller_name,
+                    "detail": self._detail,
+                    "checked_at": self._last_ok_at,
+                }
 
     def note_io_failure(self, detail=None):
         with self._lock:
@@ -136,6 +152,13 @@ class ControllerSessionManager:
         with self._lock:
             self._state = STATE_RECOVERING
             self._detail = "正在恢复控制器 program 模式"
+        serial_wrap = self._get_loaded_serial_wrap()
+        if serial_wrap is not None:
+            try:
+                with serial_wrap.lock:
+                    serial_wrap._close_locked()
+            except Exception:
+                pass
         probe = probe_controller()
         self._set_probe(probe)
         if not probe.ready:

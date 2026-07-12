@@ -5,7 +5,8 @@ from dataclasses import dataclass
 
 DEFAULT_SERVER_ORIGIN = "http://127.0.0.1"
 DEFAULT_API_PORT = 5050
-DEFAULT_STREAM_PORT = 5000
+DEFAULT_STREAM_PORT = DEFAULT_API_PORT
+DEFAULT_STREAM_PATH = "/stream/"
 DEFAULT_API_PREFIX = "/v1"
 DEFAULT_REQUEST_TIMEOUT = 10.0
 DEFAULT_WAIT_TIMEOUT = 300.0
@@ -20,8 +21,11 @@ def _build_http_url(origin, port):
     return f"{_strip_trailing_slash(origin)}:{int(port)}"
 
 
-def _build_streamer_url(origin, port):
-    return f"{_build_http_url(origin, port)}/"
+def _build_streamer_url(origin, port, path):
+    stream_path = "/" + str(path or "").strip("/")
+    if stream_path != "/":
+        stream_path += "/"
+    return f"{_build_http_url(origin, port)}{stream_path}"
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,7 @@ def load_settings():
     )
     api_port = int(os.getenv("RAK_CAR_API_PORT", str(DEFAULT_API_PORT)))
     stream_port = int(os.getenv("RAK_CAR_STREAM_PORT", str(DEFAULT_STREAM_PORT)))
+    stream_path = os.getenv("RAK_CAR_STREAM_PATH", DEFAULT_STREAM_PATH)
     api_base = _strip_trailing_slash(
         os.getenv(
             "RAK_CAR_API_BASE",
@@ -51,7 +56,7 @@ def load_settings():
     )
     streamer_url = os.getenv(
         "RAK_CAR_STREAMER_URL",
-        _build_streamer_url(server_origin, stream_port),
+        _build_streamer_url(server_origin, stream_port, stream_path),
     )
     return BusinessSettings(
         server_origin=server_origin,

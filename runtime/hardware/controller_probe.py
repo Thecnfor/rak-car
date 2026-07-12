@@ -1,11 +1,18 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
+import json
 import time
+import urllib.request
 from dataclasses import dataclass
 
 import serial
 from serial.tools import list_ports
-from smartcar.whalesbot.vehicle.base.pydownload import Scratch_Download_MC602P
+
+from runtime.hardware.controller_recover import (
+    ping_mc601,
+    ping_mc602,
+    recover_controller,
+)
 
 
 PORT_KEYWORDS = ("CH340", "USB")
@@ -17,6 +24,46 @@ class ControllerProbeResult:
     port: str = None
     controller: str = None
     detail: str = None
+
+
+# #region debug-point A:report-helper
+def _debug_event(hypothesis_id, location, msg, data=None, run_id="pre"):
+    env_path = ".dbg/mc602-download-stuck.env"
+    server_url = "http://127.0.0.1:7777/event"
+    session_id = "mc602-download-stuck"
+    try:
+        with open(env_path, "r", encoding="utf-8") as env_file:
+            for raw_line in env_file:
+                line = raw_line.strip()
+                if line.startswith("DEBUG_SERVER_URL="):
+                    server_url = line.split("=", 1)[1]
+                elif line.startswith("DEBUG_SESSION_ID="):
+                    session_id = line.split("=", 1)[1]
+    except Exception:
+        pass
+    payload = {
+        "sessionId": session_id,
+        "runId": run_id,
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": "[DEBUG] {}".format(msg),
+        "data": data or {},
+        "ts": int(time.time() * 1000),
+    }
+    try:
+        urllib.request.urlopen(
+            urllib.request.Request(
+                server_url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+            ),
+            timeout=0.2,
+        ).read()
+    except Exception:
+        pass
+
+
+# #endregion
 
 
 def _get_port_name(port_info):
@@ -36,99 +83,16 @@ def list_candidate_ports():
     ports.sort(key=lambda item: "CH340" not in item[1])
     return ports
 
-
-def _read_exact(serial_obj, size, timeout_s):
-    time_end = time.time() + timeout_s
-    chunks = b""
-    while len(chunks) < size and time.time() < time_end:
-        chunk = serial_obj.read(size - len(chunks))
-        if chunk:
-            chunks += chunk
-    return chunks
-
-
-def _ping_mc601(serial_obj, timeout_s=0.05):
-    serial_obj.baudrate = 380400
-    time_end = time.time() + timeout_s
-    while time.time() < time_end:
-        serial_obj.reset_input_buffer()
-        serial_obj.reset_output_buffer()
-        serial_obj.write(bytes.fromhex("77 68 04 00 01 CA 01 0A"))
-        head = _read_exact(serial_obj, 3, 0.03)
-        if len(head) != 3:
-            continue
-        frame_len = head[2] + 7
-        body = _read_exact(serial_obj, frame_len - 3, 0.03)
-        response = head + body
-        if len(response) == frame_len and response[:2] == bytes.fromhex("77 68") and response[-1:] == bytes.fromhex("0A"):
-            return True
-    return False
-
-
-def _ping_mc602(serial_obj, timeout_s=0.05):
-    serial_obj.baudrate = 1000000
-    time_end = time.time() + timeout_s
-    while time.time() < time_end:
-        serial_obj.reset_input_buffer()
-        serial_obj.reset_output_buffer()
-        serial_obj.write(bytes.fromhex("77 68 07 02 01 10 0A"))
-        head = _read_exact(serial_obj, 3, 0.02)
-        if len(head) != 3:
-            continue
-        frame_len = head[2]
-        body = _read_exact(serial_obj, frame_len - 3, 0.02)
-        response = head + body
-        if len(response) == frame_len and response[:2] == bytes.fromhex("77 68") and response[-1:] == bytes.fromhex("0A"):
-            return True
-    return False
-
-
-def _recover_mc602(port_name, serial_obj):
-    serial_obj.baudrate = 1000000
-    serial_obj.reset_input_buffer()
-    serial_obj.reset_output_buffer()
-    serial_obj.write(bytes.fromhex("55 AA 00 01 08 00 00 F7"))
-    time.sleep(0.01)
-    ret = _read_exact(serial_obj, 10, 0.1)
-    if ret != bytes.fromhex("66 BB 01 01 0A 00 5A 02 00 76"):
-        return False, None
-
-    # 先尝试直接拉起已有的 program，避免每次都重新下载。
-    start_time = time.time()
-    while time.time() - start_time < 1.0:
-        serial_obj.reset_input_buffer()
-        serial_obj.reset_output_buffer()
-        serial_obj.write(bytes.fromhex("55 AA 00 40 0B 00 00 D0 00 08 DD"))
-        time.sleep(0.01)
-        ret = _read_exact(serial_obj, 11, 0.1)
-        if ret == bytes.fromhex("66 BB 01 41 0B 00 00 D0 00 08 B9"):
-            if _ping_mc602(serial_obj, timeout_s=2.0):
-                return True, "控制器已从 bootloader 拉起到 program 模式"
-            break
-
-    serial_obj.close()
-    result, _msg = Scratch_Download_MC602P("RunA", isrun=True)
-    if not result:
-        return False, "mc602 处于 bootloader，但自动下载 Run.bin 失败"
-
-    with serial.Serial(
-        port=port_name,
-        baudrate=115200,
-        timeout=0.03,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        xonxoff=False,
-        rtscts=False,
-        dsrdtr=False,
-    ) as retry_serial:
-        if _ping_mc602(retry_serial, timeout_s=1.5):
-            return True, "控制器已自动下载 Run.bin 并进入 program 模式"
-    return False, "mc602 自动下载后仍未进入 program 模式"
-
-
 def probe_controller():
     ports = list_candidate_ports()
+    # #region debug-point E:probe-entry
+    _debug_event(
+        "E",
+        "controller_probe.probe_controller",
+        "开始探测控制器",
+        {"ports": [{"name": name, "desc": desc} for name, desc in ports]},
+    )
+    # #endregion
     if not ports:
         return ControllerProbeResult(
             ready=False,
@@ -149,22 +113,59 @@ def probe_controller():
                 rtscts=False,
                 dsrdtr=False,
             ) as serial_obj:
-                if _ping_mc602(serial_obj):
+                # #region debug-point E:probe-port-open
+                _debug_event(
+                    "E",
+                    "controller_probe.probe_controller",
+                    "串口已打开，开始握手",
+                    {"port": port_name, "desc": _desc},
+                )
+                # #endregion
+                if ping_mc602(serial_obj):
+                    # #region debug-point E:probe-mc602-ok
+                    _debug_event(
+                        "E",
+                        "controller_probe.probe_controller",
+                        "mc602 program 握手成功",
+                        {"port": port_name},
+                    )
+                    # #endregion
                     return ControllerProbeResult(
                         ready=True,
                         port=port_name,
                         controller="mc602",
                         detail="控制器握手成功",
                     )
-                if _ping_mc601(serial_obj):
+                if ping_mc601(serial_obj):
+                    # #region debug-point E:probe-mc601-ok
+                    _debug_event(
+                        "E",
+                        "controller_probe.probe_controller",
+                        "mc601 program 握手成功",
+                        {"port": port_name},
+                    )
+                    # #endregion
                     return ControllerProbeResult(
                         ready=True,
                         port=port_name,
                         controller="mc601",
                         detail="控制器握手成功",
                     )
-                recovered, detail = _recover_mc602(port_name, serial_obj)
+                serial_obj.close()
+                recovered, detail = recover_controller(
+                    port_name,
+                    port_supplier=list_candidate_ports,
+                    debug_hook=_debug_event,
+                )
                 if recovered:
+                    # #region debug-point E:probe-recovered
+                    _debug_event(
+                        "E",
+                        "controller_probe.probe_controller",
+                        "bootloader 恢复成功",
+                        {"port": port_name, "detail": detail},
+                    )
+                    # #endregion
                     return ControllerProbeResult(
                         ready=True,
                         port=port_name,
@@ -172,11 +173,38 @@ def probe_controller():
                         detail=detail,
                     )
                 if detail:
-                    last_error = f"{port_name} {detail}"
+                    if str(detail).startswith(port_name):
+                        last_error = str(detail)
+                    else:
+                        last_error = f"{port_name} {detail}"
+                    # #region debug-point E:probe-detail
+                    _debug_event(
+                        "E",
+                        "controller_probe.probe_controller",
+                        "端口恢复失败",
+                        {"port": port_name, "detail": detail},
+                    )
+                    # #endregion
                     continue
                 last_error = f"{port_name} 可打开但未收到控制器响应"
+                # #region debug-point E:probe-no-response
+                _debug_event(
+                    "E",
+                    "controller_probe.probe_controller",
+                    "串口可打开但无控制器响应",
+                    {"port": port_name},
+                )
+                # #endregion
         except Exception as exc:
             last_error = f"{port_name} 探测失败: {exc}"
+            # #region debug-point E:probe-open-error
+            _debug_event(
+                "E",
+                "controller_probe.probe_controller",
+                "探测串口失败",
+                {"port": port_name, "error": repr(exc)},
+            )
+            # #endregion
 
     return ControllerProbeResult(
         ready=False,

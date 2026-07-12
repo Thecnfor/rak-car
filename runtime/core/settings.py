@@ -10,7 +10,8 @@ import os
 
 # 对外给局域网同事访问的默认地址
 PUBLIC_HOST = "192.168.3.60"
-PUBLIC_STREAM_PORT = 5000
+PUBLIC_STREAM_PORT = 5050
+PUBLIC_STREAM_PATH = "/stream/"
 
 # 本机监听地址
 BIND_HOST = "0.0.0.0"
@@ -21,6 +22,9 @@ API_V1_PREFIX = "/v1"
 LEGACY_API_PREFIX = "/api"
 
 # 初始化行为
+# 默认开启后台自愈：API 进程启动后会在后台持续尝试拉起小车，
+# 下位机掉电恢复后也能自动重建整车对象。需要时可通过
+# 环境变量 RAK_CAR_AUTO_INIT=0 关闭。
 AUTO_INIT_ON_START = True
 RESET_ARM_ON_AUTO_INIT = False
 RESET_POSITION_ON_INIT = True
@@ -28,6 +32,7 @@ STOP_AFTER_ACTION_DEFAULT = False
 AUTO_INIT_RETRY_INTERVAL = 3.0
 ACTION_READY_TIMEOUT = 30.0
 ACTION_READY_POLL_INTERVAL = 0.5
+AUTO_DOWNLOAD_ON_BOOTLOADER = False
 
 # 任务队列
 JOB_HISTORY_LIMIT = 100
@@ -40,6 +45,13 @@ def _bool_env(name, default):
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _normalize_path(value):
+    text = "/" + str(value or "").strip("/")
+    if text == "/":
+        return text
+    return text + "/"
 
 
 def get_bind_host():
@@ -67,7 +79,16 @@ def get_public_stream_host():
 
 
 def get_public_stream_port():
-    return int(os.getenv("RAK_CAR_PUBLIC_STREAM_PORT", str(PUBLIC_STREAM_PORT)))
+    value = os.getenv("RAK_CAR_PUBLIC_STREAM_PORT")
+    if value is None:
+        return get_bind_port()
+    return int(value)
+
+
+def get_public_stream_path():
+    return _normalize_path(
+        os.getenv("RAK_CAR_PUBLIC_STREAM_PATH", PUBLIC_STREAM_PATH)
+    )
 
 
 def get_api_v1_prefix():
@@ -121,12 +142,22 @@ def get_action_ready_poll_interval():
     )
 
 
+def get_auto_download_on_bootloader():
+    return _bool_env(
+        "RAK_CAR_AUTO_DOWNLOAD_ON_BOOTLOADER",
+        AUTO_DOWNLOAD_ON_BOOTLOADER,
+    )
+
+
 def get_public_api_base():
     return f"http://{get_public_api_host()}:{get_public_api_port()}"
 
 
 def get_public_stream_base():
-    return f"http://{get_public_stream_host()}:{get_public_stream_port()}/"
+    return (
+        f"http://{get_public_stream_host()}:{get_public_stream_port()}"
+        f"{get_public_stream_path()}"
+    )
 
 
 def get_bind_base():
@@ -140,6 +171,7 @@ def get_runtime_settings():
         "public_host": get_public_host(),
         "public_api_base": get_public_api_base(),
         "public_stream_base": get_public_stream_base(),
+        "public_stream_path": get_public_stream_path(),
         "api_v1_prefix": get_api_v1_prefix(),
         "legacy_api_prefix": get_legacy_api_prefix(),
         "auto_init_on_start": get_auto_init_on_start(),
@@ -149,5 +181,6 @@ def get_runtime_settings():
         "auto_init_retry_interval": get_auto_init_retry_interval(),
         "action_ready_timeout": get_action_ready_timeout(),
         "action_ready_poll_interval": get_action_ready_poll_interval(),
+        "auto_download_on_bootloader": get_auto_download_on_bootloader(),
         "job_history_limit": JOB_HISTORY_LIMIT,
     }

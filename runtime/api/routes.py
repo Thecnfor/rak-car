@@ -1,7 +1,15 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 try:
-    from fastapi import APIRouter, Body, HTTPException, Query, WebSocket, WebSocketDisconnect
+    from fastapi import APIRouter, Body, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+except ModuleNotFoundError as exc:  # pragma: no cover
+    raise RuntimeError(
+        "缺少 FastAPI 依赖，请先执行: /usr/bin/python3 -m pip install -r "
+        "/home/jetson/workspace/rak-car/runtime/requirements.txt"
+    ) from exc
+
+try:
+    from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError(
         "缺少 FastAPI 依赖，请先执行: /usr/bin/python3 -m pip install -r "
@@ -24,6 +32,115 @@ def get_public_links():
         "ws_v1": f"{ws_base}{v1}/ws",
         "health_legacy": f"{api_base}{legacy}/health",
         "streamer": settings.get_public_stream_base(),
+        "stream_info": f"{api_base}/stream/info",
+        "stream_health": f"{api_base}/stream/health",
+        "stream_cam1_frame": f"{api_base}/stream/frame/cam1.jpg",
+        "stream_cam2_frame": f"{api_base}/stream/frame/cam2.jpg",
+        "vision_models": f"{api_base}{v1}/vision/models",
+        "vision_lane": f"{api_base}{v1}/vision/lane",
+        "vision_task": f"{api_base}{v1}/vision/task",
+        "vision_ocr": f"{api_base}{v1}/vision/ocr",
+    }
+
+
+def _execute_sync(service, target, name, args=None, kwargs=None, timeout=None):
+    try:
+        job = service.submit_job_and_wait(
+            target=target,
+            name=name,
+            args=args or [],
+            kwargs=kwargs or {},
+            timeout=timeout,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail=str(exc)) from exc
+    if job["status"] != "succeeded":
+        raise HTTPException(status_code=500, detail=job["error"] or "动作执行失败")
+    return job["result"]
+
+
+def _frame_shape(camera_stream_service, cam_id):
+    frame = camera_stream_service.get_frame(cam_id)
+    if frame is None:
+        return None
+    return list(frame.shape)
+
+
+def _bbox_to_pixels(det, image_shape):
+    if not image_shape:
+        return None
+    img_h, img_w = image_shape[0], image_shape[1]
+    x_c, y_c, width, height = det[4], det[5], det[6], det[7]
+    center_x = int((x_c + 1) / 2 * img_w)
+    center_y = int((y_c + 1) / 2 * img_h)
+    box_w = int(width * img_w / 2)
+    box_h = int(height * img_h / 2)
+    x1 = int(center_x - box_w / 2)
+    y1 = int(center_y - box_h / 2)
+    x2 = int(center_x + box_w / 2)
+    y2 = int(center_y + box_h / 2)
+    return {
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "width": box_w,
+        "height": box_h,
+    }
+
+
+def _format_detection(det, index, image_shape=None):
+    return {
+        "index": index,
+        "class_id": det[0],
+        "track_id": det[1],
+        "label": det[2],
+        "score": det[3],
+        "bbox_norm": {
+            "x_center": det[4],
+            "y_center": det[5],
+            "width": det[6],
+            "height": det[7],
+        },
+        "bbox_pixels": _bbox_to_pixels(det, image_shape),
+    }
+
+
+def _vision_models_payload():
+    return {
+        "models": [
+            {
+                "name": "lane",
+                "enabled": True,
+                "camera": "cam1",
+                "camera_alias": "front",
+                "return_schema": {"error": "float", "angle": "float"},
+                "preview_frame_url": "/stream/frame/cam1.jpg",
+            },
+            {
+                "name": "task",
+                "enabled": True,
+                "camera": "cam2",
+                "camera_alias": "side",
+                "return_schema": {"detections": "list"},
+                "preview_frame_url": "/stream/frame/cam2.jpg",
+            },
+            {
+                "name": "ocr",
+                "enabled": True,
+                "camera": "cam2",
+                "camera_alias": "side",
+                "return_schema": {"text": "string|null", "matched_detection": "object|null"},
+                "preview_frame_url": "/stream/frame/cam1.jpg",
+            },
+            {
+                "name": "front",
+                "enabled": False,
+                "reason": "当前业务未使用，MyCar 未接入 front_det",
+            },
+        ]
     }
 
 
@@ -171,8 +288,117 @@ async def _handle_websocket_message(service, payload):
     raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
 
 
-def create_runtime_router(service):
+def create_runtime_router(service, camera_stream_service):
+    router = APIRouter(tags=["runtime"])
     router_v1 = APIRouter(prefix=settings.get_api_v1_prefix(), tags=["runtime"])
+
+    @router.get("/stream/info")
+    def stream_info(request: Request):
+        return camera_stream_service.get_stream_info(str(request.base_url).rstrip("/"))
+
+    @router.get("/stream")
+    @router.get("/stream/")
+    def stream_index():
+        return HTMLResponse(camera_stream_service.render_page())
+
+    @router.get("/video_feed/{cam_id}")
+    def video_feed(cam_id: str):
+        return StreamingResponse(
+            camera_stream_service.stream_frames(cam_id),
+            media_type="multipart/x-mixed-replace; boundary=frame",
+        )
+
+    @router.get("/stream/health")
+    def stream_health():
+        return camera_stream_service.get_status()
+
+    @router.get("/stream/frame/{cam_id}.jpg")
+    def stream_frame(cam_id: str, download: int = Query(default=0)):
+        filename = f"{camera_stream_service.normalize_cam_id(cam_id)}.jpg"
+        headers = {}
+        if download == 1:
+            headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        return Response(
+            content=camera_stream_service.encode_jpeg_bytes(cam_id),
+            media_type="image/jpeg",
+            headers=headers,
+        )
+
+    @router.get("/stream/clear")
+    def stream_clear(cam_id: str = Query(default=None)):
+        camera_stream_service.clear_frame(cam_id)
+        return {"ok": True, "cam_id": cam_id or "all"}
+
+    @router.post("/stream/capture")
+    def stream_capture(payload: dict = Body(default={})):
+        cam_id = payload.get("cam_id", "cam1")
+        prefix = payload.get("prefix", "capture")
+        subdir = payload.get("subdir")
+        try:
+            capture = camera_stream_service.save_capture(
+                cam_id=cam_id,
+                prefix=prefix,
+                subdir=subdir,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        normalized = capture["cam_id"]
+        capture["download_url"] = f"/stream/captures/{normalized}/{capture['filename']}"
+        if subdir:
+            capture["download_url"] += f"?subdir={subdir}"
+        capture["frame_url"] = f"/stream/frame/{normalized}.jpg"
+        return {"ok": True, "capture": capture}
+
+    @router.post("/stream/capture/{cam_id}/download")
+    def stream_capture_download(cam_id: str, payload: dict = Body(default={})):
+        prefix = payload.get("prefix", "capture")
+        subdir = payload.get("subdir")
+        try:
+            capture = camera_stream_service.save_capture(
+                cam_id=cam_id,
+                prefix=prefix,
+                subdir=subdir,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        file_path = camera_stream_service.get_saved_capture_path(
+            cam_id=capture["cam_id"],
+            filename=capture["filename"],
+            subdir=subdir,
+        )
+        return FileResponse(
+            path=str(file_path),
+            media_type="image/jpeg",
+            filename=capture["download_name"],
+        )
+
+    @router.get("/stream/captures/{cam_id}/{filename}")
+    def stream_capture_file(
+        cam_id: str,
+        filename: str,
+        subdir: str = Query(default=None),
+        download: int = Query(default=1),
+    ):
+        try:
+            file_path = camera_stream_service.get_saved_capture_path(
+                cam_id=cam_id,
+                filename=filename,
+                subdir=subdir,
+            )
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return FileResponse(
+            path=str(file_path),
+            media_type="image/jpeg",
+            filename=filename if download == 1 else None,
+        )
+
+    @router.post("/keypress")
+    def keypress(payload: dict = Body(default={})):
+        key = payload.get("key")
+        if key is None:
+            raise HTTPException(status_code=400, detail="缺少 key")
+        return {"ok": True, "received": camera_stream_service.set_key(key)}
 
     @router_v1.get("/health")
     def v1_health(snapshot: int = Query(default=0)):
@@ -189,6 +415,139 @@ def create_runtime_router(service):
     @router_v1.get("/config")
     def v1_config():
         return {"ok": True, "config": settings.get_runtime_settings()}
+
+    @router_v1.get("/vision/models")
+    def v1_vision_models():
+        return {"ok": True, **_vision_models_payload()}
+
+    @router_v1.post("/vision/lane")
+    def v1_vision_lane(payload: dict = Body(default={})):
+        timeout = payload.get("timeout", 20)
+        result = _execute_sync(
+            service,
+            target="car",
+            name="get_lane_results",
+            timeout=timeout,
+        )
+        return {
+            "ok": True,
+            "model": "lane",
+            "camera": "cam1",
+            "frame_url": "/stream/frame/cam1.jpg",
+            "preview_url": "/stream/",
+            "result": {
+                "error": result[0],
+                "angle": result[1],
+            },
+            "frame_shape": _frame_shape(camera_stream_service, "cam1"),
+        }
+
+    @router_v1.post("/vision/task")
+    def v1_vision_task(payload: dict = Body(default={})):
+        timeout = payload.get("timeout", 20)
+        sort_pos = payload.get("sort_pos", [0, 0])
+        limit_x = payload.get("limit_x", 1)
+        limit_y = payload.get("limit_y", 1)
+        result = _execute_sync(
+            service,
+            target="car",
+            name="get_detection_results",
+            kwargs={
+                "sort_pos": sort_pos,
+                "limit_x": limit_x,
+                "limit_y": limit_y,
+            },
+            timeout=timeout,
+        )
+        image_shape = _frame_shape(camera_stream_service, "cam2")
+        detections = [
+            _format_detection(det, index=index, image_shape=image_shape)
+            for index, det in enumerate(result)
+        ]
+        return {
+            "ok": True,
+            "model": "task",
+            "camera": "cam2",
+            "frame_url": "/stream/frame/cam2.jpg",
+            "preview_url": "/stream/",
+            "filters": {
+                "sort_pos": sort_pos,
+                "limit_x": limit_x,
+                "limit_y": limit_y,
+            },
+            "count": len(detections),
+            "detections": detections,
+            "frame_shape": image_shape,
+        }
+
+    @router_v1.post("/vision/ocr")
+    def v1_vision_ocr(payload: dict = Body(default={})):
+        timeout = payload.get("timeout", 20)
+        label = payload.get("label")
+        sort_pos = payload.get("sort_pos", [0, 0])
+        limit_x = payload.get("limit_x", 1)
+        limit_y = payload.get("limit_y", 1)
+        detections = _execute_sync(
+            service,
+            target="car",
+            name="get_detection_results",
+            kwargs={
+                "sort_pos": sort_pos,
+                "limit_x": limit_x,
+                "limit_y": limit_y,
+            },
+            timeout=timeout,
+        )
+        image_shape = _frame_shape(camera_stream_service, "cam2")
+        formatted_detections = [
+            _format_detection(det, index=index, image_shape=image_shape)
+            for index, det in enumerate(detections)
+        ]
+        matched_index = None
+        matched_det = None
+        for index, det in enumerate(detections):
+            det_label = det[2]
+            if label is None and det_label in {"order", "name"}:
+                matched_index = index
+                matched_det = det
+                break
+            if label is not None and det_label == label:
+                matched_index = index
+                matched_det = det
+                break
+        if matched_det is None:
+            return {
+                "ok": True,
+                "model": "ocr",
+                "camera": "cam2",
+                "frame_url": "/stream/frame/cam1.jpg",
+                "preview_url": "/stream/",
+                "label": label,
+                "text": None,
+                "matched_detection": None,
+                "detections": formatted_detections,
+                "message": "当前画面未找到匹配的 OCR 检测框",
+            }
+        text = _execute_sync(
+            service,
+            target="car",
+            name="get_det_ocr",
+            args=[matched_det],
+            kwargs={"label": label, "time_out": timeout},
+            timeout=timeout,
+        )
+        return {
+            "ok": True,
+            "model": "ocr",
+            "camera": "cam2",
+            "frame_url": "/stream/frame/cam1.jpg",
+            "source_frame_url": "/stream/frame/cam2.jpg",
+            "preview_url": "/stream/",
+            "label": label,
+            "text": text,
+            "matched_detection": formatted_detections[matched_index],
+            "detections": formatted_detections,
+        }
 
     @router_v1.get("/jobs")
     def v1_jobs():
@@ -262,7 +621,8 @@ def create_runtime_router(service):
                 result["request_id"] = request_id
             await websocket.send_json(result)
 
-    return router_v1
+    router.include_router(router_v1)
+    return router
 
 
 def create_legacy_router(service):

@@ -473,19 +473,29 @@ class MecanumDriver:
 
         定期更新车辆位姿信息
         """
-        previous_wheel_linear_velocities = np.array(self.wheels_chassis.get_linear())
+        try:
+            previous_wheel_linear_velocities = np.array(self.wheels_chassis.get_linear())
+        except Exception as exc:
+            logger.warning("里程计线程未能启动: {}".format(exc))
+            return
         while True:
             if self._stop_thread:
                 break
-            current_wheel_linear_velocities = self.wheels_chassis.get_linear()
-            # 获取每个轮子的位移
-            wheel_linear_displacements = (
-                current_wheel_linear_velocities - previous_wheel_linear_velocities
-            )
-            previous_wheel_linear_velocities = current_wheel_linear_velocities
-            # 里程计根据轮子的位置变化更新，使用锁确保线程安全
-            with self._lock:
-                self.chassis.update_odometry(wheel_linear_displacements)
+            try:
+                current_wheel_linear_velocities = self.wheels_chassis.get_linear()
+                # 获取每个轮子的位移
+                wheel_linear_displacements = (
+                    current_wheel_linear_velocities - previous_wheel_linear_velocities
+                )
+                previous_wheel_linear_velocities = current_wheel_linear_velocities
+                # 里程计根据轮子的位置变化更新，使用锁确保线程安全
+                with self._lock:
+                    self.chassis.update_odometry(wheel_linear_displacements)
+            except Exception as exc:
+                if self._stop_thread:
+                    break
+                logger.warning("里程计线程退出，原因: {}".format(exc))
+                break
             time.sleep(0.05)
 
     def get_odometry(self,show_info=False) -> np.ndarray:

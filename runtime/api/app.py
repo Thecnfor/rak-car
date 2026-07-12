@@ -10,10 +10,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 from runtime.api.routes import create_legacy_router, create_runtime_router, get_public_links
 from runtime.core import settings
+from runtime.services.camera_stream_service import CameraStreamService
 from runtime.services.runtime_service import CarRuntimeService
 
 
 service = CarRuntimeService()
+camera_stream_service = CameraStreamService(service)
+service.set_stream_service(camera_stream_service)
 _startup_ran = False
 
 
@@ -30,8 +33,14 @@ def create_app():
         if _startup_ran:
             return
         _startup_ran = True
+        camera_stream_service.start()
         if settings.get_auto_init_on_start():
             service.start_auto_init()
+
+    @app.on_event("shutdown")
+    def shutdown_event():
+        camera_stream_service.stop()
+        service.close()
 
     @app.get("/")
     def index():
@@ -42,7 +51,7 @@ def create_app():
             "config_hint": "/v1/config",
         }
 
-    app.include_router(create_runtime_router(service))
+    app.include_router(create_runtime_router(service, camera_stream_service))
     app.include_router(create_legacy_router(service))
     return app
 

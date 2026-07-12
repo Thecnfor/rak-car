@@ -3,6 +3,8 @@
 `main/` 现在只保留最小可用集，目标就是一件事：
 
 - 不关心底层源码细节，只通过 HTTP API 做真实业务开发
+- 业务代码只允许放在 `main/`，并且只能通过接口控制
+- 不允许直接依赖 `main/` 以外的任何 Python 源码
 
 ## 文件分工
 
@@ -16,12 +18,12 @@
   - 开发自检脚本，先看配置，再测连通性
 - [car_start_api.py](file:///home/jetson/workspace/rak-car/main/car_start_api.py)
   - 类似官方 `car_start_2026.py` 的 API 编排模板
-- [ws_monitor_tui.py](file:///home/jetson/workspace/rak-car/main/ws_monitor_tui.py)
-  - WebSocket 实时监测 + 底盘遥控 TUI
+- [BUSINESS_API_GUIDE.md](file:///home/jetson/workspace/rak-car/main/BUSINESS_API_GUIDE.md)
+  - 业务层调用手册，只讲怎么控制和怎么闭环读取
 - [CAPABILITY_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)
   - 能力总表
 - [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)
-  - 速查手册
+  - 主文档，所有接口总表速查
 
 ## 配置
 
@@ -29,7 +31,8 @@
 
 - `RAK_CAR_SERVER_ORIGIN` 默认 `http://127.0.0.1`
 - `RAK_CAR_API_PORT` 默认 `5050`
-- `RAK_CAR_STREAM_PORT` 默认 `5000`
+- `RAK_CAR_STREAM_PORT` 默认复用 `5050`
+- `RAK_CAR_STREAM_PATH` 默认 `/stream/`
 - `RAK_CAR_API_PREFIX` 默认 `/v1`
 - `RAK_CAR_REQUEST_TIMEOUT` 默认 `10`
 - `RAK_CAR_WAIT_TIMEOUT` 默认 `300`
@@ -48,7 +51,7 @@ export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
 这样会同时影响：
 
 - API: `http://192.168.3.60:5050`
-- Streamer: `http://192.168.3.60:5000/`
+- Streamer: `http://192.168.3.60:5050/stream/`
 
 安装依赖：
 
@@ -61,10 +64,9 @@ python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
 ```bash
 export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
 python3 /home/jetson/workspace/rak-car/main/quick_start.py
-python3 /home/jetson/workspace/rak-car/main/ws_monitor_tui.py
 ```
 
-先确认联通和状态，再开始写自己的业务脚本。
+先确认联通和状态，再直接看 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 
 ## Python 调用
 
@@ -98,6 +100,8 @@ client.call("car", "lane_dis_offset", timeout=80, speed=0.3, dis_hold=0.2)
 client.call("arm", "move_x_position", 0.20, timeout=20)
 ```
 
+接口总表和用途，直接看 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+
 ## 现成脚本
 
 官方流程风格的 API 模板：
@@ -109,34 +113,6 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py
 这个脚本默认不直接动小车，只保留和 `car_start_2026.py` 一样的任务顺序模板。
 你只要把需要的那几行取消注释，就能开始业务编排。
 
-WebSocket 实时监测 TUI：
-
-```bash
-python3 /home/jetson/workspace/rak-car/main/ws_monitor_tui.py
-```
-
-界面里支持：
-
-- `q` 退出
-- `r` 立即刷新
-- `c` 主动重连
-- `m` 连动/点动切换
-- `w/a/s/d` 或方向键控制底盘
-- `j/k` 左右旋转
-- `space/x` 急停
-- `+/-` 调线速度
-- `[/]` 调角速度
-
-它会实时显示：
-
-- runtime 初始化状态
-- 控制器 session 状态
-- 当前任务
-- 电池电压
-- 左右 IR
-- 机械臂状态
-- 位姿与距离
-
 ## curl 调用
 
 最常用的就是 `POST /v1/execute`：
@@ -147,7 +123,7 @@ curl -sS -X POST http://127.0.0.1:5050/v1/execute \
   -d '{"target":"car","name":"beep","timeout":40}'
 ```
 
-更多可直接抄的请求体，见 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+所有接口总表，见 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 
 如果你想先看“这台车现在到底会什么”，直接看 [CAPABILITY_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)。
 

@@ -1,925 +1,284 @@
-# main 接口速查手册
+# main API 速查手册
 
-这份文档按“能直接抄请求体”的方式写，面向真实业务开发。
+只看这个文件就行。
 
-如果你想先看完整能力边界，不想每次重新口头描述，直接看 [CAPABILITY_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)。
+补充文档：
 
-## 1. 先记住这一个接口
+- 双摄流、截图、保存下载： [STREAM_API.md](file:///home/jetson/workspace/rak-car/runtime/STREAM_API.md)
+- `lane/task/ocr` 结构化推理结果： [VISION_API.md](file:///home/jetson/workspace/rak-car/runtime/VISION_API.md)
 
-推荐统一使用：
+用途：
+
+- 把当前可调接口全部列出来
+- 只写接口名、用途、关键参数、返回
+- 不讲驱动，不讲业务废话
+
+最重要的约束：
+
+- `car` 和 `arm` 不是让你在业务代码里直接 import 的 Python 对象
+- `car` / `arm` / `task` 只是接口里的 `target` 名字
+- `main/` 里的业务代码只能通过 API 调用它们
+- 不允许业务层直接 import `main/` 以外的任何源码
+- 不允许业务层直接调用 `car_wrap_2026.py`、`car_task_function.py`、`smartcar/`、`runtime/` 里的内部实现
+- 一切控制统一走接口
+
+## 通用调用格式
+
+统一入口：
 
 - `POST /v1/execute`
 
-请求体固定长这样：
+你要这样理解：
+
+| 名字     | 身份                        | 业务层该怎么用                                      |
+| ------ | ------------------------- | -------------------------------------------- |
+| `car`  | 底盘/传感/视觉这一组接口的 `target` 名 | 用 `POST /v1/execute` 或 WebSocket `execute` 调 |
+| `arm`  | 机械臂这一组接口的 `target` 名      | 用 `POST /v1/execute` 或 WebSocket `execute` 调 |
+| `task` | 已封装任务流程的 `target` 名       | 用 `POST /v1/execute` 或 WebSocket `execute` 调 |
+
+不是这样用：
+
+- 不是 `from xxx import car`
+- 不是 `from xxx import arm`
+- 不是业务脚本直接调 `car_wrap_2026.MyCar()`
+- 不是业务脚本直接调 `car_task_function.*`
+
+请求体：
 
 ```json
 {
   "target": "car",
-  "name": "beep",
-  "args": [],
+  "name": "move_for",
+  "args": [[0.05, 0.0, 0.0]],
   "kwargs": {},
-  "timeout": 40
+  "timeout": 60
 }
 ```
 
-字段含义：
-
-- `target`: `car` / `arm` / `task`
-- `name`: 动作名
-- `args`: 位置参数列表
-- `kwargs`: 关键字参数
-- `timeout`: 本次动作超时秒数
-
-特点：
-
-- 一次 `POST` 直接拿最终结果
-- 服务端自动等待初始化
-- 服务端自动做控制器恢复
-
-## 2. Python 最小用法
-
-最简单的代码只需要 [api_client.py](file:///home/jetson/workspace/rak-car/main/api_client.py)：
-
-```python
-from main.api_client import RuntimeApiClient
-
-client = RuntimeApiClient()
-print(client.call("car", "beep", timeout=40))
-```
-
-也可以显式写：
-
-```python
-client.execute("car", "beep", timeout=40)
-```
-
-## 3. 底盘坐标和单位
-
-先统一几个概念，不然后面参数容易写反：
-
-- `x`: 前后方向，`+` 前进，`-` 后退
-- `y`: 左右横移，`+` 向左，`-` 向右
-- `theta` / `z`: 旋转角，单位是弧度，`+` 逆时针，`-` 顺时针
-- 底盘位置单位：
-  - `move_for` / `move_to_position` 用米和弧度
-  - `move_time` 用速度向量和秒
-  - `lane_*` 的 `speed` 用前进速度，单位近似米每秒
-
-## 4. 底盘直控速查
-
-这类接口是“纯底盘控制”，不依赖巡线。
-
-### 4.1 `beep`
-
-- `target`: `car`
-- `name`: `beep`
-- 参数：无
-- 用途：蜂鸣一声
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{"target":"car","name":"beep","timeout":20}'
-```
-
-### 4.2 `shooting`
-
-- `target`: `car`
-- `name`: `shooting`
-- 参数：无
-- 用途：继电器枪单次触发
-- 当前逻辑：先拉低，再高电平脉冲，再强制拉低
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{"target":"car","name":"shooting","timeout":50}'
-```
-
-### 4.3 `move_for`
-
-- `target`: `car`
-- `name`: `move_for`
-- 语义：相对当前姿态移动
-- 适合：
-  - 纯前进
-  - 纯横移
-  - 原地转角
-  - 麦轮组合位移
-
-参数：
-
-- `args[0] = [x, y, theta]`
-- 可选 `kwargs.duration`
-- 可选 `kwargs.max_velocities = [vx_max, vy_max, wz_max]`
-- 可选 `kwargs.tolerance = [x_tol, y_tol, theta_tol]`
-
-例子 1，纯前进 5cm：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_for",
-    "args":[[0.05, 0.0, 0.0]],
-    "timeout":60
-  }'
-```
-
-例子 2，纯横移到左边 3cm：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_for",
-    "args":[[0.0, 0.03, 0.0]],
-    "timeout":60
-  }'
-```
-
-例子 3，原地左转约 90 度：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_for",
-    "args":[[0.0, 0.0, 1.5708]],
-    "timeout":60
-  }'
-```
-
-例子 4，麦轮斜着走：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_for",
-    "args":[[0.10, 0.05, 0.0]],
-    "timeout":80
-  }'
-```
-
-说明：
-
-- 这是最推荐的“纯纯往前走/横移/旋转”接口
-- 它走的是里程计闭环，不是视觉巡线
-
-### 4.4 `move_to_position`
-
-- `target`: `car`
-- `name`: `move_to_position`
-- 语义：移动到绝对位姿
-
-参数：
-
-- `args[0] = [x, y, theta]`
-- 可选 `kwargs.duration`
-- 可选 `kwargs.max_velocities`
-- 可选 `kwargs.tolerance`
-- 可选 `kwargs.timeout`
-
-例子，回到原点：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_to_position",
-    "args":[[0.0, 0.0, 0.0]],
-    "timeout":80
-  }'
-```
-
-适合：
-
-- 已记录过里程计位置
-- 想回某个点位
-- 不想走巡线
-
-### 4.5 `move_time`
-
-- `target`: `car`
-- `name`: `move_time`
-- 语义：按速度跑固定时间
-
-参数：
-
-- `args[0] = [vx, vy, wz]`
-- 可选 `kwargs.dur_time`
-- 可选 `kwargs.stop`
-
-例子，前进 1 秒：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_time",
-    "args":[[0.10, 0.0, 0.0]],
-    "kwargs":{"dur_time":1.0},
-    "timeout":20
-  }'
-```
-
-适合：
-
-- 临时联调
-- 粗调速度
-- 不适合要求高精度的位置控制
-
-### 4.6 `move_distance`
-
-- `target`: `car`
-- `name`: `move_distance`
-- 语义：按给定速度，走到累计距离达到阈值
-
-参数：
-
-- `args[0] = [vx, vy, wz]`
-- 可选 `kwargs.dis`
-- 可选 `kwargs.stop`
-
-例子，前进累计 10cm：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_distance",
-    "args":[[0.10, 0.0, 0.0]],
-    "kwargs":{"dis":0.10},
-    "timeout":30
-  }'
-```
-
-说明：
-
-- 它还是“按速度跑”，只是结束条件换成累计距离
-- 精度和鲁棒性一般不如 `move_for`
-
-## 5. 智能导航速查
-
-这类接口是“用前摄巡线”的智能导航。
-
-### 5.1 `lane_time`
-
-- `target`: `car`
-- `name`: `lane_time`
-- 语义：跟着车道线跑固定时间
-
-参数：
-
-- `kwargs.speed`
-- `kwargs.time_dur`
-- 可选 `kwargs.stop`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"lane_time",
-    "kwargs":{"speed":0.3,"time_dur":1.5},
-    "timeout":40
-  }'
-```
-
-### 5.2 `lane_dis`
-
-- `target`: `car`
-- `name`: `lane_dis`
-- 语义：巡线直到累计距离超过目标值
-
-参数：
-
-- `kwargs.speed`
-- `kwargs.dis_end`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"lane_dis",
-    "kwargs":{"speed":0.3,"dis_end":1.0},
-    "timeout":80
-  }'
-```
-
-### 5.3 `lane_dis_offset`
-
-- `target`: `car`
-- `name`: `lane_dis_offset`
-- 语义：从当前累计距离继续巡线一段增量
-- 这是最常用的“智能导航往前走”接口
-
-参数：
-
-- `kwargs.speed`
-- `kwargs.dis_hold`
-
-例子，巡线前进 20cm：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"lane_dis_offset",
-    "kwargs":{"speed":0.3,"dis_hold":0.2},
-    "timeout":80
-  }'
-```
-
-怎么选：
-
-- 想“纯纯前进/横移/旋转”：用 `move_for`
-- 想“沿赛道自动往前走”：用 `lane_dis_offset`
-
-## 6. 视觉对齐与识别速查
-
-### 6.1 `get_detection_results`
-
-- `target`: `car`
-- `name`: `get_detection_results`
-- 语义：获取侧摄目标检测结果
-
-参数：
-
-- 可选 `kwargs.sort_pos = [x_ref, y_ref]`
-- 可选 `kwargs.limit_x`
-- 可选 `kwargs.limit_y`
-
-返回每项格式：
-
-- `[cls_id, det_id, label, score, x_c, y_c, w, h]`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"get_detection_results",
-    "kwargs":{"sort_pos":[0,0],"limit_x":0.5,"limit_y":1.0},
-    "timeout":20
-  }'
-```
-
-### 6.2 `move_to_detection_target`
-
-- `target`: `car`
-- `name`: `move_to_detection_target`
-- 语义：根据侧摄识别结果对齐到目标
-
-参数：
-
-- 可选 `kwargs.delta_x`
-- 可选 `kwargs.delta_y`
-- 可选 `kwargs.label`
-- 可选 `kwargs.time_out`
-- 可选 `kwargs.sort_pos`
-- 可选 `kwargs.num`
-
-常用场景：
-
-- `delta_y=None`: 只做横向/前向视觉对准，不强制某个 y 偏差
-- `label="order"`: 只盯某类标签
-
-例子，对齐最近目标：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_to_detection_target",
-    "kwargs":{"delta_x":0.0,"delta_y":null,"time_out":3.0},
-    "timeout":50
-  }'
-```
-
-### 6.3 `adjust_arm_position`
-
-- `target`: `car`
-- `name`: `adjust_arm_position`
-- 语义：根据机械臂当前朝向，微调 X 轴位置
-
-参数：
-
-- 可选 `kwargs.dis`，默认 `0.05`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"adjust_arm_position",
-    "kwargs":{"dis":0.03},
-    "timeout":20
-  }'
-```
-
-### 6.4 `get_ocr`
-
-- `target`: `car`
-- `name`: `get_ocr`
-- 语义：侧摄检测文字区域并做 OCR
-
-参数：
-
-- 可选 `kwargs.label`
-- 可选 `kwargs.time_out`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"get_ocr",
-    "kwargs":{"label":"order","time_out":3.0},
-    "timeout":20
-  }'
-```
-
-## 7. 机械臂速查
-
-机械臂位置单位统一按米来写。
-
-### 7.1 `reset_position`
-
-- `target`: `arm`
-- `name`: `reset_position`
-- 语义：整体复位
-- 动作内容：
-  - 手爪向上
-  - 大臂向右
-  - X/Y 回零
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{"target":"arm","name":"reset_position","timeout":40}'
-```
-
-### 7.2 `reset_x`
-
-- `target`: `arm`
-- `name`: `reset_x`
-- 语义：只复位 X 轴
-
-### 7.3 `move_x_position`
-
-- `target`: `arm`
-- `name`: `move_x_position`
-- 语义：把机械臂水平轴移到目标位置
-
-参数：
-
-- `args[0] = target`
-- 可选 `kwargs.out_time`
-
-例子，X 轴移动到 `0.20m`：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"move_x_position",
-    "args":[0.20],
-    "kwargs":{"out_time":6.0},
-    "timeout":20
-  }'
-```
-
-### 7.4 `move_y_position`
-
-- `target`: `arm`
-- `name`: `move_y_position`
-- 语义：把机械臂竖直轴移到目标高度
-
-参数：
-
-- `args[0] = target`
-
-例子，Y 轴移动到 `0.10m`：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"move_y_position",
-    "args":[0.10],
-    "timeout":20
-  }'
-```
-
-### 7.5 `set_arm_angle`
-
-- `target`: `arm`
-- `name`: `set_arm_angle`
-- 语义：大臂总成角度
-
-参数：
-
-- `kwargs.angle`: `"LEFT"` / `"MID"` / `"RIGHT"` 或数字角度
-- 可选 `kwargs.speed`
-
-例子 1，用枚举：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"set_arm_angle",
-    "kwargs":{"angle":"LEFT","speed":80},
-    "timeout":20
-  }'
-```
-
-例子 2，直接给角度：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"set_arm_angle",
-    "kwargs":{"angle":94,"speed":80},
-    "timeout":20
-  }'
-```
-
-### 7.6 `set_hand_angle`
-
-- `target`: `arm`
-- `name`: `set_hand_angle`
-- 语义：手爪舵机角度
-
-参数：
-
-- `kwargs.angle`: `"UP"` / `"MID"` / `"DOWN"` 或数字角度
-- 可选 `kwargs.speed`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"set_hand_angle",
-    "kwargs":{"angle":"DOWN","speed":80},
-    "timeout":20
-  }'
-```
-
-### 7.7 `set_arm_pose`
-
-- `target`: `arm`
-- `name`: `set_arm_pose`
-- 语义：一次同时设位置和姿态
-
-参数：
-
-- 可选 `kwargs.x`
-- 可选 `kwargs.y`
-- 可选 `kwargs.arm`
-- 可选 `kwargs.hand`
-
-例子 1，完整设置：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"set_arm_pose",
-    "kwargs":{"x":0.05,"y":0.05,"arm":"LEFT","hand":"UP"},
-    "timeout":30
-  }'
-```
-
-例子 2，只改姿态不改 X/Y：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"set_arm_pose",
-    "kwargs":{"arm":"RIGHT","hand":"DOWN"},
-    "timeout":30
-  }'
-```
-
-### 7.8 `grasp`
-
-- `target`: `arm`
-- `name`: `grasp`
-- 语义：气泵抓取/释放
-
-参数：
-
-- `args[0] = true` 抓取
-- `args[0] = false` 释放
-
-例子，抓取：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"arm",
-    "name":"grasp",
-    "args":[true],
-    "timeout":20
-  }'
-```
-
-### 7.9 `x_get_position`
-
-- `target`: `arm`
-- `name`: `x_get_position`
-- 语义：读取当前 X 轴位置
-
-## 8. 系统接口速查
-
-### 8.1 `GET /v1/health`
-
-用途：
-
-- 看服务是否在线
-- 看是否初始化完成
-- 看控制器探测状态
-
-关键字段：
-
-- `state.initialized`
-- `state.initializing`
-- `state.last_error`
-- `state.controller_probe.ready`
-- `state.controller_probe.detail`
-
-### 8.2 `GET /v1/actions`
-
-用途：
-
-- 查看当前支持哪些动作
-
-### 8.3 `GET /v1/runtime`
-
-用途：
-
-- 看里程计、累计距离、stop 标记
-
-### 8.4 `POST /v1/control/emergency-stop`
-
-用途：
-
-- 立即停车
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/control/emergency-stop
-```
-
-### 8.5 `POST /v1/control/close`
-
-用途：
-
-- 关闭当前 runtime 内部实例
-- 下次动作会重新自动初始化
-
-### 8.6 `POST /v1/control/init`
-
-用途：
-
-- 手动初始化
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/control/init \
-  -H 'Content-Type: application/json' \
-  -d '{"force":true,"reset_arm":false,"reset_position":true}'
-```
-
-## 9. 任务接口速查
-
-这类是完整业务任务，不是单步控制。
-
-常见任务名：
-
-- `auto_lane_tracing`
-- `auto_seeding`
-- `target_shooting_detection`
-- `water_tower_task`
-- `target_shooting`
-- `crop_harvesting`
-- `sort_and_store`
-- `get_order`
-- `order_delivery`
-
-例子：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"task",
-    "name":"auto_lane_tracing",
-    "kwargs":{"speed":0.3,"dis_hold":0.2},
-    "timeout":120
-  }'
-```
-
-说明：
-
-- 单步业务开发优先用 `car` / `arm`
-- 成熟流程再收敛成 `task`
-
-### 9.1 两个可继续编排的任务返回值
-
-- `target_shooting_detection`
-  - 返回 `animal_list`
-- `get_order`
-  - 返回 `order_list`
-
-上层业务可以这样串：
-
-```python
-from main.api_client import RuntimeApiClient
-
-client = RuntimeApiClient()
-
-animal_job = client.execute("task", "target_shooting_detection", timeout=240)
-animal_list = animal_job["result"]
-client.execute("task", "target_shooting", kwargs={"animal_list": animal_list}, timeout=240)
-
-order_job = client.execute("task", "get_order", timeout=300)
-order_list = order_job["result"]
-client.execute("task", "order_delivery", kwargs={"order_list": order_list}, timeout=300)
-```
-
-### 9.2 原始控制和传感接口
-
-现在已经支持这些更底层的业务接口：
-
-- `car.set_chassis_velocity`
-- `car.get_lane_results`
-- `car.get_key_event`
-- `car.get_key_state`
-- `car.get_bluetooth_pad`
-- `car.get_battery_voltage`
-- `car.get_ir_distance`
-- `car.get_all_ir_distance`
-- `car.set_light_color`
-- `car.show_text`
-- `car.set_storage_angle`
-- `car.set_pwm_servo_angle`
-- `car.set_digital_output`
-- `car.set_shoot_state`
-- `car.get_arm_state`
-- `arm.goto_position`
-- `arm.go_for`
-- `arm.x_speed`
-- `arm.y_speed`
-- `arm.y_get_position`
-
-例子，原始底盘速度控制：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"set_chassis_velocity",
-    "kwargs":{"x":0.10,"y":0.00,"z":0.00,"duration":0.20},
-    "timeout":20
-  }'
-```
-
-例子，读取左右 IR：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"get_all_ir_distance",
-    "timeout":20
-  }'
-```
-
-例子，控制任意数字口：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"set_digital_output",
-    "kwargs":{"port":4,"value":true},
-    "timeout":20
-  }'
-```
-
-### 9.3 WebSocket 长连接
-
-如果上层要做高频控制、持续轮询或长连接编排，直接用：
-
-- `ws://192.168.3.60:5050/v1/ws`
-
-连接成功后，发送 JSON 消息即可。
-
-最常用 3 类消息：
+字段：
+
+| 字段        | 说明                     |
+| --------- | ---------------------- |
+| `target`  | `car` / `arm` / `task` |
+| `name`    | 动作名                    |
+| `args`    | 位置参数列表                 |
+| `kwargs`  | 关键字参数                  |
+| `timeout` | 本次动作超时秒数               |
+
+坐标约定：
+
+| 项             | 说明                    |
+| ------------- | --------------------- |
+| `x`           | 前后，`+` 前进，`-` 后退      |
+| `y`           | 左右，`+` 左移，`-` 右移      |
+| `theta` / `z` | 旋转，弧度，`+` 逆时针，`-` 顺时针 |
+
+## HTTP 接口
+
+### 状态与元信息
+
+| 接口                | 用途              | 关键返回                                                                                  |
+| ----------------- | --------------- | ------------------------------------------------------------------------------------- |
+| `GET /v1/health`  | 看服务是否在线、是否初始化完成 | `state.initialized` `state.initializing` `state.last_error`                           |
+| `GET /v1/runtime` | 看当前运行时状态        | `runtime.odometry` `runtime.distance` `runtime.stop_after_action` `runtime.stop_flag` |
+| `GET /v1/actions` | 看当前支持哪些动作       | `actions.car` `actions.arm` `actions.task` `actions.system`                           |
+| `GET /v1/config`  | 看 runtime 配置    | `config`                                                                              |
+
+### 作业接口
+
+| 接口                      | 用途            | 说明                      |
+| ----------------------- | ------------- | ----------------------- |
+| `POST /v1/execute`      | 同步执行一个动作并等待结果 | 最常用                     |
+| `POST /v1/jobs`         | 创建异步任务        | 返回 `job.id`             |
+| `GET /v1/jobs`          | 查看任务列表        | 返回全部 jobs               |
+| `GET /v1/jobs/{job_id}` | 查看单个任务状态      | 看 `status/result/error` |
+
+### 控制接口
+
+| 接口                                | 用途              | 关键参数                                 |
+| --------------------------------- | --------------- | ------------------------------------ |
+| `POST /v1/control/init`           | 手动初始化 runtime   | `force` `reset_arm` `reset_position` |
+| `POST /v1/control/stop-mode`      | 设置动作后是否自动停      | `enabled`                            |
+| `POST /v1/control/reset-stop`     | 清掉 stop 标记      | 无                                    |
+| `POST /v1/control/close`          | 关闭当前 runtime 实例 | 无                                    |
+| `POST /v1/control/emergency-stop` | 立即停车            | 无                                    |
+
+## WebSocket
+
+地址：
+
+- `ws://<ip>:5050/v1/ws`
+
+支持的 `op`：
+
+| `op`             | 用途           |
+| ---------------- | ------------ |
+| `ping`           | 连通性检查        |
+| `health`         | 查询健康状态       |
+| `runtime`        | 查询运行时快照      |
+| `actions`        | 查询动作清单       |
+| `config`         | 查询配置         |
+| `execute`        | 直接执行动作       |
+| `create_job`     | 创建异步任务       |
+| `get_job`        | 查询任务         |
+| `init`           | 初始化          |
+| `stop_mode`      | 设置 stop mode |
+| `reset_stop`     | 清 stop 标记    |
+| `close`          | 关闭 runtime   |
+| `emergency_stop` | 立即停车         |
+
+## `car` 接口
+
+### 底盘与执行
+
+| 接口名                        | 用途          | 关键参数                                                             | 关键返回                       |
+| -------------------------- | ----------- | ---------------------------------------------------------------- | -------------------------- |
+| `car.beep`                 | 蜂鸣一声        | 无                                                                | 通常无关键返回                    |
+| `car.stop`                 | 立即停车        | 无                                                                | 通常无关键返回                    |
+| `car.reset_position`       | 重置底盘里程计原点   | 无                                                                | 通常无关键返回                    |
+| `car.move_for`             | 相对位姿移动      | `args[0]=[x,y,theta]` `duration?` `max_velocities?` `tolerance?` | 动作完成                       |
+| `car.move_to_position`     | 绝对位姿移动      | `args[0]=[x,y,theta]` `duration?` `max_velocities?` `tolerance?` | 动作完成                       |
+| `car.move_time`            | 按速度跑固定时间    | `args[0]=[vx,vy,wz]` `dur_time?` `stop?`                         | 动作完成                       |
+| `car.move_distance`        | 按速度跑到指定累计距离 | `args[0]=[vx,vy,wz]` `dis?` `stop?`                              | 动作完成                       |
+| `car.set_chassis_velocity` | 原始底盘速度控制    | `x` `y` `z` `duration?`                                          | `{"x","y","z","duration"}` |
+
+### 巡线
+
+| 接口名                    | 用途            | 关键参数                       | 关键返回                     |
+| ---------------------- | ------------- | -------------------------- | ------------------------ |
+| `car.lane_time`        | 巡线固定时间        | `speed` `time_dur` `stop?` | 动作完成                     |
+| `car.lane_dis`         | 巡线到目标累计距离     | `speed` `dis_end` `stop?`  | 动作完成                     |
+| `car.lane_dis_offset`  | 从当前距离继续巡线一段增量 | `speed` `dis_hold` `stop?` | 动作完成                     |
+| `car.get_lane_results` | 读取巡线误差        | 无                          | `(error_y, error_angle)` |
+
+### 视觉与 OCR
+
+| 接口名                            | 用途             | 关键参数                                                          | 关键返回                                             |
+| ------------------------------ | -------------- | ------------------------------------------------------------- | ------------------------------------------------ |
+| `car.get_detection_results`    | 读取侧摄检测结果       | `sort_pos?` `limit_x?` `limit_y?`                             | `[[cls_id,det_id,label,score,x_c,y_c,w,h], ...]` |
+| `car.move_to_detection_target` | 按检测结果做视觉对齐     | `delta_x?` `delta_y?` `label?` `time_out?` `sort_pos?` `num?` | `(cls_id,label)` 或 `(None,None)`                 |
+| `car.adjust_arm_position`      | 根据机械臂朝向微调机械臂 X | `dis?`                                                        | 动作完成                                             |
+| `car.get_ocr`                  | 对侧摄文本目标做 OCR   | `label?` `time_out?`                                          | `text` 或 `None`                                  |
+| `car.get_det_ocr`              | 对指定检测框做 OCR    | `det` `label?` `time_out?`                                    | `text` 或 `None`                                  |
+
+### 枪 / 数字口 / 灯 / 屏
+
+| 接口名                      | 用途       | 关键参数                 | 关键返回                     |
+| ------------------------ | -------- | -------------------- | ------------------------ |
+| `car.shooting`           | 单次射击触发   | 无                    | 动作完成                     |
+| `car.set_shoot_state`    | 直接控制枪口输出 | `value`              | `true/false`             |
+| `car.set_digital_output` | 控任意数字输出口 | `port` `value`       | `{"port","value"}`       |
+| `car.set_light_color`    | 控灯带颜色    | `led_id` `r` `g` `b` | `{"led_id","r","g","b"}` |
+| `car.show_text`          | 屏幕显示文本   | `args[0]=text`       | 返回显示内容                   |
+
+### PWM / 储物仓
+
+| 接口名                       | 用途         | 关键参数                            | 关键返回                              |
+| ------------------------- | ---------- | ------------------------------- | --------------------------------- |
+| `car.set_storage`         | 储物仓开合      | 业务参数                            | 动作完成                              |
+| `car.set_storage_angle`   | 直接设储物仓角度   | `angle` `speed?`                | `angle`                           |
+| `car.set_pwm_servo_angle` | 控任意 PWM 舵机 | `port` `angle` `mode?` `speed?` | `{"port","angle","mode","speed"}` |
+
+### 状态读取
+
+| 接口名                       | 用途        | 关键参数                | 关键返回                                                  |
+| ------------------------- | --------- | ------------------- | ----------------------------------------------------- |
+| `car.get_odometry`        | 读取当前位姿    | `show_info?`        | `[x,y,theta]`                                         |
+| `car.get_distance`        | 读取累计行驶距离  | `show_info?`        | `float`                                               |
+| `car.get_battery_voltage` | 读取电池电压    | 无                   | `float/int`                                           |
+| `car.get_ir_distance`     | 读取单侧 IR   | `side="left/right"` | 单侧距离值                                                 |
+| `car.get_all_ir_distance` | 同时读取左右 IR | 无                   | `{"left","right"}`                                    |
+| `car.get_key_event`       | 读取按键事件    | 无                   | 按键事件值                                                 |
+| `car.get_key_state`       | 读取按键状态    | 无                   | 按键状态值                                                 |
+| `car.get_bluetooth_pad`   | 读取蓝牙手柄状态  | 无                   | 手柄状态数组                                                |
+| `car.get_arm_state`       | 读取机械臂状态   | 无                   | `{"x","y","side","arm_angle","hand_angle","y_limit"}` |
+
+## `arm` 接口
+
+### 位置 / 姿态 / 抓取
+
+| 接口名                   | 用途                  | 关键参数                           | 关键返回    |
+| --------------------- | ------------------- | ------------------------------ | ------- |
+| `arm.reset_position`  | 机械臂整体复位             | 无                              | 动作完成    |
+| `arm.reset_x`         | 只复位 X 轴             | 无                              | 动作完成    |
+| `arm.set_arm_pose`    | 一次设置 `x/y/arm/hand` | `x?` `y?` `arm?` `hand?`       | 动作完成    |
+| `arm.set_hand_angle`  | 设置手爪角度              | `angle` `speed?`               | 动作完成    |
+| `arm.set_arm_angle`   | 设置大臂角度              | `angle` `speed?`               | 动作完成    |
+| `arm.move_x_position` | X 轴定位               | `args[0]=target` `out_time?`   | 动作完成    |
+| `arm.move_y_position` | Y 轴定位               | `args[0]=target`               | 动作完成    |
+| `arm.goto_position`   | 直接移动到指定 `x/y`       | `x?` `y?` `time_run?` `speed?` | 动作完成    |
+| `arm.go_for`          | 相对位移                | 相对位移参数                         | 动作完成    |
+| `arm.x_speed`         | X 轴原始速度控制           | 速度参数                           | 动作完成    |
+| `arm.y_speed`         | Y 轴原始速度控制           | 速度参数                           | 动作完成    |
+| `arm.grasp`           | 吸盘抓取/释放             | `args[0]=true/false`           | 动作完成    |
+| `arm.x_get_position`  | 读当前 X 位置            | 无                              | `float` |
+| `arm.y_get_position`  | 读当前 Y 位置            | 无                              | `float` |
+
+## `task` 接口
+
+| 接口名                              | 用途              | 关键参数                  | 关键返回          |
+| -------------------------------- | --------------- | --------------------- | ------------- |
+| `task.auto_lane_tracing`         | 巡线测试 / 任务流程中的巡线 | 常用 `speed` `dis_hold` | 任务结果          |
+| `task.auto_seeding`              | 播种任务            | 无或任务内部参数              | 任务结果          |
+| `task.target_shooting_detection` | 识别虫害目标          | 无                     | `animal_list` |
+| `task.water_tower_task`          | 灌溉任务            | 无                     | 任务结果          |
+| `task.target_shooting`           | 射击除害            | 常用 `animal_list`      | 任务结果          |
+| `task.crop_harvesting`           | 作物收集            | 无                     | 任务结果          |
+| `task.sort_and_store`            | 作物分拣入仓          | 无                     | 任务结果          |
+| `task.get_order`                 | 读取订单            | 无                     | `order_list`  |
+| `task.order_delivery`            | 按订单配送           | 常用 `order_list`       | 任务结果          |
+
+## 最常用返回结构
+
+### `POST /v1/execute`
 
 ```json
-{"op":"health","request_id":"h1"}
-{"op":"execute","request_id":"e1","target":"car","name":"beep","timeout":20}
-{"op":"execute","request_id":"e2","target":"car","name":"set_chassis_velocity","kwargs":{"x":0.1,"y":0.0,"z":0.0}}
+{
+  "ok": true,
+  "job": {
+    "id": "xxxx",
+    "target": "car",
+    "name": "get_odometry",
+    "status": "succeeded",
+    "result": [0.0, 0.0, 0.0],
+    "error": null
+  }
+}
 ```
 
-WebSocket 支持的 `op`：
+### `GET /v1/runtime`
 
-- `ping`
-- `health`
-- `runtime`
-- `actions`
-- `config`
-- `execute`
-- `create_job`
-- `get_job`
-- `init`
-- `stop_mode`
-- `reset_stop`
-- `close`
-- `emergency_stop`
-
-## 10. 推荐写法
-
-### 10.1 最推荐的 Python 写法
-
-```python
-from main.api_client import RuntimeApiClient
-
-client = RuntimeApiClient()
-
-client.call("car", "beep", timeout=40)
-client.call("car", "move_for", [0.05, 0.0, 0.0], timeout=60)
-client.call("arm", "move_x_position", 0.20, timeout=20)
-client.call("arm", "set_arm_pose", timeout=30, x=0.05, y=0.05, arm="LEFT", hand="UP")
+```json
+{
+  "ok": true,
+  "runtime": {
+    "odometry": [0.0, 0.0, 0.0],
+    "distance": 0.0,
+    "stop_after_action": false,
+    "stop_flag": false
+  }
+}
 ```
 
-### 10.2 最推荐的 curl 写法
+### `car.get_detection_results`
 
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "target":"car",
-    "name":"move_for",
-    "args":[[0.05, 0.0, 0.0]],
-    "timeout":60
-  }'
+```json
+[
+  [0, 12, "order", 0.98, 0.02, -0.15, 0.30, 0.22]
+]
 ```
 
-## 11. 选型建议
+## 一句话选型
 
-- 想直走 5cm、横移 3cm、转 90 度：`move_for`
-- 想回到某个已记录的位置：`move_to_position`
-- 想粗略跑一会儿：`move_time`
-- 想跟着赛道自动走：`lane_dis_offset`
-- 想靠视觉贴近目标：`move_to_detection_target`
-- 想单独调机械臂某个电机：`move_x_position` / `move_y_position`
-- 想一次设机械臂整体姿态：`set_arm_pose`
-
-## 12. 一句话结论
-
-现在 `main/` 业务层可以按最简单的方式使用：
-
-- 配置在 [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)
-- 调用在 [api_client.py](file:///home/jetson/workspace/rak-car/main/api_client.py)
-- 详细参数直接抄这份文档里的请求体即可
+| 需求           | 接口                             |
+| ------------ | ------------------------------ |
+| 直走 / 横移 / 转角 | `car.move_for`                 |
+| 回到某个位置       | `car.move_to_position`         |
+| 沿赛道自动往前      | `car.lane_dis_offset`          |
+| 靠视觉对齐目标      | `car.move_to_detection_target` |
+| 读取位姿         | `car.get_odometry`             |
+| 读取检测框        | `car.get_detection_results`    |
+| 读取 OCR       | `car.get_ocr`                  |
+| 控制机械臂姿态      | `arm.set_arm_pose`             |
+| 读取机械臂状态      | `car.get_arm_state`            |
+| 跑完整任务        | `task.*`                       |

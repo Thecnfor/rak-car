@@ -37,6 +37,8 @@ class CarRuntimeService:
         self.car = None
         self._car_class = None
         self._task_module = None
+        self.shared_front_camera = None
+        self.shared_side_camera = None
         self.controller_session = get_controller_session()
         self.controller_generation = None
         self.car_lock = threading.RLock()
@@ -53,9 +55,11 @@ class CarRuntimeService:
         self.current_job_id = None
         self.stop_after_action = settings.get_stop_after_action_default()
         self.auto_init_requested = False
+        self.auto_heal_armed = settings.get_auto_init_on_start()
         self.auto_init_retry_interval = settings.get_auto_init_retry_interval()
         self.action_ready_timeout = settings.get_action_ready_timeout()
         self.action_ready_poll_interval = settings.get_action_ready_poll_interval()
+        self.stream_service = None
         self.auto_init_kwargs = {
             "reset_arm": settings.get_reset_arm_on_auto_init(),
             "reset_position": settings.get_reset_position_on_init(),
@@ -65,6 +69,25 @@ class CarRuntimeService:
             daemon=True,
         )
         self.auto_init_supervisor.start()
+
+    def set_stream_service(self, stream_service):
+        self.stream_service = stream_service
+
+    def _remember_shared_cameras(self, car):
+        if car is None:
+            return
+        if self.shared_front_camera is None:
+            self.shared_front_camera = getattr(car, "cap_front", None)
+        if self.shared_side_camera is None:
+            self.shared_side_camera = getattr(car, "cap_side", None)
+
+    def get_stream_camera(self, cam_id):
+        cam_name = str(cam_id).lower()
+        if cam_name in {"cam1", "front"}:
+            return self.shared_front_camera
+        if cam_name in {"cam2", "side"}:
+            return self.shared_side_camera
+        return None
 
     def _is_controller_related_error(self, detail):
         if not detail:
@@ -128,6 +151,20 @@ class CarRuntimeService:
     def _probe_controller(self):
         return self._sync_controller_health_state(self.controller_session.snapshot())
 
+    def _is_generation_stale(self, snapshot=None):
+        snapshot = snapshot or self.controller_session.snapshot()
+        if self.car is None or self.controller_generation is None:
+            return False
+        return self.controller_generation != snapshot.get("generation")
+
+    def _is_car_ready(self, snapshot=None):
+        snapshot = snapshot or self.controller_session.snapshot()
+        return (
+            self.car is not None
+            and snapshot.get("state") == "PROGRAM_READY"
+            and not self._is_generation_stale(snapshot)
+        )
+
     def _ensure_controller_ready(self):
         snapshot = self.controller_session.ensure_ready(
             timeout=self.action_ready_timeout
@@ -144,7 +181,12 @@ class CarRuntimeService:
 
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
-        car = self._get_car_class()()
+        car = self._get_car_class()(
+            cap_front=self.shared_front_camera,
+            cap_side=self.shared_side_camera,
+            streamer=self.stream_service,
+        )
+        self._remember_shared_cameras(car)
         car.STOP_PARAM = self.stop_after_action
         self._bind_task_car(car)
         car.beep()
@@ -157,6 +199,7 @@ class CarRuntimeService:
         self.controller_generation = session.get("generation")
         self.last_init_at = time.time()
         self.last_error = None
+        self.auto_heal_armed = True
         return car
 
     def ensure_initialized(self, reset_arm=False, force=False, reset_position=True):
@@ -195,14 +238,24 @@ class CarRuntimeService:
 
     def start_auto_init(self):
         self.auto_init_requested = True
+        self.auto_heal_armed = True
 
     def _auto_init_loop(self):
         while True:
-            if self.auto_init_requested and self.car is None and not self.initializing:
-                try:
-                    self.ensure_initialized(**self.auto_init_kwargs)
-                except Exception:
-                    pass
+            if self.current_job_id is not None or self.initializing:
+                time.sleep(self.auto_init_retry_interval)
+                continue
+            if not self.auto_heal_armed:
+                time.sleep(self.auto_init_retry_interval)
+                continue
+            snapshot = self._probe_controller()
+            if self._is_car_ready(snapshot):
+                time.sleep(self.auto_init_retry_interval)
+                continue
+            try:
+                self.ensure_initialized(**self.auto_init_kwargs)
+            except Exception:
+                pass
             time.sleep(self.auto_init_retry_interval)
 
     def _safe_close_locked(self):
@@ -219,7 +272,10 @@ class CarRuntimeService:
         self.car = None
         self.controller_generation = None
 
-    def close(self):
+    def close(self, disable_auto_init=True):
+        if disable_auto_init:
+            self.auto_init_requested = False
+            self.auto_heal_armed = False
         with self.car_lock:
             self._safe_close_locked()
 
@@ -251,7 +307,7 @@ class CarRuntimeService:
             jobs = list(self.jobs.values())
         queued_count = sum(job["status"] == "queued" for job in jobs)
         return {
-            "initialized": self.car is not None,
+            "initialized": self._is_car_ready(controller_snapshot),
             "initializing": self.initializing,
             "last_error": self.last_error,
             "last_init_at": self.last_init_at,
@@ -275,6 +331,10 @@ class CarRuntimeService:
                 "stop_after_action": self.car.STOP_PARAM,
                 "stop_flag": self.car._stop_flag,
             }
+
+    def get_car_for_stream(self):
+        with self.car_lock:
+            return self.car
 
     def list_actions(self):
         return {

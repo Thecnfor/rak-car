@@ -5,6 +5,7 @@
 # Ignore
 **/dataset/
 **/test.py
+incoming/
 
 
 
