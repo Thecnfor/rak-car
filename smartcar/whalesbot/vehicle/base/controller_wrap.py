@@ -27,7 +27,14 @@ serial_wrap = serial_wrap
 
 # 获取devid
 def get_devid():
-    dev_name = serial_wrap.dev.name
+    ctl_dev = getattr(serial_wrap, "dev", None)
+    dev_name = getattr(ctl_dev, "name", None)
+    if not dev_name:
+        controller_hint = os.environ.get("RAK_CAR_CONTROLLER_HINT", "mc602").lower()
+        logger.info("dev_name unavailable, fallback controller_hint:{}".format(controller_hint))
+        if "mc601" in controller_hint:
+            return 0
+        return 1
     logger.info('dev_name:{}'.format(dev_name))
     if 'mc601' in dev_name:
         return 0

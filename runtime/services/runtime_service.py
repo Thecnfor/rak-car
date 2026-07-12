@@ -6,6 +6,9 @@ import threading
 import time
 import traceback
 import uuid
+from pathlib import Path
+
+import yaml
 
 from runtime.core import settings
 from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS, TASK_ACTION_NAMES
@@ -37,11 +40,13 @@ class CarRuntimeService:
         self.car = None
         self._car_class = None
         self._task_module = None
+        self._camera_cfg = None
         self.shared_front_camera = None
         self.shared_side_camera = None
         self.controller_session = get_controller_session()
         self.controller_generation = None
         self.car_lock = threading.RLock()
+        self.camera_lock = threading.Lock()
         self.init_lock = threading.Lock()
         self.job_lock = threading.Lock()
         self.jobs = {}
@@ -69,9 +74,69 @@ class CarRuntimeService:
             daemon=True,
         )
         self.auto_init_supervisor.start()
+        self.camera_supervisor = None
+        self.camera_supervisor_started = False
 
     def set_stream_service(self, stream_service):
         self.stream_service = stream_service
+
+    def start_background_services(self):
+        with self.camera_lock:
+            if self.camera_supervisor_started:
+                return
+            self.camera_supervisor_started = True
+            self.camera_supervisor = threading.Thread(
+                target=self._camera_supervisor_loop,
+                daemon=True,
+            )
+            self.camera_supervisor.start()
+
+    def _camera_supervisor_loop(self):
+        while True:
+            try:
+                self.ensure_shared_cameras()
+                return
+            except Exception:
+                time.sleep(1.0)
+
+    def _load_camera_cfg(self):
+        if self._camera_cfg is not None:
+            return self._camera_cfg
+        config_path = Path(__file__).resolve().parents[2] / "config_car.yml"
+        with config_path.open("r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        camera_cfg = config.get("camera") or {}
+        self._camera_cfg = {
+            "front": int(camera_cfg.get("front", 1)),
+            "side": int(camera_cfg.get("side", 2)),
+        }
+        return self._camera_cfg
+
+    def ensure_shared_cameras(self):
+        with self.camera_lock:
+            cfg = self._load_camera_cfg()
+            if self.shared_front_camera is None:
+                from smartcar.whalesbot.tools.camera import Camera
+
+                self.shared_front_camera = Camera(cfg["front"])
+            if self.shared_side_camera is None:
+                from smartcar.whalesbot.tools.camera import Camera
+
+                self.shared_side_camera = Camera(cfg["side"])
+            return self.shared_front_camera, self.shared_side_camera
+
+    def _close_shared_cameras_locked(self):
+        unique_cameras = []
+        for camera in (self.shared_front_camera, self.shared_side_camera):
+            if camera is not None and camera not in unique_cameras:
+                unique_cameras.append(camera)
+        self.shared_front_camera = None
+        self.shared_side_camera = None
+        for camera in unique_cameras:
+            try:
+                camera.close()
+            except Exception:
+                pass
 
     def _remember_shared_cameras(self, car):
         if car is None:
@@ -181,6 +246,7 @@ class CarRuntimeService:
 
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
+        self.ensure_shared_cameras()
         car = self._get_car_class()(
             cap_front=self.shared_front_camera,
             cap_side=self.shared_side_camera,
@@ -278,6 +344,8 @@ class CarRuntimeService:
             self.auto_heal_armed = False
         with self.car_lock:
             self._safe_close_locked()
+        with self.camera_lock:
+            self._close_shared_cameras_locked()
 
     def emergency_stop(self):
         with self.car_lock:

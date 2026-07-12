@@ -33,6 +33,7 @@ def create_app():
         if _startup_ran:
             return
         _startup_ran = True
+        service.start_background_services()
         camera_stream_service.start()
         if settings.get_auto_init_on_start():
             service.start_auto_init()

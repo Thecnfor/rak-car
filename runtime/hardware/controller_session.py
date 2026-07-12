@@ -45,6 +45,8 @@ class ControllerSessionManager:
         return getattr(module, "serial_wrap", None)
 
     def _load_serial_wrap(self):
+        if "smartcar.whalesbot.vehicle" not in sys.modules:
+            importlib.import_module("smartcar.whalesbot.vehicle")
         module = importlib.import_module("smartcar.whalesbot.vehicle.base.serial_wrap")
         return getattr(module, "serial_wrap")
 
@@ -164,7 +166,10 @@ class ControllerSessionManager:
         if not probe.ready:
             self.mark_offline(probe.detail)
             raise RuntimeError(probe.detail or "控制器探测失败")
-        serial_wrap = self._load_serial_wrap()
+        try:
+            serial_wrap = self._load_serial_wrap()
+        except Exception:
+            raise
         serial_wrap.sync_with_probe(probe)
         self._refresh_from_serial(serial_wrap)
         with self._lock:
