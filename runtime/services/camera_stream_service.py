@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
+import asyncio
 import os
 import threading
 import time
@@ -332,7 +333,7 @@ class CameraStreamService:
         return True
 
     def stream_frames(self, cam_id):
-        """MJPEG multipart 生成器——所有连接共享 _jpeg_cache 的同一份 JPEG bytes。
+        """同步 MJPEG 生成器——保留作为后备；推荐用 `stream_frames_async`。
 
         实际编码由 `_encoder_loop` 后台线程按 fps 节奏统一做一次；本生成器
         只是 yield 缓存的内容，**不做 cv2.imencode**。
@@ -359,6 +360,36 @@ class CameraStreamService:
             sleep_for = self.capture_interval - elapsed
             if sleep_for > 0:
                 time.sleep(sleep_for)
+
+    async def stream_frames_async(self, cam_id):
+        """异步 MJPEG 生成器——FastAPI 在 event loop 里直接消费。
+
+        与 `stream_frames` 语义完全一致；差别在 `time.sleep` → `asyncio.sleep`
+        ——后者把控制权让回 event loop，让同进程里的其他 async 端点
+        （`/v1/realtime/lane_state`、`/v1/health`、`/v1/vision/*`）不被卡住。
+
+        同步版本依然保留：当未来同步调用方需要时仍可用。
+        """
+        normalized = self.normalize_cam_id(cam_id)
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        crlf = b"\r\n"
+        last_yield_ts = 0.0
+        loop = asyncio.get_event_loop()
+        while self.running:
+            with self.frame_lock:
+                entry = self._jpeg_cache.get(normalized)
+            if entry is not None:
+                _updated_at, jpeg_bytes = entry
+                yield boundary + jpeg_bytes + crlf
+                last_yield_ts = loop.time()
+            else:
+                # 编码器还没准备好：yield 一个 1x1 placeholder JPEG 让浏览器
+                # 至少收到 200 + 合法 JPEG 头，避免 <img> 报错。
+                yield boundary + _PLACEHOLDER_JPEG + crlf
+            elapsed = loop.time() - last_yield_ts if last_yield_ts else 0.0
+            sleep_for = self.capture_interval - elapsed
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
 
     def encode_jpeg_bytes(self, cam_id, quality=None):
         """返回 _jpeg_cache 中的 JPEG bytes。
