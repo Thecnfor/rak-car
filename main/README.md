@@ -24,6 +24,8 @@
   - 能力总表
 - [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)
   - 主文档，所有接口总表速查
+- [chassis/README.md](file:///home/jetson/workspace/rak-car/main/chassis/README.md)
+  - 底盘组独享子包（自动寻线 client 端外环 + 底盘专用 API 子集），底盘请直接看这里
 
 ## 配置
 

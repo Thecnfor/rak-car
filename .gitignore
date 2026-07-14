@@ -149,3 +149,5 @@ dmypy.json
 cython_debug/
 **/logs
 .dbg/
+
+main/test

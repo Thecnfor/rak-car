@@ -363,6 +363,11 @@ class MyCar(MecanumDriver):
         self.thread_key.daemon = True
         self.thread_key.start()
 
+        # lane 误差缓存守护线程：客户端外环用，车端不动轮速
+        self._lane_feed_thread = None
+        self._lane_feed_stop = None
+        self._lane_feed_lock = threading.Lock()
+
         self.beep()
 
     def resolve_stop(self, stop=None):
@@ -1173,6 +1178,81 @@ class MyCar(MecanumDriver):
                 distance=self.get_distance(),
             )
 
+    def start_lane_feed(self, hz: float = 20.0):
+        """
+        启动 lane 误差缓存守护线程（只刷 lane_state，不下发轮速）。
+
+        给客户端外环用：外环不在车上、但要稳定拿到 (error_y, error_angle)，
+        由本方法在车端起一个守护线程持续跑 get_lane_results(),
+        并把结果写到 streamer.set_lane_state(...)。
+
+        重要：不会调用任何 set_velocity / set_wheel_speeds,
+        不会与客户端外环的轮速下发抢锁。
+        """
+        with self._lane_feed_lock:
+            if self._lane_feed_thread is not None and self._lane_feed_thread.is_alive():
+                return {"started": False, "reason": "already_running", "hz": hz}
+            self._lane_feed_stop = threading.Event()
+            stop_event = self._lane_feed_stop
+            period = 1.0 / max(float(hz), 1.0)
+
+            def _feed_loop():
+                streamer = getattr(self, "streamer", None)
+                set_state = getattr(streamer, "set_lane_state", None)
+                while not stop_event.is_set():
+                    if self._stop_flag:
+                        break
+                    try:
+                        error_y, error_angle = self.get_lane_results()
+                        if set_state is not None:
+                            set_state(
+                                active=True,
+                                mode="external_feed",
+                                error_y=error_y,
+                                error_angle=error_angle,
+                                forward_speed=None,
+                                lateral_speed=None,
+                                angular_speed=None,
+                                distance=self.get_distance(),
+                            )
+                    except Exception as exc:
+                        logger.warning("lane feed loop exit: {}".format(exc))
+                        break
+                    stop_event.wait(period)
+                if set_state is not None:
+                    try:
+                        set_state(
+                            active=False,
+                            mode="idle",
+                            forward_speed=None,
+                            lateral_speed=None,
+                            angular_speed=None,
+                            distance=self.get_distance(),
+                        )
+                    except Exception:
+                        pass
+
+            self._lane_feed_thread = threading.Thread(target=_feed_loop, name="lane-feed")
+            self._lane_feed_thread.daemon = True
+            self._lane_feed_thread.start()
+            return {"started": True, "hz": hz}
+
+    def stop_lane_feed(self):
+        """
+        停止 lane 误差缓存守护线程，并把 lane_state 复位成 idle。
+        """
+        with self._lane_feed_lock:
+            stop_event = self._lane_feed_stop
+            thread = self._lane_feed_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        with self._lane_feed_lock:
+            self._lane_feed_thread = None
+            self._lane_feed_stop = None
+        return {"stopped": True}
+
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):
     #     """
     #     目标检测基础方法
@@ -1910,6 +1990,11 @@ class MyCar(MecanumDriver):
         """
         self._stop_flag = False
         self._end_flag = True
+        # 关闭 lane_feed 守护线程
+        try:
+            self.stop_lane_feed()
+        except Exception:
+            pass
         if self.thread_key.is_alive():
             self.thread_key.join(timeout=1.0)
         try:
