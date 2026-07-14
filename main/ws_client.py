@@ -152,6 +152,10 @@ class RuntimeWsClient:
     def realtime_wheel_encoders(self, timeout=None):
         return self.request("realtime/wheel_encoders", request_timeout=timeout)
 
+    def realtime_lane_state(self, timeout=None):
+        resp = self.request("realtime/lane_state", request_timeout=timeout)
+        return (resp.get("data") or {}).get("lane_state") or {}
+
     def realtime_motor_speed(self, port, speed, reverse=1, timeout=None):
         return self.request(
             "realtime/motor_speed",
