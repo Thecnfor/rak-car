@@ -499,7 +499,13 @@ class CameraStreamService:
                 <div class="streams">
                     <div class="stream-cell">
                         <span class="label">cam1 / front</span>
-                        <img src="/video_feed/cam1" alt="front camera">
+                        <span class="label" style="left:auto; right:8px; background: rgba(0,80,140,0.55);">
+                            <label style="cursor:pointer; user-select:none;">
+                                <input type="checkbox" id="laneOverlay" style="vertical-align:middle; margin-right:3px;">
+                                lane overlay
+                            </label>
+                        </span>
+                        <img id="cam1Img" src="/video_feed/cam1" alt="front camera">
                     </div>
                     <div class="stream-cell">
                         <span class="label">cam2 / side</span>
@@ -545,6 +551,28 @@ class CameraStreamService:
                     }
                     pollLane();
                     setInterval(pollLane, 1000);  // 1Hz 足够（MJPEG 已经 20Hz）
+
+                    // ---- cam1 车道 overlay 切换 ----
+                    // 默认走 MJPEG /video_feed/cam1（干净流）。
+                    // 勾上 checkbox 时切到 /v1/vision/lane/preview.jpg?cam_id=cam1，
+                    // 该端点会读 streamer 缓存 + 画车道误差字，单帧 JPEG，
+                    // 因此需要 JS 周期性 reload（默认 10Hz）。
+                    const cam1Img = document.getElementById('cam1Img');
+                    const laneOverlay = document.getElementById('laneOverlay');
+                    let overlayTimer = null;
+                    function refreshOverlay() {
+                        // cache-buster 时间戳让浏览器拉新帧
+                        cam1Img.src = '/v1/vision/lane/preview.jpg?cam_id=cam1&t=' + Date.now();
+                    }
+                    laneOverlay.addEventListener('change', () => {
+                        if (laneOverlay.checked) {
+                            refreshOverlay();
+                            overlayTimer = setInterval(refreshOverlay, 100);  // 10Hz
+                        } else {
+                            if (overlayTimer) { clearInterval(overlayTimer); overlayTimer = null; }
+                            cam1Img.src = '/video_feed/cam1';
+                        }
+                    });
 
                     // 键盘按键转发（保留）
                     let pageActive = false;

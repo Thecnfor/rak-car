@@ -19,6 +19,13 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 from runtime.core import settings
 import time
 
+try:
+    import cv2  # 仅 /v1/vision/lane/preview.jpg 用，单独 try 避免污染启动路径
+    _HAS_CV2 = True
+except ImportError:  # pragma: no cover
+    cv2 = None  # type: ignore
+    _HAS_CV2 = False
+
 
 def get_public_links():
     api_base = settings.get_public_api_base()
@@ -690,6 +697,55 @@ def create_runtime_router(service, camera_stream_service):
             "updated_at": updated_at,
             "state_url": "/v1/vision/lane/state",
         }
+
+    @router_v1.get("/vision/lane/preview.jpg")
+    def v1_vision_lane_preview_jpg(cam_id: str = Query(default="cam1")):
+        """cam1 帧 + 车道误差 overlay 一次性 JPEG。
+
+        设计目的：lane_feed 守护线程已经不再 cv2.putText 主帧流，
+        但调试时仍然想看到 "d_e:... d_a:..." 字样。这个端点：
+          1) 读 streamer.frames[cam_id] 缓存（不读摄像头，不抢 _capture_loop）
+          2) 读 lane_state 拿 (error_y, error_angle)
+          3) 调 cv2.putText × 2 一次性画字（白底+绿字，和之前调试期一致）
+          4) imencode JPEG 返回
+        端点不抢摄像头、不污染 cam1 主帧流，前端 <img> 默认走
+        /video_feed/cam1 拿干净流；想看叠加就切到本端点。
+        """
+        if not _HAS_CV2:
+            raise HTTPException(status_code=503, detail="cv2 不可用，无法生成 overlay")
+        normalized = camera_stream_service.normalize_cam_id(cam_id)
+        frame = camera_stream_service.get_frame(normalized)
+        if frame is None:
+            raise HTTPException(status_code=409, detail="摄像头当前没有可用的帧")
+        # 拷贝再画字，避免污染缓存
+        try:
+            drawn = frame.copy()
+        except Exception:
+            drawn = frame
+        state = camera_stream_service.get_lane_state() or {}
+        ey = state.get("error_y")
+        ea = state.get("error_angle")
+        if ey is not None and ea is not None:
+            try:
+                label = f"d_e:{float(ey):7.5f}  d_a:{float(ea):7.5f}"
+                # 与 get_lane_results 旧实现一致：白底厚 + 绿字薄（双重 putText 防锯齿）
+                cv2.putText(drawn, label, (20, 40),
+                            cv2.FONT_HERSHEY_TRIPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.putText(drawn, label, (20, 40),
+                            cv2.FONT_HERSHEY_TRIPLEX, 1.0, (0, 255, 0), 1, cv2.LINE_AA)
+            except cv2.error:
+                # cv2 putText 偶发在 copy 后的非连续数组上失败，忽略 overlay 即可
+                drawn = frame
+        try:
+            ret, buf = cv2.imencode(
+                ".jpg", drawn,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+            )
+        except cv2.error:
+            raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
+        if not ret:
+            raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
+        return Response(content=buf.tobytes(), media_type="image/jpeg")
 
     @router_v1.post("/vision/task")
     def v1_vision_task(payload: dict = Body(default={})):
