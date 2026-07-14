@@ -47,13 +47,21 @@
   - 原始底盘速度控制，适合高频上层闭环
 - `car.get_lane_results`
   - 读取前摄巡线误差和角度误差
+- `POST /v1/realtime/wheels/speeds`
+  - 4 轮线速度直达，绕过 set_chassis_velocity 的里程计耦合路径（car_lock 同步，50Hz 友好）
+- `GET /v1/realtime/wheels/encoders`
+  - 4 轮编码器弧度累计值
+- `POST /v1/realtime/motor/speed`
+  - 单电机原始速度（开环，不进 PID）
+- `GET /v1/realtime/encoder?port=N`
+  - 单电机编码器原始累计值
+- `POST /v1/realtime/stepper/rad`
+  - 底盘步进电机弧度定位
 
 ### 1.2 底层已具备，但当前未直接暴露为 API
 
-- 四轮线速度/角速度直接下发
-- 单电机速度控制
-- 编码器原始读数
-- 步进电机控制
+- 四轮角速度（rad/s）直接下发（线速度已通过 `/v1/realtime/wheels/speeds` 暴露）
+- 四轮虚拟速度（PWM [-100,100]，mc602 `Motor4_2.set_speed`）—— 业务侧一般无需直发原始 PWM
 
 ### 1.3 麦轮特色能力
 
@@ -149,6 +157,10 @@
   - 控机械臂末端 PWM 舵机角度
 - `car.set_pwm_servo_angle`
   - 任意端口 PWM 舵机通用控制
+- `POST /v1/realtime/bus-servo/angle`
+  - 任意端口总线舵机（ServoBus）角度下发，绕过 `arm.set_arm_angle` 的业务封装
+- `GET /v1/realtime/bus-servo/angle?port=N`
+  - 读取总线舵机当前角度（mc602 实现，mc601 暂不支持）
 
 ### 4.2 已在代码中使用，但以业务动作形式暴露
 
@@ -159,7 +171,7 @@
 
 ### 4.3 底层仍未直接暴露为 API
 
-- 原始 `ServoBus(port).set_angle(angle, speed)`
+- 原始 `ServoBus(port).set_speed(speed)`（速度模式，mc602 协议层支持；本轮只接了位置模式）
 
 ## 5. 其他可检测/可交互能力
 
@@ -193,13 +205,15 @@
   - 控制灯带颜色
 - `car.show_text`
   - 屏幕显示文本
+- `GET /v1/realtime/analog?port=N`
+  - 单路模拟量（mc602 走 `Sensor_Analog2_2`，对应第二路 `dev_id=0x08`）
+- `GET /v1/realtime/analog2?port=N`
+  - 第二路模拟量（mc602 走 `AnalogInput`，对应 `dev_id=0x07 mode=0`）
 
 ### 5.2 底层已具备，但当前未直接暴露为 API
 
 - `BoardKey`
   - 板载按键读取
-- `AnalogInput / AnalogInput2`
-  - 模拟量读取
 - `sensor_touch`
   - 触碰类输入，协议层已有
 - `sensor_ultrasonic`

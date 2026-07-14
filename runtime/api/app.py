@@ -41,7 +41,7 @@ def create_app():
     @app.on_event("shutdown")
     def shutdown_event():
         camera_stream_service.stop()
-        service.close()
+        service.shutdown()
 
     @app.get("/")
     def index():

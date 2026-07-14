@@ -9,9 +9,9 @@ import serial
 from serial.tools import list_ports
 
 from runtime.hardware.controller_recover import (
+    boot_ping,
     ping_mc601,
     ping_mc602,
-    recover_controller,
 )
 
 
@@ -23,7 +23,10 @@ class ControllerProbeResult:
     ready: bool
     port: str = None
     controller: str = None
+    mode: str = None
     detail: str = None
+    bootloader_seen: bool = False
+    program_seen: bool = False
 
 
 # #region debug-point A:report-helper
@@ -83,130 +86,117 @@ def list_candidate_ports():
     ports.sort(key=lambda item: "CH340" not in item[1])
     return ports
 
+
+def probe_port_mode(port_name, debug_hook=None):
+    try:
+        with serial.Serial(
+            port=port_name,
+            baudrate=115200,
+            timeout=0.03,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            xonxoff=False,
+            rtscts=False,
+            dsrdtr=False,
+        ) as serial_obj:
+            if debug_hook is not None:
+                debug_hook(
+                    "E",
+                    "controller_probe.probe_port_mode",
+                    "串口已打开，开始纯探测",
+                    {"port": port_name},
+                )
+            if ping_mc602(serial_obj):
+                return ControllerProbeResult(
+                    ready=True,
+                    port=port_name,
+                    controller="mc602",
+                    mode="program",
+                    detail="mc602 program 握手成功",
+                    program_seen=True,
+                )
+            if ping_mc601(serial_obj):
+                return ControllerProbeResult(
+                    ready=True,
+                    port=port_name,
+                    controller="mc601",
+                    mode="program",
+                    detail="mc601 program 握手成功",
+                    program_seen=True,
+                )
+            serial_obj.baudrate = 1000000
+            ok, _frame = boot_ping(serial_obj)
+            if ok:
+                return ControllerProbeResult(
+                    ready=False,
+                    port=port_name,
+                    controller="mc602",
+                    mode="bootloader",
+                    detail="bootloader 在线，等待拉起 program",
+                    bootloader_seen=True,
+                )
+            return ControllerProbeResult(
+                ready=False,
+                port=port_name,
+                controller=None,
+                mode="unknown",
+                detail="串口可打开，但既非 program 也非 bootloader",
+            )
+    except Exception as exc:
+        if debug_hook is not None:
+            debug_hook(
+                "E",
+                "controller_probe.probe_port_mode",
+                "探测串口失败",
+                {"port": port_name, "error": repr(exc)},
+            )
+        return ControllerProbeResult(
+            ready=False,
+            port=port_name,
+            controller=None,
+            mode="unknown",
+            detail=f"{port_name} 探测失败: {exc}",
+        )
+
+
 def probe_controller():
     ports = list_candidate_ports()
-    # #region debug-point E:probe-entry
     _debug_event(
         "E",
         "controller_probe.probe_controller",
         "开始探测控制器",
         {"ports": [{"name": name, "desc": desc} for name, desc in ports]},
     )
-    # #endregion
     if not ports:
         return ControllerProbeResult(
             ready=False,
+            mode="no_port",
             detail="未找到控制器串口，检查 USB 连接和下位机供电",
         )
 
-    last_error = None
+    last_result = None
     for port_name, _desc in ports:
-        try:
-            with serial.Serial(
-                port=port_name,
-                baudrate=115200,
-                timeout=0.03,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False,
-            ) as serial_obj:
-                # #region debug-point E:probe-port-open
-                _debug_event(
-                    "E",
-                    "controller_probe.probe_controller",
-                    "串口已打开，开始握手",
-                    {"port": port_name, "desc": _desc},
-                )
-                # #endregion
-                if ping_mc602(serial_obj):
-                    # #region debug-point E:probe-mc602-ok
-                    _debug_event(
-                        "E",
-                        "controller_probe.probe_controller",
-                        "mc602 program 握手成功",
-                        {"port": port_name},
-                    )
-                    # #endregion
-                    return ControllerProbeResult(
-                        ready=True,
-                        port=port_name,
-                        controller="mc602",
-                        detail="控制器握手成功",
-                    )
-                if ping_mc601(serial_obj):
-                    # #region debug-point E:probe-mc601-ok
-                    _debug_event(
-                        "E",
-                        "controller_probe.probe_controller",
-                        "mc601 program 握手成功",
-                        {"port": port_name},
-                    )
-                    # #endregion
-                    return ControllerProbeResult(
-                        ready=True,
-                        port=port_name,
-                        controller="mc601",
-                        detail="控制器握手成功",
-                    )
-                serial_obj.close()
-                recovered, detail = recover_controller(
-                    port_name,
-                    port_supplier=list_candidate_ports,
-                    debug_hook=_debug_event,
-                )
-                if recovered:
-                    # #region debug-point E:probe-recovered
-                    _debug_event(
-                        "E",
-                        "controller_probe.probe_controller",
-                        "bootloader 恢复成功",
-                        {"port": port_name, "detail": detail},
-                    )
-                    # #endregion
-                    return ControllerProbeResult(
-                        ready=True,
-                        port=port_name,
-                        controller="mc602",
-                        detail=detail,
-                    )
-                if detail:
-                    if str(detail).startswith(port_name):
-                        last_error = str(detail)
-                    else:
-                        last_error = f"{port_name} {detail}"
-                    # #region debug-point E:probe-detail
-                    _debug_event(
-                        "E",
-                        "controller_probe.probe_controller",
-                        "端口恢复失败",
-                        {"port": port_name, "detail": detail},
-                    )
-                    # #endregion
-                    continue
-                last_error = f"{port_name} 可打开但未收到控制器响应"
-                # #region debug-point E:probe-no-response
-                _debug_event(
-                    "E",
-                    "controller_probe.probe_controller",
-                    "串口可打开但无控制器响应",
-                    {"port": port_name},
-                )
-                # #endregion
-        except Exception as exc:
-            last_error = f"{port_name} 探测失败: {exc}"
-            # #region debug-point E:probe-open-error
+        result = probe_port_mode(port_name, debug_hook=_debug_event)
+        last_result = result
+        if result.mode == "program":
             _debug_event(
                 "E",
                 "controller_probe.probe_controller",
-                "探测串口失败",
-                {"port": port_name, "error": repr(exc)},
+                "program 探测成功",
+                {"port": port_name, "controller": result.controller},
             )
-            # #endregion
-
-    return ControllerProbeResult(
+            return result
+        if result.mode == "bootloader":
+            _debug_event(
+                "E",
+                "controller_probe.probe_controller",
+                "bootloader 探测成功",
+                {"port": port_name},
+            )
+            return result
+    return last_result or ControllerProbeResult(
         ready=False,
-        detail=last_error or "控制器探测失败",
+        mode="unknown",
+        detail="控制器探测失败",
     )

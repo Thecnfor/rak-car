@@ -41,13 +41,18 @@ class CameraStreamService:
         self.fps = max(float(fps), 1.0)
         self.quality = int(quality)
         self.capture_interval = 1.0 / self.fps
+        self.stale_timeout = max(self.capture_interval * 8, 2.0)
+        self.recover_cooldown = 3.0
         self.project_root = Path(__file__).resolve().parents[2]
         self.running = False
         self.last_key = None
         self._thread = None
         self.frame_lock = threading.Lock()
         self.key_lock = threading.Lock()
+        self.meta_lock = threading.Lock()
         self.frames = {}
+        self.frame_meta = {}
+        self.lane_state = self._default_lane_state()
 
     def start(self):
         if self.running:
@@ -62,6 +67,9 @@ class CameraStreamService:
             self._thread.join(timeout=2)
         with self.frame_lock:
             self.frames.clear()
+            self.frame_meta.clear()
+        with self.meta_lock:
+            self.lane_state = self._default_lane_state()
 
     def get_key(self, clear=True):
         with self.key_lock:
@@ -75,23 +83,47 @@ class CameraStreamService:
             self.last_key = key
         return key
 
-    def clear_frame(self, cam_id=None):
+    def clear_frame(self, cam_id=None, preserve_meta=False):
         with self.frame_lock:
             if cam_id is None:
                 self.frames.clear()
+                if not preserve_meta:
+                    self.frame_meta.clear()
                 return
             normalized = self.normalize_cam_id(cam_id)
             if normalized in self.frames:
                 del self.frames[normalized]
+            if (not preserve_meta) and normalized in self.frame_meta:
+                del self.frame_meta[normalized]
 
     def get_status(self):
         with self.frame_lock:
             active_cams = sorted(self.frames.keys())
+            cameras = {}
+            for cam_id in ("cam1", "cam2"):
+                meta = dict(self.frame_meta.get(cam_id, {}))
+                source_updated_at = meta.get("source_updated_at")
+                frame_age = None
+                stale = True
+                if source_updated_at:
+                    frame_age = round(max(time.time() - float(source_updated_at), 0.0), 3)
+                    stale = frame_age > self.stale_timeout
+                cameras[cam_id] = {
+                    "active": cam_id in self.frames and not stale,
+                    "stale": stale,
+                    "frame_age": frame_age,
+                    "last_capture_at": meta.get("captured_at"),
+                    "last_source_update_at": source_updated_at,
+                    "last_recover_at": meta.get("last_recover_at"),
+                    "last_issue": meta.get("last_issue"),
+                }
         return {
             "status": "running" if self.running else "stopped",
             "active_cams": active_cams,
             "fps": self.fps,
             "quality": self.quality,
+            "stale_timeout": self.stale_timeout,
+            "cameras": cameras,
         }
 
     def get_stream_info(self, base_url):
@@ -100,6 +132,7 @@ class CameraStreamService:
             "ok": True,
             "page_url": f"{base}/stream/",
             "health_url": f"{base}/stream/health",
+            "lane_state_url": f"{base}/v1/vision/lane/state",
             "keypress_url": f"{base}/keypress",
             "capture_url": f"{base}/stream/capture",
             "cameras": {
@@ -107,6 +140,27 @@ class CameraStreamService:
                 "cam2": self._camera_info(base, "cam2", ["cam2", "side"]),
             },
         }
+
+    def set_lane_state(self, **updates):
+        with self.meta_lock:
+            state = dict(self.lane_state)
+            for key, value in updates.items():
+                state[key] = value
+            state["updated_at"] = time.time()
+            self.lane_state = state
+            return dict(state)
+
+    def clear_lane_state(self):
+        with self.meta_lock:
+            self.lane_state = self._default_lane_state()
+            return dict(self.lane_state)
+
+    def get_lane_state(self):
+        with self.meta_lock:
+            state = dict(self.lane_state)
+        state["frame_url"] = "/stream/frame/cam1.jpg"
+        state["preview_url"] = "/stream/"
+        return state
 
     def normalize_cam_id(self, cam_id):
         return self.CAM_ALIASES.get(str(cam_id).lower(), "cam1")
@@ -117,12 +171,99 @@ class CameraStreamService:
             frame = self.frames.get(normalized)
             return None if frame is None else frame.copy()
 
+    def _frame_is_fresh(self, cam_id):
+        normalized = self.normalize_cam_id(cam_id)
+        with self.frame_lock:
+            meta = dict(self.frame_meta.get(normalized, {}))
+        source_updated_at = meta.get("source_updated_at")
+        if not source_updated_at:
+            return False
+        return (time.time() - float(source_updated_at)) <= self.stale_timeout
+
     def get_frame_or_placeholder(self, cam_id):
         normalized = self.normalize_cam_id(cam_id)
         frame = self.get_frame(normalized)
-        if frame is not None:
+        if frame is not None and self._frame_is_fresh(normalized):
             return frame
+        if frame is not None:
+            self.clear_frame(normalized, preserve_meta=True)
         return self._build_waiting_frame(normalized)
+
+    def _update_frame_meta(self, cam_id, **updates):
+        normalized = self.normalize_cam_id(cam_id)
+        with self.frame_lock:
+            meta = dict(self.frame_meta.get(normalized, {}))
+            meta.update(updates)
+            self.frame_meta[normalized] = meta
+
+    def _request_camera_recover(self, camera, cam_id, reason):
+        normalized = self.normalize_cam_id(cam_id)
+        with self.frame_lock:
+            meta = dict(self.frame_meta.get(normalized, {}))
+        now = time.time()
+        last_recover_at = meta.get("last_recover_at") or 0.0
+        self._update_frame_meta(
+            normalized,
+            last_issue=reason,
+            last_issue_at=now,
+        )
+        if now - float(last_recover_at) < self.recover_cooldown:
+            return
+        if camera is not None and hasattr(camera, "request_reopen"):
+            try:
+                camera.request_reopen(reason)
+                self._update_frame_meta(normalized, last_recover_at=now)
+            except Exception:
+                pass
+
+    def _get_camera_source_updated_at(self, camera):
+        updated_at = getattr(camera, "frame_updated_at", None)
+        if updated_at:
+            return float(updated_at)
+        return None
+
+    def update_frame(self, image, cam_id, source_updated_at=None):
+        if image is None:
+            return
+        normalized = self.normalize_cam_id(cam_id)
+        captured_at = time.time()
+        if source_updated_at is None:
+            source_updated_at = captured_at
+        with self.frame_lock:
+            self.frames[normalized] = image.copy()
+            meta = dict(self.frame_meta.get(normalized, {}))
+            meta.update(
+                {
+                    "captured_at": captured_at,
+                    "source_updated_at": float(source_updated_at),
+                    "last_issue": None,
+                }
+            )
+            self.frame_meta[normalized] = meta
+
+    def stream_frames(self, cam_id):
+        normalized = self.normalize_cam_id(cam_id)
+        last_frame_time = 0.0
+        while self.running:
+            current_time = time.time()
+            if current_time - last_frame_time < self.capture_interval:
+                time.sleep(0.01)
+                continue
+            frame = self.get_frame_or_placeholder(normalized)
+            ret, buffer = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+            )
+            if ret:
+                last_frame_time = current_time
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + buffer.tobytes()
+                    + b"\r\n"
+                )
+            time.sleep(0.01)
 
     def encode_jpeg_bytes(self, cam_id, quality=None):
         frame = self.get_frame_or_placeholder(cam_id)
@@ -139,7 +280,7 @@ class CameraStreamService:
     def save_capture(self, cam_id, prefix="capture", subdir=None):
         normalized = self.normalize_cam_id(cam_id)
         frame = self.get_frame(normalized)
-        if frame is None:
+        if frame is None or not self._frame_is_fresh(normalized):
             raise RuntimeError("当前摄像头还没有可保存的实时画面")
         file_prefix = self._safe_slug(prefix or "capture")
         target_dir = self._get_capture_dir(normalized, subdir=subdir)
@@ -172,39 +313,6 @@ class CameraStreamService:
         if not file_path.exists():
             raise FileNotFoundError(safe_name)
         return file_path
-
-    def update_frame(self, image, cam_id):
-        if image is None:
-            return
-        normalized = self.normalize_cam_id(cam_id)
-        with self.frame_lock:
-            self.frames[normalized] = image.copy()
-
-    def stream_frames(self, cam_id):
-        normalized = self.normalize_cam_id(cam_id)
-        last_frame_time = 0.0
-        while self.running:
-            current_time = time.time()
-            if current_time - last_frame_time < self.capture_interval:
-                time.sleep(0.01)
-                continue
-            frame = self.get_frame(normalized)
-            if frame is None:
-                frame = self._build_waiting_frame(normalized)
-            ret, buffer = cv2.imencode(
-                ".jpg",
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
-            )
-            if ret:
-                last_frame_time = current_time
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + buffer.tobytes()
-                    + b"\r\n"
-                )
-            time.sleep(0.01)
 
     def render_page(self):
         return """
@@ -269,6 +377,28 @@ class CameraStreamService:
                         margin-top: 20px;
                         width: 100%;
                     }
+                    .status-grid {
+                        display: grid;
+                        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+                        gap: 12px;
+                        margin-top: 20px;
+                    }
+                    .status-card {
+                        background: rgba(255, 255, 255, 0.03);
+                        border: 1px solid rgba(255, 255, 255, 0.1);
+                        border-radius: 12px;
+                        padding: 12px 14px;
+                    }
+                    .status-card .label {
+                        font-size: 0.85em;
+                        color: #8892b0;
+                        margin-bottom: 6px;
+                    }
+                    .status-card .value {
+                        font-size: 1.1em;
+                        color: #e6f1ff;
+                        font-family: monospace;
+                    }
                     .stream-box {
                         background: rgba(255, 255, 255, 0.03);
                         border: 2px solid rgba(255, 255, 255, 0.1);
@@ -318,6 +448,32 @@ class CameraStreamService:
                             <span class="key-icon">⌨️</span>
                         </h4>
                     </header>
+                    <div class="status-grid">
+                        <div class="status-card">
+                            <div class="label">Lane 状态</div>
+                            <div class="value" id="laneActive">idle</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="label">横向误差</div>
+                            <div class="value" id="laneError">--</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="label">角度误差</div>
+                            <div class="value" id="laneAngle">--</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="label">横移速度</div>
+                            <div class="value" id="laneYSpeed">--</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="label">角速度</div>
+                            <div class="value" id="laneAngleSpeed">--</div>
+                        </div>
+                        <div class="status-card">
+                            <div class="label">累计距离</div>
+                            <div class="value" id="laneDistance">--</div>
+                        </div>
+                    </div>
                     <div class="stream-container">
                         <div class="stream-box">
                             <h3>前视画面 (cam1 / front)</h3>
@@ -361,6 +517,34 @@ class CameraStreamService:
                             event.preventDefault();
                         }
                     });
+
+                    function formatNum(value, digits = 4) {
+                        if (value === null || value === undefined) {
+                            return '--';
+                        }
+                        if (typeof value !== 'number') {
+                            return String(value);
+                        }
+                        return value.toFixed(digits);
+                    }
+
+                    async function refreshLaneState() {
+                        try {
+                            const response = await fetch('/v1/vision/lane/state');
+                            const data = await response.json();
+                            document.getElementById('laneActive').innerText = data.active ? (data.mode || 'tracking') : 'idle';
+                            document.getElementById('laneError').innerText = formatNum(data.error_y);
+                            document.getElementById('laneAngle').innerText = formatNum(data.error_angle);
+                            document.getElementById('laneYSpeed').innerText = formatNum(data.lateral_speed);
+                            document.getElementById('laneAngleSpeed').innerText = formatNum(data.angular_speed);
+                            document.getElementById('laneDistance').innerText = formatNum(data.distance, 3);
+                        } catch (error) {
+                            console.error('lane state 获取失败:', error);
+                        }
+                    }
+
+                    refreshLaneState();
+                    setInterval(refreshLaneState, 300);
                 </script>
             </body>
         </html>
@@ -385,12 +569,21 @@ class CameraStreamService:
 
     def _capture_from_camera(self, camera, cam_id):
         if camera is None:
-            self.clear_frame(cam_id)
+            self.clear_frame(cam_id, preserve_meta=True)
+            self._update_frame_meta(cam_id, last_issue="camera object missing", last_issue_at=time.time())
             return
         frame = getattr(camera, "frame", None)
-        if frame is None:
+        source_updated_at = self._get_camera_source_updated_at(camera)
+        if frame is None or source_updated_at is None:
+            self._request_camera_recover(camera, cam_id, "camera frame missing")
+            self.clear_frame(cam_id, preserve_meta=True)
             return
-        self.update_frame(frame, cam_id)
+        frame_age = time.time() - source_updated_at
+        if frame_age > self.stale_timeout:
+            self._request_camera_recover(camera, cam_id, "camera frame stale {:.2f}s".format(frame_age))
+            self.clear_frame(cam_id, preserve_meta=True)
+            return
+        self.update_frame(frame, cam_id, source_updated_at=source_updated_at)
 
     def _build_waiting_frame(self, cam_id):
         title = {
@@ -439,3 +632,17 @@ class CameraStreamService:
             else:
                 allowed.append("_")
         return "".join(allowed).strip("_") or "capture"
+
+    def _default_lane_state(self):
+        return {
+            "active": False,
+            "mode": "idle",
+            "error_y": None,
+            "error_angle": None,
+            "forward_speed": None,
+            "lateral_speed": None,
+            "angular_speed": None,
+            "distance": None,
+            "frame_shape": None,
+            "updated_at": None,
+        }

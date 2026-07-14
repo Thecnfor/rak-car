@@ -6,66 +6,191 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (smart-agriculture) track — a Jetson Nano + MC602 controller running on a WhalesBot mecanum-wheel chassis. A single run executes **8 fixed-order tasks** (seed → scout pests → water → shoot pests → harvest → sort → read order via OCR → deliver). The repo is a frozen-for-competition codebase; per-track calibration happens in `config_car.yml` and the odometry offsets hardcoded inside `car_task_function.py`.
 
-## Run / build commands
+## Branches (check before reading)
 
-There are no build steps, no tests, no linter, and no `requirements.txt`. The runtime is Python 3.8+ on a Jetson Nano with PaddlePaddle Inference (CPU/CUDA or TensorRT, configured via `config_car.yml → infer_cfg[].run_mode`).
+- **`main`** — the live Python monolith + runtime FastAPI service. **You are here.** This file documents `main`.
+- **`develop/ros2-sidecar`** — a ROS2 experiment with a different top level (`ros2_ws/`, `urdf/`, `config_sensors.yml`). The Python-monolith docs do **not** apply there.
+- **`feat/chassis-p0-mecanum-8.10`** / **`legacy/main`** / **`local-snapshot-0712`** — work-in-progress and historical branches; do not target unless the user says so.
 
-- **Full mission**: `python car_start_2026.py`
-- **Single task**: comment out the other steps inside `car_start_2026.main()` (see README §"单独测试某个任务")
-- **Test lane-only traversal**: call `auto_lane_tracing(speed=0.3, dis_hold=99)` from a REPL after `init()` — `dis_hold=99` means "follow the lane until you lose it or hit the base"
-- **Data collection (two-cam over LAN)**: `python collect_data.py`, then browse `http://<car-ip>:5000/`. Bluetooth gamepad; key `3` collects lane frames into `./dataset/image_set_lane/`, key `4` collects object frames into `./dataset/image_set_object/`. Both dirs are gitignored (`**/dataset/`).
-- **Convert collected frames to COCO**: `smartcar/whalesbot/tools/x2coco.py`
+## Three entry points
 
-The four ZMQ inference backends (ports 5001–5004, see below) are **auto-spawned** the first time `MyCar()` is constructed — you should not start them by hand.
+The codebase has **three independent entry surfaces**. Pick the one that matches what you're doing:
+
+### 1. Legacy monolith script (CLI / REPL — one-shot runs)
+
+```bash
+python car_start_2026.py          # full 8-task mission
+python main/quick_start.py        # (legacy) sanity check
+```
+
+`car_start_2026.py` calls `init()` then each task in sequence — comment out the others to run a single task. This path constructs `MyCar()` directly in the calling process; inference backends are **auto-spawned** the first time `MyCar()` is constructed.
+
+### 2. Runtime API service (production / remote / debug — preferred for daily work)
+
+The car is normally driven over HTTP from a separate machine (or the Jetson itself). The runtime service is a FastAPI app that owns the `MyCar()` singleton and exposes everything as POST endpoints:
+
+```bash
+# install once
+/usr/bin/python3 -m pip install -r /home/jetson/workspace/rak-car/runtime/requirements.txt
+
+# dev
+cd /home/jetson/workspace/rak-car
+/usr/bin/python3 -m runtime.server           # serves 0.0.0.0:5050
+
+# production (what the car actually runs under)
+pm2 start ecosystem.config.js               # → process name "rak-car-api"
+pm2 logs rak-car-api
+pm2 restart rak-car-api                     # after pulling new code
+```
+
+Default URLs (override via env vars — see "Config surface" below):
+- API: `http://192.168.3.60:5050`
+- FastAPI docs: `http://192.168.3.60:5050/docs`
+- Stream page: `http://192.168.3.60:5050/stream/`
+- cam1 MJPEG: `http://192.168.3.60:5050/video_feed/cam1`
+- cam2 MJPEG: `http://192.168.3.60:5050/video_feed/cam2`
+
+The runtime's job is to:
+- Hold a single `MyCar()` instance and serialize access through `car_lock`.
+- Run `auto_init` in the background — if the MC602 reboots, runtime rebuilds `MyCar()` automatically (see `RAK_CAR_AUTO_INIT`).
+- Provide a job queue (`/v1/jobs`, `/v1/execute`) so callers don't deadlock against an init in progress.
+- Expose vision results and camera streams without each caller rebuilding the inference backends.
+
+If you only need to drive the car (no internal changes), you should be writing a script in `main/` against `RuntimeApiClient` — **not** importing `MyCar` directly.
+
+### 3. Business client (`main/`)
+
+`main/` is a separate Python package that depends **only** on the runtime API via HTTP. Business logic that doesn't need to touch the SDK lives here:
+
+```bash
+export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+/usr/bin/python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
+python3 /home/jetson/workspace/rak-car/main/quick_start.py    # connectivity check
+python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission template
+```
+
+The one client class to remember is `RuntimeApiClient` in `main/api_client.py`:
+
+```python
+from main.api_client import RuntimeApiClient
+client = RuntimeApiClient()
+client.call("car", "beep", timeout=40)
+client.call("car", "move_for", [0.05, 0.0, 0.0], timeout=60)
+client.call("arm", "move_x_position", 0.20, timeout=20)
+```
+
+For long-lived / high-frequency control, `main/ws_client.py` exposes a WebSocket. The full action surface and parameters are in `main/API_REFERENCE.md`.
 
 ## Big-picture architecture
 
-### Three layers, top-down
+Three layers, top-down. The names in **bold** are the files you'll touch most.
 
-1. **Competition orchestration** (root-level scripts)
-   - `car_start_2026.py` — thin `main()` that calls `init()` then each task in sequence.
-   - `car_task_function.py` — the 8 task functions. Each is mostly a hand-tuned sequence of `my_car.move_to_position(...)`, `my_car.move_to_detection_target()`, `my_car.arm.grasp(...)`, etc. Coordinates here (e.g. `cylinder_loc` in `auto_seeding`) are *track-specific magic numbers* — they are the calibration surface when porting to a different venue.
-   - `car_wrap_2026.py` — defines `class MyCar(MecanumDriver)`. This is the single facade the task layer talks to. `init()` in `car_task_function.py` constructs it as the global `my_car`. Construction order is: chassis → screen → streamer → arm → sensor (`Key4Btn`, `ServoPwm` for storage, `BluetoothPad`, `PoutD` for shooter) → PID → cameras → paddle infer → ERNIE bot → key-press daemon thread.
+### A. Top-level scripts (monolith path only)
 
-2. **WhalesBot hardware SDK** (`smartcar/whalesbot/`)
-   - `vehicle/driver/mecanum.py` + `vehicle_base.py` — `MecanumDriver` (base of `MyCar`), implements `move_for`, `move_to_position` (waypoint with `location_pid`), `get_odometry`, `lane_dis_offset` (follow lane for `dis_hold` meters), and chassis geometry from `cfg_vehicle.yaml` (`track=0.30`, `wheel_base=0.28`).
-   - `vehicle/arm/arm_base.py` — `ArmController`: `reset_position`, `set_arm_pose(arm_id, pitch, "LEFT"/"RIGHT", "UP"/"DOWN")`, `grasp(bool)` (vacuum on/off), `move_x_position`, `move_y_position`. Poses referenced by string direction constants, not by joint angles — look up enum in `arm_base.py` before adding joints.
-   - `vehicle/base/controller_wrap.py` — per-pin peripherals (`Beep`, `Key4Btn`, `Infrared`, `NixieTube`, `ServoPwm`, `BluetoothPad`, `PoutD`, `Motor4`, `Battry`, etc.) wired to MC602 serial via `serial_wrap.py` / `mc602_ctl2.py`.
-   - `tools/` — `Camera`, `Streamer` (Flask-based LAN preview on `:5000`), `logger` (write to `.remember/logs/`), `PID` / `PidWrap`, `CountRecord`, `IndexWrap`, `CollectControlCar`.
+- `car_start_2026.py` — thin `main()` that calls `init()` then each task in sequence.
+- `car_task_function.py` — the 8 task functions. Each is mostly a hand-tuned sequence of `my_car.move_to_position(...)`, `my_car.move_to_detection_target()`, `my_car.arm.grasp(...)`, etc. Coordinates here (e.g. `cylinder_loc` in `auto_seeding`) are *track-specific magic numbers* — they are the calibration surface when porting to a different venue.
+- **`car_wrap_2026.py`** — defines `class MyCar(MecanumDriver)`. This is the single facade the task layer talks to; it's also what the runtime owns. Construction order is: chassis → screen → streamer → arm → sensor (`Key4Btn`, `ServoPwm` for storage, `BluetoothPad`, `PoutD` for shooter) → PID → cameras → paddle infer → ERNIE bot → key-press daemon thread.
 
-3. **PaddlePaddle inference** (`smartcar/paddlebaidu/`)
-   - `paddle_jetson/base/infer_wrap.py` — *the local wrapper*. Three classes are what `MyCar` consumes: `YoloeInfer`, `LaneInfer`, `OCRReco`. Each loads Paddle weights from `smartcar/paddlebaidu/models/<dir>/` and supports `paddle` / `trt_fp32` / `trt_fp16` run modes.
-   - `paddle_jetson/base/deploy/` — **vendored upstream PaddleDetection**. Read-only. New inference code goes in the wrapper layer above, not here.
-   - `infer_cs/base/infer_back_end.py` — `InferServer`: spins up one ZMQ REQ/REP per entry in `config_car.yml → infer_cfg`, each in a daemon thread on its configured port.
-   - `infer_cs/base/infer_front.py` — `ClintInterface(name)`: ZMQ client. **First-time construction triggers `check_back_python()` → `subprocess.Popen("python3 infer_back_end.py &")`** if the backend isn't already running, then polls `get_state()` until ready.
-   - `ernie_bot/base/ernie_bot_wrap.py` — `ErnieBotWrap` with prompt subclasses `HumAttrPrompt`, `ActionPrompt`, `ImagePrompt`, `OrderPrompt`. Used by `get_order()` and other NLP-driven steps. Auth token is `config_car.yml → ernie_access_token`.
+### B. WhalesBot hardware SDK (`smartcar/whalesbot/`)
 
-### Data-flow during a typical task
+- `vehicle/driver/mecanum.py` + `vehicle_base.py` — `MecanumDriver` (base of `MyCar`), implements `move_for`, `move_to_position` (waypoint with `location_pid`), `get_odometry`, `lane_dis_offset` (follow lane for `dis_hold` meters), and chassis geometry from `cfg_vehicle.yaml` (`track=0.30`, `wheel_base=0.28`).
+- `vehicle/arm/arm_base.py` — `ArmController`: `reset_position`, `set_arm_pose(arm_id, pitch, "LEFT"/"RIGHT", "UP"/"DOWN")`, `grasp(bool)` (vacuum on/off), `move_x_position`, `move_y_position`. Poses are referenced by string direction constants, not by joint angles — look up the enum in `arm_base.py` before adding joints.
+- `vehicle/base/controller_wrap.py` — per-pin peripherals (`Beep`, `Key4Btn`, `Infrared`, `NixieTube`, `ServoPwm`, `BluetoothPad`, `PoutD`, `Motor4`, `Battry`, etc.) wired to MC602 serial via `serial_wrap.py` / `mc602_ctl2.py`.
+- `tools/` — `Camera`, `Streamer` (Flask-based LAN preview on `:5000`, now superseded by the runtime service), `logger` (writes to `.remember/logs/`), `PID` / `PidWrap`, `CountRecord`, `IndexWrap`, `CollectControlCar`.
 
-`my_car.cap_side.read()` → image → `my_car.task_det(img)` (REQs `tcp://127.0.0.1:5002`) → JSON boxes back → `my_car.get_detection_results()` → `Bbox` objects with normalised `pos_from_center()` → used as the error signal for a PD loop that drives `move_to_detection_target()`. OCR uses port 5004 with no resize (`img_size: Null`). Lane following uses port 5001 (`img_size: [128,128]`) and is consumed by `lane_dis_offset` in the chassis layer.
+### C. PaddlePaddle inference (`smartcar/paddlebaidu/`)
 
-## Configuration surface
+- `paddle_jetson/base/infer_wrap.py` — *the local wrapper*. Three classes are what `MyCar` consumes: `YoloeInfer`, `LaneInfer`, `OCRReco`. Each loads Paddle weights from `smartcar/paddlebaidu/models/<dir>/` and supports `paddle` / `trt_fp32` / `trt_fp16` run modes.
+- `paddle_jetson/base/deploy/` — **vendored upstream PaddleDetection**. Read-only. New inference code goes in the wrapper layer above, not here.
+- `infer_cs/base/infer_back_end.py` — `InferServer`: spins up one ZMQ REQ/REP per entry in `config_car.yml → infer_cfg`, each in a daemon thread on its configured port.
+- `infer_cs/base/infer_front.py` — `ClintInterface(name)`: ZMQ client. First-time construction triggers `check_back_python()` → `subprocess.Popen("python3 infer_back_end.py &")` if the backend isn't already running, then polls `get_state()` until ready.
+- `ernie_bot/base/ernie_bot_wrap.py` — `ErnieBotWrap` with prompt subclasses `HumAttrPrompt`, `ActionPrompt`, `ImagePrompt`, `OrderPrompt`. Used by `get_order()` and other NLP-driven steps. Auth token is `config_car.yml → ernie_access_token`.
 
-All knobs live in **`config_car.yml`** at repo root:
+### D. Runtime service (`runtime/`)
 
-| Block | What it controls | When to touch |
+- `runtime/server.py` — uvicorn entry point (`python -m runtime.server`).
+- `runtime/api/app.py` + `routes.py` — FastAPI assembly; `v1` and legacy `/api` prefixes.
+- `runtime/core/settings.py` — env-var-driven config (see "Config surface").
+- `runtime/core/actions.py` — `CAR_ACTIONS`, `ARM_ACTIONS`, `TASK_ACTION_NAMES` registries.
+- `runtime/services/runtime_service.py` — `CarRuntimeService`: owns `MyCar()`, the `car_lock` / `init_lock` / `job_lock`, the auto-init background thread, and the job queue.
+- `runtime/services/inference_service.py` — ZMQ-backend health/registry: tracks which inference servers are up, exposes readiness for `/v1/health` and `/v1/inference/*`, gates job dispatch when a backend is missing. Lives next to `runtime_service` for now; will grow as new vision endpoints land.
+- `runtime/services/camera_stream_service.py` — runtime-owned camera capture & MJPEG output (the legacy Flask streamer on `:5000` is no longer the production path).
+- `runtime/hardware/controller_session.py` — long-lived controller session with generation tracking (see "MC602 reboot behavior").
+- `runtime/hardware/controller_probe.py` / `controller_download.py` / `controller_recover.py` — boot-time recovery path.
+
+## Data-flow during a typical task
+
+**Legacy monolith:** `my_car.cap_side.read()` → image → `my_car.task_det(img)` (REQs `tcp://127.0.0.1:5002`) → JSON boxes → `my_car.get_detection_results()` → `Bbox` objects with normalised `pos_from_center()` → used as the error signal for a PD loop that drives `move_to_detection_target()`.
+
+**Runtime path:** Caller POSTs `{"target":"car","name":"move_to_detection_target",...}` to `/v1/execute`. The service enqueues a job, holds `car_lock`, dispatches onto the same `MyCar()` singleton, returns the result. The same flow applies for vision reads (`/v1/vision/task`, `/v1/vision/lane`, `/v1/vision/ocr`) — see `runtime/VISION_API.md`.
+
+Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5002, front detection uses 5003, OCR uses 5004 with no resize (`img_size: Null`).
+
+## Config surface
+
+| Where | What it controls | When to touch |
 | --- | --- | --- |
-| `camera.front/side` | OpenCV video indices for the two cams | Camera re-plug |
-| `speed.{x,y,angle}.limit` | Hard saturation on velocity commands in `m/s` or `rad/s` | Need to slow down for unstable tracking |
-| `lane_pid` / `det_pid` (cfg_pid_y, cfg_pid_angle) | PD gains used by `lane_dis_offset` and detection-following | Lighting/reflectivity changes the lane response |
-| `location_pid` (pid_x, pid_y) | Used by `move_to_position` waypoint control | Drift in odometry |
-| `infer_cfg[]` | One entry per model: `name`, `infer_type` (must match class name in `infer_wrap.py`), `model_dir` (relative to `models/`), `port`, `img_size`, `run_mode` | Adding a new model or switching to TensorRT |
-| `ernie_access_token` | Baidu ERNIE API bearer token | Rotating credentials |
+| `config_car.yml` (root) | Cameras, speed limits, PID gains, infer_cfg, ERNIE token | Track-specific calibration |
+| `runtime/core/settings.py` | Runtime bind/public host:port, auto-init flags, job queue limits | Sharing IP/port with teammates |
+| `main/settings.py` | Where `RuntimeApiClient` points (env-var driven) | Running `main/` from a different host |
+| `ecosystem.config.js` | PM2 process definition (path, env, restart policy) | Changing the production daemon |
+| `smartcar/whalesbot/vehicle/driver/cfg_vehicle.yaml` | Chassis geometry + per-motor velocity PID | Rarely; only for hardware swaps |
 
-For chassis geometry (`track`, `wheel_base`) and per-motor velocity PID, see `smartcar/whalesbot/vehicle/driver/cfg_vehicle.yaml` — these rarely change.
+### Runtime env vars (set in `ecosystem.config.js` or your shell)
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `RAK_CAR_BIND_HOST` | `0.0.0.0` | API listen address |
+| `RAK_CAR_BIND_PORT` | `5050` | API listen port |
+| `RAK_CAR_PUBLIC_HOST` | `192.168.3.60` | Address returned to LAN clients |
+| `RAK_CAR_PUBLIC_STREAM_PORT` | = BIND_PORT | Where the camera stream is reachable |
+| `RAK_CAR_PUBLIC_STREAM_PATH` | `/stream/` | Stream page path |
+| `RAK_CAR_AUTO_INIT` | `1` | Background auto-recover `MyCar()` when MC602 reboots |
+| `RAK_CAR_RESET_ARM` | `0` | Reset arm on auto-init |
+| `RAK_CAR_RESET_POSITION_ON_INIT` | `1` | Zero odometry on init |
+| `RAK_CAR_STOP_AFTER_ACTION` | `0` | Hard-stop chassis after each action |
+| `RAK_CAR_INFER_AUTO_START` | `1` | Spawn `infer_back_end.py` ZMQ servers on startup |
+| `RAK_CAR_INFER_POLL_INTERVAL` | `1.0` | Seconds between backend-ready polls |
+| `RAK_CAR_INFER_READY_TIMEOUT` | `45` | Max seconds to wait for a backend before failing health |
+| `RAK_CAR_INFER_HEALTH_TIMEOUT` | `2.0` | Per-call timeout used by `/v1/health` when probing inference |
 
 ## Conventions and gotchas
 
 - **Module alias `my_car`**: `car_task_function.py` declares `global my_car` inside `init()` and assumes every task function is called after `init()`. Don't import `my_car` directly; invoke through the top-level task functions.
 - **`STOP_PARAM = True` is a class var on `MyCar`** that gates emergency-stop checks. `init()` sets it to `False` before each run.
-- **No unit tests**; verification is *observed behaviour on the physical track*. New code paths should be exercised via `car_start_2026.py` with the upstream tasks commented out (see README workflow).
+- **No unit tests**; verification is *observed behaviour on the physical track*. New code paths should be exercised via `car_start_2026.py` with the upstream tasks commented out.
 - **Chinese-only comments**: most module/function docstrings are in Chinese — match the style when adding new code.
 - **`config_car.yml` uses `infer_type` strings that must exactly equal class names** in `infer_wrap.py` (`YoloeInfer`, `LaneInfer`, `OCRReco`). A typo silently produces `KeyError` at first inference. Adding a new type requires both the class and the YAML entry.
 - **OCR is two-stage** (`det_model_dir` + `rec_model_dir`); detection models use `model_dir`. `infer_back_end.py` branches on `InferType == OCRReco`.
 - **`smartcar/paddlebaidu/paddle_jetson/base/deploy/`** is a frozen vendor copy — don't edit. If you need a Paddle upstream change, bump the vendored copy and re-validate all four model classes.
 - **Dataset dirs are gitignored** (`**/dataset/`); collected images never enter version control.
+
+## MC602 reboot behavior (read before touching runtime init)
+
+The MC602 periodically reboots. The runtime must rebuild `MyCar()` after each reboot. Three concurrency hazards are tracked in the debug docs at the repo root:
+
+- `debug-controller-download-stuck.md` / `debug-mc602-download-stuck.md` — controller stuck on `downloaded` after manual reset. Caused by USB re-enumeration race, multiple serial operators (runtime + `serial_wrap.py` module-import side effect), and an over-eager whole-packet checksum comparison in the legacy recoverer. Fix path: minimal recoverer, env-var to suppress `serial_wrap`'s auto-connect, multi-attempt `RUNCODE` with cooling. **Status: OPEN — don't refactor the recovery layer until this is closed.**
+- `debug-runtime-init-queue.md` — `health` reports `initialized=false, initializing=true` with `queued_jobs` growing. H1 (auto-init blocked on `MyCar` rebuild), H2 (queue jammed by a long job), H3 (state machine drift between `controller_session` and `CarRuntimeService`), H4 (lock contention from shared-camera changes), H5 (high-frequency caller amplifying the queue).
+
+Before changing init/lock logic, read those files and the `# debug-point runtime-init-queue-session` instrumentation in `runtime/services/runtime_service.py`.
+
+## Debug instrumentation
+
+`.dbg/` contains environment snapshots and structured logs from the most recent debug sessions (`.env` files and Trae-format `.ndjson` traces). They are committed alongside the corresponding `debug-*.md` so a future session can resume the same line of investigation. When you open a new debug session, mirror this layout: a `debug-<short-slug>.md` at the repo root and matching `.dbg/<short-slug>.{env,ndjson}` artefacts. `runtime/services/runtime_service.py` already emits debug points under `DEBUG_SERVER_URL` / `TRAE_DEBUG_API_URL`; check for them before adding new ones.
+
+## Submission intake
+
+`incoming/submission/` is the staging area for incoming submission tarballs (lib + model). It is gitignored — contents there are not part of the repo. If a teammate says "drop the new model here", this is the path. Cleanup after merging into `smartcar/paddlebaidu/models/`.
+
+## Controller-only workspace (`test/controller_lab/`)
+
+`test/` is a **separate** Python package — a controller-only lab for poking the MC602 without spinning up the full car. `run_controller_lab.py` boots an interactive harness (see `test/OPERATION_GUIDE.md` + `test/PROTOCOL_NOTES.md`). Useful when debugging serial/recovery without risking the chassis. Not part of `main/`.
+
+## Pointers to deeper docs
+
+- **Legacy monolith path:** this file (sections A–C above) + `car_wrap_2026.py` + `config_car.yml` comments.
+- **Runtime HTTP API:** `runtime/README.md`, `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
+- **Business client:** `main/README.md`, `main/API_REFERENCE.md`, `main/BUSINESS_API_GUIDE.md`, `main/CAPABILITY_LIST.md`.
+- **User-facing intro:** `README.md` (the original competition-tasks overview in Chinese).
+- **Controller lab:** `test/README.md`, `test/OPERATION_GUIDE.md`, `test/PROTOCOL_NOTES.md`.
+- **Debug sessions:** `debug-*.md` at repo root (each is self-contained).

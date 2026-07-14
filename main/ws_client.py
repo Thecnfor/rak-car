@@ -140,6 +140,74 @@ class RuntimeWsClient:
             kwargs=kwargs or {},
         )
 
+    # === 实时硬件直达 op（car_lock 同步路径，不进 job_queue） ===
+
+    def realtime_wheel_speeds(self, speeds, timeout=None):
+        return self.request(
+            "realtime/wheel_speeds",
+            request_timeout=timeout,
+            speeds=list(speeds),
+        )
+
+    def realtime_wheel_encoders(self, timeout=None):
+        return self.request("realtime/wheel_encoders", request_timeout=timeout)
+
+    def realtime_motor_speed(self, port, speed, reverse=1, timeout=None):
+        return self.request(
+            "realtime/motor_speed",
+            request_timeout=timeout,
+            port=int(port),
+            speed=float(speed),
+            reverse=int(reverse),
+        )
+
+    def realtime_encoder(self, port, reverse=1, timeout=None):
+        return self.request(
+            "realtime/encoder",
+            request_timeout=timeout,
+            port=int(port),
+            reverse=int(reverse),
+        )
+
+    def realtime_stepper_rad(
+        self, port, rad, time=0.5, reverse=1, perimeter=0.008, timeout=None
+    ):
+        return self.request(
+            "realtime/stepper_rad",
+            request_timeout=timeout,
+            port=int(port),
+            rad=float(rad),
+            time=float(time),
+            reverse=int(reverse),
+            perimeter=float(perimeter),
+        )
+
+    def realtime_bus_servo_angle(self, port, angle, speed=100, timeout=None):
+        return self.request(
+            "realtime/bus_servo_angle",
+            request_timeout=timeout,
+            port=int(port),
+            angle=float(angle),
+            speed=int(speed),
+        )
+
+    def realtime_bus_servo_read(self, port, timeout=None):
+        return self.request(
+            "realtime/bus_servo_read",
+            request_timeout=timeout,
+            port=int(port),
+        )
+
+    def realtime_analog(self, port, timeout=None):
+        return self.request(
+            "realtime/analog", request_timeout=timeout, port=int(port)
+        )
+
+    def realtime_analog2(self, port, timeout=None):
+        return self.request(
+            "realtime/analog2", request_timeout=timeout, port=int(port)
+        )
+
 
 if __name__ == "__main__":
     client = RuntimeWsClient()

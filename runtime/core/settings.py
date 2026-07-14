@@ -33,6 +33,11 @@ AUTO_INIT_RETRY_INTERVAL = 3.0
 ACTION_READY_TIMEOUT = 30.0
 ACTION_READY_POLL_INTERVAL = 0.5
 AUTO_DOWNLOAD_ON_BOOTLOADER = False
+INFER_AUTO_START = True
+INFER_POLL_INTERVAL = 1.0
+INFER_READY_TIMEOUT = 45.0
+INFER_HEALTH_TIMEOUT = 2.0
+INFER_BACKEND_SCRIPT = "/home/jetson/workspace/rak-car/smartcar/paddlebaidu/infer_cs/base/infer_back_end.py"
 
 # 任务队列
 JOB_HISTORY_LIMIT = 100
@@ -149,6 +154,41 @@ def get_auto_download_on_bootloader():
     )
 
 
+def get_infer_auto_start():
+    return _bool_env("RAK_CAR_INFER_AUTO_START", INFER_AUTO_START)
+
+
+def get_infer_poll_interval():
+    return float(
+        os.getenv(
+            "RAK_CAR_INFER_POLL_INTERVAL",
+            str(INFER_POLL_INTERVAL),
+        )
+    )
+
+
+def get_infer_ready_timeout():
+    return float(
+        os.getenv(
+            "RAK_CAR_INFER_READY_TIMEOUT",
+            str(INFER_READY_TIMEOUT),
+        )
+    )
+
+
+def get_infer_health_timeout():
+    return float(
+        os.getenv(
+            "RAK_CAR_INFER_HEALTH_TIMEOUT",
+            str(INFER_HEALTH_TIMEOUT),
+        )
+    )
+
+
+def get_infer_backend_script():
+    return os.getenv("RAK_CAR_INFER_BACKEND_SCRIPT", INFER_BACKEND_SCRIPT)
+
+
 def get_public_api_base():
     return f"http://{get_public_api_host()}:{get_public_api_port()}"
 
@@ -182,5 +222,10 @@ def get_runtime_settings():
         "action_ready_timeout": get_action_ready_timeout(),
         "action_ready_poll_interval": get_action_ready_poll_interval(),
         "auto_download_on_bootloader": get_auto_download_on_bootloader(),
+        "infer_auto_start": get_infer_auto_start(),
+        "infer_poll_interval": get_infer_poll_interval(),
+        "infer_ready_timeout": get_infer_ready_timeout(),
+        "infer_health_timeout": get_infer_health_timeout(),
+        "infer_backend_script": get_infer_backend_script(),
         "job_history_limit": JOB_HISTORY_LIMIT,
     }

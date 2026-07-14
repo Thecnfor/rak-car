@@ -4,8 +4,6 @@ import zmq
 import cv2
 import numpy as np
 import json
-import subprocess
-import psutil
 import yaml
 
 import time, os, sys
@@ -36,22 +34,6 @@ def get_zmp_client(port):
     res = socket.connect(f"tcp://127.0.0.1:{port}")
     # print(res)
     return socket
-
-def get_python_processes():
-    
-    # print("----------")
-    python_processes = []
-    for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
-        try:
-            if 'python' in proc.info['name'].lower() and len(proc.info['cmdline']) > 1 and len(proc.info['cmdline'][1]) < 100:
-                info = [proc.info['pid'], proc.info['cmdline'][1]]
-                python_processes.append(info)
-        except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-            pass
-    return python_processes
-    # for process in python_processes:
-    #     print(f"PID: {process['pid']}, Name: {process['name']}, Cmdline: {process['cmdline']}")
-    # print("    ")
 
 class Bbox:
     def __init__(self, box=None, rect=None, size=[640, 480]) -> None:
@@ -130,64 +112,26 @@ class ClintInterface:
         self.img_size = model_cfg['img_size']
         self.port = model_cfg['port']
         self.client = self.get_zmp_client(self.port)
-        
-        infer_back_end_file = "infer_back_end.py"
-        # 检查后台程序是否运行, 如果未开启, 则开启
-        self.check_back_python(infer_back_end_file)
 
         flag = False
-        unhealthy_count = 0
-        while True:
+        deadline = time.time() + float(os.getenv("RAK_CAR_INFER_CLIENT_READY_TIMEOUT", "45"))
+        while time.time() < deadline:
             state = self.get_state()
             if state:
                 if flag:
                     logger.info("")
                 break
-            if state is None:
-                unhealthy_count += 1
-                if unhealthy_count >= 3:
-                    logger.warning("{}服务器无响应，尝试重启后台推理".format(name))
-                    stop_process(infer_back_end_file)
-                    time.sleep(1)
-                    self.check_back_python(infer_back_end_file)
-                    unhealthy_count = 0
-            else:
-                unhealthy_count = 0
             # 输出一个提示信息，不换行
             print('.', end='', flush=True)
-            # logger.info(".")
             time.sleep(1)
             flag = True
+        else:
+            raise RuntimeError(
+                "{}推理服务未就绪，请先确认 runtime 已托管启动 infer_back_end.py".format(name)
+            )
         # print(self.client)
         # print("连接服务器成功")
         logger.info("{}连接服务器成功".format(name))
-    
-    def check_back_python(self, file_name):
-        dir_file = os.path.abspath(os.path.dirname(__file__))
-        file_path = os.path.join(dir_file, file_name)
-        # print(file_path)
-        if not os.path.exists(file_path):
-            raise Exception("后台脚本文件不存在")
-        # 获取正在运行的python脚本
-        py_lists = get_python_processes()
-        for py_iter in py_lists:
-            # 检测是否存在后台运行的脚本
-            print(py_iter)
-            if file_name in py_iter[1]:
-                print(f"{file_name}运行{py_iter}")
-                return
-        else:
-            # 开启后台脚本，后台运行, 忽略输入输出
-            # 使用subprocess调用脚本
-            logger.info("开启{}脚本, 后台运行中, 请等待".format(file_name))
-            cmd_str = 'python3 ' + file_path + ' &'
-            # shell=True告诉subprocess模块在运行命令时使用系统的默认shell。这使得可以像在命令行中一样执行命令，包括使用通配符和其他shell特性
-            subprocess.Popen(cmd_str, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # print("已启动")
-            time.sleep(1)
-            # 这里的> /dev/null 2>&1将标准输出和标准错误都重定向到/dev/null，实现与之前subprocess.Popen相同的效果
-            # os.system(cmd_str + " > /dev/null 2>&1")
-        
 
     def get_config(self, name):
         for conf in self.configs:

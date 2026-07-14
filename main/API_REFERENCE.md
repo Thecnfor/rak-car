@@ -127,6 +127,49 @@
 | `close`          | 关闭 runtime   |
 | `emergency_stop` | 立即停车         |
 
+## 实时硬件控制（50Hz 直达路径）
+
+这一组跟 `car.*` 不一样：
+
+- 不进 `job_queue`，不走 `POST /v1/execute`
+- 同步在 `car_lock` 内执行，绕过 50Hz 业务循环的 FIFO 排队
+- 单次 RTT 在毫秒级，适合 50Hz 闭环
+- 出错返回 409（car 未初始化）或 400（参数错）
+
+### HTTP 端点
+
+| 接口 | 用途 | 关键参数 | 关键返回 |
+| --- | --- | --- | --- |
+| `POST /v1/realtime/wheels/speeds` | 4 轮线速度直达 | `speeds=[v1,v2,v3,v4]` | `{"speeds":[...]}` |
+| `GET /v1/realtime/wheels/encoders` | 读 4 轮编码器 | 无 | `{"encoders":[r1,r2,r3,r4]}` |
+| `POST /v1/realtime/motor/speed` | 单电机速度 | `port` `speed` `reverse?` | `{"port","speed","reverse"}` |
+| `GET /v1/realtime/encoder?port=N` | 单电机编码器 | `port` `reverse?` | `{"encoder":int}` |
+| `POST /v1/realtime/stepper/rad` | 步进弧度定位 | `port` `rad` `time?` `reverse?` `perimeter?` | `{"port","rad","time"}` |
+| `POST /v1/realtime/bus-servo/angle` | 总线舵机角度下发 | `port` `angle` `speed?` | `{"port","angle","speed"}` |
+| `GET /v1/realtime/bus-servo/angle?port=N` | 总线舵机读角度 | `port` | `{"angle":int}` |
+| `GET /v1/realtime/analog?port=N` | 单路模拟量 | `port` | `{"value":float}` |
+| `GET /v1/realtime/analog2?port=N` | 第二路模拟量 | `port` | `{"value":float}` |
+
+### WebSocket op
+
+| `op` | 用途 |
+| --- | --- |
+| `realtime/wheel_speeds` | 4 轮线速度 |
+| `realtime/wheel_encoders` | 4 轮编码器 |
+| `realtime/motor_speed` | 单电机速度 |
+| `realtime/encoder` | 单电机编码器 |
+| `realtime/stepper_rad` | 步进弧度定位 |
+| `realtime/bus_servo_angle` | 总线舵机角度下发 |
+| `realtime/bus_servo_read` | 总线舵机读角度 |
+| `realtime/analog` | 单路模拟量 |
+| `realtime/analog2` | 第二路模拟量 |
+
+### 注意事项
+
+- `realtime/stepper_rad` 的 port 不要跟 yaml 里配置的机械臂 y 轴端口重复，否则两路会互踩串口
+- `realtime/bus_servo_read` 在 mc601 控制板上暂不支持（协议层未实现）
+- `realtime/motor_speed` 是开环速度下发（不进 PID），调用方负责上层闭环
+
 ## `car` 接口
 
 ### 底盘与执行
@@ -144,12 +187,21 @@
 
 ### 巡线
 
-| 接口名                    | 用途            | 关键参数                       | 关键返回                     |
-| ---------------------- | ------------- | -------------------------- | ------------------------ |
-| `car.lane_time`        | 巡线固定时间        | `speed` `time_dur` `stop?` | 动作完成                     |
-| `car.lane_dis`         | 巡线到目标累计距离     | `speed` `dis_end` `stop?`  | 动作完成                     |
-| `car.lane_dis_offset`  | 从当前距离继续巡线一段增量 | `speed` `dis_hold` `stop?` | 动作完成                     |
-| `car.get_lane_results` | 读取巡线误差        | 无                          | `(error_y, error_angle)` |
+推荐这样理解：
+
+- 要让车自己沿线持续跑：优先用 `task.auto_lane_tracing`
+- 要做底盘级巡线控制：用 `car.lane_*`
+- 要看当前实时巡线误差：用 `GET /v1/vision/lane/state`
+- `car.get_lane_results` 只是单次取样，不等于“持续巡航”
+
+| 接口名                         | 用途                   | 关键参数                       | 关键返回                                          |
+| --------------------------- | -------------------- | -------------------------- | --------------------------------------------- |
+| `task.auto_lane_tracing`    | 推荐，自动巡航到目标距离         | `speed` `dis_hold`         | 任务结果                                          |
+| `car.lane_time`             | 底盘级巡线固定时间            | `speed` `time_dur` `stop?` | 动作完成                                          |
+| `car.lane_dis`              | 底盘级巡线到目标累计距离         | `speed` `dis_end` `stop?`  | 动作完成                                          |
+| `car.lane_dis_offset`       | 从当前距离继续巡线一段增量        | `speed` `dis_hold` `stop?` | 动作完成                                          |
+| `car.get_lane_results`      | 单次读取巡线误差             | 无                          | `(error_y, error_angle)`                      |
+| `GET /v1/vision/lane/state` | 读取 runtime 内最新 lane 状态 | 无                          | `active` `error_y` `error_angle` `distance` 等 |
 
 ### 视觉与 OCR
 

@@ -148,7 +148,7 @@ class SerialWrap(serial.Serial):
                     probe_result.port,
                     getattr(probe_result, "controller", None),
                 )
-            if ctl_dev is None:
+            if ctl_dev is None and probe_result is None:
                 ctl_dev = self.ping_port()
             if ctl_dev is None:
                 self.last_error = "控制器未进入 program 模式"

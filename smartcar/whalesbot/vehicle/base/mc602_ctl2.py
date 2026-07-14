@@ -493,6 +493,17 @@ class ServoBus_2(DevCmdInterface):
     def set_speed(self, speed):
         self.act_mode(2, speed, mode=2)
 
+    def read_angle(self, port_id=None):
+        """读取总线舵机当前角度（mc602, dev_id=0x06, GET sub_mode=1）。
+
+        协议格式 <bbbbbbh，回包最后一个字段即为有符号 short 角度。
+        mc602 仅实现该路径；mc601 走 ServoBus_1，本轮未补。
+        """
+        result = self.act_mode(1, 0, 0, 0, mode=1, port_id=port_id)
+        if isinstance(result, (list, tuple)):
+            return int(result[-1])
+        return int(result)
+
 class ScreenShow_2(DevCmdInterface):
     def __init__(self) -> None:
         super().__init__(**ctl602_dev_list["led_show"])

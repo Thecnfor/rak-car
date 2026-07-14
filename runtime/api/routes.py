@@ -31,6 +31,7 @@ def get_public_links():
         "jobs_v1": f"{api_base}{v1}/jobs",
         "ws_v1": f"{ws_base}{v1}/ws",
         "health_legacy": f"{api_base}{legacy}/health",
+        "infer_state": f"{api_base}{v1}/infer/state",
         "streamer": settings.get_public_stream_base(),
         "stream_info": f"{api_base}/stream/info",
         "stream_health": f"{api_base}/stream/health",
@@ -38,8 +39,17 @@ def get_public_links():
         "stream_cam2_frame": f"{api_base}/stream/frame/cam2.jpg",
         "vision_models": f"{api_base}{v1}/vision/models",
         "vision_lane": f"{api_base}{v1}/vision/lane",
+        "vision_lane_state": f"{api_base}{v1}/vision/lane/state",
         "vision_task": f"{api_base}{v1}/vision/task",
         "vision_ocr": f"{api_base}{v1}/vision/ocr",
+        "realtime_wheels_speeds": f"{api_base}{v1}/realtime/wheels/speeds",
+        "realtime_wheels_encoders": f"{api_base}{v1}/realtime/wheels/encoders",
+        "realtime_motor_speed": f"{api_base}{v1}/realtime/motor/speed",
+        "realtime_encoder": f"{api_base}{v1}/realtime/encoder",
+        "realtime_stepper_rad": f"{api_base}{v1}/realtime/stepper/rad",
+        "realtime_bus_servo_angle": f"{api_base}{v1}/realtime/bus-servo/angle",
+        "realtime_analog": f"{api_base}{v1}/realtime/analog",
+        "realtime_analog2": f"{api_base}{v1}/realtime/analog2",
     }
 
 
@@ -57,7 +67,11 @@ def _execute_sync(service, target, name, args=None, kwargs=None, timeout=None):
     except TimeoutError as exc:
         raise HTTPException(status_code=504, detail=str(exc)) from exc
     if job["status"] != "succeeded":
-        raise HTTPException(status_code=500, detail=job["error"] or "动作执行失败")
+        detail = job["error"] or "动作执行失败"
+        status_code = 500
+        if "推理服务未就绪" in detail:
+            status_code = 503
+        raise HTTPException(status_code=status_code, detail=detail)
     return job["result"]
 
 
@@ -258,6 +272,8 @@ async def _handle_websocket_message(service, payload):
         return {"ok": True, "op": "actions", "data": {"actions": service.list_actions()}}
     if op == "config":
         return {"ok": True, "op": "config", "data": {"config": settings.get_runtime_settings()}}
+    if op == "infer_state":
+        return {"ok": True, "op": "infer_state", "data": {"infer": service.get_infer_state()}}
     if op == "create_job":
         return {"ok": True, "op": "create_job", "data": _create_job_from_payload(service, payload)}
     if op == "get_job":
@@ -285,6 +301,135 @@ async def _handle_websocket_message(service, payload):
         return {"ok": True, "op": "close", "data": _submit_simple_system_job(service, "close")}
     if op == "emergency_stop":
         return {"ok": True, "op": "emergency_stop", "data": {"stopped": service.emergency_stop()}}
+
+    # === 实时硬件直达 op（car_lock 同步路径，不进 job_queue） ===
+    if op == "realtime/wheel_speeds":
+        speeds = payload.get("speeds")
+        if not isinstance(speeds, list) or len(speeds) != 4:
+            raise HTTPException(status_code=400, detail="speeds 必须是长度为 4 的数组")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"result": service.set_wheel_speeds([float(s) for s in speeds])},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/wheel_encoders":
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"encoders": service.get_wheel_encoders()},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/motor_speed":
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {
+                    "result": service.set_single_motor(
+                        int(port),
+                        float(payload.get("speed", 0)),
+                        reverse=int(payload.get("reverse", 1)),
+                    )
+                },
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/encoder":
+        port = payload.get("port")
+        reverse = payload.get("reverse", 1)
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"encoder": service.get_encoder(int(port), reverse=int(reverse))},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/stepper_rad":
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {
+                    "result": service.set_stepper_rad(
+                        int(port),
+                        float(payload.get("rad", 0.0)),
+                        time=float(payload.get("time", 0.5)),
+                        reverse=int(payload.get("reverse", 1)),
+                        perimeter=float(payload.get("perimeter", 0.008)),
+                    )
+                },
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/bus_servo_angle":
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {
+                    "result": service.set_bus_servo(
+                        int(port),
+                        float(payload.get("angle", 0)),
+                        speed=int(payload.get("speed", 100)),
+                    )
+                },
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/bus_servo_read":
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"angle": service.read_bus_servo(int(port))},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/analog":
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"value": service.read_analog(int(port))},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/analog2":
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"value": service.read_analog2(int(port))},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
 
 
@@ -416,6 +561,10 @@ def create_runtime_router(service, camera_stream_service):
     def v1_config():
         return {"ok": True, "config": settings.get_runtime_settings()}
 
+    @router_v1.get("/infer/state")
+    def v1_infer_state():
+        return {"ok": True, "infer": service.get_infer_state()}
+
     @router_v1.get("/vision/models")
     def v1_vision_models():
         return {"ok": True, **_vision_models_payload()}
@@ -435,12 +584,17 @@ def create_runtime_router(service, camera_stream_service):
             "camera": "cam1",
             "frame_url": "/stream/frame/cam1.jpg",
             "preview_url": "/stream/",
+            "state_url": "/v1/vision/lane/state",
             "result": {
                 "error": result[0],
                 "angle": result[1],
             },
             "frame_shape": _frame_shape(camera_stream_service, "cam1"),
         }
+
+    @router_v1.get("/vision/lane/state")
+    def v1_vision_lane_state():
+        return {"ok": True, **camera_stream_service.get_lane_state()}
 
     @router_v1.post("/vision/task")
     def v1_vision_task(payload: dict = Body(default={})):
@@ -584,6 +738,115 @@ def create_runtime_router(service, camera_stream_service):
     @router_v1.post("/control/emergency-stop")
     def v1_emergency_stop():
         return {"ok": True, "stopped": service.emergency_stop()}
+
+    # === 实时硬件直达（car_lock 同步路径，不进 job_queue） ===
+
+    @router_v1.post("/realtime/wheels/speeds")
+    def v1_realtime_wheel_speeds(payload: dict = Body(default={})):
+        speeds = payload.get("speeds")
+        if not isinstance(speeds, list) or len(speeds) != 4:
+            raise HTTPException(status_code=400, detail="speeds 必须是长度为 4 的数组")
+        try:
+            return {
+                "ok": True,
+                "result": service.set_wheel_speeds([float(s) for s in speeds]),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/wheels/encoders")
+    def v1_realtime_wheel_encoders():
+        try:
+            return {"ok": True, "encoders": service.get_wheel_encoders()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.post("/realtime/motor/speed")
+    def v1_realtime_motor_speed(payload: dict = Body(default={})):
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "result": service.set_single_motor(
+                    int(port),
+                    float(payload.get("speed", 0)),
+                    reverse=int(payload.get("reverse", 1)),
+                ),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/encoder")
+    def v1_realtime_encoder(
+        port: int = Query(...),
+        reverse: int = Query(default=1),
+    ):
+        try:
+            return {
+                "ok": True,
+                "encoder": service.get_encoder(port, reverse=reverse),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.post("/realtime/stepper/rad")
+    def v1_realtime_stepper_rad(payload: dict = Body(default={})):
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "result": service.set_stepper_rad(
+                    int(port),
+                    float(payload.get("rad", 0.0)),
+                    time=float(payload.get("time", 0.5)),
+                    reverse=int(payload.get("reverse", 1)),
+                    perimeter=float(payload.get("perimeter", 0.008)),
+                ),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.post("/realtime/bus-servo/angle")
+    def v1_realtime_bus_servo_angle(payload: dict = Body(default={})):
+        port = payload.get("port")
+        if port is None:
+            raise HTTPException(status_code=400, detail="缺少 port")
+        try:
+            return {
+                "ok": True,
+                "result": service.set_bus_servo(
+                    int(port),
+                    float(payload.get("angle", 0)),
+                    speed=int(payload.get("speed", 100)),
+                ),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/bus-servo/angle")
+    def v1_realtime_bus_servo_read(port: int = Query(...)):
+        try:
+            return {"ok": True, "angle": service.read_bus_servo(port)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/analog")
+    def v1_realtime_analog(port: int = Query(...)):
+        try:
+            return {"ok": True, "value": service.read_analog(port)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/analog2")
+    def v1_realtime_analog2(port: int = Query(...)):
+        try:
+            return {"ok": True, "value": service.read_analog2(port)}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @router_v1.websocket("/ws")
     async def v1_ws(websocket: WebSocket):

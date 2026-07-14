@@ -187,6 +187,73 @@ class RuntimeApiClient:
     def close_runtime(self):
         return self.post(f"{self.api_prefix}/control/close", payload={})
 
+    # === 实时硬件直达（不走 /v1/execute，不进 job_queue） ===
+
+    def realtime_wheel_speeds(self, speeds):
+        return self.post(
+            f"{self.api_prefix}/realtime/wheels/speeds",
+            payload={"speeds": list(speeds)},
+        )
+
+    def realtime_wheel_encoders(self):
+        return self.get(f"{self.api_prefix}/realtime/wheels/encoders")
+
+    def realtime_motor_speed(self, port, speed, reverse=1):
+        return self.post(
+            f"{self.api_prefix}/realtime/motor/speed",
+            payload={
+                "port": int(port),
+                "speed": float(speed),
+                "reverse": int(reverse),
+            },
+        )
+
+    def realtime_encoder(self, port, reverse=1):
+        return self._request(
+            "GET",
+            f"{self.api_prefix}/realtime/encoder?port={int(port)}&reverse={int(reverse)}",
+        )
+
+    def realtime_stepper_rad(
+        self, port, rad, time=0.5, reverse=1, perimeter=0.008
+    ):
+        return self.post(
+            f"{self.api_prefix}/realtime/stepper/rad",
+            payload={
+                "port": int(port),
+                "rad": float(rad),
+                "time": float(time),
+                "reverse": int(reverse),
+                "perimeter": float(perimeter),
+            },
+        )
+
+    def realtime_bus_servo_angle(self, port, angle, speed=100):
+        return self.post(
+            f"{self.api_prefix}/realtime/bus-servo/angle",
+            payload={
+                "port": int(port),
+                "angle": float(angle),
+                "speed": int(speed),
+            },
+        )
+
+    def realtime_bus_servo_read(self, port):
+        return self._request(
+            "GET",
+            f"{self.api_prefix}/realtime/bus-servo/angle?port={int(port)}",
+        )
+
+    def realtime_analog(self, port):
+        return self._request(
+            "GET", f"{self.api_prefix}/realtime/analog?port={int(port)}"
+        )
+
+    def realtime_analog2(self, port):
+        return self._request(
+            "GET", f"{self.api_prefix}/realtime/analog2?port={int(port)}"
+        )
+
     def run_task(self, name, *args, **kwargs):
         return self.create_job("task", name, args=list(args), kwargs=kwargs)
 

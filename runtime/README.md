@@ -76,5 +76,79 @@ pm2 logs rak-car-api
 - `RAK_CAR_PUBLIC_HOST`: 返回给同事访问的统一主机地址，API 和视频流共用
 - `RAK_CAR_PUBLIC_STREAM_PORT`: 视频流对外端口，默认复用 `BIND_PORT`
 - `RAK_CAR_PUBLIC_STREAM_PATH`: 视频流页面路径，默认 `/stream/`
+- `RAK_CAR_INFER_AUTO_START`: runtime 启动后是否统一托管推理后端，默认 `1`
+- `RAK_CAR_INFER_POLL_INTERVAL`: 推理后端健康轮询间隔，默认 `1.0`
+- `RAK_CAR_INFER_READY_TIMEOUT`: runtime 等待推理后端 ready 的超时时间，默认 `45`
+- `RAK_CAR_INFER_HEALTH_TIMEOUT`: 单次推理健康探测超时，默认 `2.0`
 
 其中 API 对外端口默认复用 `BIND_PORT`，视频流也默认挂在同一个 runtime 服务里，不再单独维护独立 Flask 端口。
+
+## 推理托管边界
+
+`runtime` 现在不仅托管 `MyCar()`，也统一托管 `infer_back_end.py`。
+
+这意味着：
+
+- `runtime` 是唯一允许拉起/停止推理后端的服务
+- legacy `ClintInterface` 只保留 ZMQ 客户端职责，不再负责自启、自杀、重启 `infer_back_end.py`
+- 业务层和前端只通过 API 看推理状态，不再依赖隐式脚本行为
+
+推荐排障顺序：
+
+1. `GET /v1/health`
+2. `GET /v1/infer/state`
+3. `GET /stream/health`
+4. 再看具体 `vision/*` 或 `execute` 接口
+
+## 组件隔离
+
+runtime 按三条链路分别管理：
+
+- 控制器链路：`controller_session` / `MyCar()` 初始化
+- 推理链路：`infer_back_end.py` + ZMQ 健康状态
+- 摄像头链路：`camera_stream_service.py` 双摄缓存与 MJPEG 输出
+
+设计要求：
+
+- 推理未 ready，不应把摄像头流线程带死
+- 控制器暂时掉线，不应把流服务和推理状态接口带死
+- 摄像头无新帧时，仍然保留健康接口、占位图与最近错误元信息
+
+## 失败语义
+
+看 `GET /v1/health` 时重点关注：
+
+- `state.components.controller`
+  - 下位机是否在 `PROGRAM_READY`
+- `state.components.infer`
+  - 推理是否 `ready`
+- `state.components.camera`
+  - 当前是否存在活跃相机帧
+
+新增只读接口：
+
+- `GET /v1/infer/state`
+  - 查看 runtime 托管的推理进程状态、最近错误、各模型端口是否 ready
+
+常见判断：
+
+- `controller.ready=false`
+  - 优先排查下位机 / 串口 / program 模式
+- `infer.ready=false`
+  - 优先排查推理后端冷启动、模型初始化、端口探测
+- `camera.ready=false`
+  - 优先排查摄像头节点、帧是否 stale、相机重开是否持续失败
+
+## 运维建议
+
+- 修改 `ecosystem.config.js` 里的 runtime 入口或推理相关环境变量后，用 `pm2 delete rak-car-api && pm2 start ecosystem.config.js` 刷新注册信息
+- 冷启动阶段优先看 `v1/infer/state`，不要再根据旧的 `infer_front.py` 输出判断推理是否需要重启
+- 如果 `vision/*` 返回 503，优先确认推理后端是否仍在冷启动，而不是直接 kill `infer_back_end.py`
+
+## 实时硬件控制
+
+`runtime` 服务除了常规的 `execute` 作业队列外，还提供 `/v1/realtime/*` 一组 HTTP 端点以及 `realtime/*` 一组 WebSocket op。它们走 `car_lock` 同步路径、不进 `job_queue`，50Hz 高频场景下延迟可控。
+
+涵盖：4 轮线速度/编码器、单电机、步进电机、总线舵机（含读角度）、模拟量。
+
+详细端点表参见 `main/API_REFERENCE.md` 中「实时硬件控制（50Hz 直达路径）」章节。

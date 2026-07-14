@@ -1,11 +1,14 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 import importlib
+import json
+import os
 import queue
 import threading
 import time
 import traceback
 import uuid
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -13,11 +16,37 @@ import yaml
 from runtime.core import settings
 from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS, TASK_ACTION_NAMES
 from runtime.hardware.controller_session import get_controller_session
+from runtime.services.inference_service import InferBackendService
 
 try:
     import numpy as np
 except ImportError:  # pragma: no cover
     np = None
+
+
+#region debug-point runtime-init-queue-session
+def _debug_emit(hypothesis_id, location, msg, data=None):
+    api_url = os.environ.get("DEBUG_SERVER_URL") or os.environ.get("TRAE_DEBUG_API_URL")
+    if not api_url:
+        return
+    payload = {
+        "sessionId": "runtime-init-queue",
+        "hypothesisId": hypothesis_id,
+        "location": location,
+        "msg": msg,
+        "data": data or {},
+    }
+    try:
+        req = urllib.request.Request(
+            api_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=0.2).read()
+    except Exception:
+        pass
+#endregion debug-point runtime-init-queue-session
 
 
 def normalize_value(value):
@@ -43,6 +72,7 @@ class CarRuntimeService:
         self._camera_cfg = None
         self.shared_front_camera = None
         self.shared_side_camera = None
+        self.infer_service = InferBackendService()
         self.controller_session = get_controller_session()
         self.controller_generation = None
         self.car_lock = threading.RLock()
@@ -81,6 +111,7 @@ class CarRuntimeService:
         self.stream_service = stream_service
 
     def start_background_services(self):
+        self.infer_service.start_background()
         with self.camera_lock:
             if self.camera_supervisor_started:
                 return
@@ -237,7 +268,7 @@ class CarRuntimeService:
         return self._sync_controller_health_state(snapshot)
 
     def _mark_controller_offline(self, detail=None):
-        self.controller_session.mark_offline(detail)
+        self.controller_session.mark_offline(detail, mode="unknown")
         with self.car_lock:
             self._safe_close_locked()
         if detail:
@@ -246,7 +277,6 @@ class CarRuntimeService:
 
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
-        self.ensure_shared_cameras()
         car = self._get_car_class()(
             cap_front=self.shared_front_camera,
             cap_side=self.shared_side_camera,
@@ -268,12 +298,17 @@ class CarRuntimeService:
         self.auto_heal_armed = True
         return car
 
+    def _ensure_infer_ready(self):
+        return self.infer_service.ensure_ready()
+
     def ensure_initialized(self, reset_arm=False, force=False, reset_position=True):
         with self.init_lock:
             self.initializing = True
             self.last_error = None
             try:
                 session = self._ensure_controller_ready()
+                self._ensure_infer_ready()
+                self.ensure_shared_cameras()
                 with self.car_lock:
                     if self.car is not None and force:
                         self._safe_close_locked()
@@ -319,7 +354,8 @@ class CarRuntimeService:
                 time.sleep(self.auto_init_retry_interval)
                 continue
             try:
-                self.ensure_initialized(**self.auto_init_kwargs)
+                if snapshot.get("state") == "PROGRAM_READY":
+                    self.ensure_initialized(**self.auto_init_kwargs)
             except Exception:
                 pass
             time.sleep(self.auto_init_retry_interval)
@@ -347,6 +383,10 @@ class CarRuntimeService:
         with self.camera_lock:
             self._close_shared_cameras_locked()
 
+    def shutdown(self):
+        self.close()
+        self.infer_service.stop()
+
     def emergency_stop(self):
         with self.car_lock:
             if self.car is None:
@@ -362,6 +402,57 @@ class CarRuntimeService:
             self.car._stop_flag = False
             return True
 
+    # === 实时硬件控制（car_lock 同步路径，绕过 job_queue，50Hz 友好） ===
+
+    def _realtime_check_locked(self):
+        if self.car is None:
+            raise RuntimeError("car 未初始化")
+
+    def set_wheel_speeds(self, speeds):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.set_wheel_speeds(speeds)
+
+    def get_wheel_encoders(self):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.get_wheel_encoders()
+
+    def set_single_motor(self, port, speed, reverse=1):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.set_single_motor(port, speed, reverse=reverse)
+
+    def get_encoder(self, port, reverse=1):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.get_encoder(port, reverse=reverse)
+
+    def set_stepper_rad(self, port, rad, time=0.5, reverse=1, perimeter=0.008):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.set_stepper_rad(port, rad, time, reverse, perimeter)
+
+    def set_bus_servo(self, port, angle, speed=100):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.set_bus_servo(port, angle, speed)
+
+    def read_bus_servo(self, port):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.read_bus_servo(port)
+
+    def read_analog(self, port):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.read_analog(port)
+
+    def read_analog2(self, port):
+        with self.car_lock:
+            self._realtime_check_locked()
+            return self.car.read_analog2(port)
+
     def set_stop_mode(self, enabled):
         with self.car_lock:
             self.stop_after_action = bool(enabled)
@@ -374,6 +465,10 @@ class CarRuntimeService:
         with self.job_lock:
             jobs = list(self.jobs.values())
         queued_count = sum(job["status"] == "queued" for job in jobs)
+        infer_snapshot = self.infer_service.get_state()
+        camera_snapshot = (
+            self.stream_service.get_status() if self.stream_service is not None else None
+        )
         return {
             "initialized": self._is_car_ready(controller_snapshot),
             "initializing": self.initializing,
@@ -386,6 +481,27 @@ class CarRuntimeService:
             "streamer_url": settings.get_public_stream_base(),
             "controller_probe": self.last_controller_probe,
             "controller_session": controller_snapshot,
+            "infer_service": infer_snapshot,
+            "camera_stream": camera_snapshot,
+            "components": {
+                "controller": {
+                    "ready": controller_snapshot.get("state") == "PROGRAM_READY",
+                    "state": controller_snapshot.get("state"),
+                    "mode": controller_snapshot.get("mode"),
+                    "detail": (controller_snapshot.get("last_probe") or {}).get("detail")
+                    or controller_snapshot.get("detail"),
+                },
+                "infer": {
+                    "ready": infer_snapshot.get("status") == "ready",
+                    "state": infer_snapshot.get("status"),
+                    "detail": infer_snapshot.get("last_error"),
+                },
+                "camera": {
+                    "ready": bool(camera_snapshot and camera_snapshot.get("active_cams")),
+                    "state": camera_snapshot.get("status") if camera_snapshot else "unknown",
+                    "detail": camera_snapshot.get("cameras") if camera_snapshot else None,
+                },
+            },
         }
 
     def get_runtime_snapshot(self):
@@ -417,6 +533,9 @@ class CarRuntimeService:
                 "emergency_stop",
             ],
         }
+
+    def get_infer_state(self):
+        return self.infer_service.get_state()
 
     def submit_job(self, target, name, args=None, kwargs=None):
         args = args or []
@@ -522,20 +641,55 @@ class CarRuntimeService:
         deadline = time.time() + timeout
         last_exc = None
         self.start_auto_init()
+        #region debug-point runtime-init-queue-ready
+        _debug_emit(
+            "H1",
+            "runtime_service._wait_until_ready",
+            "进入 wait_until_ready",
+            {
+                "reset_position": reset_position,
+                "timeout": timeout,
+                "current_job_id": self.current_job_id,
+                "initializing": self.initializing,
+                "controller_state": self.controller_session.snapshot().get("state"),
+            },
+        )
+        #endregion debug-point runtime-init-queue-ready
         while time.time() < deadline:
             try:
+                snapshot = self._sync_controller_health_state()
+                if snapshot.get("state") != "PROGRAM_READY":
+                    snapshot = self.controller_session.ensure_ready(
+                        timeout=min(0.8, max(0.1, deadline - time.time()))
+                    )
+                if snapshot.get("state") != "PROGRAM_READY":
+                    raise RuntimeError(
+                        "控制器尚未进入 program 模式: {}".format(
+                            (snapshot.get("last_probe") or {}).get("detail")
+                            or snapshot.get("detail")
+                        )
+                    )
                 return self.ensure_initialized(reset_position=reset_position)
             except Exception as exc:
                 last_exc = exc
+                #region debug-point runtime-init-queue-ready
+                _debug_emit(
+                    "H1",
+                    "runtime_service._wait_until_ready",
+                    "ensure_initialized 失败，继续等待",
+                    {
+                        "exc_type": type(exc).__name__,
+                        "exc_repr": repr(exc),
+                        "initializing": self.initializing,
+                        "current_job_id": self.current_job_id,
+                    },
+                )
+                #endregion debug-point runtime-init-queue-ready
                 if self._should_probe_controller(exc):
-                    snapshot = self._probe_controller()
-                    last_probe = snapshot.get("last_probe") or {}
-                    if snapshot.get("state") != "PROGRAM_READY":
-                        self._mark_controller_offline(
-                            "等待动作执行时检测到下位机离线: {}".format(
-                                last_probe.get("detail") or snapshot.get("detail")
-                            )
-                        )
+                    self.controller_session.note_io_failure(exc)
+                    snapshot = self._sync_controller_health_state()
+                    if snapshot.get("state") == "PROGRAM_READY":
+                        snapshot = self.controller_session.snapshot()
                 time.sleep(self.action_ready_poll_interval)
         detail = str(last_exc) if last_exc is not None else "未知错误"
         raise RuntimeError(f"等待小车就绪超时: {detail}")
@@ -545,18 +699,14 @@ class CarRuntimeService:
         self.controller_session.note_io_failure(detail)
         with self.car_lock:
             self._safe_close_locked()
-        snapshot = self.controller_session.ensure_ready(
-            timeout=self.action_ready_timeout
+        self.start_auto_init()
+        snapshot = self._sync_controller_health_state()
+        self.last_error = "{}; state={}".format(
+            detail,
+            (snapshot.get("last_probe") or {}).get("detail")
+            or snapshot.get("detail"),
         )
-        if snapshot.get("state") == "PROGRAM_READY":
-            self.last_error = None
-        else:
-            self.last_error = "{}; probe={}".format(
-                detail,
-                (snapshot.get("last_probe") or {}).get("detail")
-                or snapshot.get("detail"),
-            )
-        return self._sync_controller_health_state(snapshot)
+        return snapshot
 
     def _dispatch_target_locked(self, target, name, args, kwargs):
         self._bind_task_car(self.car)
@@ -581,16 +731,12 @@ class CarRuntimeService:
             if not self._should_probe_controller(exc):
                 raise
             snapshot = self._recover_controller_runtime(exc)
-            if snapshot.get("state") != "PROGRAM_READY":
-                raise RuntimeError(
-                    "下位机掉线，等待恢复: {}".format(
-                        (snapshot.get("last_probe") or {}).get("detail")
-                        or snapshot.get("detail")
-                    )
-                ) from exc
-            self._wait_until_ready(reset_position=False)
-            with self.car_lock:
-                return self._dispatch_target_locked(target, name, args, kwargs)
+            raise RuntimeError(
+                "下位机掉线，已转入后台自愈: {}".format(
+                    (snapshot.get("last_probe") or {}).get("detail")
+                    or snapshot.get("detail")
+                )
+            ) from exc
 
     def _should_probe_controller(self, exc):
         text = traceback.format_exception_only(type(exc), exc)
@@ -621,14 +767,7 @@ class CarRuntimeService:
             return
         if not self._should_probe_controller(exc):
             return
-        snapshot = self._probe_controller()
-        if snapshot.get("state") != "PROGRAM_READY":
-            self._mark_controller_offline(
-                "运行时检测到下位机离线: {}".format(
-                    (snapshot.get("last_probe") or {}).get("detail")
-                    or snapshot.get("detail")
-                )
-            )
+        self._sync_controller_health_state()
 
     def _worker_loop(self):
         while True:
@@ -644,6 +783,19 @@ class CarRuntimeService:
                 started_at=time.time(),
                 error=None,
             )
+            #region debug-point runtime-init-queue-worker
+            _debug_emit(
+                "H2",
+                "runtime_service._worker_loop",
+                "worker 开始执行任务",
+                {
+                    "job_id": job_id,
+                    "target": job["target"],
+                    "name": job["name"],
+                    "queued_size": self.job_queue.qsize(),
+                },
+            )
+            #endregion debug-point runtime-init-queue-worker
             try:
                 result = self._dispatch(
                     job["target"],
@@ -657,6 +809,18 @@ class CarRuntimeService:
                     result=normalize_value(result),
                     finished_at=time.time(),
                 )
+                #region debug-point runtime-init-queue-worker
+                _debug_emit(
+                    "H2",
+                    "runtime_service._worker_loop",
+                    "worker 任务成功",
+                    {
+                        "job_id": job_id,
+                        "target": job["target"],
+                        "name": job["name"],
+                    },
+                )
+                #endregion debug-point runtime-init-queue-worker
             except Exception as exc:
                 self._handle_dispatch_failure(job["target"], exc)
                 self._set_job(
@@ -665,6 +829,20 @@ class CarRuntimeService:
                     error=traceback.format_exc(),
                     finished_at=time.time(),
                 )
+                #region debug-point runtime-init-queue-worker
+                _debug_emit(
+                    "H2",
+                    "runtime_service._worker_loop",
+                    "worker 任务失败",
+                    {
+                        "job_id": job_id,
+                        "target": job["target"],
+                        "name": job["name"],
+                        "exc_type": type(exc).__name__,
+                        "exc_repr": repr(exc),
+                    },
+                )
+                #endregion debug-point runtime-init-queue-worker
             finally:
                 self.current_job_id = None
                 self.job_queue.task_done()

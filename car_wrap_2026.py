@@ -469,6 +469,91 @@ class MyCar(MecanumDriver):
             self.set_velocity_for_duration(x, y, z, float(duration))
         return {"x": x, "y": y, "z": z, "duration": duration}
 
+    # === 实时硬件控制 wrapper（car_lock 同步路径，绕过 job_queue，50Hz 友好） ===
+    # 内部 SDK 实例按 (kind, port) 懒构造、绑定 self._realtime_instances，
+    # 重建 car 时随旧实例自动失效，无需手动清理。
+
+    def _get_realtime_instance(self, kind, port, **ctor_kwargs):
+        """懒构造并缓存 SDK 实例，避免反复 new。"""
+        cache = getattr(self, "_realtime_instances", None)
+        if cache is None:
+            self._realtime_instances = {}
+            cache = self._realtime_instances
+        key = (kind, int(port))
+        if key not in cache:
+            from smartcar.whalesbot.vehicle.base import controller_wrap as _cw
+            cls_map = {
+                "stepper": _cw.StepperWrap,
+                "motor": _cw.Motor_2,
+                "encoder": _cw.EncoderMotor_2,
+                "bus_servo": _cw.ServoBus,
+                "analog": _cw.AnalogInput,
+                "analog2": _cw.AnalogInput2,
+            }
+            cls = cls_map[kind]
+            if kind in ("stepper", "motor", "encoder"):
+                cache[key] = cls(port_id=int(port), **ctor_kwargs)
+            else:
+                cache[key] = cls(port_id=int(port))
+        return cache[key]
+
+    def set_wheel_speeds(self, speeds):
+        """直接下发 4 轮线速度，绕过 set_chassis_velocity 的里程计耦合路径。"""
+        speeds = list(speeds)
+        if len(speeds) != 4:
+            raise ValueError("speeds 必须是长度为 4 的数组 [v1, v2, v3, v4]")
+        speeds_f = [float(s) for s in speeds]
+        self.wheels_chassis.set_linear(speeds_f)
+        return {"speeds": speeds_f}
+
+    def get_wheel_encoders(self):
+        """读取 4 轮编码器弧度累计值。"""
+        rad = self.wheels_chassis.get_rad()
+        try:
+            return [float(x) for x in rad]
+        except TypeError:
+            return [float(rad)]
+
+    def set_single_motor(self, port, speed, reverse=1):
+        """单电机原始速度控制。"""
+        motor = self._get_realtime_instance("motor", port, reverse=int(reverse))
+        motor.set_speed(speed)
+        return {"port": int(port), "speed": float(speed), "reverse": int(reverse)}
+
+    def get_encoder(self, port, reverse=1):
+        """读取单电机编码器原始累计值。"""
+        enc = self._get_realtime_instance("encoder", port, reverse=int(reverse))
+        return int(enc.get_encoder())
+
+    def set_stepper_rad(self, port, rad, time=0.5, reverse=1, perimeter=0.008):
+        """底盘步进电机弧度定位。注意：port 不要跟 arm_cfg.yaml 里配置的机械臂 y 轴端口冲突。"""
+        stepper = self._get_realtime_instance(
+            "stepper", port, reverse=int(reverse), perimeter=float(perimeter)
+        )
+        stepper.set_rad(float(rad), time=float(time))
+        return {"port": int(port), "rad": float(rad), "time": float(time)}
+
+    def set_bus_servo(self, port, angle, speed=100):
+        """总线舵机角度下发（mc602 ServoBus_2 协议）。"""
+        servo = self._get_realtime_instance("bus_servo", port)
+        servo.set_angle(float(angle), int(speed))
+        return {"port": int(port), "angle": float(angle), "speed": int(speed)}
+
+    def read_bus_servo(self, port):
+        """读取总线舵机当前角度（mc602 实现；mc601 暂不支持）。"""
+        servo = self._get_realtime_instance("bus_servo", port)
+        return int(servo.read_angle())
+
+    def read_analog(self, port):
+        """读单路模拟量（mc602 走 Sensor_Analog2_2，dev_id=0x08）。"""
+        ai = self._get_realtime_instance("analog2", port)
+        return float(ai.read())
+
+    def read_analog2(self, port):
+        """读第二路模拟量（mc602 走 AnalogInput，dev_id=0x07 mode=0）。"""
+        ai = self._get_realtime_instance("analog", port)
+        return float(ai.read())
+
     def get_key_event(self):
         return self.key.get_key()
 
@@ -494,6 +579,35 @@ class MyCar(MecanumDriver):
         }
 
     def get_arm_state(self):
+        #region debug-point runtime-init-queue-arm-state
+        import json as _json
+        import os as _os
+        import urllib.request as _urllib_request
+
+        def _debug_emit(msg, data=None):
+            api_url = _os.environ.get("DEBUG_SERVER_URL") or _os.environ.get("TRAE_DEBUG_API_URL")
+            if not api_url:
+                return
+            payload = {
+                "sessionId": "runtime-init-queue",
+                "hypothesisId": "H1",
+                "location": "car_wrap_2026.get_arm_state",
+                "msg": msg,
+                "data": data or {},
+            }
+            try:
+                req = _urllib_request.Request(
+                    api_url,
+                    data=_json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                _urllib_request.urlopen(req, timeout=0.2).read()
+            except Exception:
+                pass
+
+        _debug_emit("开始读取机械臂状态")
+        #endregion debug-point runtime-init-queue-arm-state
         return {
             "x": self.arm.x_get_position(),
             "y": self.arm.y_get_position(),
@@ -1020,15 +1134,44 @@ class MyCar(MecanumDriver):
         stop = self.resolve_stop(stop)
         while True:
             if self._stop_flag:
+                if hasattr(self.streamer, "set_lane_state"):
+                    self.streamer.set_lane_state(
+                        active=False,
+                        mode="stopped",
+                        forward_speed=0.0,
+                        lateral_speed=0.0,
+                        angular_speed=0.0,
+                        distance=self.get_distance(),
+                    )
                 return
 
             error_y, error_angle = self.get_lane_results()
             y_speed, angle_speed = self.lane_pid.get_out(-error_y, -error_angle)
             self.set_velocity(speed, y_speed, angle_speed)
+            if hasattr(self.streamer, "set_lane_state"):
+                self.streamer.set_lane_state(
+                    active=True,
+                    mode="tracking",
+                    error_y=error_y,
+                    error_angle=error_angle,
+                    forward_speed=speed,
+                    lateral_speed=y_speed,
+                    angular_speed=angle_speed,
+                    distance=self.get_distance(),
+                )
             if end_fuction():
                 break
         if stop:
             self.stop()
+        if hasattr(self.streamer, "set_lane_state"):
+            self.streamer.set_lane_state(
+                active=False,
+                mode="idle",
+                forward_speed=0.0,
+                lateral_speed=0.0,
+                angular_speed=0.0,
+                distance=self.get_distance(),
+            )
 
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):
     #     """
@@ -1512,6 +1655,12 @@ class MyCar(MecanumDriver):
             cv2.LINE_AA,
         )
         self.streamer.update_frame(image, "cam1")
+        if hasattr(self.streamer, "set_lane_state"):
+            self.streamer.set_lane_state(
+                error_y=error,
+                error_angle=angle,
+                frame_shape=list(image.shape),
+            )
         # print(label_text)
         return error, angle
 

@@ -55,6 +55,26 @@ def main():
         print("\n=== beep ===")
         print("已跳过。需要主动蜂鸣时执行: RAK_CAR_QUICK_START_BEEP=1 python3 quick_start.py")
 
+    run_realtime = os.getenv("RAK_CAR_QUICK_START_REALTIME", "0") == "1"
+    if run_realtime:
+        print("\n=== realtime bus-servo read (opt-in, requires mc602 hardware) ===")
+        try:
+            print(
+                json.dumps(
+                    client.realtime_bus_servo_read(1),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+        except Exception as exc:
+            print(f"realtime bus-servo read failed (likely no hardware): {exc}")
+    else:
+        print("\n=== realtime ===")
+        print(
+            "已跳过。需要主动测实时硬件路径时执行:"
+            " RAK_CAR_QUICK_START_REALTIME=1 python3 quick_start.py"
+        )
+
 
 if __name__ == "__main__":
     main()

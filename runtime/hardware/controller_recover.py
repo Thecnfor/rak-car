@@ -132,6 +132,16 @@ def ping_mc602(serial_obj, timeout_s=0.05):
     return False
 
 
+def boot_ping(serial_obj, timeout_s=0.12):
+    serial_obj.baudrate = 1000000
+    serial_obj.reset_input_buffer()
+    serial_obj.reset_output_buffer()
+    _write_slow(serial_obj, BOOT_PING)
+    time.sleep(0.01)
+    ret = _read_exact(serial_obj, 10, timeout_s)
+    return _is_bootloader_ack(ret), ret
+
+
 def wait_port_stable(
     port_name,
     port_supplier,
@@ -233,7 +243,7 @@ def _try_runcode_sequence(port_name, debug_hook=None):
                 if _is_runcode_ack(ret):
                     last_detail = "RUNCODE 已确认，等待 program 握手"
                 else:
-                    last_detail = "bootloader 已响应，但 RUNCODE 未确认"
+                    last_detail = "bootloader 已响应，但 RUNCODE 未确认，继续等待 program 接管"
         except Exception as exc:
             last_detail = "发送 RUNCODE 时串口异常: {}".format(exc)
             if debug_hook is not None:
@@ -254,7 +264,29 @@ def _try_runcode_sequence(port_name, debug_hook=None):
 
 
 def recover_controller(port_name, port_supplier, debug_hook=None):
+    return recover_controller_with_probe(
+        probe_result=None,
+        port_name=port_name,
+        port_supplier=port_supplier,
+        debug_hook=debug_hook,
+    )
+
+
+def recover_controller_with_probe(
+    probe_result,
+    port_name,
+    port_supplier,
+    debug_hook=None,
+):
     with _RECOVERY_LOCK:
+        if probe_result is not None:
+            mode = getattr(probe_result, "mode", None)
+            if mode == "program":
+                return True, "控制器 program 模式在线"
+            if mode == "no_port":
+                return False, "未找到控制器串口，检查 USB 连接和下位机供电"
+            if mode == "unknown":
+                return False, getattr(probe_result, "detail", None) or "{} 可打开但未收到控制器响应".format(port_name)
         if not wait_port_stable(port_name, port_supplier, debug_hook=debug_hook):
             return False, "串口重枚举未稳定，跳过本轮恢复"
         deadline = time.time() + RECOVERY_WINDOW_S
@@ -268,13 +300,7 @@ def recover_controller(port_name, port_supplier, debug_hook=None):
                         return True, "控制器 program 模式在线"
                     if ping_mc601(serial_obj, timeout_s=0.3):
                         return True, "控制器 program 模式在线"
-
-                    serial_obj.baudrate = 1000000
-                    serial_obj.reset_input_buffer()
-                    serial_obj.reset_output_buffer()
-                    _write_slow(serial_obj, BOOT_PING)
-                    time.sleep(0.01)
-                    ret = _read_exact(serial_obj, 10, 0.12)
+                    ok, ret = boot_ping(serial_obj, timeout_s=0.12)
                     if debug_hook is not None:
                         debug_hook(
                             "R",
@@ -286,10 +312,16 @@ def recover_controller(port_name, port_supplier, debug_hook=None):
                                 "response_hex": ret.hex(),
                             },
                         )
-                    if _is_bootloader_ack(ret):
+                    if ok:
                         ok, detail = _try_runcode_sequence(port_name, debug_hook=debug_hook)
                         if ok:
                             return True, detail
+                        if wait_program_ready(
+                            port_name,
+                            timeout_s=PROGRAM_PING_AFTER_RUNCODE_S,
+                            debug_hook=debug_hook,
+                        ):
+                            return True, "控制器已进入 program 模式"
                         last_detail = detail
                     else:
                         last_detail = "{} 可打开但未收到控制器响应".format(port_name)

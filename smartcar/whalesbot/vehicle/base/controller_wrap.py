@@ -471,6 +471,11 @@ class ServoBus():
         funcs = [self.servo_bus_1.set_speed, self.servo_bus_2.set_speed]
         return funcs[ctl_id](speed)
 
+    def read_angle(self, port_id=None):
+        """读取总线舵机当前角度。mc601 路径当前未实现，会抛 AttributeError。"""
+        funcs = [self.servo_bus_1.read_angle, self.servo_bus_2.read_angle]
+        return funcs[ctl_id](port_id)
+
 class PoutD():
     def __init__(self, port):
         self.pout_1 = PortOut_1(port)

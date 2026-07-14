@@ -30,6 +30,67 @@
 - `front` 虽然还保留在 `config_car.yml` 里，但当前业务没用，`MyCar` 也没有接入 `front_det`
 - 所以 runtime 接口会明确把它标记为 `enabled=false`
 
+## 推理托管说明
+
+从现在开始，`infer_back_end.py` 由 `runtime` 统一托管。
+
+这意味着：
+
+- 不再依赖 legacy `ClintInterface` 自动拉起或重启推理后端
+- `vision/*` 接口只消费 runtime 当前的推理状态
+- 如果推理仍在冷启动，接口会返回“未就绪”语义，而不是无限等待
+
+建议配套观察：
+
+- `GET /v1/health`
+- `GET /v1/infer/state`
+- `GET /stream/health`
+
+## 推理状态接口
+
+### `GET /v1/infer/state`
+
+用途：
+
+- 看 runtime 当前托管的推理后端状态
+- 区分“推理冷启动中”和“推理真正异常”
+- 看各模型端口是否 ready
+
+示例：
+
+```bash
+curl -sS http://127.0.0.1:5050/v1/infer/state
+```
+
+返回示例：
+
+```json
+{
+  "ok": true,
+  "infer": {
+    "status": "ready",
+    "managed": true,
+    "process_running": true,
+    "pid": 12345,
+    "last_error": null,
+    "models": [
+      {"name": "lane", "port": 5001, "ready": true},
+      {"name": "task", "port": 5002, "ready": true},
+      {"name": "ocr", "port": 5004, "ready": true}
+    ]
+  }
+}
+```
+
+字段说明：
+
+- `status`
+  - `starting` / `ready` / `stopped`
+- `process_running`
+  - runtime 当前托管的后端进程是否仍在
+- `models[*].ready`
+  - 各推理端口是否通过了 runtime 的健康探测
+
 ## 1. 模型总览
 
 ### `GET /v1/vision/models`
@@ -92,6 +153,11 @@ curl -sS http://127.0.0.1:5050/v1/vision/models
 }
 ```
 
+失败语义：
+
+- 若推理未 ready，接口可能返回 `503`
+- 此时优先看 `/v1/infer/state`，不要直接手工杀 `infer_back_end.py`
+
 ## 2. 车道结果
 
 ### `POST /v1/vision/lane`
@@ -135,6 +201,11 @@ curl -sS -X POST http://127.0.0.1:5050/v1/vision/lane \
 }
 ```
 
+失败语义：
+
+- 若控制器未就绪，会在健康接口中体现为 `state.components.controller.ready=false`
+- 若推理未 ready，会返回 `503` 或 job 失败信息里包含“推理服务未就绪”
+
 字段说明：
 
 - `result.error`
@@ -143,6 +214,64 @@ curl -sS -X POST http://127.0.0.1:5050/v1/vision/lane \
   - 车道角度偏差
 - `frame_url`
   - 取当前推理后单帧
+
+### `GET /v1/vision/lane/state`
+
+用途：
+
+- 读取 runtime 当前缓存的实时 lane 状态
+- 最适合前端轮询
+- 当你在执行 `task.auto_lane_tracing`、`car.lane_time`、`car.lane_dis`、`car.lane_dis_offset` 时，这个接口会持续更新
+
+示例：
+
+```bash
+curl -sS http://127.0.0.1:5050/v1/vision/lane/state
+```
+
+返回示例：
+
+```json
+{
+  "ok": true,
+  "active": true,
+  "mode": "tracking",
+  "error_y": 0.0012,
+  "error_angle": -0.4354,
+  "forward_speed": 0.3,
+  "lateral_speed": -0.012,
+  "angular_speed": 0.086,
+  "distance": 1.284,
+  "frame_shape": [480, 640, 3],
+  "updated_at": 1783863600.123,
+  "frame_url": "/stream/frame/cam1.jpg",
+  "preview_url": "/stream/"
+}
+```
+
+失败语义：
+
+- 如果只想确认相机是否还在出实时帧，优先看 `/stream/health`
+- 如果 `detections` 正常但截图仍是占位图，说明是流服务链路问题，不一定是推理问题
+
+字段说明：
+
+- `active`
+  - 当前是否处于巡线闭环中
+- `mode`
+  - `tracking` / `idle` / `stopped`
+- `error_y`
+  - 当前横向偏差
+- `error_angle`
+  - 当前角度偏差
+- `forward_speed`
+  - 当前前进速度
+- `lateral_speed`
+  - 当前横移修正速度
+- `angular_speed`
+  - 当前转向修正角速度
+- `distance`
+  - 当前累计行驶距离
 
 ## 3. 目标检测结果
 
