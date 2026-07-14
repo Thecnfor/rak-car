@@ -14,6 +14,24 @@ from typing import Optional
 SIDES = ("LEFT", "MID", "RIGHT")
 HANDS = ("UP", "MID", "DOWN")
 
+# 存储仓（二选一档位）枚举。
+#
+# 角度范围：ServoPwm wrapper 是 0~180 度（mc602 没 clamp，但下层 8-bit
+# 通道收到 0~180 之外的 angle 会被协议层回中 / 回弹）。
+# 实测：
+#   - LEFT  -42° -> wrapper 后协议值 = -42+90 = 48，合法，不回弹
+#   - RIGHT 90°  -> wrapper 后协议值 = 90+90  = 180，临界值，合法
+# 历史事故：RIGHT 曾用 165°，协议值 255 超 0~180，mc602 会回弹。
+# 因此 RIGHT 改用 90° 附近的值（=协议值 180，刚好是上边界）。
+#
+# 注意：car_wrap_2026.servo_1_angle_list[1] 也保持同步是 90，否则 set_storage
+# 传 True 会再被这里"换算前"的 -42/90 算成 out-of-range。
+# 默认 LEFT 用 -42° 保持和初始化（注释掉前）一致；如果后续发现 mc602 也不喜欢
+# -42，统一改成 0~180 区间。
+STORAGE_SIDES = ("LEFT", "RIGHT")
+STORAGE_DEFAULT_LEFT_ANGLE = -42
+STORAGE_DEFAULT_RIGHT_ANGLE = 90
+
 
 @dataclass
 class ArmOrigin:
@@ -25,6 +43,10 @@ class ArmOrigin:
     soft_y_max_m: float = 0.18        # 业务软上限（m）
     soft_x_min_m: float = 0.005
     soft_x_max_m: float = 0.30
+    # 丢步/位置偏差阈值（mm）：move_x / move_y 完成后对比 actual vs target，超此值 warn。
+    # y 是步进电机，堵转/失步较常见，默认 2mm（≈1 step）；x 是编码器闭环，默认 5mm。
+    step_loss_y_mm: float = 2.0
+    step_loss_x_mm: float = 5.0
     calibrated_at: str = ""           # ISO 8601
 
     @property
@@ -51,6 +73,9 @@ class ArmState:
     hand: str = "UP"
     grasping: bool = False
 
+    # 存储仓档位（独立 PWM 舵机，二选一）
+    storage_side: str = "LEFT"  # "LEFT" / "RIGHT"，None 表示未知
+
     # 坐标系可信度
     y_origin_valid: bool = False
     x_origin_valid: bool = False
@@ -74,10 +99,13 @@ class ArmState:
     # ---- 校验 ----
 
     def in_safe_box(self, x_mm: float, y_mm: float) -> bool:
-        """给定 (x, y) 是否在业务软限位内（含）。"""
+        """给定 (x, y) 是否在业务软限位内（含）。
+
+        y 业务坐标：触底=0，向下取正、向上取负；区间 [-soft_y_max_mm, 0]。
+        """
         return (
             self.soft_x_min_mm <= x_mm <= self.soft_x_max_mm
-            and 0.0 <= y_mm <= self.soft_y_max_mm
+            and -self.soft_y_max_mm <= y_mm <= 0.0
         )
 
     def is_ready(self) -> bool:
@@ -92,5 +120,5 @@ class ArmState:
             f"side={self.side}, hand={self.hand}, grasp={self.grasping}, "
             f"y_valid={self.y_origin_valid}, x_valid={self.x_origin_valid}, "
             f"safe=[{self.soft_x_min_mm:.0f}..{self.soft_x_max_mm:.0f} x "
-            f"0..{self.soft_y_max_mm:.0f}]mm)"
+            f"-{self.soft_y_max_mm:.0f}..0]mm)"
         )

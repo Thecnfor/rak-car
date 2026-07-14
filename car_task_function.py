@@ -46,12 +46,6 @@ def init(reset_arm=False):
     bind_car(MyCar())
     my_car.STOP_PARAM = False
     my_car.beep()
-    time.sleep(1)
-    # 安全起见，默认不做机械臂复位，避免零位/限位未校准时顶死舵机
-    if reset_arm:
-        my_car.arm.reset_position()
-    my_car.reset_position()  #
-    return my_car
 
 def auto_lane_tracing(speed=0.3, dis_hold=0.85):
     my_car.lane_dis_offset(speed=speed, dis_hold=dis_hold)

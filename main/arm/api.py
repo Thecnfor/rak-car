@@ -20,7 +20,15 @@ except ImportError:  # pragma: no cover
     from api_client import RuntimeApiClient  # type: ignore
     from ws_client import RuntimeWsClient  # type: ignore
 
-from .state import ArmState, ArmOrigin, SIDES, HANDS
+from .state import (
+    ArmState,
+    ArmOrigin,
+    SIDES,
+    HANDS,
+    STORAGE_SIDES,
+    STORAGE_DEFAULT_LEFT_ANGLE,
+    STORAGE_DEFAULT_RIGHT_ANGLE,
+)
 from .trajectory import TrajectoryGenerator, TrajectoryPlan
 
 
@@ -48,6 +56,16 @@ def _normalize_hand(hand: Optional[str]) -> Optional[str]:
     if h not in HANDS:
         raise ValueError(f"hand 必须是 {HANDS} 之一，收到: {hand!r}")
     return h
+
+
+def _normalize_storage_side(side: Optional[str]) -> Optional[str]:
+    """存储仓二选一档位归一化。和机械臂 SIDES 区别：只有 LEFT/RIGHT 两档。"""
+    if side is None:
+        return None
+    s = side.upper()
+    if s not in STORAGE_SIDES:
+        raise ValueError(f"storage side 必须是 {STORAGE_SIDES} 之一，收到: {side!r}")
+    return s
 
 
 @dataclass
@@ -203,20 +221,67 @@ class ArmClient:
         )
 
     def move_y(self, y_mm: float, v_max_mms: float = 80.0, timeout: float = 20.0) -> dict:
+        # 业务坐标语义：y_mm=0 在磁感应触底，向下（朝触底）取正值，向上取负值；上限 = -soft_y_max_mm。
         self._check_safe(y_mm=y_mm)
-        return self._call_arm(
+        job = self._call_arm(
             "move_y_position",
             timeout=timeout,
             target=_mm_to_m(y_mm),
         )
+        # 磁感应触底兜底：目标接近触底 (y≈0) 但车端 y_limit 仍为 False 时 warn。
+        # y_origin_valid 在 get_state 里映射自车端 y_limit（API.md: get_arm_state 返回 y_limit）。
+        origin = self.origin or ArmOrigin()
+        try:
+            state = self.get_state()
+            near_bottom = abs(y_mm) <= 0.1 * origin.soft_y_max_mm
+            if near_bottom and not state.y_origin_valid:
+                print(
+                    f"[move_y] 警告: 目标 y={y_mm:.1f}mm 接近触底(0mm)，"
+                    f"但车端 y_limit 仍为 False（磁感应未触发）。",
+                    flush=True,
+                )
+            # 丢步补偿：步进电机失步后实际位置 ≠ 目标，超阈值时 warn。
+            # 阈值 2mm（≈步距），可在 ArmOrigin 里覆盖。
+            self._check_step_loss("y", target_mm=y_mm, actual_mm=state.y_mm,
+                                  threshold_mm=origin.step_loss_y_mm)
+        except Exception as e:
+            print(f"[move_y] 状态校验读取失败: {e}", flush=True)
+        return job
 
     def move_x(self, x_mm: float, v_max_mms: float = 150.0, timeout: float = 20.0) -> dict:
+        # 业务坐标语义：x_mm=0 在撞墙参考点（reset_x 堵转后），远离墙为正；区间 [soft_x_min, soft_x_max]。
+        # motor_280 是编码器闭环，正常不会丢步，但仍做一次回校以防打滑/卡阻。
         self._check_safe(x_mm=x_mm)
-        return self._call_arm(
+        job = self._call_arm(
             "move_x_position",
             timeout=timeout,
             target=_mm_to_m(x_mm),
         )
+        origin = self.origin or ArmOrigin()
+        try:
+            state = self.get_state()
+            self._check_step_loss("x", target_mm=x_mm, actual_mm=state.x_mm,
+                                  threshold_mm=origin.step_loss_x_mm)
+        except Exception as e:
+            print(f"[move_x] 状态校验读取失败: {e}", flush=True)
+        return job
+
+    # ---- 丢步/位置偏差校验 ----
+
+    @staticmethod
+    def _check_step_loss(axis: str, target_mm: float, actual_mm: float,
+                         threshold_mm: float) -> None:
+        """对比目标 vs 实际，超阈值 warn（不抛错，由调用方决定是否重试）。"""
+        try:
+            err = abs(float(actual_mm) - float(target_mm))
+        except (TypeError, ValueError):
+            return
+        if err > threshold_mm:
+            print(
+                f"[move_{axis}] 警告: 目标={target_mm:.1f}mm 实际={actual_mm:.1f}mm "
+                f"偏差={err:.1f}mm > {threshold_mm:.1f}mm（步进/电机可能丢步或堵转）",
+                flush=True,
+            )
 
     def set_side(self, side: str, speed: int = 80, timeout: float = 10.0) -> dict:
         side = _normalize_side(side)
@@ -229,6 +294,78 @@ class ArmClient:
         if hand is None:
             raise ValueError("set_hand 必须给 UP/MID/DOWN")
         return self._call_arm("set_hand_angle", timeout=timeout, angle=hand, speed=speed)
+
+    # ---- 存储仓（二选一档位） ----
+
+    def set_storage(self, side: str, timeout: float = 10.0) -> dict:
+        """切换车体上的存储仓舵机（独立 PWM 舵机，port=1）。
+
+        只接受两个档位：
+          - "LEFT"  → 写死角度 STORAGE_DEFAULT_LEFT_ANGLE（-42°，与初始化复位角度一致）
+          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（90°，车端 servo_1_angle_list[1]）
+
+        底层走 car.set_storage(bool)，它在 car_wrap_2026.sensor_init 阶段已构造。
+        之所以走 car（而不是 arm）是因为这块舵机不属于机械臂（arm），属于车体外设。
+
+        返回（业务层常用字段）：
+            {
+              "ok": bool,            # job 是否 succeeded
+              "side": "LEFT"/"RIGHT",# 实际生效的档位（车端回传）
+              "flag": 0/1,
+              "angle": int,
+              "state": bool,         # 透传 set_storage 的 bool 参数
+              "raw_job": dict,       # 完整 job dict（保留给调试）
+            }
+        """
+        side = _normalize_storage_side(side)
+        if side is None:
+            raise ValueError(f"set_storage 必须给 {STORAGE_SIDES}")
+        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 90°（RIGHT 档），
+        # False → servo_1_angle_list[0] = -42°（LEFT 档）。
+        # （历史曾用 165°，协议值 255 超 0~180，mc602 会回弹，已统一为 90°）
+        open_flag = side == "RIGHT"
+        job = self._call_car("set_storage", timeout=timeout, state=open_flag)
+
+        # 把车端 result 解出来（runtime 已 normalize_value 序列化）。
+        # 失败 job 这里 result 通常是 None / 错误字符串。
+        result = job.get("result") if isinstance(job, dict) else None
+        out = {
+            "ok": bool(isinstance(job, dict) and job.get("status") == "succeeded"),
+            "side": None,
+            "flag": None,
+            "angle": None,
+            "state": open_flag,
+            "raw_job": job,
+        }
+        if isinstance(result, dict):
+            r_side = str(result.get("side", "")).upper()
+            if r_side in STORAGE_SIDES:
+                out["side"] = r_side
+            if "flag" in result:
+                try:
+                    out["flag"] = int(result["flag"])
+                except (TypeError, ValueError):
+                    pass
+            if "angle" in result:
+                try:
+                    out["angle"] = int(result["angle"])
+                except (TypeError, ValueError):
+                    pass
+        # 兜底：如果车端没回 side，按请求的 side 填
+        if out["side"] is None and out["ok"]:
+            out["side"] = side
+        # 客户端缓存：让 get_storage() 不用再下发舵机
+        if out["side"] in STORAGE_SIDES:
+            self._storage_side_cache = out["side"]
+        return out
+
+    def get_storage(self) -> str:
+        """只读：返回当前存储仓档位 "LEFT" / "RIGHT" / "UNKNOWN"。
+
+        纯客户端缓存：每次 set_storage 成功后本地更新；
+        **不会让舵机动作**。ArmClient 重建后状态归零，回到 "UNKNOWN"。
+        """
+        return getattr(self, "_storage_side_cache", "UNKNOWN")
 
     def grasp(self, on: bool, timeout: float = 10.0) -> dict:
         return self._call_arm("grasp", bool(on), timeout=timeout)
@@ -325,9 +462,11 @@ class ArmClient:
 
     def _check_safe(self, x_mm: Optional[float] = None, y_mm: Optional[float] = None) -> None:
         origin = self.origin or ArmOrigin()
-        if y_mm is not None and not (0.0 <= y_mm <= origin.soft_y_max_mm):
+        # y 业务坐标：触底=0，向下（朝触底）取正值，向上（远离触底）取负值；区间 [-soft_y_max_mm, 0]。
+        if y_mm is not None and not (-origin.soft_y_max_mm <= y_mm <= 0.0):
             raise ValueError(
-                f"y_mm={y_mm} 超出软上限 {origin.soft_y_max_mm}mm（触底=0, top={origin.soft_y_max_mm:.0f}mm）"
+                f"y_mm={y_mm} 超出软区间 [-{origin.soft_y_max_mm:.0f}, 0] mm"
+                f"（触底=0, 顶部=-{origin.soft_y_max_mm:.0f}mm）"
             )
         if x_mm is not None and not (origin.soft_x_min_mm <= x_mm <= origin.soft_x_max_mm):
             raise ValueError(
@@ -339,7 +478,7 @@ class ArmClient:
 
     def ping(self, timeout: float = 5.0) -> bool:
         try:
-            self.http.get_health(timeout=timeout)
+            self.http.get_health()
             return True
         except Exception:
             return False

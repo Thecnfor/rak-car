@@ -17,6 +17,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover
     ) from exc
 
 from runtime.core import settings
+import time
 
 
 def get_public_links():
@@ -44,6 +45,7 @@ def get_public_links():
         "vision_ocr": f"{api_base}{v1}/vision/ocr",
         "realtime_wheels_speeds": f"{api_base}{v1}/realtime/wheels/speeds",
         "realtime_wheels_encoders": f"{api_base}{v1}/realtime/wheels/encoders",
+        "realtime_chassis_velocity": f"{api_base}{v1}/realtime/chassis-velocity",
         "realtime_motor_speed": f"{api_base}{v1}/realtime/motor/speed",
         "realtime_encoder": f"{api_base}{v1}/realtime/encoder",
         "realtime_stepper_rad": f"{api_base}{v1}/realtime/stepper/rad",
@@ -312,6 +314,22 @@ async def _handle_websocket_message(service, payload):
                 "ok": True,
                 "op": op,
                 "data": {"result": service.set_wheel_speeds([float(s) for s in speeds])},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/chassis_velocity":
+        # 外环最常用：(vx, vy, wz) 直接下发，内部 IK 反算 4 轮速、绕开 set_velocity 里程计耦合
+        try:
+            vx = float(payload.get("vx", 0.0))
+            vy = float(payload.get("vy", 0.0))
+            wz = float(payload.get("wz", 0.0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="vx/vy/wz 必须是数字")
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"result": service.set_chassis_velocity(vx, vy, wz)},
             }
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -596,6 +614,83 @@ def create_runtime_router(service, camera_stream_service):
     def v1_vision_lane_state():
         return {"ok": True, **camera_stream_service.get_lane_state()}
 
+    # ---- 外环专用端点：start/stop lane_feed 守护线程 + 状态 ----
+    # 为什么要单独包一层：
+    #   - 外环启动 / 停止 "只刷 lane_state 不下轮速" 的守护线程，是个有副作用的状态切换
+    #   - 走 /v1/execute + target=car + name=start_lane_feed 太绕，TS/前端写起来啰嗦
+    #   - 把动作 / 状态 / stop 三件事放在同一组 URL 下，便于外环做"启动→订阅→停止"编排
+
+    @router_v1.post("/vision/lane/feed")
+    def v1_vision_lane_feed_start(payload: dict = Body(default={})):
+        """启动车端 lane 误差缓存守护线程。
+
+        请求体（全部可选）：
+          {"hz": 20.0}      # 守护线程刷 lane_state 的频率（1~50Hz）
+
+        行为：
+          - 已经在跑时直接返回 {"started": false, "reason": "already_running", "hz": ...}
+          - 否则调用 car.start_lane_feed(hz=hz)，守护线程会持续跑 get_lane_results()，
+            把结果写入 streamer.set_lane_state(...)，让 /v1/vision/lane/state 持续更新
+          - 不会下发任何轮速，不会和客户端外环抢 car_lock
+        """
+        hz = float(payload.get("hz", 20.0))
+        result = _execute_sync(
+            service,
+            target="car",
+            name="start_lane_feed",
+            kwargs={"hz": hz},
+            timeout=10,
+        )
+        return {
+            "ok": True,
+            "started": True,
+            "hz": hz,
+            "result": result,
+            "state_url": "/v1/vision/lane/state",
+        }
+
+    @router_v1.post("/vision/lane/feed/stop")
+    def v1_vision_lane_feed_stop():
+        """停止车端 lane 误差缓存守护线程。
+
+        - 已经在停止状态时返回 {"stopped": false, "reason": "not_running"}
+        - 不会动轮速，只是不再更新 lane_state
+        """
+        result = _execute_sync(
+            service,
+            target="car",
+            name="stop_lane_feed",
+            timeout=10,
+        )
+        return {"ok": True, "stopped": True, "result": result}
+
+    @router_v1.get("/vision/lane/feed")
+    def v1_vision_lane_feed_status():
+        """读当前 lane_feed 守护线程状态。
+
+        注意：runtime 没有维护 start/stop 的状态机，直接读 lane_state 的 updated_at
+        推断"是否有人在刷"。age < 2s 视为 alive，否则 stale。
+        """
+        state = camera_stream_service.get_lane_state()
+        updated_at = state.get("updated_at")
+        if updated_at is None:
+            return {
+                "ok": True,
+                "running": False,
+                "reason": "no_data",
+                "state_url": "/v1/vision/lane/state",
+            }
+        age = max(time.time() - float(updated_at), 0.0)
+        return {
+            "ok": True,
+            "running": age < 2.0,
+            "age": round(age, 3),
+            "mode": state.get("mode"),
+            "active": state.get("active"),
+            "updated_at": updated_at,
+            "state_url": "/v1/vision/lane/state",
+        }
+
     @router_v1.post("/vision/task")
     def v1_vision_task(payload: dict = Body(default={})):
         timeout = payload.get("timeout", 20)
@@ -761,6 +856,23 @@ def create_runtime_router(service, camera_stream_service):
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router_v1.post("/realtime/chassis-velocity")
+    def v1_realtime_chassis_velocity(payload: dict = Body(default={})):
+        """(vx, vy, wz) 直发，绕开 set_velocity 里程计耦合。供外环 50Hz 用。"""
+        try:
+            vx = float(payload.get("vx", 0.0))
+            vy = float(payload.get("vy", 0.0))
+            wz = float(payload.get("wz", 0.0))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="vx/vy/wz 必须是数字")
+        try:
+            return {
+                "ok": True,
+                "result": service.set_chassis_velocity(vx, vy, wz),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @router_v1.post("/realtime/motor/speed")
     def v1_realtime_motor_speed(payload: dict = Body(default={})):
         port = payload.get("port")
@@ -850,6 +962,8 @@ def create_runtime_router(service, camera_stream_service):
 
     @router_v1.websocket("/ws")
     async def v1_ws(websocket: WebSocket):
+        import asyncio as _asyncio
+
         await websocket.accept()
         await websocket.send_json(
             {
@@ -860,9 +974,60 @@ def create_runtime_router(service, camera_stream_service):
                     "execute": {"op": "execute", "target": "car|arm|task|system", "name": "动作名"},
                     "create_job": {"op": "create_job", "target": "task", "name": "任务名"},
                     "health": {"op": "health", "snapshot": 0},
+                    "subscribe_lane": {"op": "subscribe_lane", "note": "持续 push lane_state"},
+                    "unsubscribe_lane": {"op": "unsubscribe_lane"},
+                    "realtime_chassis_velocity": {"op": "realtime/chassis_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0},
+                    "realtime_wheel_speeds": {"op": "realtime/wheel_speeds", "speeds": [0,0,0,0]},
                 },
             }
         )
+
+        # ---- lane_state push 后台任务 ----
+        # 外环订阅：服务端在 updated_at 变化时主动 push 一次完整 lane_state。
+        # 订阅存在则后台 task 一直在跑；disconnect / unsubscribe 时 cancel。
+        lane_push_task = None
+        lane_subscribed = False
+        lane_push_hz = 20.0  # 默认 20Hz 轮询 lane_state，更新才推
+
+        async def _lane_push_loop():
+            last_updated_at = None
+            interval = 1.0 / max(float(lane_push_hz), 1.0)
+            while True:
+                try:
+                    state = camera_stream_service.get_lane_state()
+                except Exception:
+                    state = None
+                updated_at = state.get("updated_at") if state else None
+                if state and updated_at is not None and updated_at != last_updated_at:
+                    last_updated_at = updated_at
+                    try:
+                        await websocket.send_json(
+                            {"ok": True, "op": "lane_state", "data": state}
+                        )
+                    except Exception:
+                        # 连接已断
+                        return
+                await _asyncio.sleep(interval)
+
+        async def _start_lane_push():
+            nonlocal lane_push_task, lane_subscribed
+            if lane_subscribed and lane_push_task is not None and not lane_push_task.done():
+                return False
+            lane_subscribed = True
+            lane_push_task = _asyncio.create_task(_lane_push_loop())
+            return True
+
+        async def _stop_lane_push():
+            nonlocal lane_push_task, lane_subscribed
+            lane_subscribed = False
+            if lane_push_task is not None and not lane_push_task.done():
+                lane_push_task.cancel()
+                try:
+                    await lane_push_task
+                except (_asyncio.CancelledError, Exception):
+                    pass
+            lane_push_task = None
+
         while True:
             try:
                 payload = await websocket.receive_json()
@@ -873,16 +1038,41 @@ def create_runtime_router(service, camera_stream_service):
                     {"ok": False, "op": "invalid_json", "error": str(exc)}
                 )
                 continue
+
+            op = payload.get("op")
+
+            # ---- 订阅控制（不走 _handle_websocket_message，避免被解释成通用 op）----
+            if op == "subscribe_lane":
+                started = await _start_lane_push()
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "op": "subscribe_lane",
+                        "subscribed": started,
+                        "hz": lane_push_hz,
+                    }
+                )
+                continue
+            if op == "unsubscribe_lane":
+                await _stop_lane_push()
+                await websocket.send_json(
+                    {"ok": True, "op": "unsubscribe_lane", "subscribed": False}
+                )
+                continue
+
             request_id = payload.get("request_id")
             try:
                 result = await _handle_websocket_message(service, payload)
             except HTTPException as exc:
-                result = {"ok": False, "op": payload.get("op"), "error": exc.detail}
+                result = {"ok": False, "op": op, "error": exc.detail}
             except Exception as exc:  # pragma: no cover
-                result = {"ok": False, "op": payload.get("op"), "error": str(exc)}
+                result = {"ok": False, "op": op, "error": str(exc)}
             if request_id is not None:
                 result["request_id"] = request_id
             await websocket.send_json(result)
+
+        # ---- disconnect 清理 ----
+        await _stop_lane_push()
 
     router.include_router(router_v1)
     return router

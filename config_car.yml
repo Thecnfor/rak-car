@@ -139,13 +139,6 @@ infer_cfg:
     img_size: [416, 416]
     run_mode: paddle
 
-  - name: front
-    infer_type: YoloeInfer
-    model_dir: front_model2
-    port: 5003
-    img_size: [416, 416]
-    run_mode: paddle
-
   - name: ocr
     infer_type: OCRReco
     # OCR 使用两阶段模型：检测(det) + 识别(rec)

@@ -3,7 +3,15 @@
 外部 import 只允许指向 main.*，不接触 runtime / smartcar。
 """
 from .api import ArmClient
-from .state import ArmState, ArmOrigin, SIDES, HANDS
+from .state import (
+    ArmState,
+    ArmOrigin,
+    SIDES,
+    HANDS,
+    STORAGE_SIDES,
+    STORAGE_DEFAULT_LEFT_ANGLE,
+    STORAGE_DEFAULT_RIGHT_ANGLE,
+)
 from .origin import OriginCalibrator, run_calibrator
 from .trajectory import (
     TrajectoryGenerator,
@@ -18,6 +26,9 @@ __all__ = [
     "ArmOrigin",
     "SIDES",
     "HANDS",
+    "STORAGE_SIDES",
+    "STORAGE_DEFAULT_LEFT_ANGLE",
+    "STORAGE_DEFAULT_RIGHT_ANGLE",
     "OriginCalibrator",
     "run_calibrator",
     "TrajectoryGenerator",

@@ -413,6 +413,32 @@ class CarRuntimeService:
             self._realtime_check_locked()
             return self.car.set_wheel_speeds(speeds)
 
+    def set_chassis_velocity(self, vx, vy, wz, duration=None):
+        """
+        上层外环专用：(vx, vy, wz) → 4 轮速直发，绕开 set_velocity 的里程计耦合。
+
+        走 car_lock 同步路径，50Hz 友好。里程计照常由 odometer_thread 自动更新
+        （它读 wheels_chassis.get_linear()）。
+        """
+        with self.car_lock:
+            self._realtime_check_locked()
+            vx = float(vx)
+            vy = float(vy)
+            wz = float(wz)
+            # 直接复用 chassis 的 IK（避免重复实现 mecanum 公式）
+            wheel_speeds = list(
+                self.car.chassis.calculate_wheel_velocities(vx, vy, wz)
+            )
+            # 直发轮速，绕开 set_velocity（set_velocity 会反复 lock + set）
+            self.car.wheels_chassis.set_linear([float(s) for s in wheel_speeds])
+            return {
+                "vx": vx,
+                "vy": vy,
+                "wz": wz,
+                "duration": duration,
+                "wheel_speeds": wheel_speeds,
+            }
+
     def get_wheel_encoders(self):
         with self.car_lock:
             self._realtime_check_locked()

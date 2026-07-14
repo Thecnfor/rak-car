@@ -16,32 +16,41 @@
 
 ### 1. 机械臂底层（不动的部分）
 
-- `smartcar/whalesbot/vehicle/arm/arm_base.py` `ArmController` 已经把 y 步进 / x 带编码器 / 手爪 PWM / 大臂总线舵机 / 气泵 / 限位 6 全部串起来。
-- `runtime/core/actions.py` `ARM_ACTIONS` 注册了 14 个 `arm.*` action，业务层调它就行。
-- 关键代码现状：
-  - `reset_y` 用 `y_limit_sensor.read() > 1000` 触底归零，**y 单边坐标 (≥0)**
-  - `reset_x` 用 `x_stop_check()`（编码器无变化连续 N 次）堵转归零，再靠 yml 的 `pose_horiz` 二次纠正
-  - `goto_position` 是两轴独立 PID 拼起来，曲线是 L 形折线，没有同步轨迹
-  - `x_speed` / `y_speed` 是开环速度下发，PID 是位置环
-  - `set_manually()` 4 键是 `Key4Btn(4)`，已有：`1=上, 3=下, 4=右, 2=左`
+* `smartcar/whalesbot/vehicle/arm/arm_base.py` `ArmController` 已经把 y 步进 / x 带编码器 / 手爪 PWM / 大臂总线舵机 / 气泵 / 限位 6 全部串起来。
+
+* `runtime/core/actions.py` `ARM_ACTIONS` 注册了 14 个 `arm.*` action，业务层调它就行。
+
+* 关键代码现状：
+
+  * `reset_y` 用 `y_limit_sensor.read() > 1000` 触底归零，**y 单边坐标 (≥0)**
+
+  * `reset_x` 用 `x_stop_check()`（编码器无变化连续 N 次）堵转归零，再靠 yml 的 `pose_horiz` 二次纠正
+
+  * `goto_position` 是两轴独立 PID 拼起来，曲线是 L 形折线，没有同步轨迹
+
+  * `x_speed` / `y_speed` 是开环速度下发，PID 是位置环
+
+  * `set_manually()` 4 键是 `Key4Btn(4)`，已有：`1=上, 3=下, 4=右, 2=左`
 
 ### 2. main 现状
 
-- `main/chassis/` 已经是"组别子包"模板：README、api.py (ChassisClient)、state.py、loops/closed_loop.py、loops/safety.py、controllers/、tasks/、examples/。
-- `main/arm/` 不存在。
-- 业务层与底层之间只通过 `RuntimeApiClient` / `RuntimeWsClient`，约束保留。
+* `main/chassis/` 已经是"组别子包"模板：README、api.py (ChassisClient)、state.py、loops/closed\_loop.py、loops/safety.py、controllers/、tasks/、examples/。
+
+* `main/arm/` 不存在。
+
+* 业务层与底层之间只通过 `RuntimeApiClient` / `RuntimeWsClient`，约束保留。
 
 ### 3. 用户已经拍板的设计
 
-| 决策点 | 用户选择 |
-| --- | --- |
-| 原点标定方式 | **4 键手动**到 y 触底、x 撞一侧墙 |
-| x 编码器 | 有编码器但无机械限位；**主动撞一侧墙**编码器读起点 |
-| y 坐标原点 | y **触底 = 0**（保险，实际不触底） |
-| 软限位 | **要的**，首次要靠手动调 |
-| 轨迹 | **S 曲线同步**双轴，给 API 准备好基础设施 |
-| main 层 API | **保持原名**（`arm.set_arm_pose` 等都不动） |
-| 文档 | main 下机械臂**单独工作区** + **所有 API 文档** + **快速上手** |
+| 决策点        | 用户选择                                          |
+| ---------- | --------------------------------------------- |
+| 原点标定方式     | **4 键手动**到 y 触底、x 撞一侧墙                        |
+| x 编码器      | 有编码器但无机械限位；**主动撞一侧墙**编码器读起点                   |
+| y 坐标原点     | y **触底 = 0**（保险，实际不触底）                        |
+| 软限位        | **要的**，首次要靠手动调                                |
+| 轨迹         | **S 曲线同步**双轴，给 API 准备好基础设施                    |
+| main 层 API | **保持原名**（`arm.set_arm_pose` 等都不动）             |
+| 文档         | main 下机械臂**单独工作区** + **所有 API 文档** + **快速上手** |
 
 ## Proposed Changes
 
@@ -140,16 +149,25 @@ class ArmClient:
 
 **关键点**：
 
-- `move_xy(...)` / `move_y` / `move_x` **底层都是调 `arm.goto_position` / `arm.move_y_position` / `arm.move_x_position`**（保留车端 PID + 现有逻辑），但**额外**通过 `trajectory.TrajectoryGenerator` 在客户端算 S 曲线监督：
-  - 启动前 1 次 dry-run，预测 `t_total`
-  - 不发到硬件
-  - 给业务层记录/日志/超时
-- `reset_origin(x_wall="left")` 走 `arm.reset_y` + `arm.reset_x` + 撞墙补偿
-  - y 触底 = 0（`y_pose_start = motor_y.get_dis()`，现有逻辑）
-  - x 撞左墙：先以慢速往左走 `x = -0.05`，等 `x_stop_check()` 触发（编码器 N 个 tick 不动），记录 `x_pose_start = motor_x.get_dis()`。这样**未来 x 坐标起点就是"撞左墙时的编码器值"**，由车端自己换算。
-  - x 撞右墙同理往右走
-  - **不主动往两侧都撞**，每次 `reset_origin` 只撞用户指定的那一侧
-- `set_pose(...)` 走 `arm.set_arm_pose(x, y, arm, hand)`，任意参数为 `None` 保持当前值
+* `move_xy(...)` / `move_y` / `move_x` **底层都是调** **`arm.goto_position`** **/** **`arm.move_y_position`** **/** **`arm.move_x_position`**（保留车端 PID + 现有逻辑），但**额外**通过 `trajectory.TrajectoryGenerator` 在客户端算 S 曲线监督：
+
+  * 启动前 1 次 dry-run，预测 `t_total`
+
+  * 不发到硬件
+
+  * 给业务层记录/日志/超时
+
+* `reset_origin(x_wall="left")` 走 `arm.reset_y` + `arm.reset_x` + 撞墙补偿
+
+  * y 触底 = 0（`y_pose_start = motor_y.get_dis()`，现有逻辑）
+
+  * x 撞左墙：先以慢速往左走 `x = -0.05`，等 `x_stop_check()` 触发（编码器 N 个 tick 不动），记录 `x_pose_start = motor_x.get_dis()`。这样**未来 x 坐标起点就是"撞左墙时的编码器值"**，由车端自己换算。
+
+  * x 撞右墙同理往右走
+
+  * **不主动往两侧都撞**，每次 `reset_origin` 只撞用户指定的那一侧
+
+* `set_pose(...)` 走 `arm.set_arm_pose(x, y, arm, hand)`，任意参数为 `None` 保持当前值
 
 #### 5.3 `main/arm/origin.py`（OriginCalibrator）
 
@@ -168,16 +186,16 @@ class OriginCalibrator:
 
 **按键映射**（与现有 `ArmController.set_manually` 一致）：
 
-| 键 | 行为 | 速度 |
-| --- | --- | --- |
-| 1 | y 下降 | 0.1 m/s（现有） |
-| 3 | y 上升 | 0.1 m/s（现有） |
-| 2 | x 左移 | 0.1 m/s（现有） |
-| 4 | x 右移 | 0.1 m/s（现有） |
-| 1+3 同时按 1s | 触发 `reset_origin`，落盘 `arm_origin.yaml` | — |
-| 1+3 同时按 3s | 退出程序 | — |
+| 键          | 行为                                     | 速度          |
+| ---------- | -------------------------------------- | ----------- |
+| 1          | y 下降                                   | 0.1 m/s（现有） |
+| 3          | y 上升                                   | 0.1 m/s（现有） |
+| 2          | x 左移                                   | 0.1 m/s（现有） |
+| 4          | x 右移                                   | 0.1 m/s（现有） |
+| 1+3 同时按 1s | 触发 `reset_origin`，落盘 `arm_origin.yaml` | —           |
+| 1+3 同时按 3s | 退出程序                                   | —           |
 
-**为什么用现有 `set_manually` 风格而不是新写**：现有 `set_manually` 是 `arm_base.py` 已经跑过的、4 键连续按住；新写反而引入第二套按键约定。
+**为什么用现有** **`set_manually`** **风格而不是新写**：现有 `set_manually` 是 `arm_base.py` 已经跑过的、4 键连续按住；新写反而引入第二套按键约定。
 
 **落盘格式**（`arm_origin.yaml`，放在 `main/arm/arm_origin.yaml`，gitignore）：
 
@@ -194,8 +212,10 @@ calibrated_at: 2026-07-14T10:00:00
 ```
 
 > 注意：底层 `ArmController` 已经把 `y_pose_start` / `x_pose_start` 存在 `arm_cfg.yaml:pos_cfg`，新加的 `arm_origin.yaml` 是**业务层坐标系软限位 + 标注**，不替代 `arm_cfg.yaml:pos_cfg`。两边职责分开：
-> - `arm_cfg.yaml:pos_cfg` = 车端硬件原点
-> - `main/arm/arm_origin.yaml` = 业务软限位
+>
+> * `arm_cfg.yaml:pos_cfg` = 车端硬件原点
+>
+> * `main/arm/arm_origin.yaml` = 业务软限位
 
 #### 5.4 `main/arm/trajectory.py`（S 曲线发生器）
 
@@ -226,11 +246,11 @@ class TrajectoryGenerator:
 
 **关键参数**：
 
-| 参数 | 默认 | 说明 |
-| --- | --- | --- |
-| `v_max` | 150 mm/s | x 轴最大线速度（从 yml `pid.output_limits` 0.2 m/s 推算） |
-| `a_max` | 400 mm/s² | 软启动加速度 |
-| `j_max` | 2000 mm/s³ | jerk 限制，避免启停冲击 |
+| 参数      | 默认         | 说明                                             |
+| ------- | ---------- | ---------------------------------------------- |
+| `v_max` | 150 mm/s   | x 轴最大线速度（从 yml `pid.output_limits` 0.2 m/s 推算） |
+| `a_max` | 400 mm/s²  | 软启动加速度                                         |
+| `j_max` | 2000 mm/s³ | jerk 限制，避免启停冲击                                 |
 
 > 这是**给业务层 dry-run / 日志用**，不是下发到硬件。硬件还是车端 PID。
 
@@ -251,25 +271,35 @@ class ArmRunner:
 
 #### 5.6 `main/arm/tasks/`（高层组合）
 
-- `go_home.py`: `move_xy(0, 0)` + `set_hand("UP")` + `set_side("MID")`
-- `pick_left.py`: `set_side("LEFT")` → `move_xy(x, y)` → `grasp(True)`
-- `pick_right.py`: 右侧同理
-- `release.py`: `set_hand("DOWN")` → `move_xy(0, drop_y)` → `grasp(False)`
+* `go_home.py`: `move_xy(0, 0)` + `set_hand("UP")` + `set_side("MID")`
+
+* `pick_left.py`: `set_side("LEFT")` → `move_xy(x, y)` → `grasp(True)`
+
+* `pick_right.py`: 右侧同理
+
+* `release.py`: `set_hand("DOWN")` → `move_xy(0, drop_y)` → `grasp(False)`
 
 #### 5.7 `main/arm/examples/`
 
-- `01_calibrate_origin.py`：启动 `OriginCalibrator`，按提示按 4 键。
-- `02_trajectory_preview.py`：只算 S 曲线不连车，打印 t-x-y 表格。
-- `03_move_xy_basic.py`：先 calibrate 一次，然后 `move_xy(100, 80)`。
-- `04_grasp_template.py`：完整 pick-and-place 模板。
+* `01_calibrate_origin.py`：启动 `OriginCalibrator`，按提示按 4 键。
+
+* `02_trajectory_preview.py`：只算 S 曲线不连车，打印 t-x-y 表格。
+
+* `03_move_xy_basic.py`：先 calibrate 一次，然后 `move_xy(100, 80)`。
+
+* `04_grasp_template.py`：完整 pick-and-place 模板。
 
 #### 5.8 文档
 
-- `main/arm/README.md`：照 `main/chassis/README.md` 体例写。
-- `main/arm/ARM_API.md`：业务层机械臂 API 速查，含 `arm.*` 原始 action 速查 + `ArmClient` 便捷方法 + 状态字段。
-- `main/arm/QUICKSTART.md`：10 行起步：`pip install`、`calibrate_origin`、第一个 `move_xy`。
-- 在 `main/README.md` 加一段"机械臂" 引导到 `main/arm/QUICKSTART.md`。
-- 在 `main/API.md` 第 7 节 `arm` 末尾加一行"业务侧推荐用 `from main.arm import ArmClient`"。
+* `main/arm/README.md`：照 `main/chassis/README.md` 体例写。
+
+* `main/arm/ARM_API.md`：业务层机械臂 API 速查，含 `arm.*` 原始 action 速查 + `ArmClient` 便捷方法 + 状态字段。
+
+* `main/arm/QUICKSTART.md`：10 行起步：`pip install`、`calibrate_origin`、第一个 `move_xy`。
+
+* 在 `main/README.md` 加一段"机械臂" 引导到 `main/arm/QUICKSTART.md`。
+
+* 在 `main/API.md` 第 7 节 `arm` 末尾加一行"业务侧推荐用 `from main.arm import ArmClient`"。
 
 #### 5.9 `.gitignore`
 
@@ -294,73 +324,113 @@ __all__ = ["ArmClient", "ArmState", "OriginCalibrator",
 1. **4 键连续按住**：直接复用 `arm_base.ArmController.set_manually()` 的按键约定（1=上、3=下、2=左、4=右），**不**新写一套点动逻辑（你选了连续按住）。
 2. **x 撞墙方向可配**：默认 `x_wall="left"`（与车端 `reset_x` 目标 `-0.33` 一致）。
 3. **S 曲线不在车端跑**：车端继续用现成 PID；S 曲线是**客户端** dry-run + 日志，避免改 runtime。
-4. **`arm_origin.yaml` 与 `arm_cfg.yaml:pos_cfg` 共存**：前者业务软限位，后者车端硬件原点。**不**改 `arm_cfg.yaml`。
-5. **不动 `runtime/core/actions.py`**：现有 14 个 `arm.*` action 已经够用。
+4. **`arm_origin.yaml`** **与** **`arm_cfg.yaml:pos_cfg`** **共存**：前者业务软限位，后者车端硬件原点。**不**改 `arm_cfg.yaml`。
+5. **不动** **`runtime/core/actions.py`**：现有 14 个 `arm.*` action 已经够用。
 6. **业务层 API 名字不变**：`arm.set_arm_pose` / `arm.move_xy_position` 等保持原名；`main/arm/` 是薄包装，不替代。
 7. **首次 calibrate 必须有人**：第一次跑 `01_calibrate_origin.py` 需要按 4 键把机械臂移到触底 + 撞墙；后续 `arm.reset_origin()` 自动做。
 8. **calibrate 写文件不是直接调车端 reset**：避免在 calibrate 流程中触发车端 reset 误判。
 
 ## Files to be created
 
-- `main/arm/__init__.py`
-- `main/arm/README.md`
-- `main/arm/ARM_API.md`
-- `main/arm/QUICKSTART.md`
-- `main/arm/api.py`
-- `main/arm/state.py`
-- `main/arm/origin.py`
-- `main/arm/trajectory.py`
-- `main/arm/loops/__init__.py`
-- `main/arm/loops/runner.py`
-- `main/arm/tasks/__init__.py`
-- `main/arm/tasks/go_home.py`
-- `main/arm/tasks/pick_left.py`
-- `main/arm/tasks/pick_right.py`
-- `main/arm/tasks/release.py`
-- `main/arm/examples/__init__.py`
-- `main/arm/examples/01_calibrate_origin.py`
-- `main/arm/examples/02_trajectory_preview.py`
-- `main/arm/examples/03_move_xy_basic.py`
-- `main/arm/examples/04_grasp_template.py`
-- `main/arm/arm_origin.yaml`（含注释模板 + gitignore）
+* `main/arm/__init__.py`
+
+* `main/arm/README.md`
+
+* `main/arm/ARM_API.md`
+
+* `main/arm/QUICKSTART.md`
+
+* `main/arm/api.py`
+
+* `main/arm/state.py`
+
+* `main/arm/origin.py`
+
+* `main/arm/trajectory.py`
+
+* `main/arm/loops/__init__.py`
+
+* `main/arm/loops/runner.py`
+
+* `main/arm/tasks/__init__.py`
+
+* `main/arm/tasks/go_home.py`
+
+* `main/arm/tasks/pick_left.py`
+
+* `main/arm/tasks/pick_right.py`
+
+* `main/arm/tasks/release.py`
+
+* `main/arm/examples/__init__.py`
+
+* `main/arm/examples/01_calibrate_origin.py`
+
+* `main/arm/examples/02_trajectory_preview.py`
+
+* `main/arm/examples/03_move_xy_basic.py`
+
+* `main/arm/examples/04_grasp_template.py`
+
+* `main/arm/arm_origin.yaml`（含注释模板 + gitignore）
 
 ## Files to be modified
 
-- `main/README.md` — 在目录索引里加 `arm/`
-- `main/API.md` — 第 7 节 `arm` 末尾加 `main/arm` 业务封装推荐
-- `.gitignore` — 第 153 行附近加 `main/arm/arm_origin.yaml`
+* `main/README.md` — 在目录索引里加 `arm/`
+
+* `main/API.md` — 第 7 节 `arm` 末尾加 `main/arm` 业务封装推荐
+
+* `.gitignore` — 第 153 行附近加 `main/arm/arm_origin.yaml`
 
 ## Files NOT touched
 
-- `smartcar/whalesbot/vehicle/arm/arm_base.py`（底层不动）
-- `runtime/core/actions.py`（action 名不动）
-- `main/api_client.py`（HTTP 客户端不动）
-- 现有 14 个 `arm.*` action 名字
+* `smartcar/whalesbot/vehicle/arm/arm_base.py`（底层不动）
+
+* `runtime/core/actions.py`（action 名不动）
+
+* `main/api_client.py`（HTTP 客户端不动）
+
+* 现有 14 个 `arm.*` action 名字
 
 ## Verification
 
 1. **静态校验**
-   - `python3 -c "from main.arm import ArmClient, ArmState, OriginCalibrator, TrajectoryGenerator"` 不报错
-   - `python3 -c "from main.arm.trajectory import TrajectoryGenerator; t = TrajectoryGenerator(); p = t.plan_xy(0, 0, 100, 80, 150, 400, 2000); print(p.T, p.peak_v)"` 输出 `t_peak`
-   - `python3 main/arm/examples/02_trajectory_preview.py` 跑完打 t-x-y 表格
+
+   * `python3 -c "from main.arm import ArmClient, ArmState, OriginCalibrator, TrajectoryGenerator"` 不报错
+
+   * `python3 -c "from main.arm.trajectory import TrajectoryGenerator; t = TrajectoryGenerator(); p = t.plan_xy(0, 0, 100, 80, 150, 400, 2000); print(p.T, p.peak_v)"` 输出 `t_peak`
+
+   * `python3 main/arm/examples/02_trajectory_preview.py` 跑完打 t-x-y 表格
 
 2. **冒烟测试**（在有车硬件时）
-   - `python3 main/arm/examples/01_calibrate_origin.py` — 4 键定原点，文件写入 `arm_origin.yaml`
-   - `python3 main/arm/examples/03_move_xy_basic.py` — 触发 `arm.move_xy_position` 不抛异常
-   - `python3 main/arm/examples/04_grasp_template.py` — set_side + move_xy + grasp 不抛异常
+
+   * `python3 main/arm/examples/01_calibrate_origin.py` — 4 键定原点，文件写入 `arm_origin.yaml`
+
+   * `python3 main/arm/examples/03_move_xy_basic.py` — 触发 `arm.move_xy_position` 不抛异常
+
+   * `python3 main/arm/examples/04_grasp_template.py` — set\_side + move\_xy + grasp 不抛异常
 
 3. **回归**
-   - `python3 main/quick_start.py`（不动）仍能跑
-   - `main/chassis/examples/01_minimal_p_lane.py`（不动）仍能跑
+
+   * `python3 main/quick_start.py`（不动）仍能跑
+
+   * `main/chassis/examples/01_minimal_p_lane.py`（不动）仍能跑
 
 4. **文档**
-   - 业务同学只看 `main/arm/QUICKSTART.md` 能 5 分钟起一个 move_xy
+
+   * 业务同学只看 `main/arm/QUICKSTART.md` 能 5 分钟起一个 move\_xy
 
 ## Out of scope (本次不做)
 
-- 不改 `arm_base.py` 的 PID / 触底逻辑 / x 撞墙判定（车端已有）
-- 不动 MC602 协议层
-- 不加新 action（`arm.*` 14 个不动）
-- 不实现"双原点"（y 触底 + y 触顶都记）
-- 不做 multi-arm
-- 不加可视化（matplotlib、S 曲线 plot 留到 examples 之外再说）
+* 不改 `arm_base.py` 的 PID / 触底逻辑 / x 撞墙判定（车端已有）
+
+* 不动 MC602 协议层
+
+* 不加新 action（`arm.*` 14 个不动）
+
+* 不实现"双原点"（y 触底 + y 触顶都记）
+
+* 不做 multi-arm
+
+* 不加可视化（matplotlib、S 曲线 plot 留到 examples 之外再说）
+

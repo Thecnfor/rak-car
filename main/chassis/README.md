@@ -1,138 +1,424 @@
-# main/chassis —— 底盘组独享子包
+# main/chassis —— 底盘组独享工作区
 
-> 这份文档只回答一件事：**底盘组跑自动寻线（client 端外环）需要知道哪些 API、怎么搭起来**。
-> 完整 API 总表见 `main/API_REFERENCE.md`，本文件不再重复。
+> **一句话定位**：`main/chassis/` = 客户端外环（50Hz 控制律 + 安全兜底）全套工具。
+> 底盘同学只需要新写 `controllers/*.py` 和组合 `tasks/*.py`；其它（HTTP/WS、lane 误差源、轮速下发、安全门）都在这一层包好了。
 
-## 一句话定位
+---
 
-`main/chassis/` = **底盘组专属子包**：自动寻线（lane 推理→客户端控制律→轮速下发）的主循环在这里；底盘只需要新写控律、组合任务，其他全部走 API。
+## 目录
 
-## 双环怎么搭
+1. [架构与双环数据流](#1-架构与双环数据流)
+2. [10 行起步](#2-10-行起步)
+3. [`ChassisClient` 全 API 表](#3-chassisclient-全-api-表)
+4. [`state.py` 数据契约](#4-statepy-数据契约)
+5. [`controllers/` 控制律库](#5-controllers-控制律库)
+6. [`loops/` 主循环与安全兜底](#6-loops-主循环与安全兜底)
+7. [`tasks/` 高层任务组合](#7-tasks-高层任务组合)
+8. [`examples/` 索引](#8-examples-索引)
+9. [调参 checklist](#9-调参-checklist)
+10. [三条红线（踩坑 FAQ）](#10-三条红线踩坑-faq)
+11. [性能基准](#11-性能基准)
+12. [目录结构](#12-目录结构)
 
-- **外环（客户端，50Hz）**
-  - 订阅 `GET /v1/vision/lane/state` 拿 `(error_y, error_angle, distance, mode)`。
-  - 客户端按自己算法（Stanley / Pure Pursuit / P）算 4 轮线速度 `[v1, v2, v3, v4]`（m/s）。
-  - 通过 `POST /v1/realtime/wheels/speeds`（或 ws `realtime/wheel_speeds`）直接下发到 MC602，绕开车端 job_queue。
-- **内环（车端，车端已有 PID）**
-  - `car.move_to_position` / `car.move_for` / `car.lane_*` / `car.move_to_detection_target` 都在车端跑 PID。
-  - **重要**：client 端外环跑起来后，**不要再开 `car.lane_*`**，否则会和外环互斥排队。
+---
 
-## 10 行起步
+## 1. 架构与双环数据流
+
+```
+┌─────────────────── 车端 (Jetson) ───────────────────┐  ┌── 客户端 (任何主机) ──┐
+│                                                    │  │                       │
+│  cam1 ─► ZMQ port 5001 (lane) ─► start_lane_feed ─┼──┤                       │
+│                                       │            │  │                       │
+│                                       ▼            │  │   ┌──────────────┐    │
+│                                  lane_state  ◄────┼──┼───┤ get_lane_state│    │
+│                                       │            │  │   └──────┬───────┘    │
+│   调度 / 内环 PID:                    │            │  │          ▼            │
+│     car.lane_* / move_* /             │            │  │   ┌──────────────┐    │
+│     move_to_detection_target          │            │  │   │  OuterLoop   │    │
+│                                       │            │  │   │   .step()    │    │
+│   wheels_chassis ◄── set_wheel_speeds ┼────────────┼──┼───┤  → [v1..v4]  │    │
+│                                       │            │  │   └──────┬───────┘    │
+│                                       │            │  │          ▼            │
+│                                       │            │  │   ┌──────────────┐    │
+│   odometer_thread ─► odometry / encoders ◄────────┼──┼───┤ set_wheel_sp │    │
+│                                                    │  │   └──────────────┘    │
+└────────────────────────────────────────────────────┘  └───────────────────────┘
+
+外环：客户端，20-50Hz，控制律只读 lane_state，写 4 轮速
+内环：车端，PID（已存在），吃 4 轮速直接驱动
+车端 lane_feed：单独线程，只刷 lane_state 不下发轮速（不抢 car_lock）
+```
+
+**核心原则**：外环和内环 **不能同时跑**。`start_lane_feed` 是"只刷 state"的旁路线程，跟外环下发轮速不冲突；但如果你又开了 `car.lane_*`（车端内环 PID），就会撞 `car_lock`，外环被串行化延迟。
+
+---
+
+## 2. 10 行起步
 
 ```python
 from main.chassis import ChassisClient, DoubleLoopRunner, POuterLoop
 
-api = ChassisClient.connect()             # 默认走 env: RAK_CAR_SERVER_ORIGIN
-api.start_lane_feed(hz=20.0)              # 车端开 lane 误差缓存线程（不动轮速）
-runner = DoubleLoopRunner(api=api, outer=POuterLoop(vx=0.3), hz=50.0)
-runner.run(max_seconds=15.0)               # 内置 zero out 退出
+api = ChassisClient.connect()                  # 1. 连 HTTP + WS（自动）
+api.start_lane_feed(hz=20.0)                   # 2. 车端开 lane 误差缓存
+runner = DoubleLoopRunner(
+    api=api,
+    outer=POuterLoop(vx=0.3),                  # 3. 控制律：P 起步
+    hz=50.0,
+)
+runner.run(max_seconds=15.0)                    # 4. 跑 15 秒（自动 zero out）
+api.stop_lane_feed()                           # 5. 关守护线程
+```
+
+完整示例：`examples/01_minimal_p_lane.py`。
+
+---
+
+## 3. `ChassisClient` 全 API 表
+
+> 所有方法都走 `RuntimeApiClient`（HTTP）或 `RuntimeWsClient`（WS）。
+> `set_wheel_speeds` / `set_single_motor` **优先 WS**（实时路径），WS 断了自动回退 HTTP。
+
+| 方法 | 底层 HTTP / WS | 返回 | 量纲 | 推荐频率 |
+| --- | --- | --- | --- | --- |
+| `connect()` | — | `ChassisClient` | — | 启动一次 |
+| `start_lane_feed(hz=20)` | `POST /v1/vision/lane/feed` | `{started, hz}` | Hz | 启动一次 |
+| `stop_lane_feed()` | `POST /v1/vision/lane/feed/stop` | `{stopped}` | — | 退出必调 |
+| `stop_wheel_speeds()` | `realtime/wheel_speeds [0,0,0,0]` | `{speeds: [0,0,0,0]}` | m/s | 退出必调 |
+| `emergency_stop()` | `POST /v1/control/emergency-stop` | `{stopped}` | — | 兜底 |
+| `get_lane_state()` | `GET /v1/vision/lane/state` | dict | — | ≤50Hz |
+| `get_odometry()` | `car.get_odometry` | `(x, y, theta)` float3 | m, m, rad | ≤50Hz |
+| `get_wheel_encoders()` | `GET /v1/realtime/wheels/encoders` | list[float] (4) | rad 累计 | ≤50Hz |
+| `set_wheel_speeds([v1,v2,v3,v4])` | ws `realtime/wheel_speeds` | `{speeds}` | m/s | ≤50Hz |
+| `set_single_motor(port, speed, reverse=1)` | ws `realtime/motor_speed` | `{port, speed, reverse}` | — | ≤50Hz |
+| `ping()` | `GET /v1/health` | bool | — | 1Hz |
+
+**量纲约定**（与车端 SDK 一致）：
+
+- 轮速 `m/s`
+- 编码器 `rad` 累计（不是位移）
+- `error_y` `m`、`error_angle` `rad`
+- `odometry` `(x, y, theta)` 世界坐标系，m / m / rad
+
+**错误码**（HTTPException 抛出）：
+
+| 状态码 | 含义 | 处理 |
+| --- | --- | --- |
+| 400 | 参数错误（如 wheel_speeds 不是 4 个 float） | 检查入参 |
+| 409 | car 未初始化 / runtime 卡死 | `GET /v1/health` 看 `state.initialized` |
+| 504 | job 超时 | 提高 timeout 或检查 lane_feed |
+
+---
+
+## 4. `state.py` 数据契约
+
+底盘组的控制律 **只接 dataclass，不接 dict**。
+
+### `LaneState`
+
+```python
+@dataclass
+class LaneState:
+    error_y: Optional[float]   # 横向误差（m），左侧为正
+    error_angle: Optional[float]  # 角度误差（rad），逆时针为正
+    forward: Optional[float]    # 历史 forward_speed（外部 feed 时为 None）
+    lateral: Optional[float]    # 历史 lateral_speed（同上）
+    angular: Optional[float]    # 历史 angular_speed（同上）
+    distance: Optional[float]   # 累计行驶距离（m）
+    mode: Optional[str]         # tracking / external_feed / idle / stopped
+    age_ms: Optional[float]     # 距离上次更新的毫秒数
+```
+
+**属性**：
+
+- `is_fresh`：`age_ms is not None and age_ms < 500.0`（<500ms 视为新鲜）
+- `has_error`：`error_y and error_angle 都不为 None`
+
+**来源**：
+
+```python
+LaneState.from_lane_state_payload(payload)  # payload 来自 get_lane_state()
+```
+
+**控制律使用规范**：
+
+```python
+def step(self, state: LaneState, dt: float) -> List[float]:
+    if not state.has_error:
+        return self._safe_zero()      # 没误差 → 零速，不要硬推
+    # ... 用 state.error_y / state.error_angle 算 ...
+```
+
+### `OdometryState` / `WheelsState`
+
+只读 dataclass，给上层任务（点到点、航位推算）用，目前 `ChassisClient` 还没暴露它们的 dataclass 形式，按需扩展。
+
+---
+
+## 5. `controllers/` 控制律库
+
+### P / Stanley / Pure Pursuit 公式与适用场景
+
+| 控律 | 类 | 公式 | 适用场景 | 调参难度 |
+| --- | --- | --- | --- | --- |
+| **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
+| **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
+| **Pure Pursuit** | `PurePursuitOuterLoop` | 视觉误差当假想目标点 → 几何曲率 → omega | 占位骨架（需替换为目标轨迹） | ⭐⭐⭐ |
+
+**实测典型取值**（调参从这开始）：
+
+| 参数 | 起步值 | 调大 | 调小 |
+| --- | --- | --- | --- |
+| `vx` | 0.3 m/s | 跑得更快（弯道要多调 P） | 慢速更稳 |
+| `kp_y` (P) | 0.4 | 横移更猛（直线偏离修得快） | 减小震荡 |
+| `kp_theta` (P) | 1.2 | 转向更猛 | 减小过冲 |
+| `k` (Stanley) | 0.6 | 误差大时转向更猛 | 减少摇摆 |
+| `look_ahead_m` (PP) | 0.6 m | 提前减速（弯道更平滑） | 提前切入（直线更稳） |
+| `r_eff` | 0.30 m | 一般不改 | 一般不改 |
+
+**r_eff 是什么**：麦轮几何里"角速度 → 4 轮异速"的耦合系数。等于 `(track/2 + wheel_base/2)`，从 `cfg_vehicle.yaml` 算出来是 `(0.30/2 + 0.28/2) = 0.29`，代码里写 0.30 是凑整。
+
+### 新增一个控制律
+
+继承 `controllers/base.py:OuterLoop`，实现一个 `step()`：
+
+```python
+from typing import List
+from main.chassis.controllers.base import OuterLoop
+from main.chassis.state import LaneState
+
+class MyOuterLoop(OuterLoop):
+    def __init__(self, ...):
+        ...
+
+    def step(self, state: LaneState, dt: float) -> List[float]:
+        if not state.has_error:
+            return self._safe_zero()
+        # 你的控制律
+        vx, vy, omega = ...
+        # 用 base.mecanum_inverse(vx, vy, omega, r_eff) 反算 4 轮速
+        return mecanum_inverse(vx, vy, omega, r_eff=0.30)
+```
+
+放在 `controllers/my_controller.py`，加到 `__init__.py` 的 `__all__`。
+
+---
+
+## 6. `loops/` 主循环与安全兜底
+
+### `DoubleLoopRunner`（外环主循环）
+
+```python
+DoubleLoopRunner(
+    api=api,
+    outer=POuterLoop(vx=0.3),
+    hz=50.0,                  # 闭环频率
+    watchdog_ms=500.0,        # lane_state 太久没刷就急停
+    on_tick=lambda state, speeds: print(state.error_y),  # 可选回调
+)
+runner.run(max_seconds=15.0)
+```
+
+**调度**：
+
+```
+now = monotonic
+while not self._stop and now < deadline:
+    state = self._sense()                            # 拉 lane_state
+    if watchdog.should_stop(state) or lost.should_alert(state):
+        emergency_stop()
+        break
+    speeds = outer.step(state, dt)                   # 控制律
+    api.set_wheel_speeds(speeds)                     # 下发
+    on_tick(state, speeds)                           # 回调（try/except 兜住）
+    next_tick += dt
+    sleep if 落后 < 0.5*dt else 放弃补偿避免 catching up
+finally:
+    api.set_wheel_speeds([0, 0, 0, 0])               # 自动 zero out
+```
+
+**关键不变量**：
+
+- 任何异常路径都走 `finally` → 零速（不会留轮速在那空转）
+- 调度落后超过 `dt/2` 就放弃补偿，不 catch up（避免突发阻塞后追帧）
+- `emergency_stop` 触发后立刻退出，不会再下发轮速
+
+### `EmergencyWatchdog(threshold_ms=500)`
+
+```python
+def should_stop(self, state):
+    return state.age_ms is not None and state.age_ms > threshold_ms
+```
+
+**触发场景**：车端 `lane_feed` 卡死、lane 推理超时、runtime 重启。500ms 是经验值，外环 50Hz × 2 = 100ms 一帧，500ms 已经 5 帧没数据，肯定有问题。
+
+### `LostLineDetector(stable_ms=300, zero_eps=1e-3)`
+
+```python
+def should_alert(self, state):
+    if error is None: return False
+    near_zero = |error_y| < 1e-3 and |error_angle| < 1e-3
+    return 已经齐 0 持续 stable_ms
+```
+
+**触发场景**：车真到了终点（误差都 ≈ 0）、或者丢线（推理炸了返回全 0）。300ms 是经验值，太短会误报（正常过直线段也接近 0）。
+
+---
+
+## 7. `tasks/` 高层任务组合
+
+| 任务 | 用途 | 走哪个环 |
+| --- | --- | --- |
+| `follow_lane(api, outer, dis_hold=1.5, timeout_s=30)` | 起 lane feed + 外环跑 N 秒 | **外环** |
+| `track_target(api, label=None, delta_x=0, delta_y=None, time_out=3)` | 让位给车端 `car.move_to_detection_target` 微调终点 | **内环** |
+| `back_to_line(api, straight_seconds=0.6, vx=0.2)` | 丢线时直行恢复（占位骨架） | **外环** |
+
+### 任务编排模板
+
+```python
+from main.chassis import ChassisClient, DoubleLoopRunner, StanleyOuterLoop
+from main.chassis.tasks import follow_lane, track_target
+
+api = ChassisClient.connect()
+
+# Phase 1：外环巡线（沿主车道走）
+follow_lane(api, outer=StanleyOuterLoop(vx=0.3), timeout_s=10.0)
+
+# Phase 2：让位给内环（车端 PID 做视觉终点微调）
+api.stop_wheel_speeds()
+track_target(api, label=None, time_out=3.0)
 api.stop_lane_feed()
 ```
 
-完整示例在 `examples/01_minimal_p_lane.py`。
+### `back_to_line` 注意事项
 
-## 底盘组专用 API 子集
+- 当前是直行兜底，**底盘组按真实"丢线恢复"策略替换**（比如倒车、转 90° 找线）
+- 默认 `straight_seconds=0.6s`，按麦轮 0.2m/s 估算走过 12cm，按场地调
 
-| 用途 | 接口 | 推荐方式 | 推荐频率 |
+---
+
+## 8. `examples/` 索引
+
+| 文件 | 场景 | 频率 | 控制律 |
 | --- | --- | --- | --- |
-| **喂 lane 误差源**（客户端外环必备） | `car.start_lane_feed` / `car.stop_lane_feed` | `ChassisClient.start_lane_feed(hz)` | 启动一次 |
-| **读 lane 误差**（外环每帧必读） | `GET /v1/vision/lane/state` | `ChassisClient.get_lane_state()` | ≤50Hz |
-| **下发轮速**（外环每帧必写） | `POST /v1/realtime/wheels/speeds` 或 ws `realtime/wheel_speeds` | `ChassisClient.set_wheel_speeds([v1,v2,v3,v4])` | ≤50Hz |
-| **读里程计**（点到点/航位推算用） | `car.get_odometry` | `ChassisClient.get_odometry()` | ≤50Hz |
-| **读编码器**（高级控律用） | `GET /v1/realtime/wheels/encoders` | `ChassisClient.get_wheel_encoders()` | ≤50Hz |
-| **急停** | `POST /v1/control/emergency-stop` | `ChassisClient.emergency_stop()` | 任意 |
-| **健康检查** | `GET /v1/health` 或 ws `ping` | `ChassisClient.ping()` | 1Hz |
-| **视觉对齐（内环触发）** | `car.move_to_detection_target` | `tasks.track_target(...)` 包装 | 1–2Hz |
-| **巡线内环（兜底用）** | `car.lane_dis_offset` | 直接调 | 1–2Hz |
+| `01_minimal_p_lane.py` | 起步、直线赛道、低速 | 50Hz | `POuterLoop` |
+| `02_stanley_lane.py` | 弯道、中速 | 50Hz | `StanleyOuterLoop` |
+| `03_p2p_with_vision.py` | 巡线 → 视觉终点微调（外环+内环切换） | 50Hz | `StanleyOuterLoop` + `track_target` |
 
-### 1. `car.start_lane_feed(hz=20.0)`
+**用法**：
 
-- **做什么**：车端起一个守护线程，**只**跑 `get_lane_results()` 并把 `(error_y, error_angle, distance)` 写到 `/v1/vision/lane/state`。
-- **不做什么**：不调用任何 `set_velocity` / `set_wheel_speeds`，不会和你的外环抢锁。
-- **同一时刻只允许一个实例**，重复调用 noop。
-- 参数：`hz` 默认 20（外环 50Hz 完全够用；上限受 lane 推理 ≈5–10ms 限制）。
+```bash
+# 默认参数（vx=0.3, 15/20/5 秒）
+python3 main/chassis/examples/01_minimal_p_lane.py
 
-### 2. `GET /v1/vision/lane/state`
-
-返回示例：
-
-```json
-{
-  "active": true,
-  "mode": "external_feed",
-  "error_y": -0.0234,
-  "error_angle": 0.087,
-  "forward_speed": null,
-  "lateral_speed": null,
-  "angular_speed": null,
-  "distance": 1.234,
-  "updated_at": 1761234567.890,
-  "frame_url": "/stream/frame/cam1.jpg",
-  "preview_url": "/stream/"
-}
+# 自定义
+python3 -c "from main.chassis.examples import 01_minimal_p_lane; 01_minimal_p_lane.main(max_seconds=30, vx=0.4)"
 ```
 
-`LaneState.from_lane_state_payload(...)` 会把它转成 dataclass，自动算 `age_ms`；超过 500ms 没刷新 `DoubleLoopRunner` 会自动 `emergency_stop`。
+---
 
-### 3. 下发轮速
+## 9. 调参 checklist
 
-- **WebSocket 优先**：底层 `ChassisClient.set_wheel_speeds(...)` 优先走 ws `realtime/wheel_speeds`，失败回退 http。
-- **量纲**：4 个 m/s 线速度，`v1 v2 v3 v4` 分别对应车端 `wheels_chassis.set_linear(...)` 的 4 个轮；逆解由车端完成。
-- **典型前向 0.3 m/s + 横移 ±0.1 m/s + 角速度 ±0.5 rad/s** 是这辆麦轮的常用域。
+按这个顺序调，最稳：
 
-### 4. 客户端控制律（controllers/）
+1. **`vx`**：先固定 `vx=0.3`，确认场地能直走（无 lane 误差时稳态 ≈0）
+2. **`kp_theta`**：先只调转向，看弯道能不能跟（`Stanley` 或 P 的转向项）
+3. **`kp_y`**：再加横向修正（误差大时横移修正）
+4. **`watchdog_ms`**：如果 lane 推理慢，调大到 1000-2000ms
+5. **`hz`**：外环上限受 lane_feed 推理速度限制，**实测 50Hz 跑不通就降到 30Hz**，别硬撑
+6. **`r_eff`**：换车体（轮距/轴距变）才需要改
 
-| 名字 | 含义 | 行数 |
+**调参时一定要打印这几个量**：
+
+```python
+DoubleLoopRunner(
+    api=api, outer=...,
+    on_tick=lambda state, speeds: print(
+        f"ey={state.error_y:+.4f} ea={state.error_angle:+.4f} "
+        f"age={state.age_ms:.0f}ms speeds={speeds}"
+    ),
+)
+```
+
+---
+
+## 10. 三条红线（踩坑 FAQ）
+
+### 🔴 1. `start_lane_feed` 跑起来后，**不要**再调 `car.lane_*`
+
+- **症状**：外环轮速下发被串行化，50Hz 变成 5-10Hz，车一抖一抖
+- **原因**：`car.lane_*` 走 `car_lock`，外环也走 `car_lock`（虽然走的是 `realtime/wheel_speeds` 路径），相互等锁
+- **检查**：调试时打印 `api.ws_ready` 和 `/v1/health.components.controller.ready`
+
+### 🔴 2. **不要**用 `POST /v1/execute` 下发轮速
+
+- **症状**：50Hz 走 job_queue 排队变成 5Hz
+- **正确**：
+  - WS：`op: realtime/wheel_speeds` 或 `op: realtime/chassis_velocity`
+  - HTTP：`POST /v1/realtime/wheels/speeds` 或 `POST /v1/realtime/chassis-velocity`
+- **代码层强制**：`ChassisClient.set_wheel_speeds` 内部已经只走这两个入口，业务层不会误用
+
+### 🔴 3. **任何脚本入口都要 `try/finally: api.stop_wheel_speeds()`**
+
+- **症状**：Ctrl-C 后车一直以最后那个轮速冲出去
+- **`DoubleLoopRunner.run` 已经做了**，手写循环请照抄：
+
+```python
+try:
+    api.start_lane_feed(hz=20)
+    while True:
+        ...
+finally:
+    api.stop_wheel_speeds()    # ← 必加
+    api.stop_lane_feed()
+```
+
+---
+
+## 11. 性能基准
+
+| 项 | 实测值 | 备注 |
 | --- | --- | --- |
-| `POuterLoop` | 最简 P：`-kp_y * error_y` 横移 / `-kp_theta * error_angle` 角速度 | <40 |
-| `StanleyOuterLoop` | Stanley：误差角度 + arctan(k*error_y/v) | <50 |
-| `PurePursuitOuterLoop` | Pure Pursuit 占位（按 LaneState 模拟前方目标点） | <60 |
+| 外环频率 | 50Hz | 受 lane 推理 ~5-10ms + HTTP/WS RTT ~2-5ms 限制 |
+| `lane_feed` 推送频率 | 15-20Hz | 受 ZMQ 推理 + service 层 set_lane_state 限制 |
+| 单轮端到端 RTT（WS） | ~5ms | ws 路径比 http 快 ~3-5ms |
+| 单轮端到端 RTT（HTTP） | ~10ms | 仍能跑 50Hz，但留余量小 |
+| WebSocket push 5s | ~80 次 | `subscribe_lane` 实测（受 lane_feed 频率上限约束） |
+| lane_outer_loop.py 3.3s | 51 push + 51 下发 | 15.5 Hz 端到端 |
 
-新增控律：继承 `controllers/base.py:OuterLoop`，实现 `step(state, dt) -> [v1,v2,v3,v4]`。`state.has_error / state.error_y / state.error_angle / state.distance` 是稳定字段。
+---
 
-### 5. 安全与兜底（loops/safety.py）
-
-- `EmergencyWatchdog(threshold_ms)`：`lane_state.age_ms` 超阈值 → `emergency_stop`。
-- `LostLineDetector(stable_ms, zero_eps)`：误差值齐 0 持续 `stable_ms` → 视作丢线报警。
-
-`DoubleLoopRunner` 已默认接入两者，底盘同学可直接用。
-
-## 目录结构
+## 12. 目录结构
 
 ```
 main/chassis/
 ├── README.md                 ← 你正在看
-├── __init__.py
-├── api.py                    ← ChassisClient：薄封装 main.api_client / main.ws_client
+├── __init__.py               ← 只导出 public API
+├── api.py                    ← ChassisClient：薄封装 RuntimeApiClient/WS
 ├── state.py                  ← LaneState / OdometryState / WheelsState
 ├── loops/
 │   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环
 │   └── safety.py             ← EmergencyWatchdog / LostLineDetector
 ├── controllers/
 │   ├── base.py               ← OuterLoop ABC + mecanum_inverse helper
-│   ├── p_controller.py
-│   ├── stanley.py
-│   └── pure_pursuit.py
+│   ├── p_controller.py       ← POuterLoop
+│   ├── stanley.py            ← StanleyOuterLoop
+│   └── pure_pursuit.py       ← PurePursuitOuterLoop（占位骨架）
 ├── tasks/                    ← 高层组合（外环 + 内环事件）
 │   ├── follow_lane.py        ← 起 lane feed + 外环跑 N 秒
 │   ├── track_target.py       ← car.move_to_detection_target 包装
 │   └── back_to_line.py       ← 丢线恢复（直走 straight_seconds）
-└── examples/
-    ├── 01_minimal_p_lane.py  ← README 中引用的 10 行起步
+└── examples/                 ← 3 个起步脚本
+    ├── 01_minimal_p_lane.py
     ├── 02_stanley_lane.py
     └── 03_p2p_with_vision.py
 ```
 
-## 三条红线
-
-1. **`start_lane_feed` 跑起来后，不要再调 `car.lane_*`**——会撞 car_lock，让外环下发被串行化。
-2. **50Hz 闭环只走 `/v1/realtime/wheel_speeds`**（或 ws `realtime/wheel_speeds`）；不要走 `POST /v1/execute`——会进 job queue 排队。
-3. **任何脚本入口都要 `try/finally: api.stop_wheel_speeds()`**。`DoubleLoopRunner.run` 已经做了，遇到自己手写的循环请保留同样习惯。
+---
 
 ## 在哪查 API
 
-- 底盘专用接口子集：本文档（上面那张表）
+- 底盘专用接口子集：本文档
 - 全部接口速查：[main/API_REFERENCE.md](../API_REFERENCE.md)
 - 完整能力清单：[main/CAPABILITY_LIST.md](../CAPABILITY_LIST.md)
-- 怎么改控律：直接看 [controllers/base.py](controllers/base.py)，所有控律都是同样的接口
-- 出问题了看：[debug-controller-download-stuck.md](../../debug-controller-download-stuck.md)、[debug-mc602-download-stuck.md](../../debug-mc602-download-stuck.md)、[debug-runtime-init-queue.md](../../debug-runtime-init-queue.md)
+- Runtime 服务端 lane_state / WS push：[runtime/VISION_API.md](../../runtime/VISION_API.md)
+- 出问题了看：[debug-controller-download-stuck.md](../../debug-controller-download-stuck.md)、[debug-runtime-init-queue.md](../../debug-runtime-init-queue.md)

@@ -11,6 +11,103 @@ import os
 
 from .log_wrap import logger
 
+# 连续 read 失败多少次后才真正 release fd（避免一遇错就关 fd 让内核 autosuspend）。
+# 短时抖动（USB 噪声 / 一次坏帧）走"反复 read"路径；持续 ENODEV 才走"释放 + 重开"。
+_CONSECUTIVE_READ_FAILURES_BEFORE_RELEASE = 8
+
+# sysfs 里 power/control / autosuspend 的取值
+_POWER_CONTROL_ON = "on"          # 永远不休眠
+_POWER_CONTROL_AUTO = "auto"     # 内核默认（按 autosuspend timeout 决定）
+_AUTOSUSPEND_NEVER = "-1"         # 单位秒；-1 = 禁用 autosuspend
+
+
+def _find_usb_device_sysfs_path(video_dev_node):
+    """
+    给一个 /dev/videoN 节点（也接受 /dev/camN symlink），反推它对应的 USB 设备 sysfs 目录
+    （如 /sys/devices/.../1-2.3）。
+
+    链路：
+      /sys/class/video4linux/videoN/device -> ../../../.../1-2.3:1.0  (USB 接口)
+      /sys/class/video4linux/videoN/device/.. -> .../1-2.3                (USB 设备，含 power/)
+
+    返回 USB 设备目录的绝对路径；找不到 / 不是 USB 设备 / 没权限时返回 None。
+    """
+    if not video_dev_node:
+        return None
+    try:
+        # 先 realpath：/dev/camN 是 symlink → /dev/videoN，必须解到真节点。
+        real_dev = os.path.realpath(video_dev_node)
+        basename = os.path.basename(real_dev)
+        v4l2_path = "/sys/class/video4linux/" + basename
+        if not os.path.islink(v4l2_path):
+            return None
+        # video4linux/videoN/device 指向 USB 接口 (例 1-2.3:1.0)
+        iface_link = os.path.join(v4l2_path, "device")
+        iface_real = os.path.realpath(iface_link)
+        # 上跳一级到 USB 设备目录（含 power/）
+        usb_device = os.path.dirname(iface_real)
+        if not os.path.isdir(usb_device):
+            return None
+        return usb_device
+    except Exception:
+        return None
+
+
+def _try_write_sysfs(path, value):
+    """尽量写一个 sysfs 文件；任何错误都吞掉（UAC/权限/不存在都常见）。"""
+    try:
+        with open(path, "w") as f:
+            f.write(value)
+        return True
+    except Exception as e:
+        logger.warning("写 sysfs {}={} 失败: {}".format(path, value, e))
+        return False
+
+
+def disable_usb_autosuspend_for(video_dev_node):
+    """
+    把指定 /dev/videoN 对应的 USB 设备的 power/control 设为 on，autosuspend 设为 -1。
+    失败不抛异常（jetson 用户写 sysfs 会 PermissionError，udev 才是正经路子）。
+
+    返回 True 表示至少 power/control 写成功；False 表示都失败（多半是 udev 没配）。
+    """
+    usb_device = _find_usb_device_sysfs_path(video_dev_node)
+    if usb_device is None:
+        logger.warning(
+            "找不到 {} 对应的 USB sysfs 设备，跳过 autosuspend 禁用".format(video_dev_node)
+        )
+        return False
+    control_path = os.path.join(usb_device, "power", "control")
+    autosuspend_path = os.path.join(usb_device, "power", "autosuspend")
+    wrote_control = _try_write_sysfs(control_path, _POWER_CONTROL_ON)
+    _try_write_sysfs(autosuspend_path, _AUTOSUSPEND_NEVER)
+    if wrote_control:
+        logger.info(
+            "已禁用 {} (USB 设备 {}) autosuspend".format(video_dev_node, usb_device)
+        )
+    return wrote_control
+
+
+def read_usb_power_state(video_dev_node):
+    """
+    读取 /dev/videoN 对应的 USB 设备的 power/control 和 autosuspend，给 health 端用。
+    读不到（无权限 / 不是 USB 设备）返回 (None, None)。
+    """
+    usb_device = _find_usb_device_sysfs_path(video_dev_node)
+    if usb_device is None:
+        return None, None
+    state = {"control": None, "autosuspend": None}
+    for key, filename in (("control", "control"), ("autosuspend", "autosuspend")):
+        path = os.path.join(usb_device, "power", filename)
+        try:
+            with open(path, "r") as f:
+                value = f.read().strip()
+                state[key] = value or None
+        except Exception:
+            state[key] = None
+    return state["control"], state["autosuspend"]
+
+
 class Camera:
     def __init__(self, index=1, width=640, height=480):
         # if src ==0:
@@ -31,6 +128,8 @@ class Camera:
         self.last_open_attempt_at = None
         self.last_open_error = None
         self.reopen_requested = False
+        # 连续 read 失败计数；到达阈值才真的 release fd。
+        self._consecutive_read_failures = 0
         self._last_log_times = {}
         # 暂停标志
         self.pause_flag = False
@@ -40,6 +139,8 @@ class Camera:
         if self.cap is not None and self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # 兜底：启动时主动关 autosuspend（udev 不生效时的兜底）
+            disable_usb_autosuspend_for(self.src)
 
         # thread是否运行标志
         self.flag_thread = False
@@ -167,13 +268,46 @@ class Camera:
                 if ret and frame is not None:
                     self.frame = frame
                     self.frame_updated_at = time.time()
+                    self._consecutive_read_failures = 0
+                    continue
+                # ---- read 失败：不要立刻 release fd ----
+                # 老逻辑：失败一次就 _release_cap()，内核看到 fd 关了 → 2 秒后 autosuspend
+                #          → 下次 reopen 时 VIDIOC_REQBUFS 失败 → 死循环
+                # 新逻辑：先累计 _consecutive_read_failures，连续 N 次失败才真的 release。
+                #        这段时间里 fd 还开着，内核不会 autosuspend；偶发抖动也能被自愈。
+                self._consecutive_read_failures += 1
+                if self._consecutive_read_failures >= _CONSECUTIVE_READ_FAILURES_BEFORE_RELEASE:
+                    self._log_throttled(
+                        "read-failed",
+                        "read:连续{}次读取失败，触发重连".format(
+                            self._consecutive_read_failures
+                        ),
+                    )
+                    self.request_reopen("read failed (consecutive)")
+                    self._consecutive_read_failures = 0
                 else:
-                    self._log_throttled("read-failed", "read:读取图像错误!!!!")
-                    self.request_reopen("read failed")
-                    time.sleep(0.2)
+                    self._log_throttled(
+                        "read-blip",
+                        "read:第{}次读取失败（保留 fd，避免触发 autosuspend）".format(
+                            self._consecutive_read_failures
+                        ),
+                        interval=1.0,
+                    )
+                    # 新 fd 也尝试主动关 autosuspend（首次重开场景兜底）
+                    if self.cap is None:
+                        disable_usb_autosuspend_for(self.src)
+                time.sleep(0.2)
             except Exception as e:
-                self._log_throttled("read-exception", "exception:摄像头错误!! {}".format(e))
-                self.request_reopen("exception")
+                self._consecutive_read_failures += 1
+                self._log_throttled(
+                    "read-exception",
+                    "exception:摄像头错误!! {} (累计{})".format(
+                        e, self._consecutive_read_failures
+                    ),
+                )
+                if self._consecutive_read_failures >= _CONSECUTIVE_READ_FAILURES_BEFORE_RELEASE:
+                    self.request_reopen("exception (consecutive)")
+                    self._consecutive_read_failures = 0
                 time.sleep(0.2)
 
     def set_size(self, width, height):

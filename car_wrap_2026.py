@@ -406,10 +406,12 @@ class MyCar(MecanumDriver):
         self.light = LedLight(cfg_sensor["light"])
         self.left_sensor = Infrared(cfg_sensor["left_sensor"])
         self.right_sensor = Infrared(cfg_sensor["right_sensor"])
-        self.servo_1_angle_list = [-42, 165]
+        self.servo_1_angle_list = [-42, 90]
         self.servo_1_flag = 0
         self.servo_1 = ServoPwm(1, 180)
-        self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
+        # 默认不主动写舵机：保留用户上一次 set_storage 留下的物理位置。
+        # 需要"每次启动回到 LEFT"再把下面这行 set_angle(...) 注释打开。
+        # self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
         self.blue_pad = BluetoothPad()
         self.shoot = PoutD(4)
         self.battery = Battry()
@@ -421,10 +423,30 @@ class MyCar(MecanumDriver):
         根据状态参数控制储存仓的开关。
 
         参数:
-            state (bool): 储存仓状态。False 表示放下，True 表示收起。默认为 False。
+            state (bool): 储存仓状态。False 表示放下（LEFT），True 表示收起（RIGHT）。默认为 False。
+
+        返回:
+            dict: {"side": "LEFT"/"RIGHT", "flag": 0/1, "angle": int, "state": bool}
         """
         flag = 1 if state else 0
-        self.servo_1.set_angle(self.servo_1_angle_list[flag])
+        angle = self.servo_1_angle_list[flag]
+        # 防御性：ServoPwm wrapper 会把 angle 转成 `int(angle/180*180 + 90)`，
+        # 即协议值 = angle + 90。mc602 不 clamp，>180 会让舵机瞬间回弹/回中。
+        # mc601 会自动 clamp 到 0~180，但跨平台一致起见，强制保证 +90 后 ∈ [0, 180]。
+        proto = angle + 90
+        if proto < 0 or proto > 180:
+            raise ValueError(
+                f"set_storage: angle={angle} -> protocol_value={proto} 超出 0~180 范围，"
+                f"会被 mc602 协议回中。请把 servo_1_angle_list 改到 [-90, 90] 之间。"
+            )
+        self.servo_1.set_angle(angle)
+        self.servo_1_flag = flag
+        return {
+            "side": "RIGHT" if flag == 1 else "LEFT",
+            "flag": int(flag),
+            "angle": int(angle),
+            "state": bool(state),
+        }
 
     def shooting(self):
         # 继电器触发型枪口：单次触发必须保证固定高电平脉冲，并可靠拉低收尾。
@@ -787,6 +809,26 @@ class MyCar(MecanumDriver):
             # print(key_val)
             if key_val == 3:
                 self._stop_flag = True
+            # === 按键手动 jog：1=y↑ 3=y↓ 2=x← 4=x→ 松开都停 ===
+            try:
+                if key_val == 1:
+                    self.arm.y_speed(0.1)
+                    self.arm.x_speed(0)
+                elif key_val == 3:
+                    self.arm.y_speed(-0.1)
+                    self.arm.x_speed(0)
+                elif key_val == 2:
+                    self.arm.x_speed(-0.1)
+                    self.arm.y_speed(0)
+                elif key_val == 4:
+                    self.arm.x_speed(0.1)
+                    self.arm.y_speed(0)
+                else:
+                    # 无按键：停
+                    self.arm.x_speed(0)
+                    self.arm.y_speed(0)
+            except Exception:
+                pass
             time.sleep(0.2)
 
     # 根据某个值获取列表中匹配的结果
