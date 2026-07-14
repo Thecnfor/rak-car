@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 import json
+import threading
 import time
 import uuid
 
@@ -219,6 +220,143 @@ class RuntimeWsClient:
         `error_y`/`error_angle` 为 None 时说明 lane_feed 未运行或刚刚启动。
         """
         return self.request("realtime/lane_state", request_timeout=timeout)
+
+    # === 推送订阅 ===
+
+    def subscribe_lane(self, on_state, hz=20.0):
+        """订阅 lane_state 推送——服务端按 `updated_at` 变化主动推，免客户端轮询。
+
+        行为：
+          - 内部**独立开一条** WebSocket 连接（不复用主连接），避免推送帧
+            和主连接的请求/响应相互干扰。
+          - 服务端按 `lane_feed` 的更新节奏（默认 20Hz）推送 `lane_state` dict。
+          - 调用 `on_state(lane_state_dict)`；on_state 抛异常不会中断订阅。
+
+        参数：
+          on_state: callable(dict) -> None；lane_state 字典，回调里只读。
+          hz: 服务端订阅频率提示（实际频率受 lane_feed 限制）。
+
+        返回：unsubscribe() callable。多次调用安全（幂等）。
+
+        用法：
+          client = RuntimeWsClient(); client.connect()
+          stop = client.subscribe_lane(lambda s: print(s['error_y']))
+          # ... 运行若干秒 ...
+          stop()  # 断开订阅连接
+        """
+        # 幂等：同一 client 多次订阅返回同一个 unsubscribe 句柄
+        existing = getattr(self, "_lane_subscriber", None)
+        if existing is not None and existing.is_alive():
+            return existing.stop
+
+        sub = _LaneStateSubscriber(
+            ws_url=self.ws_url,
+            on_state=on_state,
+            poll_interval=max(1.0 / max(float(hz), 1.0), 0.001),
+        )
+        sub.start()
+        self._lane_subscriber = sub
+        return sub.stop
+
+    @property
+    def lane_subscription_active(self):
+        sub = getattr(self, "_lane_subscriber", None)
+        return sub is not None and sub.is_alive()
+
+
+class _LaneStateSubscriber:
+    """独立 WebSocket 连接，只负责收 lane_state 推送。
+
+    独立连接的设计目的：避免推送帧和主连接的 req/rep 流相互抢占——
+    websocket-client 是单 conn 单 recv，独立连接让两条流零干扰。
+    服务端 asyncio 同时跑 N 条 WS 连接的代价可忽略。
+    """
+
+    def __init__(self, ws_url, on_state, poll_interval):
+        self._ws_url = ws_url
+        self._on_state = on_state
+        self._poll_interval = poll_interval
+        self._stop_event = threading.Event()
+        self._thread = None
+        self._conn = None
+        self.push_count = 0
+        self.error_count = 0
+
+    def start(self):
+        self._thread = threading.Thread(
+            target=self._run, name="lane-subscriber", daemon=True
+        )
+        self._thread.start()
+
+    def is_alive(self):
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self):
+        self._stop_event.set()
+        # 关连接让阻塞的 recv() 立刻抛异常，线程退出
+        conn = self._conn
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self):
+        try:
+            self._conn = create_connection(self._ws_url, timeout=2.0)
+            # server 立刻发 welcome，先吃掉
+            try:
+                self._conn.settimeout(2.0)
+                self._conn.recv()
+            except Exception:
+                pass
+            # 发订阅请求；服务端的 ack 也会通过同一个连接回，先吃掉
+            self._conn.send(
+                json.dumps({"op": "subscribe_lane", "hz": 1.0 / self._poll_interval})
+            )
+            try:
+                self._conn.settimeout(2.0)
+                ack = self._conn.recv()
+                ack_data = json.loads(ack)
+                if not ack_data.get("ok"):
+                    return
+            except Exception:
+                return
+            # 主循环：等推送
+            while not self._stop_event.is_set():
+                try:
+                    self._conn.settimeout(1.0)
+                    raw = self._conn.recv()
+                except WebSocketTimeoutException:
+                    continue
+                except (OSError, WebSocketConnectionClosedException):
+                    break
+                except Exception:
+                    self.error_count += 1
+                    if self.error_count > 5:
+                        break
+                    continue
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    continue
+                if data.get("op") != "lane_state":
+                    continue
+                self.push_count += 1
+                lane_state = data.get("data") or {}
+                try:
+                    self._on_state(lane_state)
+                except Exception:
+                    # 回调抛异常不能让订阅线程死
+                    self.error_count += 1
+        finally:
+            try:
+                if self._conn is not None:
+                    self._conn.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
