@@ -1240,12 +1240,41 @@ class MyCar(MecanumDriver):
 
             def _feed_loop():
                 streamer = getattr(self, "streamer", None)
-                set_state = getattr(streamer, "set_lane_state", None)
+                set_state = getattr(streamer, "set_lane_state", None) if streamer else None
+                get_frame = getattr(streamer, "get_frame", None) if streamer else None
+                # 复用 self.crusie (ClintInterface("lane"))，不重新 connect。
+                # 不再 cap_front.read() / cv2.putText / update_frame —— 这些是
+                # 调试期副作用，会和 _capture_loop 抢摄像头 + frame_lock + GIL，
+                # 把前端 /stream/frame/cam1.jpg 的吞吐从 233 fps 砸到 57 fps。
+                # 这里只从 streamer.frames["cam1"] 读最新缓存帧 (≤50ms)，
+                # ClintInterface.get_infer 内部 resize 128x128 + jpeg + ZMQ REQ/REP。
+                infer_client = self.crusie
+                norm_id = (
+                    streamer.normalize_cam_id("cam1")
+                    if (streamer is not None and hasattr(streamer, "normalize_cam_id"))
+                    else "cam1"
+                )
+                consecutive_err = 0
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
                     try:
-                        error_y, error_angle = self.get_lane_results()
+                        img = get_frame(norm_id) if get_frame is not None else None
+                        if img is None:
+                            # _capture_loop 还没捕到第一帧；下一拍重试，不退出
+                            stop_event.wait(period)
+                            continue
+                        result = infer_client.get_infer(img)
+                        # ClintInterface.get_infer 返回 list[float, float]
+                        if not isinstance(result, (list, tuple)) or len(result) < 2:
+                            logger.warning(
+                                "lane feed: unexpected result shape %r", result
+                            )
+                            stop_event.wait(period)
+                            continue
+                        error_y = float(result[0])
+                        error_angle = float(result[1])
+                        consecutive_err = 0
                         if set_state is not None:
                             set_state(
                                 active=True,
@@ -1258,8 +1287,19 @@ class MyCar(MecanumDriver):
                                 distance=self.get_distance(),
                             )
                     except Exception as exc:
-                        logger.warning("lane feed loop exit: {}".format(exc))
-                        break
+                        consecutive_err += 1
+                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出，
+                        # 否则外环会丢一份新鲜的 lane_state。
+                        logger.warning(
+                            "lane feed transient err ({}): {}".format(
+                                consecutive_err, exc
+                            )
+                        )
+                        if consecutive_err >= 5:
+                            logger.warning("lane feed loop exit after {} errs".format(consecutive_err))
+                            break
+                        stop_event.wait(period)
+                        continue
                     stop_event.wait(period)
                 if set_state is not None:
                     try:
