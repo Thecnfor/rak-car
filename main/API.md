@@ -236,6 +236,8 @@ print(client.call("car", "get_odometry", timeout=20)["result"])
 | `arm.x_get_position` | 读当前 X 位置 | 无 | `float` |
 | `arm.y_get_position` | 读当前 Y 位置 | 无 | `float` |
 
+> 业务层推荐用 `main/arm/` 子包：`from main.arm import ArmClient, ArmRunner`。薄封装上述 action + 4 键手动定原点 + 双轴同步 S 曲线 dry-run + 软限位校验 + `ArmState` dataclass。详见 [main/arm/README.md](arm/README.md) / [main/arm/ARM_API.md](arm/ARM_API.md)。
+
 ## 8. `task` 接口
 
 | 接口名 | 用途 | 关键参数 | 关键返回 |
