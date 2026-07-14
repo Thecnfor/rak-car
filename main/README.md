@@ -27,7 +27,7 @@
 - [chassis/README.md](file:///home/jetson/workspace/rak-car/main/chassis/README.md)
   - 底盘组独享子包（自动寻线 client 端外环 + 底盘专用 API 子集），底盘请直接看这里
 - [arm/README.md](file:///home/jetson/workspace/rak-car/main/arm/README.md)
-  - 机械臂组独享子包（4 键手动定原点 + 双轴同步 S 曲线 + 业务便捷 API），机械臂请直接看这里
+  - 机械臂组独享子包（runtime 启动自动定原点 + 漂移手 reset + 双轴同步 S 曲线 + 业务便捷 API），机械臂请直接看这里
   - [arm/QUICKSTART.md](file:///home/jetson/workspace/rak-car/main/arm/QUICKSTART.md) — 10 行起步
   - [arm/ARM_API.md](file:///home/jetson/workspace/rak-car/main/arm/ARM_API.md) — 机械臂业务 API 速查
 

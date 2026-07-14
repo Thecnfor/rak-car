@@ -12,7 +12,7 @@ from main.arm import (
     ArmOrigin,        # 业务坐标系软限位
     TrajectoryGenerator,   # S 曲线 dry-run
     TrajectoryPlan,   # 一次 plan 的结果
-    OriginCalibrator, # 4 键手动定原点
+    OriginCalibrator, # 调车端 reset_position 重新定原点（漂移后手调用）
     SIDES, HANDS,     # 合法枚举
 )
 ```
@@ -35,8 +35,8 @@ from main.arm import (
 | `set_side("LEFT"/"MID"/"RIGHT")` | 大臂方向（总线舵机） | enum, speed? | job dict |
 | `set_hand("UP"/"MID"/"DOWN")` | 手爪角度（PWM 舵机） | enum, speed? | job dict |
 | `grasp(True/False)` | 吸盘抓取/释放 | bool | job dict |
-| `reset_y()` | 仅复位 y（车端 `reset_position`） | — | job dict |
-| `reset_x()` | 仅复位 x（车端 `reset_x`） | — | job dict |
+| `reset_y()` | 复位 y（底层走 `arm.reset_position`，会**同时复位 x**） | — | job dict |
+| `reset_x()` | 仅复位 x（车端 `arm.reset_x`，不动 y） | — | job dict |
 | `reset_origin(x_wall="left")` | 主动撞一侧墙 + 触底，落盘 `arm_origin.yaml` | `"left"`/`"right"` | job dict |
 
 ```json
@@ -85,6 +85,8 @@ class ArmState:
     arm_angle: int | None
     hand_angle: int | None
     fetched_at: float
+    # 注意：以下字段当前未被 ArmClient.get_state() 填充，恒为默认值，使用时务必看注释。
+    #  - storage_side     恒为 "LEFT"。请改用 ArmClient.get_storage() 拿真实档位。
 ```
 
 ## 4. ArmRunner（业务编排入口）
@@ -112,7 +114,7 @@ class ArmState:
 | `pick_right(x_mm, y_mm)` | 右侧抓取 |
 | `release(drop_x_mm=0, drop_y_mm=30)` | 释放到指定位置 |
 
-## 6. OriginCalibrator（4 键手动定原点）
+## 6. OriginCalibrator（调车端 reset_position 重新定原点）
 
 ```python
 from main.arm import OriginCalibrator
@@ -120,19 +122,19 @@ from main.api_client import RuntimeApiClient
 
 http = RuntimeApiClient()
 OriginCalibrator(http).run(x_wall="left")
+# 底层走车端 arm.reset_position（y 触底 + x 撞墙），完成后读 y_get_position / x_get_position
+# 把当前编码器值作为新原点写到 arm_origin.yaml。
 ```
 
-按键映射：
+什么时候用：
 
-| 键 | 行为 |
+| 场景 | 用法 |
 | --- | --- |
-| 1 | y 下降 |
-| 3 | y 上升 |
-| 2 | x 左移 |
-| 4 | x 右移 |
-| 1+3 同时按 1s | 保存原点到 `arm_origin.yaml` 并退出 |
-| 1+3 同时按 3s | 强制退出（不保存） |
-| Ctrl-C | 中断（不保存） |
+| 首次上电 | **不需要手动调** —— runtime 启动时若 `RAK_CAR_RESET_ARM=1` 会自动跑一次 |
+| 漂移严重 / PID 卡死 / 编码器读数明显不对 | 手跑 `examples/01_calibrate_origin.py left`（或 `right`） |
+| 业务代码里临时复位 | `ArmClient.reset_origin(x_wall="left")`（见 [README.md](./README.md) §3） |
+
+> 历史说明：旧版 `OriginCalibrator` 需要在车端按 4 键（1=y 下，3=y 上，2=x 左，4=x 右）手动 jog，再 `1+3` 同时按 1 秒保存 —— **该流程已删除**。当前实现直接下发一次 `arm.reset_position`，由车端 PID 闭环完成触底 / 撞墙，不再监听任何按键。
 
 ## 7. TrajectoryGenerator（S 曲线 dry-run）
 
@@ -193,7 +195,7 @@ class TrajectoryPlan:
 
 | 需求 | 接口 |
 | --- | --- |
-| 首次上电手动定原点 | `examples/01_calibrate_origin.py` |
+| 首次上电定原点 | 不用手动 —— runtime 在 `RAK_CAR_RESET_ARM=1` 时自动跑；漂移后再手跑 `examples/01_calibrate_origin.py` |
 | 之后 reset 原点 | `ArmClient.reset_origin("left")` |
 | 双轴同步移动 | `ArmClient.move_xy(...)` / `ArmRunner.move_xy(...)` |
 | 单轴移动 | `ArmClient.move_x/move_y` |

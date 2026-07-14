@@ -13,7 +13,7 @@
 - `ArmClient`：薄封装 `RuntimeApiClient` / `RuntimeWsClient`
 - `ArmState`：业务位姿（mm + 枚举）
 - `TrajectoryGenerator`：双轴 S 曲线同步发生器（dry-run）
-- `OriginCalibrator`：4 键手动硬定原点
+- `OriginCalibrator`：调车端 `arm.reset_position` 重新触底定原点（写 `arm_origin.yaml`）
 - `ArmRunner`：业务编排入口
 - `tasks/`：高层组合（go_home / pick_left / pick_right / release）
 - `examples/`：4 个起步脚本
@@ -47,6 +47,17 @@
 | `soft_x_min_mm` | 5 | x 业务下界（防止撞墙） |
 | `soft_x_max_mm` | 300 | x 业务上限 |
 
+## 关键环境变量
+
+`main/arm/` 业务层**只读**这些环境变量；如果改的是启动行为，请去 `ecosystem.config.js`。
+
+| 变量 | 含义 | 默认 |
+| --- | --- | --- |
+| `RAK_CAR_SERVER_ORIGIN` | runtime HTTP 地址 | `http://127.0.0.1` |
+| `RAK_CAR_RESET_ARM` | runtime 启动时是否自动跑一次 `arm.reset_position` 重新定原点 | `0`（部署用 `ecosystem.config.js:23` 设成 `1`） |
+
+> `RAK_CAR_RESET_ARM=1` 时，runtime 会在 auto-init 阶段调一次 `arm.reset_position`（y 触底 + x 撞墙），并把当前编码器值落到 `arm_origin.yaml`。业务层看到 `arm_origin.yaml` 已存在且 `y_origin_m / x_origin_m` 非 0，即可认为首次定原点已完成，**不需要**手跑 `examples/01_calibrate_origin.py`。
+
 ## 10 行起步
 
 ```python
@@ -64,7 +75,7 @@ runner.grasp(True)
 
 | 文件 | 用途 |
 | --- | --- |
-| [examples/01_calibrate_origin.py](./examples/01_calibrate_origin.py) | 4 键手动定原点（首次必跑） |
+| [examples/01_calibrate_origin.py](./examples/01_calibrate_origin.py) | 触发车端 `arm.reset_position` 重新定原点（漂移后手调用） |
 | [examples/02_trajectory_preview.py](./examples/02_trajectory_preview.py) | 不下硬件，只算 S 曲线 |
 | [examples/03_move_xy_basic.py](./examples/03_move_xy_basic.py) | 双轴同步移动 + dry-run |
 | [examples/04_grasp_template.py](./examples/04_grasp_template.py) | 完整 pick-and-place |
@@ -73,7 +84,7 @@ runner.grasp(True)
 
 | 用途 | 接口 | 推荐方式 | 推荐频率 |
 | --- | --- | --- | --- |
-| **4 键手动定原点**（首次必跑） | `main.arm.OriginCalibrator` | `examples/01_calibrate_origin.py` | 上电一次 |
+| **重新定原点**（漂移后手调用） | `main.arm.OriginCalibrator` | `examples/01_calibrate_origin.py` | 漂移 / 换电池 |
 | **主动 reset 原点** | `arm.reset_origin(x_wall)` | `ArmClient.reset_origin(x_wall="left")` | 需要时 |
 | **双轴同步移动** | `arm.goto_position` | `ArmClient.move_xy(x_mm, y_mm)` / `ArmRunner.move_xy(...)` | 业务流 |
 | **单轴移动** | `arm.move_x_position` / `arm.move_y_position` | `ArmClient.move_x/move_y` | 业务流 |
@@ -102,8 +113,8 @@ runner.grasp(True)
 ### 3. `reset_origin(x_wall="left")`
 
 - **做什么**：先调 `arm.reset_position`（车端自己 y 触底 + x 撞墙），然后读 `y_get_position` / `x_get_position` 写 `arm_origin.yaml`。
-- **什么时候用**：换电池 / 上电 / 漂移后；不需要 calibrate 重跑。
-- **首次**：必须先跑 [examples/01_calibrate_origin.py](./examples/01_calibrate_origin.py) 把 4 键手动模式标定一次。
+- **什么时候用**：换电池 / 漂移严重 / PID 范围卡死时手调用；**首次上电不需要手动跑**。
+- **首次上电**：runtime 启动时若 `RAK_CAR_RESET_ARM=1`（默认配置见 `ecosystem.config.js:23`），会自动跑一次 `arm.reset_position`，并把当前编码器值落盘到 `arm_origin.yaml`。
 
 ### 4. `ArmState`
 
@@ -120,6 +131,8 @@ ArmState(
     fetched_at=1761234567.89,
 )
 ```
+
+> 注意：`ArmState.storage_side` 字段存在但 `ArmClient.get_state()` 当前未填充它，恒为默认值 `"LEFT"`，**不可信**。需要存储仓档位时请直接用 `ArmClient.get_storage()`（客户端缓存）。
 
 `ArmState.in_safe_box(x, y)` 和 `ArmState.is_ready()` 给上层做预校验。
 
@@ -152,7 +165,7 @@ main/arm/
 ├── api.py                     ← ArmClient：薄封装 main.api_client / main.ws_client
 ├── state.py                   ← ArmState / ArmOrigin dataclass
 ├── trajectory.py              ← TrajectoryGenerator：双轴同步 S 曲线（纯 Python）
-├── origin.py                  ← OriginCalibrator：4 键手动硬定原点
+├── origin.py                  ← OriginCalibrator：调车端 reset_position 重新定原点
 ├── arm_origin.yaml            ← 业务坐标系软限位 + 标注（gitignore）
 ├── loops/
 │   ├── __init__.py
@@ -173,7 +186,7 @@ main/arm/
 
 ## 三条红线
 
-1. **首次上电必须跑 `examples/01_calibrate_origin.py`**：`arm_origin.yaml` 不存在 / 全 0 时，所有动作虽然能跑，但坐标系是**未标定**状态，软限位使用默认值。
+1. **首次上电通常不需要手跑 `examples/01_calibrate_origin.py`**：runtime 启动时若 `RAK_CAR_RESET_ARM=1`（默认配置见 `ecosystem.config.js:23`）会自动跑一次 `arm.reset_position` 并把新原点落到 `arm_origin.yaml`。只有 `RAK_CAR_RESET_ARM=0` 且从未手调用过 reset 时，`arm_origin.yaml` 才可能不存在 / 全 0，此时坐标系处于**未标定**状态，软限位使用默认值。手动入口只用于漂移严重 / PID 范围卡死后的恢复。
 2. **`move_xy` / `move_x` / `move_y` 越界直接抛 `ValueError`**：业务层别 try-except 后硬塞，除非你确认软限位该改了。
 3. **业务层只调 `main.arm.*`，不要回退到 `client.call("arm", ...)`**：丢失软限位保护和 S 曲线 dry-run。
 
