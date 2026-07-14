@@ -296,6 +296,12 @@ class CarRuntimeService:
         self.last_init_at = time.time()
         self.last_error = None
         self.auto_heal_armed = True
+        # 默认启 lane_feed 守护线程：比赛阶段 lane_state 必须持续更新
+        # 供外环消费。start_lane_feed 幂等，重复调用立即返回。
+        try:
+            car.start_lane_feed(hz=20.0)
+        except Exception as exc:  # pragma: no cover - 不让 init 失败
+            logger.warning("lane_feed auto-start failed: {}".format(exc))
         return car
 
     def _ensure_infer_ready(self):
@@ -330,6 +336,11 @@ class CarRuntimeService:
                     if reset_position:
                         self.car.reset_position()
                     self.controller_generation = session.get("generation")
+                    # 复用现有 car 时也确保 lane_feed 跑着（幂等）
+                    try:
+                        self.car.start_lane_feed(hz=20.0)
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("lane_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()

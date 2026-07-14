@@ -621,82 +621,8 @@ def create_runtime_router(service, camera_stream_service):
     def v1_vision_lane_state():
         return {"ok": True, **camera_stream_service.get_lane_state()}
 
-    # ---- 外环专用端点：start/stop lane_feed 守护线程 + 状态 ----
-    # 为什么要单独包一层：
-    #   - 外环启动 / 停止 "只刷 lane_state 不下轮速" 的守护线程，是个有副作用的状态切换
-    #   - 走 /v1/execute + target=car + name=start_lane_feed 太绕，TS/前端写起来啰嗦
-    #   - 把动作 / 状态 / stop 三件事放在同一组 URL 下，便于外环做"启动→订阅→停止"编排
-
-    @router_v1.post("/vision/lane/feed")
-    def v1_vision_lane_feed_start(payload: dict = Body(default={})):
-        """启动车端 lane 误差缓存守护线程。
-
-        请求体（全部可选）：
-          {"hz": 20.0}      # 守护线程刷 lane_state 的频率（1~50Hz）
-
-        行为：
-          - 已经在跑时直接返回 {"started": false, "reason": "already_running", "hz": ...}
-          - 否则调用 car.start_lane_feed(hz=hz)，守护线程会持续跑 get_lane_results()，
-            把结果写入 streamer.set_lane_state(...)，让 /v1/vision/lane/state 持续更新
-          - 不会下发任何轮速，不会和客户端外环抢 car_lock
-        """
-        hz = float(payload.get("hz", 20.0))
-        result = _execute_sync(
-            service,
-            target="car",
-            name="start_lane_feed",
-            kwargs={"hz": hz},
-            timeout=10,
-        )
-        return {
-            "ok": True,
-            "started": True,
-            "hz": hz,
-            "result": result,
-            "state_url": "/v1/vision/lane/state",
-        }
-
-    @router_v1.post("/vision/lane/feed/stop")
-    def v1_vision_lane_feed_stop():
-        """停止车端 lane 误差缓存守护线程。
-
-        - 已经在停止状态时返回 {"stopped": false, "reason": "not_running"}
-        - 不会动轮速，只是不再更新 lane_state
-        """
-        result = _execute_sync(
-            service,
-            target="car",
-            name="stop_lane_feed",
-            timeout=10,
-        )
-        return {"ok": True, "stopped": True, "result": result}
-
-    @router_v1.get("/vision/lane/feed")
-    def v1_vision_lane_feed_status():
-        """读当前 lane_feed 守护线程状态。
-
-        注意：runtime 没有维护 start/stop 的状态机，直接读 lane_state 的 updated_at
-        推断"是否有人在刷"。age < 2s 视为 alive，否则 stale。
-        """
-        state = camera_stream_service.get_lane_state()
-        updated_at = state.get("updated_at")
-        if updated_at is None:
-            return {
-                "ok": True,
-                "running": False,
-                "reason": "no_data",
-                "state_url": "/v1/vision/lane/state",
-            }
-        age = max(time.time() - float(updated_at), 0.0)
-        return {
-            "ok": True,
-            "running": age < 2.0,
-            "age": round(age, 3),
-            "mode": state.get("mode"),
-            "active": state.get("active"),
-            "updated_at": updated_at,
-            "state_url": "/v1/vision/lane/state",
-        }
+    # lane_feed 守护线程：runtime init 默认自动启动（详见 runtime_service._create_car_locked），
+    # 这里不暴露 start/stop 端点 —— 比赛阶段 lane_state 必须持续更新。
 
     @router_v1.get("/vision/lane/preview.jpg")
     def v1_vision_lane_preview_jpg(cam_id: str = Query(default="cam1")):
