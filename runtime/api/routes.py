@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 try:
-    from fastapi import APIRouter, Body, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+    from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError(
         "缺少 FastAPI 依赖，请先执行: /usr/bin/python3 -m pip install -r "
@@ -28,11 +28,20 @@ except ImportError:  # pragma: no cover
 
 
 def get_public_links():
+    """返回带链接的 dict。**模块级缓存**——env vars 不变就不重算。
+
+    健康检查 1Hz 轮询时省下 30+ f-string 拼接；env vars 通过 settings 模块
+    的 cache-busting 接口（如果有）显式触发失效。
+    """
+    global _PUBLIC_LINKS_CACHE
+    cached = _PUBLIC_LINKS_CACHE
+    if cached is not None:
+        return cached
     api_base = settings.get_public_api_base()
     v1 = settings.get_api_v1_prefix()
     legacy = settings.get_legacy_api_prefix()
     ws_base = api_base.replace("http://", "ws://").replace("https://", "wss://")
-    return {
+    cached = {
         "api_base": api_base,
         "docs": f"{api_base}/docs",
         "health_v1": f"{api_base}{v1}/health",
@@ -61,6 +70,12 @@ def get_public_links():
         "realtime_analog2": f"{api_base}{v1}/realtime/analog2",
         "realtime_lane_state": f"{api_base}{v1}/realtime/lane/state",
     }
+    _PUBLIC_LINKS_CACHE = cached
+    return cached
+
+
+# 模块级缓存：env vars 不变就不重算。要 invalidate 直接赋 None。
+_PUBLIC_LINKS_CACHE = None
 
 
 def _execute_sync(service, target, name, args=None, kwargs=None, timeout=None):
@@ -498,11 +513,30 @@ def create_runtime_router(service, camera_stream_service):
         return camera_stream_service.get_status()
 
     @router.get("/stream/frame/{cam_id}.jpg")
-    def stream_frame(cam_id: str, download: int = Query(default=0)):
+    def stream_frame(
+        cam_id: str,
+        download: int = Query(default=0),
+        if_none_match=Header(default=None),
+    ):
+        """返回单帧 JPEG + ETag。客户端带 If-None-Match 时若帧未变返回 304。
+
+        ETag 用 `streamer._jpeg_cache[cam_id]` 的 source_updated_at——编码器
+        每帧刷新一次。`Cache-Control: public, max-age=1` 允许浏览器/CDN 缓存
+        1s，把高频轮询的请求量再砍一档。
+        """
         filename = f"{camera_stream_service.normalize_cam_id(cam_id)}.jpg"
-        headers = {}
+        updated_at, _bytes = camera_stream_service.get_jpeg_meta(cam_id)
+        # updated_at 可能为 None（编码器尚未跑出第一帧）——回退到 wall-clock 秒
+        etag = f'W/"{int(updated_at * 1000) if updated_at else int(time.time())}"'
+        headers = {
+            "Cache-Control": "public, max-age=1",
+            "ETag": etag,
+        }
         if download == 1:
             headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        if if_none_match and if_none_match == etag:
+            # 客户端帧未变：返回 304 不带 body，省一次 JPEG 传输
+            return Response(status_code=304, headers=headers)
         return Response(
             content=camera_stream_service.encode_jpeg_bytes(cam_id),
             media_type="image/jpeg",
