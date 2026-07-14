@@ -455,6 +455,22 @@ class CarRuntimeService:
             self._realtime_check_locked()
             return self.car.get_wheel_encoders()
 
+    def get_lane_state(self):
+        """外环专用：读 streamer 缓存的 lane_state。
+
+        数据来源：`lane_feed` 守护线程（runtime 启动后默认 20Hz）通过
+        `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 `meta_lock`（极快）。
+        因此 50Hz+ 外环轮询安全，不会和 lane_feed 守护线程或 MJPEG 推流抢锁。
+
+        `stream_service` 由 `runtime.api.app` 在路由注册前 `set_stream_service`
+        注入，正常启动后不会为 None；若 runtime 尚未注入则返回 503。
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_lane_state()
+
     def set_single_motor(self, port, speed, reverse=1):
         with self.car_lock:
             self._realtime_check_locked()

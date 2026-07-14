@@ -254,6 +254,18 @@ class RuntimeApiClient:
             "GET", f"{self.api_prefix}/realtime/analog2?port={int(port)}"
         )
 
+    def realtime_lane_state(self):
+        """外环最常用：读 lane_feed 守护线程缓存的 lane_state。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
+        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 20Hz）的
+        更新频率解耦，所以轮询再快也只会读到同一份最新缓存。
+
+        返回 `{"lane_state": {"error_y": ..., "error_angle": ..., "active": ..., ...}}`。
+        `error_y`/`error_angle` 为 None 时说明 lane_feed 未运行或刚刚启动。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/lane/state")
+
     def run_task(self, name, *args, **kwargs):
         return self.create_job("task", name, args=list(args), kwargs=kwargs)
 

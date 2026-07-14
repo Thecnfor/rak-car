@@ -59,6 +59,7 @@ def get_public_links():
         "realtime_bus_servo_angle": f"{api_base}{v1}/realtime/bus-servo/angle",
         "realtime_analog": f"{api_base}{v1}/realtime/analog",
         "realtime_analog2": f"{api_base}{v1}/realtime/analog2",
+        "realtime_lane_state": f"{api_base}{v1}/realtime/lane/state",
     }
 
 
@@ -454,6 +455,20 @@ async def _handle_websocket_message(service, payload):
             }
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if op == "realtime/lane_state":
+        # 外环最常用：读 streamer 缓存的 lane_state。
+        # 数据来源是 lane_feed 守护线程（runtime 启动后默认 20Hz）通过
+        # `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
+        # 不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock（极快），
+        # 50Hz+ 外环轮询安全，不会和 lane_feed 守护线程或 MJPEG 推流抢锁。
+        try:
+            return {
+                "ok": True,
+                "op": op,
+                "data": {"lane_state": service.get_lane_state()},
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
 
@@ -837,6 +852,18 @@ def create_runtime_router(service, camera_stream_service):
             return {"ok": True, "encoders": service.get_wheel_encoders()}
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/lane/state")
+    def v1_realtime_lane_state():
+        """外环 50Hz 轮询 lane 误差。读 lane_feed 守护线程缓存的 lane_state。
+
+        比 `get_lane_results` action 路径轻得多——不走 job_queue、不打 ZMQ、
+        不持 car_lock。响应字段见 `camera_stream_service.get_lane_state`。
+        """
+        try:
+            return {"ok": True, "lane_state": service.get_lane_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @router_v1.post("/realtime/chassis-velocity")
     def v1_realtime_chassis_velocity(payload: dict = Body(default={})):
