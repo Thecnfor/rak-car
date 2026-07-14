@@ -59,14 +59,14 @@
 from main.chassis import ChassisClient, DoubleLoopRunner, POuterLoop
 
 api = ChassisClient.connect()                  # 1. 连 HTTP + WS（自动）
-api.start_lane_feed(hz=20.0)                   # 2. 车端开 lane 误差缓存
+# 注意：lane_feed 守护线程由 runtime init 默认启起来（20Hz），不用手动 start/stop。
 runner = DoubleLoopRunner(
     api=api,
-    outer=POuterLoop(vx=0.3),                  # 3. 控制律：P 起步
+    outer=POuterLoop(vx=0.3),                  # 2. 控制律：P 起步
     hz=50.0,
 )
-runner.run(max_seconds=15.0)                    # 4. 跑 15 秒（自动 zero out）
-api.stop_lane_feed()                           # 5. 关守护线程
+runner.run(max_seconds=15.0)                    # 3. 跑 15 秒（自动 zero out）
+api.stop_wheel_speeds()                        # 4. 关轮速（必调）
 ```
 
 完整示例：`examples/01_minimal_p_lane.py`。
@@ -81,8 +81,8 @@ api.stop_lane_feed()                           # 5. 关守护线程
 | 方法 | 底层 HTTP / WS | 返回 | 量纲 | 推荐频率 |
 | --- | --- | --- | --- | --- |
 | `connect()` | — | `ChassisClient` | — | 启动一次 |
-| `start_lane_feed(hz=20)` | `POST /v1/vision/lane/feed` | `{started, hz}` | Hz | 启动一次 |
-| `stop_lane_feed()` | `POST /v1/vision/lane/feed/stop` | `{stopped}` | — | 退出必调 |
+| `start_lane_feed(hz=20)` | runtime init 默认启（20Hz），无需手动调用 | `{started, hz}` | Hz | 自动 |
+| `stop_lane_feed()` | 已禁用 —— lane_feed 由 runtime 一直跑 | `{stopped}` | — | 不调 |
 | `stop_wheel_speeds()` | `realtime/wheel_speeds [0,0,0,0]` | `{speeds: [0,0,0,0]}` | m/s | 退出必调 |
 | `emergency_stop()` | `POST /v1/control/emergency-stop` | `{stopped}` | — | 兜底 |
 | `get_lane_state()` | `GET /v1/vision/lane/state` | dict | — | ≤50Hz |
@@ -286,7 +286,7 @@ follow_lane(api, outer=StanleyOuterLoop(vx=0.3), timeout_s=10.0)
 # Phase 2：让位给内环（车端 PID 做视觉终点微调）
 api.stop_wheel_speeds()
 track_target(api, label=None, time_out=3.0)
-api.stop_lane_feed()
+# 注意：不需要 api.stop_lane_feed() —— lane_feed 由 runtime 一直跑
 ```
 
 ### `back_to_line` 注意事项
@@ -363,13 +363,14 @@ DoubleLoopRunner(
 - **`DoubleLoopRunner.run` 已经做了**，手写循环请照抄：
 
 ```python
+# 注意：lane_feed 由 runtime init 默认启起来，不需要 start。
+# 这里只需要确保 Ctrl-C 退出后把轮速归零，避免车冲出去。
 try:
-    api.start_lane_feed(hz=20)
     while True:
         ...
 finally:
     api.stop_wheel_speeds()    # ← 必加
-    api.stop_lane_feed()
+    # 不要 api.stop_lane_feed() —— 它一直跑
 ```
 
 ---

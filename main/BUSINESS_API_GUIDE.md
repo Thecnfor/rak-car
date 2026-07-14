@@ -25,7 +25,7 @@
 最常用环境变量只改一个：
 
 ```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 ```
 
 安装依赖：

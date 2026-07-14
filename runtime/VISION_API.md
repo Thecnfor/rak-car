@@ -10,8 +10,8 @@
 
 ## 地址约定
 
-- API 根地址：`http://192.168.3.60:5050`
-- 预览页：`http://192.168.3.60:5050/stream/`
+- API 根地址：`http://192.168.6.231:5050`
+- 预览页：`http://192.168.6.231:5050/stream/`
 
 摄像头别名：
 
@@ -273,62 +273,11 @@ curl -sS http://127.0.0.1:5050/v1/vision/lane/state
 - `distance`
   - 当前累计行驶距离
 
-### 外环专用：`/v1/vision/lane/feed` + WebSocket `subscribe_lane`
+### 外环专用：WebSocket `subscribe_lane`
 
 > **外环 = 不在车端、但要稳定拿到 `(error_y, error_angle)` 做控制**。
-> 用法分两步：先开 feed 守护线程（让 `lane_state` 持续更新），再订阅 WS push 或 HTTP 轮询拿数据。
-
-#### `POST /v1/vision/lane/feed`
-
-启动车端 lane 误差缓存守护线程。
-
-请求体（全部可选）：
-
-```json
-{ "hz": 20.0 }
-```
-
-- `hz` — 守护线程刷新 lane_state 的频率（1~50Hz，默认 20）
-
-行为：
-- 已经在跑 → 返回 `{started: false, reason: "already_running"}`
-- 否则 → 守护线程持续跑 `get_lane_results()`，把结果写入 `streamer.set_lane_state(...)`
-- **不会下发任何轮速**，不会与客户端外环抢 `car_lock`
-
-示例：
-
-```bash
-curl -sS -X POST http://192.168.3.60:5050/v1/vision/lane/feed \
-  -H 'Content-Type: application/json' -d '{"hz":20}'
-```
-
-返回：
-
-```json
-{ "ok": true, "started": true, "hz": 20.0, "state_url": "/v1/vision/lane/state" }
-```
-
-#### `POST /v1/vision/lane/feed/stop`
-
-停止守护线程。已经在停 → `{stopped: false, reason: "not_running"}`。
-
-#### `GET /v1/vision/lane/feed`
-
-读守护线程状态（按 `lane_state.updated_at` 推断）：
-
-```json
-{
-  "ok": true,
-  "running": true,
-  "age": 0.025,
-  "mode": "external_feed",
-  "active": true,
-  "updated_at": 1784032461.516
-}
-```
-
-- `running` — `age < 2.0` 视为 alive
-- `age` — 距离上一次更新的秒数
+> lane_feed 守护线程（20Hz 刷 lane_state）由 `runtime/services/runtime_service.py` 在 init 时**默认启动**，
+> 不需要任何手动开关。直接连 WS 订阅 `lane_state` push 或 HTTP 轮询 `/v1/vision/lane/state` 即可。
 
 #### WebSocket `subscribe_lane`（**推荐外环用这个**）
 
@@ -338,7 +287,7 @@ curl -sS -X POST http://192.168.3.60:5050/v1/vision/lane/feed \
 
 ```python
 import json, websocket
-ws = websocket.create_connection('ws://192.168.3.60:5050/v1/ws')
+ws = websocket.create_connection('ws://192.168.6.231:5050/v1/ws')
 ws.recv()  # welcome
 
 ws.send(json.dumps({"op": "subscribe_lane"}))
@@ -381,7 +330,7 @@ ws.send(json.dumps({
 HTTP 也行（同步路径一样）：
 
 ```bash
-curl -X POST http://192.168.3.60:5050/v1/realtime/chassis-velocity \
+curl -X POST http://192.168.6.231:5050/v1/realtime/chassis-velocity \
      -H 'Content-Type: application/json' \
      -d '{"vx":0.3,"vy":0,"wz":0}'
 ```
@@ -391,7 +340,7 @@ curl -X POST http://192.168.3.60:5050/v1/realtime/chassis-velocity \
 ```python
 import json, websocket
 
-ws = websocket.create_connection('ws://192.168.3.60:5050/v1/ws')
+ws = websocket.create_connection('ws://192.168.6.231:5050/v1/ws')
 ws.recv()  # welcome
 
 ws.send(json.dumps({"op": "subscribe_lane"}))

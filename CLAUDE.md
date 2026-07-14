@@ -44,11 +44,11 @@ pm2 restart rak-car-api                     # after pulling new code
 ```
 
 Default URLs (override via env vars — see "Config surface" below):
-- API: `http://192.168.3.60:5050`
-- FastAPI docs: `http://192.168.3.60:5050/docs`
-- Stream page: `http://192.168.3.60:5050/stream/`
-- cam1 MJPEG: `http://192.168.3.60:5050/video_feed/cam1`
-- cam2 MJPEG: `http://192.168.3.60:5050/video_feed/cam2`
+- API: `http://192.168.6.231:5050`
+- FastAPI docs: `http://192.168.6.231:5050/docs`
+- Stream page: `http://192.168.6.231:5050/stream/`
+- cam1 MJPEG: `http://192.168.6.231:5050/video_feed/cam1`
+- cam2 MJPEG: `http://192.168.6.231:5050/video_feed/cam2`
 
 The runtime's job is to:
 - Hold a single `MyCar()` instance and serialize access through `car_lock`.
@@ -63,7 +63,7 @@ If you only need to drive the car (no internal changes), you should be writing a
 `main/` is a separate Python package that depends **only** on the runtime API via HTTP. It splits into three subpackages — pick the one matching your area:
 
 ```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 /usr/bin/python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
 python3 /home/jetson/workspace/rak-car/main/quick_start.py    # connectivity check
 python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission template
@@ -130,7 +130,7 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 | --- | --- | --- |
 | `RAK_CAR_BIND_HOST` | `0.0.0.0` | API listen address |
 | `RAK_CAR_BIND_PORT` | `5050` | API listen port |
-| `RAK_CAR_PUBLIC_HOST` | `192.168.3.60` | Address returned to LAN clients |
+| `RAK_CAR_PUBLIC_HOST` | `192.168.6.231` | Address returned to LAN clients |
 | `RAK_CAR_PUBLIC_STREAM_PORT` | = BIND_PORT | Where the camera stream is reachable |
 | `RAK_CAR_PUBLIC_STREAM_PATH` | `/stream/` | Stream page path |
 | `RAK_CAR_AUTO_INIT` | `1` | Background auto-recover `MyCar()` when MC602 reboots |

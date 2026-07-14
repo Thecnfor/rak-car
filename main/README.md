@@ -51,13 +51,13 @@
 最常用的只改一个：
 
 ```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 ```
 
 这样会同时影响：
 
-- API: `http://192.168.3.60:5050`
-- Streamer: `http://192.168.3.60:5050/stream/`
+- API: `http://192.168.6.231:5050`
+- Streamer: `http://192.168.6.231:5050/stream/`
 
 安装依赖：
 
@@ -68,7 +68,7 @@ python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
 ## 建议开发顺序
 
 ```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 python3 /home/jetson/workspace/rak-car/main/quick_start.py
 ```
 

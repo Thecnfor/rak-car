@@ -42,11 +42,11 @@ pm2 logs rak-car-api
 
 ## 默认访问地址
 
-- API: `http://192.168.3.60:5050`
-- FastAPI 文档: `http://192.168.3.60:5050/docs`
-- 视频流页面: `http://192.168.3.60:5050/stream/`
-- cam1 MJPEG: `http://192.168.3.60:5050/video_feed/cam1`
-- cam2 MJPEG: `http://192.168.3.60:5050/video_feed/cam2`
+- API: `http://192.168.6.231:5050`
+- FastAPI 文档: `http://192.168.6.231:5050/docs`
+- 视频流页面: `http://192.168.6.231:5050/stream/`
+- cam1 MJPEG: `http://192.168.6.231:5050/video_feed/cam1`
+- cam2 MJPEG: `http://192.168.6.231:5050/video_feed/cam2`
 
 更完整的流媒体接口说明见：
 

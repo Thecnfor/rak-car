@@ -4,7 +4,7 @@
 
 ```bash
 python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 ```
 
 ## 2. 首次上电：runtime 自动定原点
