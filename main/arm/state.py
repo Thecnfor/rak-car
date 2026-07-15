@@ -16,21 +16,22 @@ HANDS = ("UP", "MID", "DOWN")
 
 # 存储仓（二选一档位）枚举。
 #
-# 角度范围：ServoPwm wrapper 是 0~180 度（mc602 没 clamp，但下层 8-bit
-# 通道收到 0~180 之外的 angle 会被协议层回中 / 回弹）。
-# 实测：
-#   - LEFT  -42° -> wrapper 后协议值 = -42+90 = 48，合法，不回弹
-#   - RIGHT 90°  -> wrapper 后协议值 = 90+90  = 180，临界值，合法
-# 历史事故：RIGHT 曾用 165°，协议值 255 超 0~180，mc602 会回弹。
-# 因此 RIGHT 改用 90° 附近的值（=协议值 180，刚好是上边界）。
+# 角度常量**严格对齐**官方 `baidu_smartcar_2026/car_wrap_2026.py:389`
+#   servo_1_angle_list = [-42, 165]。
+# **不要修改这两个常量** —— 改了就和官方车体物理位置对不上。
 #
-# 注意：car_wrap_2026.servo_1_angle_list[1] 也保持同步是 90，否则 set_storage
-# 传 True 会再被这里"换算前"的 -42/90 算成 out-of-range。
-# 默认 LEFT 用 -42° 保持和初始化（注释掉前）一致；如果后续发现 mc602 也不喜欢
-# -42，统一改成 0~180 区间。
+# 物理细节（仅供参考，不要据此"修正"角度）：
+#   - LEFT  = -42° → ServoPwm 协议值 = -42+90 = 48，0~180 合法
+#   - RIGHT = 165° → ServoPwm 协议值 = 165+90 = 255，**超 0~180**
+#   - mc602 协议层对 0~180 之外的协议值是"不识别"而非"回弹"，
+#     实际舵机行为由 mc602 固件决定（现场观察稳定，官方车这么用就行）。
+#   - mc601 会自动 clamp 到 0~180，所以换 mc601 时也不需要改。
+#
+# **业务层只允许 LEFT/RIGHT 二选一**（set_storage() 不接受任意 angle）。
+# 想传任意 angle 是反模式，会绕过官方标定 —— 不允许。
 STORAGE_SIDES = ("LEFT", "RIGHT")
 STORAGE_DEFAULT_LEFT_ANGLE = -42
-STORAGE_DEFAULT_RIGHT_ANGLE = 90
+STORAGE_DEFAULT_RIGHT_ANGLE = 165
 
 
 @dataclass

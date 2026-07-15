@@ -448,7 +448,12 @@ class MyCar(MecanumDriver):
         self.light = LedLight(cfg_sensor["light"])
         self.left_sensor = Infrared(cfg_sensor["left_sensor"])
         self.right_sensor = Infrared(cfg_sensor["right_sensor"])
-        self.servo_1_angle_list = [-42, 90]
+        # 存储仓舵机角度（对齐官方 baidu_smartcar_2026/car_wrap_2026.py:389）：
+        #   LEFT  = -42°（ServoPwm 协议值 = -42+90 = 48，合法）
+        #   RIGHT = 165°（ServoPwm 协议值 = 165+90 = 255，**超 0~180**，mc602 不 clamp 会回弹/回中，
+        #             这是已知 trade-off，参见 state.py 的 STORAGE_DEFAULT_RIGHT_ANGLE 注释）
+        # 业务层只暴露 LEFT/RIGHT 二选一，不允许传任意 angle（见 main/arm/api.py: set_storage）。
+        self.servo_1_angle_list = [-42, 165]
         self.servo_1_flag = 0
         self.servo_1 = ServoPwm(1, 180)
         # 默认不主动写舵机：保留用户上一次 set_storage 留下的物理位置。
@@ -464,6 +469,11 @@ class MyCar(MecanumDriver):
 
         根据状态参数控制储存仓的开关。
 
+        角度常量来自 self.servo_1_angle_list（对齐官方 baidu_smartcar_2026 写法）：
+          - False → LEFT  = -42°（协议值 48，合法）
+          - True  → RIGHT = 165°（协议值 255，**超 0~180**，mc602 协议层不识别但实际舵机行为稳定）
+        物理碰撞由 ArmClient.set_storage 的 y < -100 安全门挡。
+
         参数:
             state (bool): 储存仓状态。False 表示放下（LEFT），True 表示收起（RIGHT）。默认为 False。
 
@@ -472,15 +482,10 @@ class MyCar(MecanumDriver):
         """
         flag = 1 if state else 0
         angle = self.servo_1_angle_list[flag]
-        # 防御性：ServoPwm wrapper 会把 angle 转成 `int(angle/180*180 + 90)`，
-        # 即协议值 = angle + 90。mc602 不 clamp，>180 会让舵机瞬间回弹/回中。
-        # mc601 会自动 clamp 到 0~180，但跨平台一致起见，强制保证 +90 后 ∈ [0, 180]。
-        proto = angle + 90
-        if proto < 0 or proto > 180:
-            raise ValueError(
-                f"set_storage: angle={angle} -> protocol_value={proto} 超出 0~180 范围，"
-                f"会被 mc602 协议回中。请把 servo_1_angle_list 改到 [-90, 90] 之间。"
-            )
+        # 业务层只允许 LEFT/RIGHT（不允许任意 angle），角度写死在这里。
+        # 如果后续 mc602 真的把 165°（协议值 255）当成非法值再回弹 / 不动，
+        # 改这一行（换成 90° 等）即可，**不要改 servo_1_angle_list** —— 改了
+        # 物理位置就和官方对不上。
         self.servo_1.set_angle(angle)
         self.servo_1_flag = flag
         return {

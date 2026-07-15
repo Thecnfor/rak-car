@@ -300,6 +300,35 @@ class ArmClient:
                 flush=True,
             )
 
+    # ---- 硬件安全门（防止误操作撞车） ----
+    #
+    # 经验规则（来自现场测试 + 比赛策略）：
+    #   - y ∈ [0, -100]  ：存储仓舵机保持默认 LEFT 位置（不要变）；reset_x 会撞墙
+    #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT) 和 reset_x
+    #   - 物理依据：y 离触底越近（接近 0），x 撞墙/舵机摆动就越容易撞到地面或邻物
+    #
+    # 实现：每次关键操作前查 y，超阈就 raise ValueError。**不静默吞**。
+
+    _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage / reset_x
+
+    def _check_y_safe_for_storage(self, action: str) -> float:
+        """检查当前 y 是否允许做「会动 x 机械结构 / 存储仓舵机」的动作。
+
+        action: "set_storage" | "reset_x" | "reset_origin"（任一）
+        返回：当前 y_mm（mm），供 caller 日志
+        raise：ValueError 当 y >= _Y_STORAGE_SAFE_THRESHOLD_MM
+        """
+        st = self.get_state()
+        y_mm = float(st.y_mm)
+        if y_mm > self._Y_STORAGE_SAFE_THRESHOLD_MM:
+            raise ValueError(
+                f"[{action}] 安全门拦截: 当前 y={y_mm:.1f}mm > {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm。\n"
+                f"  规则: y < {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm 才能切存储仓或 reset_x\n"
+                f"  (y ∈ [0, -100] 接近触底,横向动作会撞车)\n"
+                f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。"
+            )
+        return y_mm
+
     def set_side(self, side: str, speed: int = 80, timeout: float = 10.0) -> dict:
         side = _normalize_side(side)
         if side is None:
@@ -317,9 +346,13 @@ class ArmClient:
     def set_storage(self, side: str, timeout: float = 10.0) -> dict:
         """切换车体上的存储仓舵机（独立 PWM 舵机，port=1）。
 
-        只接受两个档位：
-          - "LEFT"  → 写死角度 STORAGE_DEFAULT_LEFT_ANGLE（-42°，与初始化复位角度一致）
-          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（165°）
+        只接受两个档位（写死角度，不允许任意角度）：
+          - "LEFT"  → STORAGE_DEFAULT_LEFT_ANGLE  = -42°（与初始化复位角度一致）
+          - "RIGHT" → STORAGE_DEFAULT_RIGHT_ANGLE = 90°（车端 car_wrap_2026.servo_1_angle_list）
+
+        ⚠️ 安全门：y 必须 < -100mm 才能调。在 y ∈ [0, -100] 接近触底的位置舵机摆动
+        会撞底盘结构。底层走 car.set_storage(bool)（不在 arm action 表里），所以这里
+        显式 safety check。
 
         底层走 car.set_storage(bool)，它在 car_wrap_2026.sensor_init 阶段已构造。
         之所以走 car（而不是 arm）是因为这块舵机不属于机械臂（arm），属于车体外设。
@@ -337,6 +370,8 @@ class ArmClient:
         side = _normalize_storage_side(side)
         if side is None:
             raise ValueError(f"set_storage 必须给 {STORAGE_SIDES}")
+        # 硬件安全门：y 必须 < -100mm（防止 y ∈ [0,-100] 时舵机摆动撞车）
+        self._check_y_safe_for_storage("set_storage")
         # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 165°（RIGHT 档），
         # False → servo_1_angle_list[0] = -42°（LEFT 档）。
         open_flag = side == "RIGHT"
@@ -400,6 +435,12 @@ class ArmClient:
         return self._call_arm("reset_y", timeout=timeout)
 
     def reset_x(self, timeout: float = 30.0) -> dict:
+        """仅归 x（撞墙 + 编码器物理清零）。
+
+        ⚠️ 安全门：y 必须 < -100mm 才能调。x 撞墙时机械臂会横向摆动，在 y ∈ [0, -100]
+        接近触底的位置撞车风险高。详见 [ARM_API.md §reset_x 行为](./ARM_API.md#reset_x-行为撞墙是唯一到墙凭证-v2-模型驱动)。
+        """
+        self._check_y_safe_for_storage("reset_x")
         return self._call_arm("reset_x", timeout=timeout)
 
     def reset_origin(self, x_wall: str = "left", timeout: float = 60.0) -> dict:
@@ -410,6 +451,8 @@ class ArmClient:
         """
         if x_wall not in ("left", "right"):
             raise ValueError("x_wall 必须是 'left' 或 'right'")
+        # 同样 y 必须 < -100（reset_position 也包含 reset_x 撞墙）
+        self._check_y_safe_for_storage("reset_origin")
         job = self._call_arm("reset_position", timeout=timeout)
         # 重新读一次 y/x 原始坐标，作为新原点
         st = self._read_raw_state()

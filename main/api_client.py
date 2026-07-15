@@ -325,29 +325,33 @@ class RuntimeApiClient:
     def run_arm_action(self, name, *args, **kwargs):
         return self.create_job("arm", name, args=list(args), kwargs=kwargs)
 
-    def execute_task(self, name, *args, timeout=None, **kwargs):
+    def execute_task(self, name, *args, timeout=None, sync=False, **kwargs):
+        # sync 是 execute 的元参数，不能漏到 action 的 kwargs 里（SDK action 不接受）。
         return self.execute(
             "task",
             name,
             args=list(args),
             kwargs=kwargs,
             timeout=timeout,
+            sync=sync,
         )
 
-    def execute_car_action(self, name, *args, timeout=None, **kwargs):
+    def execute_car_action(self, name, *args, timeout=None, sync=False, **kwargs):
         return self.execute(
             "car",
             name,
             args=list(args),
             kwargs=kwargs,
             timeout=timeout,
+            sync=sync,
         )
 
-    def execute_arm_action(self, name, *args, timeout=None, **kwargs):
+    def execute_arm_action(self, name, *args, timeout=None, sync=False, **kwargs):
         return self.execute(
             "arm",
             name,
             args=list(args),
             kwargs=kwargs,
             timeout=timeout,
+            sync=sync,
         )
