@@ -80,10 +80,15 @@ class ArmState:
     y_origin_valid: bool = False
     x_origin_valid: bool = False
 
-    # 软限位（从 ArmOrigin 拷过来）
+    # 软限位（从 ArmOrigin 拷过来）。
+    # 默认值必须与 ArmOrigin 一致（v3 双边行程）：
+    #   soft_y_max_mm = 200    （y ∈ [-200, 0] mm）
+    #   soft_x_min_mm = -320   （x ∈ [-320, +320] mm，撞墙=0）
+    #   soft_x_max_mm = 320
+    # 旧版 (5 / 300) 是 v1 单边残留，已修正。
     soft_y_max_mm: float = 200.0
-    soft_x_min_mm: float = 5.0
-    soft_x_max_mm: float = 300.0
+    soft_x_min_mm: float = -320.0
+    soft_x_max_mm: float = 320.0
 
     # 原始坐标（车端读数，调试用；单位 m）
     raw_x_m: float = 0.0

@@ -226,21 +226,33 @@ def _execute_from_payload(service, payload):
     args = payload.get("args", [])
     kwargs = payload.get("kwargs", {})
     timeout = payload.get("timeout")
+    # D 改造：默认异步（立即返回 job_id，状态查 /v1/jobs/{id}）。
+    # 旧同步调用方传 sync=True 拿原语义（submit_job_and_wait，阻塞到完成）。
+    sync = bool(payload.get("sync", False))
     if not name:
         raise HTTPException(status_code=400, detail="缺少 name")
+    if sync:
+        try:
+            job = service.submit_job_and_wait(
+                target=target,
+                name=name,
+                args=args,
+                kwargs=kwargs,
+                timeout=timeout,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        return {"ok": job["status"] == "succeeded", "job": job}
+    # 异步：立即返回 job dict（status=queued），不阻塞。
     try:
-        job = service.submit_job_and_wait(
-            target=target,
-            name=name,
-            args=args,
-            kwargs=kwargs,
-            timeout=timeout,
+        job = service.submit_job(
+            target=target, name=name, args=args, kwargs=kwargs
         )
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    return {"ok": job["status"] == "succeeded", "job": job}
+    return {"ok": True, "async": True, "job": job}
 
 
 def _get_job(service, job_id):
@@ -909,6 +921,16 @@ def create_runtime_router(service, camera_stream_service):
     @router_v1.get("/jobs/{job_id}")
     def v1_job(job_id: str):
         return _get_job(service, job_id)
+
+    @router_v1.post("/jobs/{job_id}/stop")
+    def v1_job_stop(job_id: str):
+        """D.6 协作取消：触发 job 的 _stop_event + 车端 _stop_flag。
+
+        SDK 在下个 PID 循环检测到 _stop_flag 后协作退出，job 状态置 failed
+        （参考 emergency_stop 模式）。立即返回，不等 SDK 完成。
+        """
+        cancelled = bool(service.cancel_job(job_id))
+        return {"ok": True, "cancelled": cancelled, "job_id": job_id}
 
     @router_v1.post("/control/init", status_code=202)
     def v1_init(payload: dict = Body(default={})):

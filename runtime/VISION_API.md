@@ -596,3 +596,66 @@ curl -sS -X POST http://127.0.0.1:5050/v1/vision/ocr \
 如果只是拿模型结果：
 
 - 优先用 `/v1/vision/*`
+
+## 7. 机械臂 y/x 实时位置（arm_feed）
+
+> **机械臂位置不是模型结果**，但和 lane_state 同构：由 runtime 默认启的 `arm_feed` 守护线程（20Hz）持续刷新 `streamer.arm_state`，业务层通过 HTTP/WS 读这份缓存，**不进 job_queue、不打 ZMQ、不抢 car_lock**，调试 / UI 轮询 20Hz+ 安全。
+
+### `GET /v1/realtime/arm/state`
+
+```bash
+curl -sS http://127.0.0.1:5050/v1/realtime/arm/state
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "arm_state": {
+    "active": true,
+    "mode": "arm_feed",
+    "y_m": 0.0,
+    "x_m": 0.0,
+    "y_mm": 0.0,
+    "x_mm": 0.0,
+    "ref_encoder": 0.0115,
+    "updated_at": 1784099908.66
+  }
+}
+```
+
+字段语义：
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `y_m` / `x_m` | float / None | SDK 原始坐标，**米**，与 `arm.y_get_position()` / `arm.x_get_position()` 一致 |
+| `y_mm` / `x_mm` | float / None | 业务坐标，**毫米**，=`y_m*1000` / `=x_m*1000`。业务坐标系与 SDK 完全一致：触底 / 撞墙=0，负=向上/向左（远离触底/远离墙） |
+| `ref_encoder` | float / None | 最近 `reset_y` 触发磁感时的编码器值，丢步核对用 |
+| `active` | bool | `arm_feed` 守护线程是否在跑 |
+| `mode` | str | `"arm_feed"`（运行中）/ `"idle"`（已停） |
+| `updated_at` | float / None | unix 时间戳，WS 推送用它判"是否新数据" |
+
+### WebSocket `subscribe_arm_state`（**推荐 UI 用这个**）
+
+与 `subscribe_lane` 完全同构：
+
+```python
+import json, websocket
+ws = websocket.create_connection('ws://192.168.6.231:5050/v1/ws')
+ws.recv()  # welcome
+
+ws.send(json.dumps({"op": "subscribe_arm_state"}))
+print(json.loads(ws.recv()))  # {ok, subscribed, hz}
+
+while True:
+    msg = json.loads(ws.recv())
+    if msg.get("op") == "arm_state":
+        d = msg["data"]
+        y_mm, x_mm = d["y_mm"], d["x_mm"]
+        # ... 你的 UI 显示 ...
+```
+
+服务端行为：后台起 asyncio 任务，按 20Hz 轮询 `get_arm_state()`，**只在 `updated_at` 变化时 push**。`op: unsubscribe_arm_state` 或连接断开时自动 cancel 任务。
+
+完整端点表与字段语义见 [../main/arm/ARM_API.md §2](../main/arm/ARM_API.md#2-runtime-http--ws-端点)。

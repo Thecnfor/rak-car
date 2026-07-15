@@ -45,7 +45,7 @@ horiz_cfg:
   enable_encoder_reset: true
 pos_cfg:
   pose_enable: true
-  pose_horiz: 0.00012703908093849786
+  pose_horiz: 0.0
   pose_vert: 0.0
   side: RIGHT
 vert_cfg:

@@ -55,6 +55,8 @@ The runtime's job is to:
 - Run `auto_init` in the background — if the MC602 reboots, runtime rebuilds `MyCar()` automatically (see `RAK_CAR_AUTO_INIT`).
 - Provide a job queue (`/v1/jobs`, `/v1/execute`) so callers don't deadlock against an init in progress.
 - Expose vision results and camera streams without each caller rebuilding the inference backends.
+- **Default-on `lane_feed` daemon (20 Hz)** that keeps `lane_state` fresh for the chassis outer loop — started at init, idempotent on reuse. Toggle via `/v1/execute` actions `start_lane_feed` / `stop_lane_feed`; see `runtime/VISION_API.md` for `/v1/vision/lane` and the lane-overlay stream toggle.
+- **Default-on `arm_feed` daemon (20 Hz)** mirrors the same pattern for the arm: it keeps `arm_state` (y/x position, `ref_encoder`) fresh for UI / debugging. No action-level toggle — read via `GET /v1/realtime/arm/state` or WS `subscribe_arm_state`; see [main/arm/ARM_API.md](./main/arm/ARM_API.md) §2.
 
 If you only need to drive the car (no internal changes), you should be writing a script in `main/` against `RuntimeApiClient` — **not** importing `MyCar` directly.
 
@@ -71,9 +73,10 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission
 
 | 子包 | 用途 | 自己的 doc |
 | --- | --- | --- |
-| `main/arm/` | 机械臂业务：ArmClient + ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) |
-| `main/chassis/` | 底盘外环：ChassisClient + 50Hz `controllers/` + `loops/` 主循环 + 安全门 | [README.md](./main/chassis/README.md) |
+| `main/arm/` | 机械臂业务：ArmClient + ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/` 闭环、`tasks/` 流程、`examples/` 模板、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) |
+| `main/chassis/` | 底盘外环：ChassisClient + 50Hz 主循环；`controllers/` (P / Stanley / Pure Pursuit) + `loops/` (closed_loop, safety) + `tasks/` (follow_lane / track_target / back_to_line) + `examples/` (01–03 最小→完整模板) | [README.md](./main/chassis/README.md) |
 | `main/misc/` | 单文件 mini 任务（射击、边走边打等），每个脚本可直接 `python3` 跑 | [README.md](./main/misc/README.md) |
+| `main/test/` | 离线硬件冒烟脚本（arm / storage / x / 循迹），**非正式测试**，绕过 runtime 直接打硬件；改动 main/ 任务前先在这里验证 | — |
 
 The two base clients — `RuntimeApiClient` (HTTP, `main/api_client.py`) and `RuntimeWsClient` (WebSocket, `main/ws_client.py`) — are used by all three subpackages. Full action surface and parameters: [main/API_REFERENCE.md](./main/API_REFERENCE.md) / [main/API.md](./main/API.md) / [main/CAPABILITY_LIST.md](./main/CAPABILITY_LIST.md) / [main/BUSINESS_API_GUIDE.md](./main/BUSINESS_API_GUIDE.md).
 
@@ -151,7 +154,23 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 
 ## MC602 reboot behavior (read before touching runtime init)
 
-The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each reboot. Three concurrency hazards (USB re-enumeration races, init-queue jams, lock contention) are tracked in `debug-*.md` files at the repo root — read them before changing init/lock code, and check the `# debug-point runtime-init-queue-session` instrumentation in `runtime/services/runtime_service.py`. **Status on the controller-download-stuck issue: OPEN — don't refactor the recovery layer until it's closed.**
+The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each reboot. Three concurrency hazards (USB re-enumeration races, init-queue jams, lock contention) have been investigated in past debug sessions — check `.dbg/` for environment snapshots and Trae-format `.ndjson` traces (each session pairs a `debug-<slug>.md` note at the repo root with `.dbg/<slug>.{env,ndjson}` artefacts; older sessions may live only in `.dbg/`). Read them before changing init/lock code, and check the `# debug-point runtime-init-queue-session` instrumentation in `runtime/services/runtime_service.py`. **Status on the controller-download-stuck issue: OPEN — don't refactor the recovery layer until it's closed.**
+
+## Runtime concurrency model (replaces `car_lock`)
+
+`runtime/services/runtime_service.py` 把旧 `car_lock`（RLock，全程持锁导致 arm 长动作挡住 lane 外环）拆成两层：
+
+- **`_ref_lock`** — 只保护 `self.car` 引用替换（init / recover / close），微秒级
+- **`_realtime_gate`** — realtime 端点（`/v1/realtime/*`）入口微秒级取引用
+- 旧 `car_lock` 改成抛 `RuntimeError` 的 property，漏改的代码路径立即崩
+
+`job_queue` 拆成 `arm_queue` + `car_queue` 两个独立 worker：arm worker 卡在 1-3s PID 闭环里不影响 car worker。字节流仍由 SDK 的 `serial_mc602.lock` 串行——**这是物理约束，不可消除**。
+
+`/v1/execute` 默认改成异步（立即返回 `job_id`，状态查 `/v1/jobs/{id}`），旧同步调用方加 `"sync": true`。`/v1/jobs/{id}/stop` 协作取消（**注意**：SDK arm_base PID 循环不查 stop_event，cancel 后 arm 动作会自然跑完——这是已知 SDK 限制，不是 runtime bug）。
+
+`lane_feed` / `arm_feed` 守护线程检查 `self._stop_flag`：急停或 cancel_job 后 `_stop_flag=True`，守护线程 break 退出，`lane_state.active` 变 `false`。**清 stop 必须 POST `/v1/control/reset-stop` + 重启 lane_feed**。
+
+完整说明见 [runtime/README.md §并发任务模型](./runtime/README.md#并发任务模型)。
 
 ## Debug instrumentation
 
@@ -163,14 +182,15 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 
 ## Controller-only workspace (`test/controller_lab/`)
 
-`test/` is a **separate** Python package — a controller-only lab for poking the MC602 without spinning up the full car. `run_controller_lab.py` boots an interactive harness (see `test/OPERATION_GUIDE.md` + `test/PROTOCOL_NOTES.md`). Useful when debugging serial/recovery without risking the chassis. Not part of `main/`.
+`test/` is a **separate** Python package — a controller-only lab for poking the MC602 without spinning up the full car. `test/run_controller_lab.py` boots an interactive harness (see `test/OPERATION_GUIDE.md` + `test/PROTOCOL_NOTES.md`). Useful when debugging serial/recovery without risking the chassis. Not part of `main/`.
 
 ## Pointers to deeper docs
 
 - **Legacy monolith path:** this file (sections A–C above) + `car_wrap_2026.py` + `config_car.yml` comments.
-- **Runtime HTTP API:** `runtime/README.md`, `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
+- **Runtime HTTP API:** `runtime/README.md` (含并发任务模型、锁层次、双 worker 队列、/v1/execute 异步语义), `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
 - **Business client:** `main/README.md`, `main/API.md`, `main/API_REFERENCE.md`, `main/BUSINESS_API_GUIDE.md`, `main/CAPABILITY_LIST.md`.
 - **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/QUICKSTART.md`; `main/chassis/README.md`; `main/misc/README.md`.
 - **User-facing intro:** `README.md` (the original competition-tasks overview in Chinese).
 - **Controller lab:** `test/README.md`, `test/OPERATION_GUIDE.md`, `test/PROTOCOL_NOTES.md`.
+- **本地端到端验证脚本：** `main/test/verify_concurrent.py`（gitignored，本地用），跑双线程探针测 lane + arm 并发。
 - **Debug sessions:** `debug-*.md` at repo root (each is self-contained).

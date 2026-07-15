@@ -147,11 +147,12 @@ class ArmRunner:
     # ---- 复位 ----
 
     def reset_y(self, timeout: float = 30.0) -> dict:
-        """y 步进电机触底复位（车端跑 reset_position，会同时触发 x 复位）。
+        """y 步进电机触底复位（车端跑 reset_y，**仅动 y，不动 x**）。
 
-        仅在 y 跑偏严重（补偿不收敛）时调。
+        仅在 y 跑偏严重（补偿不收敛）时调。要同时归 x 请用 reset_position
+        路径（`ArmClient.reset_origin` / 显式调 `arm.reset_position`）。
         """
-        return self.client._call_arm("reset_position", timeout=timeout)
+        return self.client._call_arm("reset_y", timeout=timeout)
 
     def reset_x(self, timeout: float = 30.0) -> dict:
         """x 编码器电机堵转复位。
