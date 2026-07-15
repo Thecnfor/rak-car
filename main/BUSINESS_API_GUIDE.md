@@ -111,8 +111,12 @@ print(client.call("car", "get_odometry", timeout=20))
 
 - `client.call(target, name, *args, timeout=..., **kwargs)`
   - 最顺手，适合 90% 业务脚本
-- `client.execute(target, name, args=None, kwargs=None, timeout=None)`
+- `client.execute(target, name, args=None, kwargs=None, timeout=None, sync=False)`
   - 显式传 `args/kwargs`，适合动态组包
+  - **默认异步**（`sync=False`），立即返回 `job` dict，状态查 `client.get_job(job_id)`
+  - 传 `sync=True` 阻塞到完成（链式编排 / 老调用方）
+- `client.cancel_job(job_id)`
+  - 协作取消（`/v1/jobs/{id}/stop`），立即返回 `cancelled: true`
 - `client.create_job(...) + client.wait_job(...)`
   - 适合你想先创建任务、后面再轮询
 - `client.get_health()`
@@ -121,6 +125,8 @@ print(client.call("car", "get_odometry", timeout=20))
   - 看里程计、累计距离、停机标记
 - `client.get_actions()`
   - 动态查看当前允许调哪些动作
+
+> **执行模式（2026-07 改造）**：`/v1/execute` 默认异步（不阻塞客户端），`job_queue` 拆成 `arm_queue` + `car_queue` 两个独立 worker，长动作（arm PID 闭环 1-3s）不再挡住短动作 / 实时端点。详见 [runtime/README.md §并发任务模型](../runtime/README.md#并发任务模型)。
 
 ## 4. 先学会怎么选接口
 

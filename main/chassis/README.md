@@ -46,10 +46,12 @@
 
 外环：客户端，20-50Hz，控制律只读 lane_state，写 4 轮速
 内环：车端，PID（已存在），吃 4 轮速直接驱动
-车端 lane_feed：单独线程，只刷 lane_state 不下发轮速（不抢 car_lock）
+车端 lane_feed：单独线程，只刷 lane_state 不下发轮速（不抢 runtime 锁）
 ```
 
-**核心原则**：外环和内环 **不能同时跑**。`start_lane_feed` 是"只刷 state"的旁路线程，跟外环下发轮速不冲突；但如果你又开了 `car.lane_*`（车端内环 PID），就会撞 `car_lock`，外环被串行化延迟。
+**核心原则**：外环和内环 **不能同时跑**。`start_lane_feed` 是"只刷 state"的旁路线程，跟外环下发轮速不冲突；但如果你又开了 `car.lane_*`（车端内环 PID），就会撞 runtime 锁，外环被串行化延迟。
+
+**runtime 锁层次（2026-07 改造）**：realtime 端点（`/v1/realtime/*`）走 `_realtime_gate` 微秒级瞬持锁，长动作（`arm.goto_position` 1-3s PID 闭环）不持任何 runtime 锁，**arm + lane 真正并发**。详见 [`../../runtime/README.md §并发任务模型`](../../runtime/README.md#并发任务模型) / [`../../CLAUDE.md §Runtime concurrency model`](../../CLAUDE.md#runtime-concurrency-model-replaces-car_lock)。
 
 ---
 

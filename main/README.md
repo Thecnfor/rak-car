@@ -124,10 +124,18 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py
 最常用的就是 `POST /v1/execute`：
 
 ```bash
+# 默认异步：立即返回 job_id，状态查 GET /v1/jobs/{id}
 curl -sS -X POST http://127.0.0.1:5050/v1/execute \
   -H 'Content-Type: application/json' \
   -d '{"target":"car","name":"beep","timeout":40}'
+
+# 同步阻塞：传 "sync": true 拿到 result
+curl -sS -X POST http://127.0.0.1:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"car","name":"beep","timeout":40,"sync":true}'
 ```
+
+> **2026-07 改造**：`/v1/execute` 默认改成异步（不阻塞客户端），适合机械臂 / 任务等长动作。客户端要等结果用 `client.execute(..., sync=True)`，运行时内部已把 `arm` / `car` 拆成两个独立 worker，长动作不再挡短动作和实时端点。详见 [runtime/README.md §并发任务模型](../runtime/README.md#并发任务模型)。
 
 所有接口总表，见 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 
