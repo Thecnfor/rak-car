@@ -4,10 +4,11 @@ from .api import ChassisClient
 from .state import LaneState
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
-from .controllers.base import OuterLoop
+from .controllers.base import OuterLoop, WheelSmoother
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
 from .controllers.pure_pursuit import PurePursuitOuterLoop
+from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 
 __all__ = [
     "ChassisClient",
@@ -16,7 +17,9 @@ __all__ = [
     "EmergencyWatchdog",
     "LostLineDetector",
     "OuterLoop",
+    "WheelSmoother",
     "POuterLoop",
     "StanleyOuterLoop",
     "PurePursuitOuterLoop",
+    "CurvatureAdaptiveOuterLoop",
 ]
