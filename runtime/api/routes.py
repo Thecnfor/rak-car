@@ -513,6 +513,21 @@ def _ws_op_realtime_arm_state(service, _payload):
     return {"ok": True, "op": "realtime/arm_state", "data": {"arm_state": arm_state}}
 
 
+def _ws_op_realtime_task_state(service, _payload):
+    """WS op=realtime/task_state: 读 streamer 缓存的 task_state 一次（侧摄目标检测）。
+
+    数据来源是 task_feed 守护线程(runtime 启动后默认 10Hz)通过
+    `car.streamer.set_task_state(...)` 持续刷新的内存缓存。
+    不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock(极快)。
+    让业务层"边走边看"侧摄目标成为可能（之前 /v1/vision/task 是 sync 5-15s 阻塞）。
+    """
+    try:
+        task_state = service.get_task_state()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/task_state", "data": {"task_state": task_state}}
+
+
 # op string → handler。统一 `(service, payload) -> dict`。
 _WS_OP_DISPATCH = {
     "ping": _ws_op_ping,
@@ -541,6 +556,7 @@ _WS_OP_DISPATCH = {
     "realtime/analog2": _ws_op_realtime_analog2,
     "realtime/lane_state": _ws_op_realtime_lane_state,
     "realtime/arm_state": _ws_op_realtime_arm_state,
+    "realtime/task_state": _ws_op_realtime_task_state,
 }
 
 
@@ -998,6 +1014,21 @@ def create_runtime_router(service, camera_stream_service):
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @router_v1.get("/realtime/vision/task")
+    def v1_realtime_task_state():
+        """边走边看侧摄目标:读 task_feed 守护线程缓存的最新一次目标检测结果。
+
+        与 /v1/realtime/lane/state 完全同构:不走 job_queue、不打 ZMQ、不持 car_lock,
+        只取 meta_lock(极快)。task_feed 默认 10Hz 刷新。
+
+        之前 /v1/vision/task 是 sync POST（5-15s 阻塞）,"边走边看"做不到。
+        现在业务层可以 50Hz 轮询本端点 + 同步下发轮速,实现实时闭环。
+        """
+        try:
+            return {"ok": True, "task_state": service.get_task_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     @router_v1.post("/realtime/chassis-velocity")
     def v1_realtime_chassis_velocity(payload: dict = Body(default={})):
         """(vx, vy, wz) 直发，绕开 set_velocity 里程计耦合。供外环 50Hz 用。"""
@@ -1120,6 +1151,8 @@ def create_runtime_router(service, camera_stream_service):
                     "unsubscribe_lane": {"op": "unsubscribe_lane"},
                     "subscribe_arm_state": {"op": "subscribe_arm_state", "note": "持续 push arm_state (y/x 位置)"},
                     "unsubscribe_arm_state": {"op": "unsubscribe_arm_state"},
+                    "subscribe_task_detection": {"op": "subscribe_task_detection", "note": "持续 push 侧摄 task_state (边走边看)"},
+                    "unsubscribe_task_detection": {"op": "unsubscribe_task_detection"},
                     "realtime_chassis_velocity": {"op": "realtime/chassis_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0},
                     "realtime_wheel_speeds": {"op": "realtime/wheel_speeds", "speeds": [0,0,0,0]},
                 },
@@ -1215,6 +1248,49 @@ def create_runtime_router(service, camera_stream_service):
                     pass
             arm_push_task = None
 
+        # ---- task_state push loop（边走边看侧摄目标）----
+        task_push_task = None
+        task_subscribed = False
+        task_push_hz = 10.0  # task_feed 默认刷新频率
+
+        async def _task_push_loop():
+            last_updated_at = None
+            interval = 1.0 / max(float(task_push_hz), 1.0)
+            while True:
+                try:
+                    state = service.get_task_state()
+                except Exception:
+                    state = None
+                updated_at = state.get("updated_at") if state else None
+                if state and updated_at is not None and updated_at != last_updated_at:
+                    last_updated_at = updated_at
+                    try:
+                        await websocket.send_json(
+                            {"ok": True, "op": "task_state", "data": state}
+                        )
+                    except Exception:
+                        return
+                await _asyncio.sleep(interval)
+
+        async def _start_task_push():
+            nonlocal task_push_task, task_subscribed
+            if task_subscribed and task_push_task is not None and not task_push_task.done():
+                return False
+            task_subscribed = True
+            task_push_task = _asyncio.create_task(_task_push_loop())
+            return True
+
+        async def _stop_task_push():
+            nonlocal task_push_task, task_subscribed
+            task_subscribed = False
+            if task_push_task is not None and not task_push_task.done():
+                task_push_task.cancel()
+                try:
+                    await task_push_task
+                except (_asyncio.CancelledError, Exception):
+                    pass
+            task_push_task = None
+
         while True:
             try:
                 payload = await websocket.receive_json()
@@ -1263,6 +1339,23 @@ def create_runtime_router(service, camera_stream_service):
                     {"ok": True, "op": "unsubscribe_arm_state", "subscribed": False}
                 )
                 continue
+            if op == "subscribe_task_detection":
+                started = await _start_task_push()
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "op": "subscribe_task_detection",
+                        "subscribed": started,
+                        "hz": task_push_hz,
+                    }
+                )
+                continue
+            if op == "unsubscribe_task_detection":
+                await _stop_task_push()
+                await websocket.send_json(
+                    {"ok": True, "op": "unsubscribe_task_detection", "subscribed": False}
+                )
+                continue
 
             request_id = payload.get("request_id")
             try:
@@ -1278,6 +1371,7 @@ def create_runtime_router(service, camera_stream_service):
         # ---- disconnect 清理 ----
         await _stop_lane_push()
         await _stop_arm_push()
+        await _stop_task_push()
 
     router.include_router(router_v1)
     return router

@@ -78,6 +78,9 @@ class CameraStreamService:
         # 机械臂 y/x 位置缓存：与 lane_state 同生命周期(meta_lock 保护),
         # 由 car.start_arm_feed 守护线程持续刷新,subscribe_arm_state WS op 推送。
         self.arm_state = self._default_arm_state()
+        # 侧摄目标检测缓存：与 arm_state 同模式，由 car.start_task_feed 守护线程
+        # 持续刷新,subscribe_task_detection WS op 推送。
+        self.task_state = self._default_task_state()
 
     def start(self):
         if self.running:
@@ -805,6 +808,32 @@ class CameraStreamService:
             else:
                 allowed.append("_")
         return "".join(allowed).strip("_") or "capture"
+
+    def _default_task_state(self):
+        """侧摄目标检测守护线程的默认缓存值（同 _default_lane_state 模式）。"""
+        return {
+            "active": False,
+            "mode": "idle",          # task_feed | tracking | idle | stopped
+            "detections": [],         # list[{cls_id, det_id, label, score, bbox_norm{...}}]
+            "count": 0,
+            "updated_at": None,
+        }
+
+    def set_task_state(self, **updates):
+        """task_feed 守护线程持续刷新的目标检测缓存（meta_lock 路径，不抢 car_lock）。"""
+        with self.meta_lock:
+            state = dict(self.task_state)
+            for key, value in updates.items():
+                state[key] = value
+            state["updated_at"] = time.time()
+            self.task_state = state
+            return dict(state)
+
+    def get_task_state(self):
+        """读 task_feed 守护线程缓存。"""
+        with self.meta_lock:
+            state = dict(self.task_state)
+        return state
 
     def _default_lane_state(self):
         return {

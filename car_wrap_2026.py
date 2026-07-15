@@ -1455,6 +1455,112 @@ class MyCar(MecanumDriver):
             self._arm_feed_stop = None
         return {"stopped": True}
 
+    # === 侧摄目标检测推送守护线程（实时 task 检测结果,给 WS subscribe_task_detection 订阅） ===
+    def start_task_feed(self, hz: float = 10.0):
+        """启动侧摄目标检测守护线程,持续刷新 streamer.task_state。
+
+        与 start_lane_feed / start_arm_feed 模式一致:
+          - 不抢 car_lock(读摄像头 + ZMQ 推理是独立 IO)
+          - 默认 10Hz（task 检测比 lane 慢,~50-100ms/次,hz 太高没意义且浪费 ZMQ）
+          - 不会下发任何控制指令,只刷新 task_state 缓存
+          - 订阅一次即可一直 push,disconnect / unsubscribe 时 cancel
+
+        业务场景:"边走边看"侧摄目标 — 不必每帧调 sync /v1/vision/task（5-15s 阻塞）,
+        直接读 /v1/realtime/vision/task 缓存或订阅 WS subscribe_task_detection。
+        """
+        if not hasattr(self, "_task_feed_lock"):
+            self._task_feed_lock = threading.Lock()
+            self._task_feed_thread = None
+            self._task_feed_stop = None
+        with self._task_feed_lock:
+            if self._task_feed_thread is not None and self._task_feed_thread.is_alive():
+                return {"started": False, "reason": "already_running", "hz": hz}
+            self._task_feed_stop = threading.Event()
+            stop_event = self._task_feed_stop
+            period = 1.0 / max(float(hz), 1.0)
+
+            def _task_feed_loop():
+                streamer = getattr(self, "streamer", None)
+                set_state = getattr(streamer, "set_task_state", None) if streamer else None
+                # 复用 self.cap_side + self.task_det,不重新初始化
+                get_frame = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
+                consecutive_err = 0
+                while not stop_event.is_set():
+                    if self._stop_flag:
+                        break
+                    try:
+                        if get_frame is None:
+                            stop_event.wait(period)
+                            continue
+                        img = get_frame()
+                        if img is None:
+                            stop_event.wait(period)
+                            continue
+                        # 直接调 self.task_det (PaddleDetection,无 sort/limit 过滤)
+                        # 排序/过滤留给上层业务按需调 /v1/vision/task (sync)
+                        raw = self.task_det(img) if hasattr(self, "task_det") else []
+                        # raw 形如 [[cls_id, det_id, label, score, x_c, y_c, w, h], ...]
+                        # 缓存到 streamer.task_state 供上层轮询/订阅
+                        if set_state is not None:
+                            set_state(
+                                active=True,
+                                mode="task_feed",
+                                detections=[
+                                    {
+                                        "cls_id": int(d[0]) if len(d) > 0 else None,
+                                        "det_id": int(d[1]) if len(d) > 1 else None,
+                                        "label": str(d[2]) if len(d) > 2 else "",
+                                        "score": float(d[3]) if len(d) > 3 else 0.0,
+                                        "bbox_norm": {
+                                            "x_center": float(d[4]) if len(d) > 4 else 0.0,
+                                            "y_center": float(d[5]) if len(d) > 5 else 0.0,
+                                            "width":    float(d[6]) if len(d) > 6 else 0.0,
+                                            "height":   float(d[7]) if len(d) > 7 else 0.0,
+                                        }
+                                    }
+                                    for d in (raw or []) if len(d) >= 8
+                                ],
+                                count=len(raw or []),
+                            )
+                        consecutive_err = 0
+                    except Exception as exc:
+                        consecutive_err += 1
+                        logger.warning(
+                            "task feed transient err ({}): {}".format(consecutive_err, exc)
+                        )
+                        if consecutive_err >= 5:
+                            logger.warning("task feed loop exit after {} errs".format(consecutive_err))
+                            break
+                        stop_event.wait(period)
+                        continue
+                    stop_event.wait(period)
+                if set_state is not None:
+                    try:
+                        set_state(active=False, mode="idle", detections=[], count=0)
+                    except Exception:
+                        pass
+
+            self._task_feed_thread = threading.Thread(target=_task_feed_loop, name="task-feed")
+            self._task_feed_thread.daemon = True
+            self._task_feed_thread.start()
+            return {"started": True, "hz": hz}
+
+    def stop_task_feed(self):
+        """停止 task_feed 守护线程,并把 task_state 复位成 idle。"""
+        if not hasattr(self, "_task_feed_lock"):
+            return {"stopped": True, "reason": "never_started"}
+        with self._task_feed_lock:
+            stop_event = self._task_feed_stop
+            thread = self._task_feed_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        with self._task_feed_lock:
+            self._task_feed_thread = None
+            self._task_feed_stop = None
+        return {"stopped": True}
+
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):
     #     """
     #     目标检测基础方法

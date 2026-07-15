@@ -364,6 +364,12 @@ class CarRuntimeService:
             car.start_arm_feed(hz=20.0)
         except Exception as exc:
             logger.warning("arm_feed auto-start failed: {}".format(exc))
+        # 默认启 task_feed 守护线程:持续刷新 streamer.task_state(侧摄目标检测),
+        # 供 WS subscribe_task_detection 实时推送,"边走边看"侧摄目标的必需组件
+        try:
+            car.start_task_feed(hz=10.0)
+        except Exception as exc:
+            logger.warning("task_feed auto-start failed: {}".format(exc))
         return car
 
     def _ensure_infer_ready(self):
@@ -408,6 +414,11 @@ class CarRuntimeService:
                         self.car.start_arm_feed(hz=20.0)
                     except Exception as exc:
                         logger.warning("arm_feed auto-start (reused) failed: {}".format(exc))
+                    # task_feed 同理
+                    try:
+                        self.car.start_task_feed(hz=10.0)
+                    except Exception as exc:
+                        logger.warning("task_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()
@@ -572,6 +583,26 @@ class CarRuntimeService:
         if self.stream_service is None:
             raise RuntimeError("stream_service 未注入（runtime 启动异常）")
         return self.stream_service.get_arm_state()
+
+    def get_task_state(self):
+        """边走边看专用：读 streamer 缓存的 task_state（侧摄目标检测）。
+
+        数据来源：`task_feed` 守护线程（runtime 启动后默认 10Hz）通过
+        `car.streamer.set_task_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        让业务层"边走边看"侧摄目标成为可能（之前 /v1/vision/task 是 sync 5-15s 阻塞）。
+
+        返回字段：
+          - active: bool (task_feed 是否在跑)
+          - mode: str ("task_feed" / "tracking" / "idle" / "stopped")
+          - detections: list[{cls_id, det_id, label, score, bbox_norm{...}}]
+          - count: int
+          - updated_at: float (unix time)
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_task_state()
 
     def set_single_motor(self, port, speed, reverse=1):
         with self._realtime_gate:

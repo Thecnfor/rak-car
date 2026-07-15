@@ -272,6 +272,30 @@ class RuntimeWsClient:
             hz=hz,
         )
 
+    def subscribe_task_detection(self, on_state, hz=10.0):
+        """订阅侧摄目标检测推送——"边走边看"侧摄目标。
+
+        服务端 task_feed 守护线程默认 10Hz 推 `task_state` dict(同 lane/arm 模式):
+          - 独立 WS 连接
+          - 字段:`active`,`mode`,`detections` (list[{cls_id, det_id, label, score, bbox_norm}]),
+            `count`,`updated_at`
+
+        之前 /v1/vision/task 是 sync POST（5-15s 阻塞）,"边走边看"做不到。
+        现在业务层可以一边发轮速一边收 detection,真正实现实时闭环。
+
+        用法:
+          stop = client.subscribe_task_detection(lambda s: print(s['label'], s['score']))
+          # ...
+          stop()
+        """
+        return self._subscribe_push(
+            slot_attr="_task_subscriber",
+            subscribe_op="subscribe_task_detection",
+            push_op="task_state",
+            on_state=on_state,
+            hz=hz,
+        )
+
     def _subscribe_push(self, slot_attr, subscribe_op, push_op, on_state, hz):
         """通用推送订阅,被 subscribe_lane / subscribe_arm_state 共用。"""
         existing = getattr(self, slot_attr, None)

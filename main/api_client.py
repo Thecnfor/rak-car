@@ -316,6 +316,18 @@ class RuntimeApiClient:
         """
         return self._request("GET", f"{self.api_prefix}/realtime/arm/state")
 
+    def get_task_state(self):
+        """读侧摄目标检测缓存(task_feed 守护线程,默认 10Hz 刷新)。
+
+        "边走边看"侧摄目标的必需组件 —— 之前 /v1/vision/task 是 sync POST
+        （5-15s 阻塞）,"边走边看"做不到。现在轮询本端点即可拿到最近一次检测结果。
+
+        返回 `{"task_state": {"active": ..., "mode": ..., "detections": [...], "count": N, "updated_at": ...}}`。
+        detections 是 list[dict],每个 dict 含 cls_id / det_id / label / score / bbox_norm。
+        字段为 None 时说明 task_feed 未运行或刚启动。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/vision/task")
+
     def run_task(self, name, *args, **kwargs):
         return self.create_job("task", name, args=list(args), kwargs=kwargs)
 
