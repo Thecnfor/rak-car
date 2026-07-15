@@ -637,7 +637,10 @@ class ArmController:
             hand2: 手部舵机配置
             grap: 抓取机构配置
         """
-        self.hand_servo = ServoPwm(hand2["port"], mode=hand2["mode"])
+        # 手爪舵机(hand2)实际接在 bus_servo port=3(总线舵机协议,不是 PWM)。
+        # 旧实现用 ServoPwm 调 hand2.port=2 → 协议错配,实际不发命令。
+        # 改成 ServoBus(跟 arm_servo 同一协议)。
+        self.hand_servo = ServoBus(hand2["port"])
         self.hand_angle_list2 = hand2["angle_list"]
         self.arm_servo = ServoBus(hand["port"])
         self.hand_angle_list = hand["angle_list"]

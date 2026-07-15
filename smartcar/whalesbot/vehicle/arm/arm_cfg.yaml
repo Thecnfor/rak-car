@@ -10,8 +10,7 @@ hand_cfg:
       UP: -90
       MID: -37
       DOWN: 0
-    port: 2
-    mode: 180
+    port: 3
   grap:
     port_pump: 2
     port_valve: 3
@@ -26,36 +25,28 @@ horiz_cfg:
     Ki: 0
     Kd: 0
     setpoint: 0
-    # 主限幅加大,避免负方向死区(motor_280 负方向响应极慢,需要更大命令才能动)
     output_limits:
     - -0.4
     - 0.4
-  # 软限位: x_threshold 旧值 [0, 0.315] 是单调正方向(只允许正位移),
-  # 实际 x 撞墙=0、远离墙=正、反向撞另一侧墙=负。
   threshold:
   - -0.32
   - 0.32
-  # 末段减速带:x 接近 |x_wall| 时, PWM 限幅降到 slow_velocity 防过冲。
-  slow_band_m: 0.020
+  slow_band_m: 0.02
   slow_velocity: 0.05
-  # 顶段减速带:x 接近反向墙时减速防失步
-  top_slow_m: 0.020
-  top_slow_velocity: 0.10
-  # reset_x 配置: motor_280 实测命令 0.05 m/s 实际只走 1.5mm/s(33x 死区),
-  # 需要 reset_velocity 大才能在 timeout 内撞墙
+  top_slow_m: 0.02
+  top_slow_velocity: 0.1
   reset_target_m: 0.34
   reset_velocity: 0.15
-  reset_dwell_time: 0.10
+  reset_dwell_time: 0.1
   reset_timeout: 15.0
-  # 撞墙判据（v2 — 模型驱动 + 速度对照）:
-  wall_ratio_threshold: 0.20
-  min_velocity_ratio: 0.30
+  wall_ratio_threshold: 0.2
+  min_velocity_ratio: 0.3
   wall_window_ms: 200
   enable_encoder_reset: true
 pos_cfg:
   pose_enable: true
-  pose_horiz: 0.0
-  pose_vert: 0.002195
+  pose_horiz: 0.00012703908093849786
+  pose_vert: 0.0
   side: RIGHT
 vert_cfg:
   motor:
@@ -71,18 +62,11 @@ vert_cfg:
     output_limits:
     - -0.1
     - 0.1
-  # 软限位 + 分段减速参数。
-  # threshold 必须为 [-soft_y_max, 0]（负=向上, 0=触底）;
-  # 旧值 [0, 0.2] 把负向全部钳掉,导致 move_y(-0.18) 被错误拦截,已修正。
-  # 行程上限设为 -200mm,实测仍有富余。
   threshold:
-  - -0.20
+  - -0.2
   - 0.0
-  # 末段减速带：y >= -slow_band 时（接近磁感）, PWM 限幅降到 slow_velocity 防过冲。
   slow_band_m: 0.015
   slow_velocity: 0.02
-  # 顶段减速带：y <= -(slow_band + top_slow) 时（远离磁感,接近顶部机械硬限位）, 减速防失步。
-  # 仅用于 move_y_position 往上走;reset_y 永不下行,不走此分支。
-  top_slow_m: 0.020
+  top_slow_m: 0.02
   top_slow_velocity: 0.03
 arm_length: 0.23
