@@ -586,6 +586,17 @@ class ArmController:
                 if hit_ratio or hit_speed:
                     if triggered_at is None:
                         triggered_at = t_now
+                        # 撞墙瞬间:**直接 motor_x.set_linear(0)**,不走 x_speed。
+                        # 原因:motor_280 是 DC 电机无刹车,x_speed(0) 仍会被
+                        # x_speed 内部的 soft-limit / velocity_limit 链路处理后再下发;
+                        # 而用户实测"顶到墙之后还会转"——说明 set_speed(0) 后电机仍
+                        # 因 PID 闭环 / 串口响应延迟继续转几下。直接 set_linear(0)
+                        # 绕过所有包装,MC602 立刻收到 0 命令 + 内部 PID 也立即停。
+                        self.motor_x.set_linear(0)
+                        logger.info(
+                            "reset_x: 撞墙触发,r=%.2f v=%.4f → motor.set_linear(0) 硬停"
+                            % (ratio, actual_speed)
+                        )
                     elif t_now - triggered_at >= DWELL:
                         # 撞墙成功 → 相对零点:撞墙时的编码器值作为 ref,x_pose_start = ref
                         # 注:不再调 motor.reset() — ctl_id=2 走 encoder_2.reset 后电机可能被锁,
@@ -609,13 +620,15 @@ class ArmController:
                             % (ratio, actual_speed, time.time() - start,
                                abs(self.x_get_position() - start_pos) * 1000, ref)
                         )
+                        # 双保险:最后再发一次 0,确保 return 前电机真停了
+                        self.motor_x.set_linear(0)
                         self.x_speed(0)
                         return True
-                    # dwell 中(已触发,等 dwell 满)
+                    # dwell 中(已触发,等 dwell 满):保持硬停
                     self.motor_x.set_linear(0)
                     time.sleep(0.01)
                     continue
-                # 未撞墙:持续推
+                # 未撞墙:持续推全速
                 triggered_at = None  # 重置触发计时
                 self.x_speed(VELOCITY)
                 time.sleep(0.01)
