@@ -9,7 +9,7 @@ import os
 
 
 # 对外给局域网同事访问的默认地址
-PUBLIC_HOST = "192.168.3.60"
+PUBLIC_HOST = "192.168.6.231"
 PUBLIC_STREAM_PORT = 5050
 PUBLIC_STREAM_PATH = "/stream/"
 

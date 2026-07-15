@@ -86,12 +86,30 @@ print(client.call("car", "get_odometry", timeout=20)["result"])
 
 | 接口 | 用途 |
 | --- | --- |
-| `POST /v1/execute` | 同步执行一个动作并等待结果（最常用） |
+| `POST /v1/execute` | 执行一个动作（**默认异步**，立即返回 `job_id`；传 `"sync": true` 阻塞到完成） |
 | `POST /v1/jobs` | 创建异步任务，返回 `job.id` |
 | `GET /v1/jobs` | 查看任务列表 |
 | `GET /v1/jobs/{job_id}` | 查看单个任务状态，看 `status/result/error` |
+| `POST /v1/jobs/{job_id}/stop` | 协作取消一个 queued / running 的 job（set stop_event + car._stop_flag） |
 
-`POST /v1/execute` 返回结构：
+`POST /v1/execute` 默认异步返回（推荐在机械臂/任务等长动作时用，不阻塞客户端）：
+
+```json
+{
+  "ok": true,
+  "async": true,
+  "job": {
+    "id": "xxxx",
+    "target": "arm",
+    "name": "goto_position",
+    "status": "queued",
+    "result": null,
+    "error": null
+  }
+}
+```
+
+`POST /v1/execute` 加 `"sync": true` 同步阻塞（兼容旧调用方 / 链式编排）：
 
 ```json
 {
@@ -107,19 +125,23 @@ print(client.call("car", "get_odometry", timeout=20)["result"])
 }
 ```
 
+> 客户端推荐用 `main.api_client.execute(target, name, kwargs, sync=False)`（默认异步），要等结果用 `sync=True`。详见 `main/arm/ARM_API.md §2`。
+
 ## 4. 控制接口
 
 | 接口 | 用途 | 关键参数 |
 | --- | --- | --- |
 | `POST /v1/control/init` | 手动初始化 runtime | `force` `reset_arm` `reset_position` |
 | `POST /v1/control/stop-mode` | 设置动作后是否自动停 | `enabled` |
-| `POST /v1/control/reset-stop` | 清掉 stop 标记 | 无 |
+| `POST /v1/control/reset-stop` | 清掉 stop 标记（恢复 `lane_feed` / `arm_feed` 守护线程） | 无 |
 | `POST /v1/control/close` | 关闭当前 runtime 实例 | 无 |
-| `POST /v1/control/emergency-stop` | 立即停车 | 无 |
+| `POST /v1/control/emergency-stop` | 立即停车（**会写 `car._stop_flag=True`**，会停掉 `lane_feed` 守护线程） | 无 |
 
 ## 5. 实时硬件控制（50Hz 直达路径）
 
-不走 `/v1/execute`，不进 `job_queue`，在 `car_lock` 内同步执行，单次 RTT 毫秒级，适合 50Hz 闭环。
+不走 `/v1/execute`，不进 `job_queue`，在 `_realtime_gate`（微秒级瞬持锁）内同步执行，单次 RTT 毫秒级，适合 50Hz 闭环。
+**关键**：realtime 端点不被 arm 长动作挡住——这是「巡线 + 机械臂」能并发的关键。
+
 错误码：409（car 未初始化）/ 400（参数错）。
 
 | 接口 | 用途 | 关键参数 | 关键返回 |
@@ -236,7 +258,7 @@ print(client.call("car", "get_odometry", timeout=20)["result"])
 | `arm.x_get_position` | 读当前 X 位置 | 无 | `float` |
 | `arm.y_get_position` | 读当前 Y 位置 | 无 | `float` |
 
-> 业务层推荐用 `main/arm/` 子包：`from main.arm import ArmClient, ArmRunner`。薄封装上述 action + 4 键手动定原点 + 双轴同步 S 曲线 dry-run + 软限位校验 + `ArmState` dataclass。详见 [main/arm/README.md](arm/README.md) / [main/arm/ARM_API.md](arm/ARM_API.md)。
+> 业务层推荐用 `main/arm/` 子包：`from main.arm import ArmClient, ArmRunner`。薄封装上述 action + 调车端 `arm.reset_position` 重新定原点（runtime 启动时若 `RAK_CAR_RESET_ARM=1` 自动跑一次）+ 双轴同步 S 曲线 dry-run + 软限位校验 + `ArmState` dataclass。详见 [main/arm/README.md](arm/README.md) / [main/arm/ARM_API.md](arm/ARM_API.md)。
 
 ## 8. `task` 接口
 

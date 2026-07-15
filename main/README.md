@@ -27,7 +27,7 @@
 - [chassis/README.md](file:///home/jetson/workspace/rak-car/main/chassis/README.md)
   - 底盘组独享子包（自动寻线 client 端外环 + 底盘专用 API 子集），底盘请直接看这里
 - [arm/README.md](file:///home/jetson/workspace/rak-car/main/arm/README.md)
-  - 机械臂组独享子包（4 键手动定原点 + 双轴同步 S 曲线 + 业务便捷 API），机械臂请直接看这里
+  - 机械臂组独享子包（runtime 启动自动定原点 + 漂移手 reset + 双轴同步 S 曲线 + 业务便捷 API），机械臂请直接看这里
   - [arm/QUICKSTART.md](file:///home/jetson/workspace/rak-car/main/arm/QUICKSTART.md) — 10 行起步
   - [arm/ARM_API.md](file:///home/jetson/workspace/rak-car/main/arm/ARM_API.md) — 机械臂业务 API 速查
 
@@ -51,13 +51,13 @@
 最常用的只改一个：
 
 ```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 ```
 
 这样会同时影响：
 
-- API: `http://192.168.3.60:5050`
-- Streamer: `http://192.168.3.60:5050/stream/`
+- API: `http://192.168.6.231:5050`
+- Streamer: `http://192.168.6.231:5050/stream/`
 
 安装依赖：
 
@@ -68,7 +68,7 @@ python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
 ## 建议开发顺序
 
 ```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 python3 /home/jetson/workspace/rak-car/main/quick_start.py
 ```
 
@@ -124,10 +124,18 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py
 最常用的就是 `POST /v1/execute`：
 
 ```bash
+# 默认异步：立即返回 job_id，状态查 GET /v1/jobs/{id}
 curl -sS -X POST http://127.0.0.1:5050/v1/execute \
   -H 'Content-Type: application/json' \
   -d '{"target":"car","name":"beep","timeout":40}'
+
+# 同步阻塞：传 "sync": true 拿到 result
+curl -sS -X POST http://127.0.0.1:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"car","name":"beep","timeout":40,"sync":true}'
 ```
+
+> **2026-07 改造**：`/v1/execute` 默认改成异步（不阻塞客户端），适合机械臂 / 任务等长动作。客户端要等结果用 `client.execute(..., sync=True)`，运行时内部已把 `arm` / `car` 拆成两个独立 worker，长动作不再挡短动作和实时端点。详见 [runtime/README.md §并发任务模型](../runtime/README.md#并发任务模型)。
 
 所有接口总表，见 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 

@@ -134,9 +134,9 @@ class ArmClient:
             y_origin_m=float(data.get("y_origin_m", 0.0)),
             x_origin_m=float(data.get("x_origin_m", 0.0)),
             x_wall=str(data.get("x_wall", "left")),
-            soft_y_max_m=float(data.get("soft_y_max_m", 0.18)),
-            soft_x_min_m=float(data.get("soft_x_min_m", 0.005)),
-            soft_x_max_m=float(data.get("soft_x_max_m", 0.30)),
+            soft_y_max_m=float(data.get("soft_y_max_m", 0.20)),
+            soft_x_min_m=float(data.get("soft_x_min_m", -0.32)),
+            soft_x_max_m=float(data.get("soft_x_max_m", 0.32)),
             calibrated_at=str(data.get("calibrated_at", "")),
         )
 
@@ -162,11 +162,28 @@ class ArmClient:
 
     # ---- 底层便捷调用 ----
 
-    def _call_arm(self, name: str, timeout: float = 20.0, *args, **kwargs) -> dict:
-        return self.http.execute_arm_action(name, *args, timeout=timeout, **kwargs)
+    def _call_arm(self, name: str, timeout: float = 20.0, *args, sync=True, **kwargs) -> dict:
+        """调车端 arm action。
 
-    def _call_car(self, name: str, timeout: float = 20.0, *args, **kwargs) -> dict:
-        return self.http.execute_car_action(name, *args, timeout=timeout, **kwargs)
+        D 改造后默认 sync=True：
+          - 长动作（move_xy / reset_y / reset_x 等）业务语义就是「等完成才能走下一步」，
+            改 sync=False 会破坏现有链式编排。
+          - 想 fire-and-forget（例如并发抓多个目标）显式传 sync=False。
+        """
+        return self.http.execute_arm_action(
+            name, *args, timeout=timeout, sync=sync, **kwargs
+        )
+
+    def _call_car(self, name: str, timeout: float = 20.0, *args, sync=False, **kwargs) -> dict:
+        """调车端 car action。
+
+        默认 sync=False：
+          - car 短动作（move_for / move_to_position / set_storage 等）默认异步，
+            调用方需要时再显式 sync=True。
+        """
+        return self.http.execute_car_action(
+            name, *args, timeout=timeout, sync=sync, **kwargs
+        )
 
     # ---- 业务动作 ----
 
@@ -283,6 +300,35 @@ class ArmClient:
                 flush=True,
             )
 
+    # ---- 硬件安全门（防止误操作撞车） ----
+    #
+    # 经验规则（来自现场测试 + 比赛策略）：
+    #   - y ∈ [0, -100]  ：存储仓舵机保持默认 LEFT 位置（不要变）；reset_x 会撞墙
+    #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT) 和 reset_x
+    #   - 物理依据：y 离触底越近（接近 0），x 撞墙/舵机摆动就越容易撞到地面或邻物
+    #
+    # 实现：每次关键操作前查 y，超阈就 raise ValueError。**不静默吞**。
+
+    _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage / reset_x
+
+    def _check_y_safe_for_storage(self, action: str) -> float:
+        """检查当前 y 是否允许做「会动 x 机械结构 / 存储仓舵机」的动作。
+
+        action: "set_storage" | "reset_x" | "reset_origin"（任一）
+        返回：当前 y_mm（mm），供 caller 日志
+        raise：ValueError 当 y >= _Y_STORAGE_SAFE_THRESHOLD_MM
+        """
+        st = self.get_state()
+        y_mm = float(st.y_mm)
+        if y_mm > self._Y_STORAGE_SAFE_THRESHOLD_MM:
+            raise ValueError(
+                f"[{action}] 安全门拦截: 当前 y={y_mm:.1f}mm > {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm。\n"
+                f"  规则: y < {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm 才能切存储仓或 reset_x\n"
+                f"  (y ∈ [0, -100] 接近触底,横向动作会撞车)\n"
+                f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。"
+            )
+        return y_mm
+
     def set_side(self, side: str, speed: int = 80, timeout: float = 10.0) -> dict:
         side = _normalize_side(side)
         if side is None:
@@ -300,9 +346,13 @@ class ArmClient:
     def set_storage(self, side: str, timeout: float = 10.0) -> dict:
         """切换车体上的存储仓舵机（独立 PWM 舵机，port=1）。
 
-        只接受两个档位：
-          - "LEFT"  → 写死角度 STORAGE_DEFAULT_LEFT_ANGLE（-42°，与初始化复位角度一致）
-          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（90°，车端 servo_1_angle_list[1]）
+        只接受两个档位（写死角度，不允许任意角度）：
+          - "LEFT"  → STORAGE_DEFAULT_LEFT_ANGLE  = -42°（与初始化复位角度一致）
+          - "RIGHT" → STORAGE_DEFAULT_RIGHT_ANGLE = 90°（车端 car_wrap_2026.servo_1_angle_list）
+
+        ⚠️ 安全门：y 必须 < -100mm 才能调。在 y ∈ [0, -100] 接近触底的位置舵机摆动
+        会撞底盘结构。底层走 car.set_storage(bool)（不在 arm action 表里），所以这里
+        显式 safety check。
 
         底层走 car.set_storage(bool)，它在 car_wrap_2026.sensor_init 阶段已构造。
         之所以走 car（而不是 arm）是因为这块舵机不属于机械臂（arm），属于车体外设。
@@ -320,11 +370,13 @@ class ArmClient:
         side = _normalize_storage_side(side)
         if side is None:
             raise ValueError(f"set_storage 必须给 {STORAGE_SIDES}")
-        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 90°（RIGHT 档），
+        # 硬件安全门：y 必须 < -100mm（防止 y ∈ [0,-100] 时舵机摆动撞车）
+        self._check_y_safe_for_storage("set_storage")
+        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 165°（RIGHT 档），
         # False → servo_1_angle_list[0] = -42°（LEFT 档）。
-        # （历史曾用 165°，协议值 255 超 0~180，mc602 会回弹，已统一为 90°）
         open_flag = side == "RIGHT"
-        job = self._call_car("set_storage", timeout=timeout, state=open_flag)
+        # 业务语义：舵机动作完成后才能确认档位，需要 sync=True（car 默认是 False）。
+        job = self._call_car("set_storage", timeout=timeout, state=open_flag, sync=True)
 
         # 把车端 result 解出来（runtime 已 normalize_value 序列化）。
         # 失败 job 这里 result 通常是 None / 错误字符串。
@@ -373,9 +425,22 @@ class ArmClient:
     # ---- reset ----
 
     def reset_y(self, timeout: float = 30.0) -> dict:
-        return self._call_arm("reset_position", timeout=timeout)  # y + x 一起复位
+        """仅归 y（步进电机触底 + 磁感确认，不动 x）。
+
+        走车端 arm.reset_y：只让 y 步进电机找磁感触底，不动 x 编码器电机。
+        与 reset_position (y + x 一起归) 区分。
+
+        失败语义见 [ARM_API.md §reset_y 行为](./ARM_API.md#reset_y-行为磁感是唯一到底凭证)。
+        """
+        return self._call_arm("reset_y", timeout=timeout)
 
     def reset_x(self, timeout: float = 30.0) -> dict:
+        """仅归 x（撞墙 + 编码器物理清零）。
+
+        ⚠️ 安全门：y 必须 < -100mm 才能调。x 撞墙时机械臂会横向摆动，在 y ∈ [0, -100]
+        接近触底的位置撞车风险高。详见 [ARM_API.md §reset_x 行为](./ARM_API.md#reset_x-行为撞墙是唯一到墙凭证-v2-模型驱动)。
+        """
+        self._check_y_safe_for_storage("reset_x")
         return self._call_arm("reset_x", timeout=timeout)
 
     def reset_origin(self, x_wall: str = "left", timeout: float = 60.0) -> dict:
@@ -386,6 +451,8 @@ class ArmClient:
         """
         if x_wall not in ("left", "right"):
             raise ValueError("x_wall 必须是 'left' 或 'right'")
+        # 同样 y 必须 < -100（reset_position 也包含 reset_x 撞墙）
+        self._check_y_safe_for_storage("reset_origin")
         job = self._call_arm("reset_position", timeout=timeout)
         # 重新读一次 y/x 原始坐标，作为新原点
         st = self._read_raw_state()
@@ -394,8 +461,8 @@ class ArmClient:
             x_origin_m=st["raw_x_m"],
             x_wall=x_wall,
             soft_y_max_m=self.origin.soft_y_max_m if self.origin else 0.18,
-            soft_x_min_m=self.origin.soft_x_min_m if self.origin else 0.005,
-            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.30,
+            soft_x_min_m=self.origin.soft_x_min_m if self.origin else -0.32,
+            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.32,
             calibrated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         self.save_origin(new_origin)

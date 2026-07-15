@@ -42,11 +42,11 @@ pm2 logs rak-car-api
 
 ## 默认访问地址
 
-- API: `http://192.168.3.60:5050`
-- FastAPI 文档: `http://192.168.3.60:5050/docs`
-- 视频流页面: `http://192.168.3.60:5050/stream/`
-- cam1 MJPEG: `http://192.168.3.60:5050/video_feed/cam1`
-- cam2 MJPEG: `http://192.168.3.60:5050/video_feed/cam2`
+- API: `http://192.168.6.231:5050`
+- FastAPI 文档: `http://192.168.6.231:5050/docs`
+- 视频流页面: `http://192.168.6.231:5050/stream/`
+- cam1 MJPEG: `http://192.168.6.231:5050/video_feed/cam1`
+- cam2 MJPEG: `http://192.168.6.231:5050/video_feed/cam2`
 
 更完整的流媒体接口说明见：
 
@@ -147,8 +147,104 @@ runtime 按三条链路分别管理：
 
 ## 实时硬件控制
 
-`runtime` 服务除了常规的 `execute` 作业队列外，还提供 `/v1/realtime/*` 一组 HTTP 端点以及 `realtime/*` 一组 WebSocket op。它们走 `car_lock` 同步路径、不进 `job_queue`，50Hz 高频场景下延迟可控。
+`runtime` 服务除了常规的 `execute` 作业队列外，还提供 `/v1/realtime/*` 一组 HTTP 端点以及 `realtime/*` 一组 WebSocket op。它们走 `_realtime_gate` 微秒级瞬持锁、不进 `job_queue`、不与 arm 长动作抢锁，50Hz 高频场景下延迟可控。
 
-涵盖：4 轮线速度/编码器、单电机、步进电机、总线舵机（含读角度）、模拟量。
+涵盖：4 轮线速度/编码器、单电机、步进电机、总线舵机（含读角度）、模拟量、**机械臂 y/x 实时位置**（`arm_feed` 守护线程）。
+
+机械臂实时位置专用：
+
+| 端点 | 用途 |
+| --- | --- |
+| `GET /v1/realtime/arm/state` | 读 `arm_feed` 守护线程缓存的机械臂 y/x 位置（meta_lock 路径，不抢 runtime 锁） |
+| WS `subscribe_arm_state` / `arm_state` / `unsubscribe_arm_state` | 持续推送（默认 20Hz，按 `updated_at` 变化推） |
+| WS `realtime/arm_state` | 一次性读取（等价于 HTTP） |
+
+## 并发任务模型
+
+runtime 把「动作执行」与「init / 引用替换」分到两把锁，让机械臂长动作（PID 闭环 1-3s）和底盘外环 50Hz 轮速下发能真正并发。
+
+### 锁层次
+
+| 锁 | 类型 | 保护什么 | 持锁时间 |
+| --- | --- | --- | --- |
+| `_ref_lock` | `Lock()` | `self.car` 引用替换（init / recover / close） | 微秒级 |
+| `_realtime_gate` | `Lock()` | realtime 端点入口微秒级取 `self.car` 引用 | 微秒级 |
+| `serial_mc602.lock`（SDK） | `Lock()` | MC602 串口字节流串行 | 单 byte round-trip ~5-20ms |
+| ~~`car_lock`~~ | —— | **已删除**，保留同名 property 抛 `RuntimeError` | —— |
+
+旧 `car_lock = RLock()` 在 `_dispatch` 里被长动作全程持锁，是「巡线 + 机械臂」互卡的根因。改造后：
+
+- 长动作（`arm.goto_position` 1-3s 闭环）执行期间**不持任何 runtime 锁**，靠 SDK 串口锁字节流串行
+- realtime 端点入口瞬时取 `car` 引用后立即释放，50Hz 调 `set_wheel_speeds` 不再被 arm 长动作挡住
+
+### 双 worker 队列
+
+`job_queue` 拆成两条独立队列，两个 daemon worker 各跑一条：
+
+| 队列 | 接收的 target | 特点 |
+| --- | --- | --- |
+| `arm_queue` | `target="arm"`（15 个 arm action） | 长动作专用，arm worker 卡 1-3s 不影响 car 队列 |
+| `car_queue` | `target="car" / "task" / "system"` | 短动作专用，短动作不被 arm 长动作排在同一个 worker 后 |
+
+底层字节流仍由 SDK 串口锁串行——两个 worker 在 Python 层是并行的，**字节流在硬件层是串行的**（物理约束，不可消除）。
+
+### `/v1/execute` 默认异步
+
+```bash
+# 异步（默认）：立即返回 job_id，客户端轮询
+curl -X POST http://localhost:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"arm","name":"goto_position","kwargs":{"x":0.05,"y":-0.05}}'
+# {"ok":true,"async":true,"job":{"id":"...","status":"queued",...}}
+
+# 同步（旧语义）：阻塞到 succeeded/failed
+curl -X POST http://localhost:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"arm","name":"goto_position","kwargs":{"x":0.05,"y":-0.05},"sync":true}'
+# {"ok":true,"job":{"id":"...","status":"succeeded","result":...}}
+```
+
+### 协作取消
+
+```bash
+# 异步下发后立刻取消
+JOB=$(curl ... -d '{...}' | jq -r .job.id)
+curl -X POST "http://localhost:5050/v1/jobs/$JOB/stop"
+# {"ok":true,"cancelled":true,"job_id":"..."}
+```
+
+`/v1/jobs/{id}/stop` 立即返回 `cancelled=true`，同时 set job 的 `stop_event` 和 `car._stop_flag`。**SDK arm_base PID 循环目前不查 `stop_event` / `_stop_flag`**（要 SDK 配合），所以 cancel 后 arm 动作会自然跑完，不会立刻中断。这是已知限制，跟 runtime 并发改造正交。
+
+### 端到端验证
+
+`main/test/verify_concurrent.py`（gitignored，本地工具）跑双线程探针：
+
+- lane 50Hz 持续发 `/v1/realtime/wheels/speeds`（HTTP 实际 ~12Hz，受 `requests.post` 单次 30-50ms 限制）
+- 同时下发异步 `arm.goto_position` 长动作
+- 关键判据：**arm 闭环期间 realtime 必须持续有帧**（旧的 car_lock bug 表现是 arm 跑期间 realtime 一帧都没有）
+- 次要判据：`realtime` 间隔 p99 < 100ms + max gap < 1s（任何 1s+ 间隔就是 car_lock 黑洞症状）
+
+### `lane_feed` / `arm_feed` 守护线程依赖 `_stop_flag`
+
+`car_wrap_2026.py:1301` 的 lane_feed 循环检查 `self._stop_flag`，看到 True 就 `break` 并把 `lane_state.active=False`。触发场景：
+
+- `POST /v1/control/emergency-stop`
+- `POST /v1/jobs/{id}/stop`（cancel_job 会写 `car._stop_flag=True`）
+- 直接 `car._stop_flag = True`
+
+恢复方式：
+
+```bash
+curl -X POST http://localhost:5050/v1/control/reset-stop   # 清 _stop_flag
+curl -X POST http://localhost:5050/v1/execute \
+  -H 'Content-Type: application/json' \
+  -d '{"target":"car","name":"start_lane_feed","kwargs":{"hz":20}}'   # 重启 lane_feed
+```
+
+arm_feed 通常由 runtime init 自动启，业务层无需手动控制。
+
+字段：`y_m` / `x_m`（SDK 原始，米）+ `y_mm` / `x_mm`（业务坐标，毫米）+ `ref_encoder`（最近一次 `reset_y` 后的编码器零点）+ `active` / `mode` / `updated_at`。
+
+详见 [../main/arm/ARM_API.md](../main/arm/ARM_API.md) §2。
 
 详细端点表参见 `main/API_REFERENCE.md` 中「实时硬件控制（50Hz 直达路径）」章节。

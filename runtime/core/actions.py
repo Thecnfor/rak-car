@@ -59,6 +59,7 @@ CAR_ACTIONS = {
 
 ARM_ACTIONS = {
     "reset_position": lambda arm_obj, *args, **kwargs: arm_obj.reset_position(),
+    "reset_y": lambda arm_obj, *args, **kwargs: arm_obj.reset_y(),
     "reset_x": lambda arm_obj, *args, **kwargs: arm_obj.reset_x(),
     "set_arm_pose": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_pose(*args, **kwargs),
     "set_hand_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_hand_angle(*args, **kwargs),

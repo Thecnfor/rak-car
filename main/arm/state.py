@@ -16,21 +16,22 @@ HANDS = ("UP", "MID", "DOWN")
 
 # 存储仓（二选一档位）枚举。
 #
-# 角度范围：ServoPwm wrapper 是 0~180 度（mc602 没 clamp，但下层 8-bit
-# 通道收到 0~180 之外的 angle 会被协议层回中 / 回弹）。
-# 实测：
-#   - LEFT  -42° -> wrapper 后协议值 = -42+90 = 48，合法，不回弹
-#   - RIGHT 90°  -> wrapper 后协议值 = 90+90  = 180，临界值，合法
-# 历史事故：RIGHT 曾用 165°，协议值 255 超 0~180，mc602 会回弹。
-# 因此 RIGHT 改用 90° 附近的值（=协议值 180，刚好是上边界）。
+# 角度常量**严格对齐**官方 `baidu_smartcar_2026/car_wrap_2026.py:389`
+#   servo_1_angle_list = [-42, 165]。
+# **不要修改这两个常量** —— 改了就和官方车体物理位置对不上。
 #
-# 注意：car_wrap_2026.servo_1_angle_list[1] 也保持同步是 90，否则 set_storage
-# 传 True 会再被这里"换算前"的 -42/90 算成 out-of-range。
-# 默认 LEFT 用 -42° 保持和初始化（注释掉前）一致；如果后续发现 mc602 也不喜欢
-# -42，统一改成 0~180 区间。
+# 物理细节（仅供参考，不要据此"修正"角度）：
+#   - LEFT  = -42° → ServoPwm 协议值 = -42+90 = 48，0~180 合法
+#   - RIGHT = 165° → ServoPwm 协议值 = 165+90 = 255，**超 0~180**
+#   - mc602 协议层对 0~180 之外的协议值是"不识别"而非"回弹"，
+#     实际舵机行为由 mc602 固件决定（现场观察稳定，官方车这么用就行）。
+#   - mc601 会自动 clamp 到 0~180，所以换 mc601 时也不需要改。
+#
+# **业务层只允许 LEFT/RIGHT 二选一**（set_storage() 不接受任意 angle）。
+# 想传任意 angle 是反模式，会绕过官方标定 —— 不允许。
 STORAGE_SIDES = ("LEFT", "RIGHT")
 STORAGE_DEFAULT_LEFT_ANGLE = -42
-STORAGE_DEFAULT_RIGHT_ANGLE = 90
+STORAGE_DEFAULT_RIGHT_ANGLE = 165
 
 
 @dataclass
@@ -40,9 +41,9 @@ class ArmOrigin:
     y_origin_m: float = 0.0           # y 触底时的原始 motor_y.get_dis() 值
     x_origin_m: float = 0.0           # x 撞墙时的原始 motor_x.get_dis() 值
     x_wall: str = "left"              # 上次撞的是哪一侧
-    soft_y_max_m: float = 0.18        # 业务软上限（m）
-    soft_x_min_m: float = 0.005
-    soft_x_max_m: float = 0.30
+    soft_y_max_m: float = 0.20        # 业务软上限（m）,实测行程可达 -200mm 还有富余
+    soft_x_min_m: float = -0.32       # 负=反向墙,允许 [-soft_x_max, soft_x_max] 双向行程
+    soft_x_max_m: float = 0.32
     # 丢步/位置偏差阈值（mm）：move_x / move_y 完成后对比 actual vs target，超此值 warn。
     # y 是步进电机，堵转/失步较常见，默认 2mm（≈1 step）；x 是编码器闭环，默认 5mm。
     step_loss_y_mm: float = 2.0
@@ -80,10 +81,15 @@ class ArmState:
     y_origin_valid: bool = False
     x_origin_valid: bool = False
 
-    # 软限位（从 ArmOrigin 拷过来）
-    soft_y_max_mm: float = 180.0
-    soft_x_min_mm: float = 5.0
-    soft_x_max_mm: float = 300.0
+    # 软限位（从 ArmOrigin 拷过来）。
+    # 默认值必须与 ArmOrigin 一致（v3 双边行程）：
+    #   soft_y_max_mm = 200    （y ∈ [-200, 0] mm）
+    #   soft_x_min_mm = -320   （x ∈ [-320, +320] mm，撞墙=0）
+    #   soft_x_max_mm = 320
+    # 旧版 (5 / 300) 是 v1 单边残留，已修正。
+    soft_y_max_mm: float = 200.0
+    soft_x_min_mm: float = -320.0
+    soft_x_max_mm: float = 320.0
 
     # 原始坐标（车端读数，调试用；单位 m）
     raw_x_m: float = 0.0

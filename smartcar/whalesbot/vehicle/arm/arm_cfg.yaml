@@ -10,8 +10,7 @@ hand_cfg:
       UP: -90
       MID: -37
       DOWN: 0
-    port: 2
-    mode: 180
+    port: 3
   grap:
     port_pump: 2
     port_valve: 3
@@ -27,15 +26,32 @@ horiz_cfg:
     Kd: 0
     setpoint: 0
     output_limits:
-    - -0.2
-    - 0.2
+    - -0.4
+    - 0.4
   threshold:
-  - 0
-  - 0.315
+  - -0.32
+  - 0.32
+  slow_band_m: 0.02
+  slow_velocity: 0.05
+  top_slow_m: 0.02
+  top_slow_velocity: 0.1
+  reset_target_m: 0.34
+  # reset_velocity: 0.05 m/s (5cm/s)。实测最小可驱动速度:
+  #   - 0.02/0.03 m/s 电机扭矩过不了静摩擦,编码器不动 → 触发误报
+  #   - 0.05 m/s 能驱动,且不撞墙反弹 — 之前 reset_x 测试这个速度稳
+  # 配合 arm_base.py 的 MIN_PRE_TRIGGER_DISP=50mm 预触发距离闸:
+  #   车必须真走出 50mm 才能进入撞墙判据,杜绝"电机没动但 ratio=0 误判撞墙"
+  reset_velocity: 0.05
+  reset_dwell_time: 0.15
+  reset_timeout: 25.0
+  wall_ratio_threshold: 0.2
+  min_velocity_ratio: 0.3
+  wall_window_ms: 200
+  enable_encoder_reset: true
 pos_cfg:
   pose_enable: true
   pose_horiz: 0.0
-  pose_vert: 0.009800000000000001
+  pose_vert: 0.0
   side: RIGHT
 vert_cfg:
   motor:
@@ -52,6 +68,10 @@ vert_cfg:
     - -0.1
     - 0.1
   threshold:
-  - 0
-  - 0.2
+  - -0.2
+  - 0.0
+  slow_band_m: 0.015
+  slow_velocity: 0.02
+  top_slow_m: 0.02
+  top_slow_velocity: 0.03
 arm_length: 0.23

@@ -16,7 +16,7 @@ module.exports = {
         PYTHONUNBUFFERED: "1",
         RAK_CAR_BIND_HOST: "0.0.0.0",
         RAK_CAR_BIND_PORT: "5050",
-        RAK_CAR_PUBLIC_HOST: "192.168.3.60",
+        RAK_CAR_PUBLIC_HOST: "192.168.6.231",
         RAK_CAR_PUBLIC_STREAM_PORT: "5050",
         RAK_CAR_PUBLIC_STREAM_PATH: "/stream/",
         RAK_CAR_AUTO_INIT: "1",

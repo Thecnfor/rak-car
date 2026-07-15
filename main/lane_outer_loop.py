@@ -1,12 +1,14 @@
 """main/lane_outer_loop.py
 lane 外环 demo：用 WebSocket 订阅 lane_state push + 下发轮速。
 
-用法：
-    1) 确认 runtime 在线、car 已初始化
-    2) python3 main/lane_outer_loop.py
-    3) Ctrl-C 退出（自动 unsubscribe_lane + stop lane_feed + 关 WS）
+lane_feed 守护线程由 runtime init 默认启起来（20Hz），不需要手动开关。
 
-完整 API：见 runtime/VISION_API.md "外环专用" 一节。
+用法：
+    1) 确认 runtime 在线、car 已初始化（GET /v1/health 看 initialized=true）
+    2) python3 main/lane_outer_loop.py
+    3) Ctrl-C 退出（自动 unsubscribe_lane + 关 WS）
+
+完整 API：见 runtime/VISION_API.md。
 """
 from __future__ import annotations
 
@@ -23,32 +25,14 @@ except ImportError:
 try:
     from main.settings import DEFAULT_API_HOST
 except ImportError:
-    DEFAULT_API_HOST = "http://192.168.3.60:5050"
-
-
-def _http(method: str, path: str, payload=None, timeout: float = 5.0):
-    import urllib.request
-    url = DEFAULT_API_HOST + path
-    data = None
-    headers = {}
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    DEFAULT_API_HOST = "http://192.168.6.231:5050"
 
 
 def main():
-    # 1) 启动车端 lane_feed 守护线程
-    print("[1] 启动 lane_feed (POST /v1/vision/lane/feed)...")
-    try:
-        r = _http("POST", "/v1/vision/lane/feed", {"hz": 20})
-    except Exception as exc:
-        print(f"  启动失败: {exc}")
-        print("  确认 runtime 在跑 + car 已初始化（GET /v1/health 看 initialized）")
-        sys.exit(1)
-    print(f"  {r}")
+    # 1) lane_feed 守护线程已由 runtime init 默认启起来
+    print("[1] lane_feed 守护线程由 runtime init 默认启起来（20Hz）")
+    print("    不用手动 POST /v1/vision/lane/feed —— 该端点已删除")
+    print("    直接连 WS 订阅 lane_state 即可")
 
     # 2) 连 WS，订阅 lane_state
     ws_url = DEFAULT_API_HOST.replace("http://", "ws://").replace("https://", "wss://") + "/v1/ws"
@@ -112,11 +96,6 @@ def main():
         except Exception:
             pass
         ws.close()
-        try:
-            _http("POST", "/v1/vision/lane/feed/stop")
-            print("  lane_feed 已停止")
-        except Exception as exc:
-            print(f"  停止 lane_feed 失败: {exc}")
 
 
 if __name__ == "__main__":
