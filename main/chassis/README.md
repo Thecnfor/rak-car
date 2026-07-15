@@ -158,13 +158,14 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 
 ## 5. `controllers/` 控制律库
 
-### P / Stanley / Pure Pursuit 公式与适用场景
+### P / Stanley / Pure Pursuit / 弧度自适应 公式与适用场景
 
 | 控律 | 类 | 公式 | 适用场景 | 调参难度 |
 | --- | --- | --- | --- | --- |
 | **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
 | **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
 | **Pure Pursuit** | `PurePursuitOuterLoop` | 视觉误差当假想目标点 → 几何曲率 → omega | 占位骨架（需替换为目标轨迹） | ⭐⭐⭐ |
+| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa` | 弧度偏差 / 变化率自适应（弯道降速 + 加强转向） | ⭐⭐⭐ |
 
 **实测典型取值**（调参从这开始）：
 
@@ -177,7 +178,43 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | `look_ahead_m` (PP) | 0.6 m | 提前减速（弯道更平滑） | 提前切入（直线更稳） |
 | `r_eff` | 0.30 m | 一般不改 | 一般不改 |
 
+**弧度自适应（`CurvatureAdaptiveOuterLoop`）起步值**：
+
+| 参数 | 起步值 | 含义 |
+| --- | --- | --- |
+| `v_max` / `v_min` | 0.30 / 0.08 | 标称 / 弯道最慢前向速度 |
+| `kappa_full` / `dkappa_full` | 0.6 / 1.5 | 弧度偏差 / 变化率满量程（用于归一化） |
+| `kp_y` / `kp_theta` | 0.5 / 1.2 | 横向 / 转向基础 P 项 |
+| `omega_gain` / `k_curvature` | 0.35 / 0.25 | 弧度大时的 omega 增益 / 变化率牵引 |
+| `omega_cap` | 1.8 rad/s | omega 软上限；超过即截断，防下位机掉电压 |
+| `ema_alpha` | 0.35 | curvature 估计的 EMA 平滑系数 |
+| `ey_release` / `ea_release` | 0.02 / 0.05 | 恢复门控误差阈值（m / rad） |
+| `hold_ms` | 250 ms | 误差小并稳定多久才放回 `v_max` |
+| `r_eff` | 0.30 m | 麦轮几何系数 |
+
 **r_eff 是什么**：麦轮几何里"角速度 → 4 轮异速"的耦合系数。等于 `(track/2 + wheel_base/2)`，从 `cfg_vehicle.yaml` 算出来是 `(0.30/2 + 0.28/2) = 0.29`，代码里写 0.30 是凑整。
+
+### `WheelSmoother`：下发前最后一道闸（防掉电压）
+
+麦轮逆解 `[v1..v4] = vx ± vy ± r*omega` 在大弧度差急转弯瞬间，单轮目标能从
+`0.30 m/s` 直接跳到 `1.0+ m/s`（50Hz 外环下相当于 ~35 m/s² 阶跃），下位机
+电源扛不住 → 掉电压。`WheelSmoother` 对每轮独立做 (a) `|v| ≤ max_abs`
+(b) 单帧 `Δv ∈ [-max_decel, +max_accel]`，挂在 runner / `subscribe_lane_state`
+入口作为最后一道闸。
+
+```python
+from main.chassis import WheelSmoother, DoubleLoopRunner
+
+smoother = WheelSmoother(
+    max_abs=0.55,    # 单轮 |v| 上限 (m/s)
+    max_accel=0.4,   # 单帧最大加速量（50Hz → 20 m/s²）
+    max_decel=0.6,   # 单帧最大减速量（急停 / 丢线更快响应）
+)
+runner = DoubleLoopRunner(api=api, outer=outer, hz=50.0, smoother=smoother)
+```
+
+`DoubleLoopRunner` 默认会自己 new 一个 `WheelSmoother()`；要彻底关掉就显式传
+一个 `max_abs=math.inf / max_accel=math.inf` 的实例。
 
 ### 新增一个控制律
 
@@ -305,6 +342,7 @@ track_target(api, label=None, time_out=3.0)
 | `01_minimal_p_lane.py` | 起步、直线赛道、低速 | 50Hz | `POuterLoop` |
 | `02_stanley_lane.py` | 弯道、中速 | 50Hz | `StanleyOuterLoop` |
 | `03_p2p_with_vision.py` | 巡线 → 视觉终点微调（外环+内环切换） | 50Hz | `StanleyOuterLoop` + `track_target` |
+| `04_curvature_adaptive.py` | 弧度偏差自适应巡线（弯道降速 + 加强转向） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
 
 **用法**：
 
@@ -328,6 +366,8 @@ python3 -c "from main.chassis.examples import 01_minimal_p_lane; 01_minimal_p_la
 4. **`watchdog_ms`**：如果 lane 推理慢，调大到 1000-2000ms
 5. **`hz`**：外环上限受 lane_feed 推理速度限制，**实测 50Hz 跑不通就降到 30Hz**，别硬撑
 6. **`r_eff`**：换车体（轮距/轴距变）才需要改
+7. **`WheelSmoother`**：如果弯道掉电压 / 4 轮跳变严重，先把 `max_accel`
+   收到 0.2~0.3 m/s/frame（=10~15 m/s²）；直线跟线稳后再往 0.4 放开
 
 **调参时一定要打印这几个量**：
 
@@ -402,18 +442,20 @@ main/chassis/
 │   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环
 │   └── safety.py             ← EmergencyWatchdog / LostLineDetector
 ├── controllers/
-│   ├── base.py               ← OuterLoop ABC + mecanum_inverse helper
+│   ├── base.py               ← OuterLoop ABC + WheelSmoother + mecanum_inverse helper
 │   ├── p_controller.py       ← POuterLoop
 │   ├── stanley.py            ← StanleyOuterLoop
-│   └── pure_pursuit.py       ← PurePursuitOuterLoop（占位骨架）
+│   ├── pure_pursuit.py       ← PurePursuitOuterLoop（占位骨架）
+│   └── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应）
 ├── tasks/                    ← 高层组合（外环 + 内环事件）
 │   ├── follow_lane.py        ← 起 lane feed + 外环跑 N 秒
 │   ├── track_target.py       ← car.move_to_detection_target 包装
 │   └── back_to_line.py       ← 丢线恢复（直走 straight_seconds）
-└── examples/                 ← 3 个起步脚本
+└── examples/                 ← 4 个起步脚本
     ├── 01_minimal_p_lane.py
     ├── 02_stanley_lane.py
-    └── 03_p2p_with_vision.py
+    ├── 03_p2p_with_vision.py
+    └── 04_curvature_adaptive.py
 ```
 
 ---
