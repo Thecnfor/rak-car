@@ -26,37 +26,31 @@ horiz_cfg:
     Ki: 0
     Kd: 0
     setpoint: 0
+    # 主限幅加大,避免负方向死区(motor_280 负方向响应极慢,需要更大命令才能动)
     output_limits:
-    - -0.2
-    - 0.2
+    - -0.4
+    - 0.4
   # 软限位: x_threshold 旧值 [0, 0.315] 是单调正方向(只允许正位移),
-  # 实际 x 撞墙=0、远离墙=正、反向撞另一侧墙=负。业务层有 soft_x_min_mm/soft_x_max_mm,
-  # 此处 SDK 阈值取业务软上限:左墙=0,右墙=soft_x_max。
-  # 旧 [0, 0.315] 把负向钳掉,导致 move_x(-X) 被错误拦截,已修正。
+  # 实际 x 撞墙=0、远离墙=正、反向撞另一侧墙=负。
   threshold:
   - -0.32
   - 0.32
-  # 末段减速带:x 接近 |x_wall| 时, PWM 限幅降到 slow_velocity 防过冲(仅 move_x_position 生效)。
-  # x 无传感器,靠"编码器持续不动"判定到墙,过冲会误判。
+  # 末段减速带:x 接近 |x_wall| 时, PWM 限幅降到 slow_velocity 防过冲。
   slow_band_m: 0.020
-  slow_velocity: 0.04
-  # 顶段减速带:x 接近反向墙时减速防失步(同 y 顶段逻辑)
+  slow_velocity: 0.05
+  # 顶段减速带:x 接近反向墙时减速防失步
   top_slow_m: 0.020
-  top_slow_velocity: 0.06
-  # reset_x 配置:reset 用 0.05 m/s 慢速撞墙
-  reset_target_m: 0.34       # 比软上限略大,保证能撞墙
-  reset_velocity: 0.05
-  reset_dwell_time: 0.10     # 撞墙后 dwell 确认(秒)
-  reset_timeout: 8.0
-  # 撞墙判据（v2 — 模型驱动 + 速度对照 + 物理清零）:
-  # 主判据: 实际位移 / 期望位移 < wall_ratio_threshold 持续 wall_window_ms
-  #  (low-speed creep 单帧位移小但持续动,不会被判成撞墙)
-  # 速度对照: 实测平均速度 < 命令速度 * min_ratio 持续 wall_window_ms (防步进失步)
+  top_slow_velocity: 0.10
+  # reset_x 配置: motor_280 实测命令 0.05 m/s 实际只走 1.5mm/s(33x 死区),
+  # 需要 reset_velocity 大才能在 timeout 内撞墙
+  reset_target_m: 0.34
+  reset_velocity: 0.15
+  reset_dwell_time: 0.10
+  reset_timeout: 15.0
+  # 撞墙判据（v2 — 模型驱动 + 速度对照）:
   wall_ratio_threshold: 0.20
   min_velocity_ratio: 0.30
   wall_window_ms: 200
-  # 物理清零编码器（撞墙后）: reset_x 成功后调 motor.reset() 把编码器绝对归零
-  # (MC602 ctl_id=2 走 encoder_2.reset;若协议不支持会 NoneDev not_support,不抛错)
   enable_encoder_reset: true
 pos_cfg:
   pose_enable: true
