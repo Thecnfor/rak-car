@@ -1,5 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
+import asyncio
 import os
 import threading
 import time
@@ -14,6 +15,22 @@ try:
     import numpy as np
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError("缺少 numpy 依赖，无法生成视频占位画面") from exc
+
+
+# 1x1 灰度 JPEG（67 字节）。用于编码器尚未产出第一帧时的早期 yield，
+# 让浏览器 <img> 至少收到合法 JPEG，避免控制台刷 404。
+_PLACEHOLDER_JPEG = bytes.fromhex(
+    "ffd8ffe000104a46494600010100000100010000ffdb004300080606070605"
+    "080707070909080a0c140d0c0b0b0c1912130f141d1a1f1e1d1a1c1c20242e272022"
+    "2c231c1c2837292c30313434341f27393d38323c2e333432ffc0000b080001000101"
+    "01110000ffc4001f0000010501010101010100000000000000000102030405060708"
+    "090a0bffc400b5100002010303020403050504040000017d01020300041105122131"
+    "410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a"
+    "25262728292a3435363738393a434445464748494a535455565758595a6364656667"
+    "68696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7"
+    "a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4"
+    "e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda0008010100003f00fb0000ffd9"
+)
 
 
 class CameraStreamService:
@@ -47,12 +64,20 @@ class CameraStreamService:
         self.running = False
         self.last_key = None
         self._thread = None
+        self._encoder_thread = None
         self.frame_lock = threading.Lock()
         self.key_lock = threading.Lock()
         self.meta_lock = threading.Lock()
         self.frames = {}
         self.frame_meta = {}
+        # JPEG 编码缓存：{cam_id: (source_updated_at: float, jpeg_bytes: bytes)}
+        # 一次编码喂所有 MJPEG 连接 + 所有 HTTP /stream/frame/*.jpg 客户端，
+        # 避免每个连接独立 cv2.imencode 抢占 CPU。
+        self._jpeg_cache = {}
         self.lane_state = self._default_lane_state()
+        # 机械臂 y/x 位置缓存：与 lane_state 同生命周期(meta_lock 保护),
+        # 由 car.start_arm_feed 守护线程持续刷新,subscribe_arm_state WS op 推送。
+        self.arm_state = self._default_arm_state()
 
     def start(self):
         if self.running:
@@ -60,14 +85,19 @@ class CameraStreamService:
         self.running = True
         self._thread = threading.Thread(target=self._capture_loop, daemon=True)
         self._thread.start()
+        self._encoder_thread = threading.Thread(target=self._encoder_loop, daemon=True)
+        self._encoder_thread.start()
 
     def stop(self):
         self.running = False
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
+        if self._encoder_thread and self._encoder_thread.is_alive():
+            self._encoder_thread.join(timeout=2)
         with self.frame_lock:
             self.frames.clear()
             self.frame_meta.clear()
+            self._jpeg_cache.clear()
         with self.meta_lock:
             self.lane_state = self._default_lane_state()
 
@@ -306,54 +336,144 @@ class CameraStreamService:
         return True
 
     def stream_frames(self, cam_id):
+        """同步 MJPEG 生成器——保留作为后备；推荐用 `stream_frames_async`。
+
+        实际编码由 `_encoder_loop` 后台线程按 fps 节奏统一做一次；本生成器
+        只是 yield 缓存的内容，**不做 cv2.imencode**。
+
+        启动早期（编码器还没产出第一帧）会 yield 占位 JPEG，保持浏览器
+        `<img>` 不 404。
+        """
         normalized = self.normalize_cam_id(cam_id)
-        last_frame_time = 0.0
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        crlf = b"\r\n"
+        last_yield_ts = 0.0
         while self.running:
-            current_time = time.time()
-            if current_time - last_frame_time < self.capture_interval:
-                time.sleep(0.01)
-                continue
-            frame = self.get_frame_or_placeholder(normalized)
-            try:
-                ret, buffer = cv2.imencode(
-                    ".jpg",
-                    frame,
-                    [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
-                )
-            except cv2.error:
-                self.clear_frame(normalized, preserve_meta=True)
-                time.sleep(0.05)
-                continue
-            if ret:
-                last_frame_time = current_time
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n"
-                    + buffer.tobytes()
-                    + b"\r\n"
-                )
-            time.sleep(0.01)
+            with self.frame_lock:
+                entry = self._jpeg_cache.get(normalized)
+            if entry is not None:
+                _updated_at, jpeg_bytes = entry
+                yield boundary + jpeg_bytes + crlf
+                last_yield_ts = time.time()
+            else:
+                # 编码器还没准备好：yield 一个 1x1 placeholder JPEG 让浏览器
+                # 至少收到 200 + 合法 JPEG 头，避免 <img> 报错。
+                yield boundary + _PLACEHOLDER_JPEG + crlf
+            elapsed = time.time() - last_yield_ts if last_yield_ts else 0.0
+            sleep_for = self.capture_interval - elapsed
+            if sleep_for > 0:
+                time.sleep(sleep_for)
+
+    async def stream_frames_async(self, cam_id):
+        """异步 MJPEG 生成器——FastAPI 在 event loop 里直接消费。
+
+        与 `stream_frames` 语义完全一致；差别在 `time.sleep` → `asyncio.sleep`
+        ——后者把控制权让回 event loop，让同进程里的其他 async 端点
+        （`/v1/realtime/lane_state`、`/v1/health`、`/v1/vision/*`）不被卡住。
+
+        同步版本依然保留：当未来同步调用方需要时仍可用。
+        """
+        normalized = self.normalize_cam_id(cam_id)
+        boundary = b"--frame\r\nContent-Type: image/jpeg\r\n\r\n"
+        crlf = b"\r\n"
+        last_yield_ts = 0.0
+        loop = asyncio.get_event_loop()
+        while self.running:
+            with self.frame_lock:
+                entry = self._jpeg_cache.get(normalized)
+            if entry is not None:
+                _updated_at, jpeg_bytes = entry
+                yield boundary + jpeg_bytes + crlf
+                last_yield_ts = loop.time()
+            else:
+                # 编码器还没准备好：yield 一个 1x1 placeholder JPEG 让浏览器
+                # 至少收到 200 + 合法 JPEG 头，避免 <img> 报错。
+                yield boundary + _PLACEHOLDER_JPEG + crlf
+            elapsed = loop.time() - last_yield_ts if last_yield_ts else 0.0
+            sleep_for = self.capture_interval - elapsed
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
 
     def encode_jpeg_bytes(self, cam_id, quality=None):
-        frame = self.get_frame_or_placeholder(cam_id)
-        quality = self.quality if quality is None else int(quality)
+        """返回 _jpeg_cache 中的 JPEG bytes。
+
+        `quality` 参数为兼容性保留：当前唯一调用方（`/stream/frame/*.jpg`）
+        不传 quality。如果未来需要按请求 quality 编码，回退到 on-demand
+        编码路径即可。
+        """
+        normalized = self.normalize_cam_id(cam_id)
+        with self.frame_lock:
+            entry = self._jpeg_cache.get(normalized)
+        if entry is not None and quality is None:
+            return entry[1]
+        # 回退：缓存未就绪或调用方指定了 quality 时按需编码。
+        frame = self.get_frame_or_placeholder(normalized)
+        use_quality = self.quality if quality is None else int(quality)
         try:
             ret, buffer = cv2.imencode(
                 ".jpg",
                 frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+                [int(cv2.IMWRITE_JPEG_QUALITY), use_quality],
             )
         except cv2.error:
-            self.clear_frame(self.normalize_cam_id(cam_id), preserve_meta=True)
-            placeholder = self._build_waiting_frame(self.normalize_cam_id(cam_id))
+            self.clear_frame(normalized, preserve_meta=True)
+            placeholder = self._build_waiting_frame(normalized)
             ret, buffer = cv2.imencode(
                 ".jpg",
                 placeholder,
-                [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+                [int(cv2.IMWRITE_JPEG_QUALITY), use_quality],
             )
         if not ret:
             raise RuntimeError("JPEG 编码失败")
         return buffer.tobytes()
+
+    def _encoder_loop(self):
+        """JPEG 编码后台线程：每个 fps tick 把 cam1+cam2 都编码一次。
+
+        设计目的：把 cv2.imencode 从 per-connection 路径挪到单线程，
+        N 个 MJPEG 客户端只跑 1 次编码（之前是 N 次）。
+        """
+        cams = ("cam1", "cam2")
+        while self.running:
+            try:
+                for cam_id in cams:
+                    if not self.running:
+                        break
+                    frame = self.get_frame_or_placeholder(cam_id)
+                    try:
+                        ok, buf = cv2.imencode(
+                            ".jpg",
+                            frame,
+                            [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+                        )
+                    except cv2.error:
+                        self.clear_frame(cam_id, preserve_meta=True)
+                        time.sleep(0.05)
+                        continue
+                    if not ok:
+                        continue
+                    with self.frame_lock:
+                        meta = self.frame_meta.get(cam_id) or {}
+                        updated_at = float(meta.get("source_updated_at") or time.time())
+                    self._store_jpeg(cam_id, updated_at, buf.tobytes())
+            except Exception:
+                # 单帧编码失败不能让线程退出
+                pass
+            time.sleep(self.capture_interval)
+
+    def _store_jpeg(self, cam_id, source_updated_at, jpeg_bytes):
+        """原子更新 JPEG 缓存。frame_lock 保护。"""
+        with self.frame_lock:
+            self._jpeg_cache[cam_id] = (float(source_updated_at), bytes(jpeg_bytes))
+
+    def get_jpeg_meta(self, cam_id):
+        """返回 (source_updated_at, jpeg_bytes) 或 (None, None)。供 ETag 使用。"""
+        normalized = self.normalize_cam_id(cam_id)
+        with self.frame_lock:
+            entry = self._jpeg_cache.get(normalized)
+        if entry is None:
+            return None, None
+        return entry
 
     def save_capture(self, cam_id, prefix="capture", subdir=None):
         normalized = self.normalize_cam_id(cam_id)
@@ -499,7 +619,13 @@ class CameraStreamService:
                 <div class="streams">
                     <div class="stream-cell">
                         <span class="label">cam1 / front</span>
-                        <img src="/video_feed/cam1" alt="front camera">
+                        <span class="label" style="left:auto; right:8px; background: rgba(0,80,140,0.55);">
+                            <label style="cursor:pointer; user-select:none;">
+                                <input type="checkbox" id="laneOverlay" style="vertical-align:middle; margin-right:3px;">
+                                lane overlay
+                            </label>
+                        </span>
+                        <img id="cam1Img" src="/video_feed/cam1" alt="front camera">
                     </div>
                     <div class="stream-cell">
                         <span class="label">cam2 / side</span>
@@ -545,6 +671,28 @@ class CameraStreamService:
                     }
                     pollLane();
                     setInterval(pollLane, 1000);  // 1Hz 足够（MJPEG 已经 20Hz）
+
+                    // ---- cam1 车道 overlay 切换 ----
+                    // 默认走 MJPEG /video_feed/cam1（干净流）。
+                    // 勾上 checkbox 时切到 /v1/vision/lane/preview.jpg?cam_id=cam1，
+                    // 该端点会读 streamer 缓存 + 画车道误差字，单帧 JPEG，
+                    // 因此需要 JS 周期性 reload（默认 10Hz）。
+                    const cam1Img = document.getElementById('cam1Img');
+                    const laneOverlay = document.getElementById('laneOverlay');
+                    let overlayTimer = null;
+                    function refreshOverlay() {
+                        // cache-buster 时间戳让浏览器拉新帧
+                        cam1Img.src = '/v1/vision/lane/preview.jpg?cam_id=cam1&t=' + Date.now();
+                    }
+                    laneOverlay.addEventListener('change', () => {
+                        if (laneOverlay.checked) {
+                            refreshOverlay();
+                            overlayTimer = setInterval(refreshOverlay, 100);  // 10Hz
+                        } else {
+                            if (overlayTimer) { clearInterval(overlayTimer); overlayTimer = null; }
+                            cam1Img.src = '/video_feed/cam1';
+                        }
+                    });
 
                     // 键盘按键转发（保留）
                     let pageActive = false;
@@ -669,5 +817,37 @@ class CameraStreamService:
             "angular_speed": None,
             "distance": None,
             "frame_shape": None,
+            "updated_at": None,
+        }
+
+    # === arm 位置缓存（供 subscribe_arm_state WS op 推送）===
+    def set_arm_state(self, **updates):
+        """由 car.start_arm_feed 守护线程持续刷新的机械臂 y/x 位置。
+
+        y_mm/x_mm: 业务坐标,触底=0,撞墙=0;负=向上/向左,正=向下/向右。
+        y_m/x_m:   SDK 原始坐标(m),精度更高。
+        ref_encoder: 最近一次 reset_y 后的编码器零点,丢步核对用。
+        """
+        with self.meta_lock:
+            state = dict(self.arm_state)
+            for key, value in updates.items():
+                state[key] = value
+            state["updated_at"] = time.time()
+            self.arm_state = state
+            return dict(state)
+
+    def get_arm_state(self):
+        with self.meta_lock:
+            state = dict(self.arm_state)
+        return state
+
+    def _default_arm_state(self):
+        return {
+            "active": False,
+            "y_m": None,         # SDK 原始(m)
+            "x_m": None,         # SDK 原始(m)
+            "y_mm": None,        # 业务(mm)
+            "x_mm": None,        # 业务(mm)
+            "ref_encoder": None, # 丢步核对 ref
             "updated_at": None,
         }

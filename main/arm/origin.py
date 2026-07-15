@@ -53,9 +53,14 @@ class OriginCalibrator:
             y_origin_m=y_val,
             x_origin_m=x_val,
             x_wall=x_wall,
-            soft_y_max_m=0.18,
-            soft_x_min_m=0.005,
-            soft_x_max_m=0.30,
+            # 必须与 state.ArmOrigin 默认值和 arm_origin.yaml 现状保持一致（v3 双边行程）：
+            #   soft_y_max_m = 0.20 （y 行程 [-200, 0] mm）
+            #   soft_x_min_m = -0.32（x 行程 [-320, +320] mm，撞墙=0）
+            #   soft_x_max_m = 0.32
+            # 旧版 (0.18 / 0.005 / 0.30) 是 v1 单边约定，会把 yaml 覆盖坏，已修正。
+            soft_y_max_m=ArmOrigin().soft_y_max_m,
+            soft_x_min_m=ArmOrigin().soft_x_min_m,
+            soft_x_max_m=ArmOrigin().soft_x_max_m,
             calibrated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         import os

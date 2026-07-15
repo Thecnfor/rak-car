@@ -4,30 +4,22 @@
 
 ```bash
 python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
-export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 ```
 
-## 2. 首次上电：4 键手动定原点
+## 2. 首次上电：runtime 自动定原点
+
+不需要任何手动操作。runtime 启动时（pm2 拉起 `rak-car-api`），`ecosystem.config.js` 默认把 `RAK_CAR_RESET_ARM=1` 注入环境变量；`runtime/core/settings.py:111-112` 看到后会在自动初始化阶段调一次 `arm.reset_position`，让 y 触底 / x 撞墙，并把当前编码器值落到 `main/arm/arm_origin.yaml`。
+
+正常情况下你接好车、连上 `RAK_CAR_SERVER_ORIGIN`、跑业务就行；`arm_origin.yaml` 不存在也不会卡死 —— runtime 会用默认软限位（0.18 / 0.005 / 0.30），下次 reset 后被覆盖。
+
+只有当机械臂"漂移严重 / PID 范围卡死 / 编码器读数明显不对"时，才手动跑一次 reset：
 
 ```bash
-python3 /home/jetson/workspace/rak-car/main/arm/examples/01_calibrate_origin.py left
+python3 /home/jetson/workspace/rak-car/main/arm/examples/01_calibrate_origin.py left   # 或 right
 ```
 
-按车端 4 键（**连续按住**）：
-
-| 键 | 行为 |
-| --- | --- |
-| 1 | y 下降（朝触底方向） |
-| 3 | y 上升 |
-| 2 | x 左移 |
-| 4 | x 右移 |
-
-把机械臂按到：
-
-- y 触底（磁感触发）
-- x 撞左侧墙（编码器堵转）
-
-然后**同时按住 1 + 3 持续 1 秒**，原点就写到 `main/arm/arm_origin.yaml` 了，程序退出。
+底层会调车端 `arm.reset_position` + 读 `y_get_position` / `x_get_position`，最后写 `arm_origin.yaml`。和旧版"按 4 键手动 jog"的区别：当前版本不再监听按键，直接走车端闭环 reset。
 
 ## 3. 10 行起步：移动到目标点
 
@@ -71,10 +63,10 @@ TrajectoryPlan((0.0,0.0) -> (100.0,80.0) mm, T=2.30s, peak_vx=120.0 peak_vy=80.0
 
 | 报错 | 原因 | 处理 |
 | --- | --- | --- |
-| `ValueError: y_mm=200 超出软上限 180mm` | y 超出 `arm_origin.yaml` 软限位 | 改 `soft_y_max_m` 后重 calibrate |
+| `ValueError: y_mm=200 超出软上限 200mm` | y 超出 `arm_origin.yaml` 软限位 | 改 `soft_y_max_m` 后重 calibrate |
 | `RuntimeError: 等待小车初始化超时` | runtime 没起来 | `pm2 restart rak-car-api` |
 | `执行超时: arm.goto_position` | 硬件堵转 / 编码器漂移 | `arm.reset_origin("left")` 重新定原点 |
-| 动作全部从 0 开始（坐标系没标定） | 没跑 `01_calibrate_origin.py` | 先跑一次 |
+| 动作全部从 0 开始（坐标系没标定） | `RAK_CAR_RESET_ARM=0` 且从未手调用 `arm.reset_position` | 在 [ecosystem.config.js:23] 把它设回 `1`，pm2 重启 runtime；或手跑 `examples/01_calibrate_origin.py left` |
 
 ## 6. 下一步
 

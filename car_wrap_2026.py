@@ -357,6 +357,11 @@ class MyCar(MecanumDriver):
         # 相关临时变量设置
         # 程序结束标志
         self._stop_flag = False
+        # 急停事件：置位后 arm 的 y_speed/x_speed 被 chokepoint 强制 0，
+        # 正在跑的 reset_y / move_* 循环因电机不动而收敛退出。
+        # 与 _stop_flag 一起构成"协作式取消"，可被 runtime 无锁抢占。
+        self._estop_event = threading.Event()
+        self.arm._estop = self._estop_event
         # 按键线程结束标志
         self._end_flag = False
         self.thread_key = threading.Thread(target=self.key_thread_func)
@@ -380,6 +385,43 @@ class MyCar(MecanumDriver):
         if stop is None:
             return self.STOP_PARAM
         return stop
+
+    def emergency_stop(self):
+        """
+        软件急停：立即停三轴 + 置协作停止标志。
+
+        设计要点（配合 runtime 无锁调用）：
+          - 底层串口每条指令自带锁并各自成包，即使 worker 线程正在跑长动作，
+            这里并发下发停车指令也不会串包，故 runtime 侧无需再抢 car_lock；
+          - 置 _stop_flag / _estop_event 后：底盘巡线循环读到 _stop_flag 退出、
+            机械臂 y_speed/x_speed 被 _estop chokepoint 强制 0，正在跑的
+            reset_y / move_* 循环随即因电机不动而收敛退出，不会又把电机驱起来。
+        返回：True。
+        """
+        self._stop_flag = True
+        self._estop_event.set()
+        errors = []
+        for label, fn in (
+            ("arm_y", lambda: self.arm.y_speed(0)),
+            ("arm_x", lambda: self.arm.x_speed(0)),
+            ("chassis", self.stop),
+        ):
+            try:
+                fn()
+            except Exception as exc:  # 急停尽力而为，单轴失败不拖累其它轴
+                errors.append("{}:{}".format(label, exc))
+        if errors:
+            logger.warning("emergency_stop 部分轴停车异常: {}".format(errors))
+        return True
+
+    def clear_stop(self):
+        """
+        解除软件急停：清除停止标志，允许后续动作重新驱动电机。
+        急停后必须显式调用本方法（或 runtime reset_stop）才能恢复运动。
+        """
+        self._stop_flag = False
+        self._estop_event.clear()
+        return True
 
     def beep(self):
         """
@@ -1240,12 +1282,41 @@ class MyCar(MecanumDriver):
 
             def _feed_loop():
                 streamer = getattr(self, "streamer", None)
-                set_state = getattr(streamer, "set_lane_state", None)
+                set_state = getattr(streamer, "set_lane_state", None) if streamer else None
+                get_frame = getattr(streamer, "get_frame", None) if streamer else None
+                # 复用 self.crusie (ClintInterface("lane"))，不重新 connect。
+                # 不再 cap_front.read() / cv2.putText / update_frame —— 这些是
+                # 调试期副作用，会和 _capture_loop 抢摄像头 + frame_lock + GIL，
+                # 把前端 /stream/frame/cam1.jpg 的吞吐从 233 fps 砸到 57 fps。
+                # 这里只从 streamer.frames["cam1"] 读最新缓存帧 (≤50ms)，
+                # ClintInterface.get_infer 内部 resize 128x128 + jpeg + ZMQ REQ/REP。
+                infer_client = self.crusie
+                norm_id = (
+                    streamer.normalize_cam_id("cam1")
+                    if (streamer is not None and hasattr(streamer, "normalize_cam_id"))
+                    else "cam1"
+                )
+                consecutive_err = 0
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
                     try:
-                        error_y, error_angle = self.get_lane_results()
+                        img = get_frame(norm_id) if get_frame is not None else None
+                        if img is None:
+                            # _capture_loop 还没捕到第一帧；下一拍重试，不退出
+                            stop_event.wait(period)
+                            continue
+                        result = infer_client.get_infer(img)
+                        # ClintInterface.get_infer 返回 list[float, float]
+                        if not isinstance(result, (list, tuple)) or len(result) < 2:
+                            logger.warning(
+                                "lane feed: unexpected result shape %r", result
+                            )
+                            stop_event.wait(period)
+                            continue
+                        error_y = float(result[0])
+                        error_angle = float(result[1])
+                        consecutive_err = 0
                         if set_state is not None:
                             set_state(
                                 active=True,
@@ -1258,8 +1329,19 @@ class MyCar(MecanumDriver):
                                 distance=self.get_distance(),
                             )
                     except Exception as exc:
-                        logger.warning("lane feed loop exit: {}".format(exc))
-                        break
+                        consecutive_err += 1
+                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出，
+                        # 否则外环会丢一份新鲜的 lane_state。
+                        logger.warning(
+                            "lane feed transient err ({}): {}".format(
+                                consecutive_err, exc
+                            )
+                        )
+                        if consecutive_err >= 5:
+                            logger.warning("lane feed loop exit after {} errs".format(consecutive_err))
+                            break
+                        stop_event.wait(period)
+                        continue
                     stop_event.wait(period)
                 if set_state is not None:
                     try:
@@ -1293,6 +1375,79 @@ class MyCar(MecanumDriver):
         with self._lane_feed_lock:
             self._lane_feed_thread = None
             self._lane_feed_stop = None
+        return {"stopped": True}
+
+    # === arm 位置推送守护线程（实时 y/x,给 WS subscribe_arm_state 订阅） ===
+    def start_arm_feed(self, hz: float = 20.0):
+        """启动机械臂 y/x 位置守护线程,持续刷新 streamer.arm_state。
+
+        与 start_lane_feed 模式一致:
+        - 不抢 car_lock(arm 位置用 arm.y_get_position / x_get_position,SDK 内部读编码器无锁)
+        - 不会与 move_y / reset_y 等动作互斥(读 vs 写,SDK 编码器读是独立的)
+        - 订阅一次即可一直 push,disconnect / unsubscribe 时 cancel
+        """
+        if not hasattr(self, "_arm_feed_lock"):
+            self._arm_feed_lock = threading.Lock()
+            self._arm_feed_thread = None
+            self._arm_feed_stop = None
+        with self._arm_feed_lock:
+            if self._arm_feed_thread is not None and self._arm_feed_thread.is_alive():
+                return {"started": False, "reason": "already_running", "hz": hz}
+            self._arm_feed_stop = threading.Event()
+            stop_event = self._arm_feed_stop
+            period = 1.0 / max(float(hz), 1.0)
+
+            def _arm_feed_loop():
+                streamer = getattr(self, "streamer", None)
+                set_state = getattr(streamer, "set_arm_state", None) if streamer else None
+                while not stop_event.is_set():
+                    if self._stop_flag:
+                        break
+                    try:
+                        y_m = self.arm.y_get_position() if self.arm is not None else None
+                        x_m = self.arm.x_get_position() if self.arm is not None else None
+                        # SDK 坐标系:  y=触底=0, 撞墙=0, 负=向上/远离触底/远离墙
+                        # 业务坐标系:  y_mm = y_m * 1000, x_mm = x_m * 1000
+                        # 业务层和 SDK 一致,都是"触底/撞墙=0,负=上/远离墙"
+                        y_mm = (y_m * 1000.0) if y_m is not None else None
+                        x_mm = (x_m * 1000.0) if x_m is not None else None
+                        ref = getattr(self.arm, "_y_ref_encoder_at_zero", None)
+                        if set_state is not None:
+                            set_state(
+                                active=True,
+                                mode="arm_feed",
+                                y_m=y_m, x_m=x_m,
+                                y_mm=y_mm, x_mm=x_mm,
+                                ref_encoder=ref,
+                            )
+                    except Exception as exc:
+                        logger.warning("arm feed transient err: {}".format(exc))
+                    stop_event.wait(period)
+                # 退出时 active=False,前端能感知
+                if set_state is not None:
+                    try:
+                        set_state(active=False, mode="idle")
+                    except Exception:
+                        pass
+
+            self._arm_feed_thread = threading.Thread(target=_arm_feed_loop, name="arm-feed")
+            self._arm_feed_thread.daemon = True
+            self._arm_feed_thread.start()
+            return {"started": True, "hz": hz}
+
+    def stop_arm_feed(self):
+        if not hasattr(self, "_arm_feed_lock"):
+            return {"stopped": True}
+        with self._arm_feed_lock:
+            stop_event = self._arm_feed_stop
+            thread = self._arm_feed_thread
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+        with self._arm_feed_lock:
+            self._arm_feed_thread = None
+            self._arm_feed_stop = None
         return {"stopped": True}
 
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):

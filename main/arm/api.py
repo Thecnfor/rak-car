@@ -134,9 +134,9 @@ class ArmClient:
             y_origin_m=float(data.get("y_origin_m", 0.0)),
             x_origin_m=float(data.get("x_origin_m", 0.0)),
             x_wall=str(data.get("x_wall", "left")),
-            soft_y_max_m=float(data.get("soft_y_max_m", 0.18)),
-            soft_x_min_m=float(data.get("soft_x_min_m", 0.005)),
-            soft_x_max_m=float(data.get("soft_x_max_m", 0.30)),
+            soft_y_max_m=float(data.get("soft_y_max_m", 0.20)),
+            soft_x_min_m=float(data.get("soft_x_min_m", -0.32)),
+            soft_x_max_m=float(data.get("soft_x_max_m", 0.32)),
             calibrated_at=str(data.get("calibrated_at", "")),
         )
 
@@ -162,11 +162,28 @@ class ArmClient:
 
     # ---- 底层便捷调用 ----
 
-    def _call_arm(self, name: str, timeout: float = 20.0, *args, **kwargs) -> dict:
-        return self.http.execute_arm_action(name, *args, timeout=timeout, **kwargs)
+    def _call_arm(self, name: str, timeout: float = 20.0, *args, sync=True, **kwargs) -> dict:
+        """调车端 arm action。
 
-    def _call_car(self, name: str, timeout: float = 20.0, *args, **kwargs) -> dict:
-        return self.http.execute_car_action(name, *args, timeout=timeout, **kwargs)
+        D 改造后默认 sync=True：
+          - 长动作（move_xy / reset_y / reset_x 等）业务语义就是「等完成才能走下一步」，
+            改 sync=False 会破坏现有链式编排。
+          - 想 fire-and-forget（例如并发抓多个目标）显式传 sync=False。
+        """
+        return self.http.execute_arm_action(
+            name, *args, timeout=timeout, sync=sync, **kwargs
+        )
+
+    def _call_car(self, name: str, timeout: float = 20.0, *args, sync=False, **kwargs) -> dict:
+        """调车端 car action。
+
+        默认 sync=False：
+          - car 短动作（move_for / move_to_position / set_storage 等）默认异步，
+            调用方需要时再显式 sync=True。
+        """
+        return self.http.execute_car_action(
+            name, *args, timeout=timeout, sync=sync, **kwargs
+        )
 
     # ---- 业务动作 ----
 
@@ -302,7 +319,7 @@ class ArmClient:
 
         只接受两个档位：
           - "LEFT"  → 写死角度 STORAGE_DEFAULT_LEFT_ANGLE（-42°，与初始化复位角度一致）
-          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（90°，车端 servo_1_angle_list[1]）
+          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（165°）
 
         底层走 car.set_storage(bool)，它在 car_wrap_2026.sensor_init 阶段已构造。
         之所以走 car（而不是 arm）是因为这块舵机不属于机械臂（arm），属于车体外设。
@@ -320,11 +337,11 @@ class ArmClient:
         side = _normalize_storage_side(side)
         if side is None:
             raise ValueError(f"set_storage 必须给 {STORAGE_SIDES}")
-        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 90°（RIGHT 档），
+        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 165°（RIGHT 档），
         # False → servo_1_angle_list[0] = -42°（LEFT 档）。
-        # （历史曾用 165°，协议值 255 超 0~180，mc602 会回弹，已统一为 90°）
         open_flag = side == "RIGHT"
-        job = self._call_car("set_storage", timeout=timeout, state=open_flag)
+        # 业务语义：舵机动作完成后才能确认档位，需要 sync=True（car 默认是 False）。
+        job = self._call_car("set_storage", timeout=timeout, state=open_flag, sync=True)
 
         # 把车端 result 解出来（runtime 已 normalize_value 序列化）。
         # 失败 job 这里 result 通常是 None / 错误字符串。
@@ -373,7 +390,14 @@ class ArmClient:
     # ---- reset ----
 
     def reset_y(self, timeout: float = 30.0) -> dict:
-        return self._call_arm("reset_position", timeout=timeout)  # y + x 一起复位
+        """仅归 y（步进电机触底 + 磁感确认，不动 x）。
+
+        走车端 arm.reset_y：只让 y 步进电机找磁感触底，不动 x 编码器电机。
+        与 reset_position (y + x 一起归) 区分。
+
+        失败语义见 [ARM_API.md §reset_y 行为](./ARM_API.md#reset_y-行为磁感是唯一到底凭证)。
+        """
+        return self._call_arm("reset_y", timeout=timeout)
 
     def reset_x(self, timeout: float = 30.0) -> dict:
         return self._call_arm("reset_x", timeout=timeout)
@@ -394,8 +418,8 @@ class ArmClient:
             x_origin_m=st["raw_x_m"],
             x_wall=x_wall,
             soft_y_max_m=self.origin.soft_y_max_m if self.origin else 0.18,
-            soft_x_min_m=self.origin.soft_x_min_m if self.origin else 0.005,
-            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.30,
+            soft_x_min_m=self.origin.soft_x_min_m if self.origin else -0.32,
+            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.32,
             calibrated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         self.save_origin(new_origin)

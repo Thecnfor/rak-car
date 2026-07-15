@@ -75,14 +75,36 @@ class CarRuntimeService:
         self.infer_service = InferBackendService()
         self.controller_session = get_controller_session()
         self.controller_generation = None
-        self.car_lock = threading.RLock()
-        self.camera_lock = threading.Lock()
-        self.init_lock = threading.Lock()
+        # 锁层次重构（runtime 并发优化）：
+        #   - `_ref_lock`：只保护 `self.car` 引用替换（init / recover / close）。
+        #     持锁时间极短（只读 self.car 或写 self.car = ...），worker / 长动作都不应持它。
+        #   - `_realtime_gate`：realtime 端点（set_wheel_speeds 等）入口处微秒级取 self.car 引用，
+        #     真正的硬件调用在锁外执行，靠 SDK 的 `serial_mc602.lock` 串行字节流。
+        #   - 旧 `car_lock`（RLock）已删除，保留同名 property 抛错，确保漏改的代码路径立即暴露。
+        self._ref_lock = threading.Lock()
+        self._realtime_gate = threading.Lock()
+        # 两个独立 worker 队列（runtime 并发优化）：
+        #   - arm_queue：机械臂长动作专用（arm.goto_position / move_xy 等 1-3s 闭环）。
+        #     arm worker 卡在 PID 闭环里不影响 car_queue。
+        #   - car_queue：底盘 / 任务 / system 短动作。短动作不被 arm 长动作排在同一个 worker 后面。
+        # 两条队列物理隔离，互不阻塞；底层硬件字节流仍由 SDK 的 serial_mc602.lock 串行。
         self.job_lock = threading.Lock()
         self.jobs = {}
-        self.job_queue = queue.Queue()
-        self.worker = threading.Thread(target=self._worker_loop, daemon=True)
-        self.worker.start()
+        # D.6 协作退出事件：与 jobs 字典分开存放，避免 JSON 序列化时碰到
+        # `threading.Event`（不可序列化）抛错。key 与 jobs[job_id]["id"] 对齐。
+        self.job_stop_events: dict = {}
+        self.arm_queue: queue.Queue = queue.Queue()
+        self.car_queue: queue.Queue = queue.Queue()
+        self.arm_worker = threading.Thread(
+            target=self._worker_loop, args=("arm",), daemon=True
+        )
+        self.car_worker = threading.Thread(
+            target=self._worker_loop, args=("car",), daemon=True
+        )
+        self.arm_worker.start()
+        self.car_worker.start()
+        self.camera_lock = threading.Lock()
+        self.init_lock = threading.Lock()
         self.initializing = False
         self.last_error = None
         self.last_init_at = None
@@ -106,6 +128,23 @@ class CarRuntimeService:
         self.auto_init_supervisor.start()
         self.camera_supervisor = None
         self.camera_supervisor_started = False
+
+    @property
+    def car_lock(self):
+        """已废弃：长动作不应再全程持锁。
+
+        新代码请用：
+          - `_ref_lock` — init / recover / 改 self.car 引用的入口
+          - `_realtime_gate` — realtime 端点入口微秒级取 self.car 引用
+        如果你的代码原本 `with self.car_lock:` 包住一长段动作（典型场景：worker 跑
+        `arm.move_xy` 1-3s 闭环），请改成 `with self._ref_lock:` 在最外圈瞬时拿
+        到 car 引用后立即释放。
+        """
+        raise RuntimeError(
+            "car_lock 已废弃,长动作不应再持锁。请改用 self._ref_lock（init/引用替换）"
+            " 或 self._realtime_gate（realtime 入口）。"
+            " grep 'self.car_lock' 找遗留。"
+        )
 
     def set_stream_service(self, stream_service):
         self.stream_service = stream_service
@@ -225,7 +264,10 @@ class CarRuntimeService:
             if job["status"] in {"succeeded", "failed"}
         ]
         while len(self.jobs) > keep and removable_ids:
-            self.jobs.pop(removable_ids.pop(0), None)
+            rid = removable_ids.pop(0)
+            self.jobs.pop(rid, None)
+            # 同步清理 D.6 的 stop_event，避免 Event 对象泄漏
+            self.job_stop_events.pop(rid, None)
 
     def _set_job(self, job_id, **updates):
         with self.job_lock:
@@ -269,7 +311,7 @@ class CarRuntimeService:
 
     def _mark_controller_offline(self, detail=None):
         self.controller_session.mark_offline(detail, mode="unknown")
-        with self.car_lock:
+        with self._ref_lock:
             self._safe_close_locked()
         if detail:
             self.last_error = detail
@@ -289,6 +331,20 @@ class CarRuntimeService:
         time.sleep(1)
         if reset_arm:
             car.arm.reset_position()
+        else:
+            # 即使外部没要求 reset_arm,每次 init 仍要 y/x 归零:
+            # 控制器重启/USB 重连后 y/x 编码器基准点丢失,不清零 move_* 会在错误基准上跑。
+            # 失败不抛(可能机械臂在不允许动的状态),仅记 last_error。
+            try:
+                car.arm.reset_y()
+            except Exception as exc:
+                self.last_error = "arm reset_y 失败: {}".format(exc)
+                logger.warning("init 时 reset_y 失败: %s" % exc)
+            try:
+                car.arm.reset_x()
+            except Exception as exc:
+                self.last_error = "arm reset_x 失败: {}".format(exc)
+                logger.warning("init 时 reset_x 失败: %s" % exc)
         if reset_position:
             car.reset_position()
         self.car = car
@@ -296,6 +352,18 @@ class CarRuntimeService:
         self.last_init_at = time.time()
         self.last_error = None
         self.auto_heal_armed = True
+        # 默认启 lane_feed 守护线程：比赛阶段 lane_state 必须持续更新
+        # 供外环消费。start_lane_feed 幂等，重复调用立即返回。
+        try:
+            car.start_lane_feed(hz=20.0)
+        except Exception as exc:  # pragma: no cover - 不让 init 失败
+            logger.warning("lane_feed auto-start failed: {}".format(exc))
+        # 默认启 arm_feed 守护线程:持续刷新 streamer.arm_state(y/x 位置),
+        # 供 WS subscribe_arm_state 实时推送,调试机械臂必备
+        try:
+            car.start_arm_feed(hz=20.0)
+        except Exception as exc:
+            logger.warning("arm_feed auto-start failed: {}".format(exc))
         return car
 
     def _ensure_infer_ready(self):
@@ -309,7 +377,7 @@ class CarRuntimeService:
                 session = self._ensure_controller_ready()
                 self._ensure_infer_ready()
                 self.ensure_shared_cameras()
-                with self.car_lock:
+                with self._ref_lock:
                     if self.car is not None and force:
                         self._safe_close_locked()
                     if (
@@ -330,6 +398,16 @@ class CarRuntimeService:
                     if reset_position:
                         self.car.reset_position()
                     self.controller_generation = session.get("generation")
+                    # 复用现有 car 时也确保 lane_feed 跑着（幂等）
+                    try:
+                        self.car.start_lane_feed(hz=20.0)
+                    except Exception as exc:  # pragma: no cover
+                        logger.warning("lane_feed auto-start (reused) failed: {}".format(exc))
+                    # arm_feed 同理
+                    try:
+                        self.car.start_arm_feed(hz=20.0)
+                    except Exception as exc:
+                        logger.warning("arm_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()
@@ -378,7 +456,7 @@ class CarRuntimeService:
         if disable_auto_init:
             self.auto_init_requested = False
             self.auto_heal_armed = False
-        with self.car_lock:
+        with self._ref_lock:
             self._safe_close_locked()
         with self.camera_lock:
             self._close_shared_cameras_locked()
@@ -388,103 +466,162 @@ class CarRuntimeService:
         self.infer_service.stop()
 
     def emergency_stop(self):
-        with self.car_lock:
-            if self.car is None:
-                return False
-            self.car._stop_flag = True
-            self.car.stop()
+        # 关键：不持 car_lock。worker 跑长动作（reset_position / move_* / 巡线）时
+        # car_lock 被占，若这里也抢 car_lock 会排队等长动作结束 → 急停失效。
+        # 停车指令走串口层自带锁，与 worker 并发安全；car.emergency_stop 内部
+        # 置 _stop_flag/_estop 让正在跑的循环协作退出，并直接停三轴。
+        car = self.car
+        if car is None:
+            return False
+        try:
+            return bool(car.emergency_stop())
+        except AttributeError:
+            # 兼容旧 car（无 emergency_stop）：至少置标志 + 停底盘
+            car._stop_flag = True
+            try:
+                car.stop()
+            except Exception:
+                pass
             return True
 
     def reset_stop_flag(self):
-        with self.car_lock:
-            if self.car is None:
-                return False
-            self.car._stop_flag = False
+        # 同样不持 car_lock，保证急停恢复不被卡住的长动作阻塞
+        car = self.car
+        if car is None:
+            return False
+        try:
+            return bool(car.clear_stop())
+        except AttributeError:
+            car._stop_flag = False
             return True
 
-    # === 实时硬件控制（car_lock 同步路径，绕过 job_queue，50Hz 友好） ===
+    # === 实时硬件控制（_realtime_gate 同步路径，绕过 job_queue，50Hz 友好） ===
+    #
+    # B 改造：所有 realtime 端点不再持 RLock，只在入口处瞬时取 self.car 引用。
+    # 硬件字节流仍由 SDK 的 `serial_mc602.lock` 串行。
+    # 这样 arm 长动作（move_xy 1-3s 闭环）不再挡住 lane 外环的 set_wheel_speeds。
 
     def _realtime_check_locked(self):
         if self.car is None:
             raise RuntimeError("car 未初始化")
 
     def set_wheel_speeds(self, speeds):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.set_wheel_speeds(speeds)
+            car = self.car
+        return car.set_wheel_speeds(speeds)
 
     def set_chassis_velocity(self, vx, vy, wz, duration=None):
         """
         上层外环专用：(vx, vy, wz) → 4 轮速直发，绕开 set_velocity 的里程计耦合。
 
-        走 car_lock 同步路径，50Hz 友好。里程计照常由 odometer_thread 自动更新
+        走 _realtime_gate 同步路径，50Hz 友好。里程计照常由 odometer_thread 自动更新
         （它读 wheels_chassis.get_linear()）。
         """
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            vx = float(vx)
-            vy = float(vy)
-            wz = float(wz)
-            # 直接复用 chassis 的 IK（避免重复实现 mecanum 公式）
-            wheel_speeds = list(
-                self.car.chassis.calculate_wheel_velocities(vx, vy, wz)
-            )
-            # 直发轮速，绕开 set_velocity（set_velocity 会反复 lock + set）
-            self.car.wheels_chassis.set_linear([float(s) for s in wheel_speeds])
-            return {
-                "vx": vx,
-                "vy": vy,
-                "wz": wz,
-                "duration": duration,
-                "wheel_speeds": wheel_speeds,
-            }
+            car = self.car
+        vx = float(vx)
+        vy = float(vy)
+        wz = float(wz)
+        # 直接复用 chassis 的 IK（避免重复实现 mecanum 公式）
+        wheel_speeds = list(
+            car.chassis.calculate_wheel_velocities(vx, vy, wz)
+        )
+        # 直发轮速，绕开 set_velocity（set_velocity 会反复 lock + set）
+        car.wheels_chassis.set_linear([float(s) for s in wheel_speeds])
+        return {
+            "vx": vx,
+            "vy": vy,
+            "wz": wz,
+            "duration": duration,
+            "wheel_speeds": wheel_speeds,
+        }
 
     def get_wheel_encoders(self):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.get_wheel_encoders()
+            car = self.car
+        return car.get_wheel_encoders()
+
+    def get_lane_state(self):
+        """外环专用：读 streamer 缓存的 lane_state。
+
+        数据来源：`lane_feed` 守护线程（runtime 启动后默认 20Hz）通过
+        `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        因此 50Hz+ 外环轮询安全，不会和 lane_feed 守护线程或 MJPEG 推流抢锁。
+
+        `stream_service` 由 `runtime.api.app` 在路由注册前 `set_stream_service`
+        注入，正常启动后不会为 None；若 runtime 尚未注入则返回 503。
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_lane_state()
+
+    def get_arm_state(self):
+        """调试/UI 专用：读 streamer 缓存的 arm_state（机械臂 y/x 位置）。
+
+        数据来源：`arm_feed` 守护线程（runtime 启动后默认 20Hz）通过
+        `car.streamer.set_arm_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        20Hz+ 轮询安全。
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_arm_state()
 
     def set_single_motor(self, port, speed, reverse=1):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.set_single_motor(port, speed, reverse=reverse)
+            car = self.car
+        return car.set_single_motor(port, speed, reverse=reverse)
 
     def get_encoder(self, port, reverse=1):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.get_encoder(port, reverse=reverse)
+            car = self.car
+        return car.get_encoder(port, reverse=reverse)
 
     def set_stepper_rad(self, port, rad, time=0.5, reverse=1, perimeter=0.008):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.set_stepper_rad(port, rad, time, reverse, perimeter)
+            car = self.car
+        return car.set_stepper_rad(port, rad, time, reverse, perimeter)
 
     def set_bus_servo(self, port, angle, speed=100):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.set_bus_servo(port, angle, speed)
+            car = self.car
+        return car.set_bus_servo(port, angle, speed)
 
     def read_bus_servo(self, port):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.read_bus_servo(port)
+            car = self.car
+        return car.read_bus_servo(port)
 
     def read_analog(self, port):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.read_analog(port)
+            car = self.car
+        return car.read_analog(port)
 
     def read_analog2(self, port):
-        with self.car_lock:
+        with self._realtime_gate:
             self._realtime_check_locked()
-            return self.car.read_analog2(port)
+            car = self.car
+        return car.read_analog2(port)
 
     def set_stop_mode(self, enabled):
-        with self.car_lock:
-            self.stop_after_action = bool(enabled)
-            if self.car is not None:
-                self.car.STOP_PARAM = self.stop_after_action
-            return self.stop_after_action
+        self.stop_after_action = bool(enabled)
+        with self._realtime_gate:
+            car = self.car
+        if car is not None:
+            car.STOP_PARAM = self.stop_after_action
+        return self.stop_after_action
 
     def get_state(self):
         controller_snapshot = self._sync_controller_health_state()
@@ -531,20 +668,24 @@ class CarRuntimeService:
         }
 
     def get_runtime_snapshot(self):
-        with self.car_lock:
-            if self.car is None:
-                return None
-            self._bind_task_car(self.car)
-            return {
-                "odometry": normalize_value(self.car.get_odometry()),
-                "distance": normalize_value(self.car.get_distance()),
-                "stop_after_action": self.car.STOP_PARAM,
-                "stop_flag": self.car._stop_flag,
-            }
+        with self._ref_lock:
+            car = self.car
+        if car is None:
+            return None
+        self._bind_task_car(car)
+        return {
+            "odometry": normalize_value(car.get_odometry()),
+            "distance": normalize_value(car.get_distance()),
+            "stop_after_action": car.STOP_PARAM,
+            "stop_flag": car._stop_flag,
+        }
 
     def get_car_for_stream(self):
-        with self.car_lock:
-            return self.car
+        # 不持 car_lock：capture_loop 在机械臂长动作期间会被卡住 5+s，
+        # 导致 stream 缓存不更新,前端 MJPEG/frame 一直吐最后那帧(画面卡死)。
+        # self.car 是单实例属性，读取是 GIL 原子操作,无撕裂风险。
+        # 切换 self.car 仅发生在 init/recover 流程,且会同步停止 capture_loop 一拍。
+        return self.car
 
     def list_actions(self):
         return {
@@ -586,11 +727,15 @@ class CarRuntimeService:
             "finished_at": None,
             "result": None,
             "error": None,
+            # 协作退出事件存在 self.job_stop_events[job_id]，不进 job dict（避免 JSON 序列化出错）。
         }
         with self.job_lock:
             self.jobs[job_id] = job
+            self.job_stop_events[job_id] = threading.Event()
             self._trim_jobs()
-        self.job_queue.put(job_id)
+        # arm → arm_queue；car / task / system → car_queue。两条队列物理隔离。
+        target_queue = self.arm_queue if target == "arm" else self.car_queue
+        target_queue.put(job_id)
         return job
 
     def wait_job(self, job_id, timeout=None, poll_interval=None):
@@ -613,8 +758,37 @@ class CarRuntimeService:
         raise TimeoutError(f"等待任务超时: {job_id}")
 
     def submit_job_and_wait(self, target, name, args=None, kwargs=None, timeout=None):
+        """D 改造：保留旧 API 给同步调用方（main.arm 等）。
+
+        D 路径默认异步后，调用方要等结果用 sync=True 走这个方法（见
+        `main/api_client.execute(sync=True)`）；新代码请直接用 `submit_job` +
+        轮询 `get_job`。
+        """
         job = self.submit_job(target=target, name=name, args=args, kwargs=kwargs)
         return self.wait_job(job["id"], timeout=timeout)
+
+    def cancel_job(self, job_id):
+        """D.6 协作退出：set job 的 stop_event，并尝试触发 SDK _stop_flag。
+
+        立即返回 True/False，不阻塞。worker 的 SDK 循环会在下个 y/x_stop_check
+        检测到 _stop_flag → 协作退出（参考 emergency_stop 模式）。
+        """
+        with self.job_lock:
+            stop_event = self.job_stop_events.get(job_id)
+            job_exists = job_id in self.jobs
+        if not job_exists:
+            return False
+        if stop_event is not None:
+            stop_event.set()
+        # 同时触发车端 _stop_flag，让 SDK 协作退出
+        try:
+            with self._realtime_gate:
+                car = self.car
+            if car is not None:
+                setattr(car, "_stop_flag", True)
+        except Exception:
+            pass
+        return True
 
     def list_jobs(self):
         with self.job_lock:
@@ -628,13 +802,13 @@ class CarRuntimeService:
         task_module = self._get_task_module()
         return getattr(task_module, name)(*args, **kwargs)
 
-    def _dispatch_car(self, name, args, kwargs):
-        self._bind_task_car(self.car)
-        return CAR_ACTIONS[name](self.car, *args, **kwargs)
+    def _dispatch_car(self, car, name, args, kwargs):
+        self._bind_task_car(car)
+        return CAR_ACTIONS[name](car, *args, **kwargs)
 
-    def _dispatch_arm(self, name, args, kwargs):
-        self._bind_task_car(self.car)
-        return ARM_ACTIONS[name](self.car.arm, *args, **kwargs)
+    def _dispatch_arm(self, car, name, args, kwargs):
+        self._bind_task_car(car)
+        return ARM_ACTIONS[name](car.arm, *args, **kwargs)
 
     def _dispatch_system(self, name, _args, kwargs):
         if name == "init":
@@ -723,7 +897,8 @@ class CarRuntimeService:
     def _recover_controller_runtime(self, exc):
         detail = f"运行时控制器异常: {type(exc).__name__}: {exc}"
         self.controller_session.note_io_failure(detail)
-        with self.car_lock:
+        # _safe_close_locked 会改 self.car 引用，必须走 _ref_lock 串行保护。
+        with self._ref_lock:
             self._safe_close_locked()
         self.start_auto_init()
         snapshot = self._sync_controller_health_state()
@@ -734,25 +909,35 @@ class CarRuntimeService:
         )
         return snapshot
 
-    def _dispatch_target_locked(self, target, name, args, kwargs):
-        self._bind_task_car(self.car)
-        if self.car is not None:
-            self.car.STOP_PARAM = self.stop_after_action
+    def _dispatch_target_locked(self, car, target, name, args, kwargs):
+        """方法名沿用旧 `_locked` 后缀只是历史命名，**实际不持任何锁**。
+
+        持锁只在 `_dispatch` 入口处瞬时取 `car` 引用（A.2 改造），动作执行期间
+        完全不持 runtime 锁。硬件层字节串行靠 SDK 的 `serial_mc602.lock`。
+        """
+        self._bind_task_car(car)
+        if car is not None:
+            car.STOP_PARAM = self.stop_after_action
         if target == "task":
             return self._dispatch_task(name, args, kwargs)
         if target == "car":
-            return self._dispatch_car(name, args, kwargs)
+            return self._dispatch_car(car, name, args, kwargs)
         if target == "arm":
-            return self._dispatch_arm(name, args, kwargs)
+            return self._dispatch_arm(car, name, args, kwargs)
         raise KeyError(f"不支持的 target: {target}")
 
     def _dispatch(self, target, name, args, kwargs):
         if target == "system":
             return self._dispatch_system(name, args, kwargs)
         self._wait_until_ready(reset_position=False)
+        # 入口处瞬时拿 car 引用（_ref_lock），之后整个动作期间不持任何 runtime 锁。
+        # 目的：让 lane 外环的 set_wheel_speeds 50Hz 调用不再被 arm 长动作（1-3s PID 闭环）挡住。
+        with self._ref_lock:
+            car = self.car
+        if car is None:
+            raise RuntimeError("car 未初始化")
         try:
-            with self.car_lock:
-                return self._dispatch_target_locked(target, name, args, kwargs)
+            return self._dispatch_target_locked(car, target, name, args, kwargs)
         except Exception as exc:
             if not self._should_probe_controller(exc):
                 raise
@@ -795,12 +980,18 @@ class CarRuntimeService:
             return
         self._sync_controller_health_state()
 
-    def _worker_loop(self):
+    def _worker_loop(self, target_filter):
+        """target_filter: "arm" 或 "car"（system 走 car worker）。
+
+        入口处瞬时取 self.car 引用（_ref_lock），之后整个动作期间不持任何
+        runtime 锁（_dispatch_target_locked 已 A.2 重构）。
+        """
+        target_queue = self.arm_queue if target_filter == "arm" else self.car_queue
         while True:
-            job_id = self.job_queue.get()
+            job_id = target_queue.get()
             job = self.get_job(job_id)
             if job is None:
-                self.job_queue.task_done()
+                target_queue.task_done()
                 continue
             self.current_job_id = job_id
             self._set_job(
@@ -818,7 +1009,7 @@ class CarRuntimeService:
                     "job_id": job_id,
                     "target": job["target"],
                     "name": job["name"],
-                    "queued_size": self.job_queue.qsize(),
+                    "queued_size": target_queue.qsize(),
                 },
             )
             #endregion debug-point runtime-init-queue-worker
@@ -871,4 +1062,4 @@ class CarRuntimeService:
                 #endregion debug-point runtime-init-queue-worker
             finally:
                 self.current_job_id = None
-                self.job_queue.task_done()
+                target_queue.task_done()

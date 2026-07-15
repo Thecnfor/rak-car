@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 try:
-    from fastapi import APIRouter, Body, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+    from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 except ModuleNotFoundError as exc:  # pragma: no cover
     raise RuntimeError(
         "缺少 FastAPI 依赖，请先执行: /usr/bin/python3 -m pip install -r "
@@ -19,13 +19,29 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 from runtime.core import settings
 import time
 
+try:
+    import cv2  # 仅 /v1/vision/lane/preview.jpg 用，单独 try 避免污染启动路径
+    _HAS_CV2 = True
+except ImportError:  # pragma: no cover
+    cv2 = None  # type: ignore
+    _HAS_CV2 = False
+
 
 def get_public_links():
+    """返回带链接的 dict。**模块级缓存**——env vars 不变就不重算。
+
+    健康检查 1Hz 轮询时省下 30+ f-string 拼接；env vars 通过 settings 模块
+    的 cache-busting 接口（如果有）显式触发失效。
+    """
+    global _PUBLIC_LINKS_CACHE
+    cached = _PUBLIC_LINKS_CACHE
+    if cached is not None:
+        return cached
     api_base = settings.get_public_api_base()
     v1 = settings.get_api_v1_prefix()
     legacy = settings.get_legacy_api_prefix()
     ws_base = api_base.replace("http://", "ws://").replace("https://", "wss://")
-    return {
+    cached = {
         "api_base": api_base,
         "docs": f"{api_base}/docs",
         "health_v1": f"{api_base}{v1}/health",
@@ -52,7 +68,14 @@ def get_public_links():
         "realtime_bus_servo_angle": f"{api_base}{v1}/realtime/bus-servo/angle",
         "realtime_analog": f"{api_base}{v1}/realtime/analog",
         "realtime_analog2": f"{api_base}{v1}/realtime/analog2",
+        "realtime_lane_state": f"{api_base}{v1}/realtime/lane/state",
     }
+    _PUBLIC_LINKS_CACHE = cached
+    return cached
+
+
+# 模块级缓存：env vars 不变就不重算。要 invalidate 直接赋 None。
+_PUBLIC_LINKS_CACHE = None
 
 
 def _execute_sync(service, target, name, args=None, kwargs=None, timeout=None):
@@ -203,21 +226,33 @@ def _execute_from_payload(service, payload):
     args = payload.get("args", [])
     kwargs = payload.get("kwargs", {})
     timeout = payload.get("timeout")
+    # D 改造：默认异步（立即返回 job_id，状态查 /v1/jobs/{id}）。
+    # 旧同步调用方传 sync=True 拿原语义（submit_job_and_wait，阻塞到完成）。
+    sync = bool(payload.get("sync", False))
     if not name:
         raise HTTPException(status_code=400, detail="缺少 name")
+    if sync:
+        try:
+            job = service.submit_job_and_wait(
+                target=target,
+                name=name,
+                args=args,
+                kwargs=kwargs,
+                timeout=timeout,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=str(exc)) from exc
+        return {"ok": job["status"] == "succeeded", "job": job}
+    # 异步：立即返回 job dict（status=queued），不阻塞。
     try:
-        job = service.submit_job_and_wait(
-            target=target,
-            name=name,
-            args=args,
-            kwargs=kwargs,
-            timeout=timeout,
+        job = service.submit_job(
+            target=target, name=name, args=args, kwargs=kwargs
         )
     except KeyError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except TimeoutError as exc:
-        raise HTTPException(status_code=504, detail=str(exc)) from exc
-    return {"ok": job["status"] == "succeeded", "job": job}
+    return {"ok": True, "async": True, "job": job}
 
 
 def _get_job(service, job_id):
@@ -257,198 +292,264 @@ def _submit_simple_system_job(service, name):
     return {"ok": True, "job": job}
 
 
+# ===== WS dispatch table =====
+# 每个 op 一个独立小函数（语义单一、好测、好维护），统一签名
+# `(service, payload) -> data_dict` 或 `-> None`（特殊：ping/pong）。
+# 出错由函数体抛 HTTPException（保持原 25 路 if 链的对外行为不变）。
+
+def _ws_op_ping(_service, _payload):
+    return {"ok": True, "op": "pong"}
+
+
+def _ws_op_health(service, payload):
+    return {"ok": True, "op": "health", "data": health_payload(service, include_snapshot=bool(payload.get("snapshot")))}
+
+
+def _ws_op_runtime(service, _payload):
+    return {"ok": True, "op": "runtime", "data": _build_runtime_snapshot(service)}
+
+
+def _ws_op_actions(service, _payload):
+    return {"ok": True, "op": "actions", "data": {"actions": service.list_actions()}}
+
+
+def _ws_op_config(_service, _payload):
+    return {"ok": True, "op": "config", "data": {"config": settings.get_runtime_settings()}}
+
+
+def _ws_op_infer_state(service, _payload):
+    return {"ok": True, "op": "infer_state", "data": {"infer": service.get_infer_state()}}
+
+
+def _ws_op_create_job(service, payload):
+    return {"ok": True, "op": "create_job", "data": _create_job_from_payload(service, payload)}
+
+
+def _ws_op_get_job(service, payload):
+    job_id = payload.get("job_id")
+    if not job_id:
+        raise HTTPException(status_code=400, detail="缺少 job_id")
+    return {"ok": True, "op": "get_job", "data": _get_job(service, job_id)}
+
+
+def _ws_op_execute(service, payload):
+    return {"ok": True, "op": "execute", "data": _execute_from_payload(service, payload)}
+
+
+def _ws_op_init(service, payload):
+    return {"ok": True, "op": "init", "data": _submit_init_job(service, payload)}
+
+
+def _ws_op_stop_mode(service, payload):
+    return {"ok": True, "op": "stop_mode", "data": _submit_stop_mode_job(service, payload)}
+
+
+def _ws_op_reset_stop(service, _payload):
+    return {"ok": True, "op": "reset_stop", "data": _submit_simple_system_job(service, "reset_stop_flag")}
+
+
+def _ws_op_close(service, _payload):
+    return {"ok": True, "op": "close", "data": _submit_simple_system_job(service, "close")}
+
+
+def _ws_op_emergency_stop(service, _payload):
+    return {"ok": True, "op": "emergency_stop", "data": {"stopped": service.emergency_stop()}}
+
+
+# === 实时硬件直达 op（car_lock 同步路径，不进 job_queue） ===
+
+def _ws_op_realtime_wheel_speeds(service, payload):
+    speeds = payload.get("speeds")
+    if not isinstance(speeds, list) or len(speeds) != 4:
+        raise HTTPException(status_code=400, detail="speeds 必须是长度为 4 的数组")
+    try:
+        result = service.set_wheel_speeds([float(s) for s in speeds])
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/wheel_speeds", "data": {"result": result}}
+
+
+def _ws_op_realtime_chassis_velocity(service, payload):
+    """外环最常用：(vx, vy, wz) 直接下发，内部 IK 反算 4 轮速、绕开 set_velocity 里程计耦合。"""
+    try:
+        vx = float(payload.get("vx", 0.0))
+        vy = float(payload.get("vy", 0.0))
+        wz = float(payload.get("wz", 0.0))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="vx/vy/wz 必须是数字")
+    try:
+        result = service.set_chassis_velocity(vx, vy, wz)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/chassis_velocity", "data": {"result": result}}
+
+
+def _ws_op_realtime_wheel_encoders(service, _payload):
+    try:
+        encoders = service.get_wheel_encoders()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/wheel_encoders", "data": {"encoders": encoders}}
+
+
+def _ws_op_realtime_motor_speed(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    try:
+        result = service.set_single_motor(
+            int(port),
+            float(payload.get("speed", 0)),
+            reverse=int(payload.get("reverse", 1)),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/motor_speed", "data": {"result": result}}
+
+
+def _ws_op_realtime_encoder(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    reverse = payload.get("reverse", 1)
+    try:
+        encoder = service.get_encoder(int(port), reverse=int(reverse))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/encoder", "data": {"encoder": encoder}}
+
+
+def _ws_op_realtime_stepper_rad(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    try:
+        result = service.set_stepper_rad(
+            int(port),
+            float(payload.get("rad", 0.0)),
+            time=float(payload.get("time", 0.5)),
+            reverse=int(payload.get("reverse", 1)),
+            perimeter=float(payload.get("perimeter", 0.008)),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/stepper_rad", "data": {"result": result}}
+
+
+def _ws_op_realtime_bus_servo_angle(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    try:
+        result = service.set_bus_servo(
+            int(port),
+            float(payload.get("angle", 0)),
+            speed=int(payload.get("speed", 100)),
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/bus_servo_angle", "data": {"result": result}}
+
+
+def _ws_op_realtime_bus_servo_read(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    try:
+        angle = service.read_bus_servo(int(port))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/bus_servo_read", "data": {"angle": angle}}
+
+
+def _ws_op_realtime_analog(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    try:
+        value = service.read_analog(int(port))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/analog", "data": {"value": value}}
+
+
+def _ws_op_realtime_analog2(service, payload):
+    port = payload.get("port")
+    if port is None:
+        raise HTTPException(status_code=400, detail="缺少 port")
+    try:
+        value = service.read_analog2(int(port))
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/analog2", "data": {"value": value}}
+
+
+def _ws_op_realtime_lane_state(service, _payload):
+    """外环最常用：读 streamer 缓存的 lane_state。
+
+    数据来源是 lane_feed 守护线程（runtime 启动后默认 20Hz）通过
+    `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
+    不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock（极快），
+    50Hz+ 外环轮询安全，不会和 lane_feed 守护线程或 MJPEG 推流抢锁。
+    """
+    try:
+        lane_state = service.get_lane_state()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/lane_state", "data": {"lane_state": lane_state}}
+
+
+def _ws_op_realtime_arm_state(service, _payload):
+    """WS op=realtime/arm_state: 读 streamer 缓存的 arm_state 一次。
+
+    数据来源是 arm_feed 守护线程(runtime 启动后默认 20Hz)通过
+    `car.streamer.set_arm_state(...)` 持续刷新的内存缓存。
+    不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock(极快)。
+    """
+    try:
+        arm_state = service.get_arm_state()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/arm_state", "data": {"arm_state": arm_state}}
+
+
+# op string → handler。统一 `(service, payload) -> dict`。
+_WS_OP_DISPATCH = {
+    "ping": _ws_op_ping,
+    "health": _ws_op_health,
+    "runtime": _ws_op_runtime,
+    "actions": _ws_op_actions,
+    "config": _ws_op_config,
+    "infer_state": _ws_op_infer_state,
+    "create_job": _ws_op_create_job,
+    "get_job": _ws_op_get_job,
+    "execute": _ws_op_execute,
+    "init": _ws_op_init,
+    "stop_mode": _ws_op_stop_mode,
+    "reset_stop": _ws_op_reset_stop,
+    "close": _ws_op_close,
+    "emergency_stop": _ws_op_emergency_stop,
+    "realtime/wheel_speeds": _ws_op_realtime_wheel_speeds,
+    "realtime/chassis_velocity": _ws_op_realtime_chassis_velocity,
+    "realtime/wheel_encoders": _ws_op_realtime_wheel_encoders,
+    "realtime/motor_speed": _ws_op_realtime_motor_speed,
+    "realtime/encoder": _ws_op_realtime_encoder,
+    "realtime/stepper_rad": _ws_op_realtime_stepper_rad,
+    "realtime/bus_servo_angle": _ws_op_realtime_bus_servo_angle,
+    "realtime/bus_servo_read": _ws_op_realtime_bus_servo_read,
+    "realtime/analog": _ws_op_realtime_analog,
+    "realtime/analog2": _ws_op_realtime_analog2,
+    "realtime/lane_state": _ws_op_realtime_lane_state,
+    "realtime/arm_state": _ws_op_realtime_arm_state,
+}
+
+
 async def _handle_websocket_message(service, payload):
     op = payload.get("op", "execute")
-    if op == "ping":
-        return {"ok": True, "op": "pong"}
-    if op == "health":
-        include_snapshot = bool(payload.get("snapshot"))
-        return {
-            "ok": True,
-            "op": "health",
-            "data": health_payload(service, include_snapshot=include_snapshot),
-        }
-    if op == "runtime":
-        return {"ok": True, "op": "runtime", "data": _build_runtime_snapshot(service)}
-    if op == "actions":
-        return {"ok": True, "op": "actions", "data": {"actions": service.list_actions()}}
-    if op == "config":
-        return {"ok": True, "op": "config", "data": {"config": settings.get_runtime_settings()}}
-    if op == "infer_state":
-        return {"ok": True, "op": "infer_state", "data": {"infer": service.get_infer_state()}}
-    if op == "create_job":
-        return {"ok": True, "op": "create_job", "data": _create_job_from_payload(service, payload)}
-    if op == "get_job":
-        job_id = payload.get("job_id")
-        if not job_id:
-            raise HTTPException(status_code=400, detail="缺少 job_id")
-        return {"ok": True, "op": "get_job", "data": _get_job(service, job_id)}
-    if op == "execute":
-        return {"ok": True, "op": "execute", "data": _execute_from_payload(service, payload)}
-    if op == "init":
-        return {"ok": True, "op": "init", "data": _submit_init_job(service, payload)}
-    if op == "stop_mode":
-        return {
-            "ok": True,
-            "op": "stop_mode",
-            "data": _submit_stop_mode_job(service, payload),
-        }
-    if op == "reset_stop":
-        return {
-            "ok": True,
-            "op": "reset_stop",
-            "data": _submit_simple_system_job(service, "reset_stop_flag"),
-        }
-    if op == "close":
-        return {"ok": True, "op": "close", "data": _submit_simple_system_job(service, "close")}
-    if op == "emergency_stop":
-        return {"ok": True, "op": "emergency_stop", "data": {"stopped": service.emergency_stop()}}
-
-    # === 实时硬件直达 op（car_lock 同步路径，不进 job_queue） ===
-    if op == "realtime/wheel_speeds":
-        speeds = payload.get("speeds")
-        if not isinstance(speeds, list) or len(speeds) != 4:
-            raise HTTPException(status_code=400, detail="speeds 必须是长度为 4 的数组")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"result": service.set_wheel_speeds([float(s) for s in speeds])},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/chassis_velocity":
-        # 外环最常用：(vx, vy, wz) 直接下发，内部 IK 反算 4 轮速、绕开 set_velocity 里程计耦合
-        try:
-            vx = float(payload.get("vx", 0.0))
-            vy = float(payload.get("vy", 0.0))
-            wz = float(payload.get("wz", 0.0))
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="vx/vy/wz 必须是数字")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"result": service.set_chassis_velocity(vx, vy, wz)},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/wheel_encoders":
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"encoders": service.get_wheel_encoders()},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/motor_speed":
-        port = payload.get("port")
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {
-                    "result": service.set_single_motor(
-                        int(port),
-                        float(payload.get("speed", 0)),
-                        reverse=int(payload.get("reverse", 1)),
-                    )
-                },
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/encoder":
-        port = payload.get("port")
-        reverse = payload.get("reverse", 1)
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"encoder": service.get_encoder(int(port), reverse=int(reverse))},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/stepper_rad":
-        port = payload.get("port")
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {
-                    "result": service.set_stepper_rad(
-                        int(port),
-                        float(payload.get("rad", 0.0)),
-                        time=float(payload.get("time", 0.5)),
-                        reverse=int(payload.get("reverse", 1)),
-                        perimeter=float(payload.get("perimeter", 0.008)),
-                    )
-                },
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/bus_servo_angle":
-        port = payload.get("port")
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {
-                    "result": service.set_bus_servo(
-                        int(port),
-                        float(payload.get("angle", 0)),
-                        speed=int(payload.get("speed", 100)),
-                    )
-                },
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/bus_servo_read":
-        port = payload.get("port")
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"angle": service.read_bus_servo(int(port))},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/analog":
-        port = payload.get("port")
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"value": service.read_analog(int(port))},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-    if op == "realtime/analog2":
-        port = payload.get("port")
-        if port is None:
-            raise HTTPException(status_code=400, detail="缺少 port")
-        try:
-            return {
-                "ok": True,
-                "op": op,
-                "data": {"value": service.read_analog2(int(port))},
-            }
-        except RuntimeError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
+    handler = _WS_OP_DISPATCH.get(op)
+    if handler is None:
+        raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
+    return handler(service, payload)
 
 
 def create_runtime_router(service, camera_stream_service):
@@ -465,9 +566,11 @@ def create_runtime_router(service, camera_stream_service):
         return HTMLResponse(camera_stream_service.render_page())
 
     @router.get("/video_feed/{cam_id}")
-    def video_feed(cam_id: str):
+    async def video_feed(cam_id: str):
+        # 走 async 生成器：MJPEG 长连接不占 threadpool，不阻塞 event loop
+        # 上的其他 async 端点（realtime_lane_state / vision / health）。
         return StreamingResponse(
-            camera_stream_service.stream_frames(cam_id),
+            camera_stream_service.stream_frames_async(cam_id),
             media_type="multipart/x-mixed-replace; boundary=frame",
         )
 
@@ -476,11 +579,30 @@ def create_runtime_router(service, camera_stream_service):
         return camera_stream_service.get_status()
 
     @router.get("/stream/frame/{cam_id}.jpg")
-    def stream_frame(cam_id: str, download: int = Query(default=0)):
+    def stream_frame(
+        cam_id: str,
+        download: int = Query(default=0),
+        if_none_match=Header(default=None),
+    ):
+        """返回单帧 JPEG + ETag。客户端带 If-None-Match 时若帧未变返回 304。
+
+        ETag 用 `streamer._jpeg_cache[cam_id]` 的 source_updated_at——编码器
+        每帧刷新一次。`Cache-Control: public, max-age=1` 允许浏览器/CDN 缓存
+        1s，把高频轮询的请求量再砍一档。
+        """
         filename = f"{camera_stream_service.normalize_cam_id(cam_id)}.jpg"
-        headers = {}
+        updated_at, _bytes = camera_stream_service.get_jpeg_meta(cam_id)
+        # updated_at 可能为 None（编码器尚未跑出第一帧）——回退到 wall-clock 秒
+        etag = f'W/"{int(updated_at * 1000) if updated_at else int(time.time())}"'
+        headers = {
+            "Cache-Control": "public, max-age=1",
+            "ETag": etag,
+        }
         if download == 1:
             headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+        if if_none_match and if_none_match == etag:
+            # 客户端帧未变：返回 304 不带 body，省一次 JPEG 传输
+            return Response(status_code=304, headers=headers)
         return Response(
             content=camera_stream_service.encode_jpeg_bytes(cam_id),
             media_type="image/jpeg",
@@ -583,6 +705,17 @@ def create_runtime_router(service, camera_stream_service):
     def v1_infer_state():
         return {"ok": True, "infer": service.get_infer_state()}
 
+    @router_v1.post("/estop")
+    def v1_estop(payload: dict = Body(default={})):
+        # 软件急停：直达 service.emergency_stop()，不进 job_queue、不抢 car_lock，
+        # 因此能在 worker 跑长动作时立刻抢占（详见 runtime_service.emergency_stop）。
+        return {"ok": True, "stopped": service.emergency_stop()}
+
+    @router_v1.post("/estop/clear")
+    def v1_estop_clear(payload: dict = Body(default={})):
+        # 解除急停，同样走无锁直达路径。急停后须调用本端点才能恢复运动。
+        return {"ok": True, "stopped": not service.reset_stop_flag()}
+
     @router_v1.get("/vision/models")
     def v1_vision_models():
         return {"ok": True, **_vision_models_payload()}
@@ -614,82 +747,57 @@ def create_runtime_router(service, camera_stream_service):
     def v1_vision_lane_state():
         return {"ok": True, **camera_stream_service.get_lane_state()}
 
-    # ---- 外环专用端点：start/stop lane_feed 守护线程 + 状态 ----
-    # 为什么要单独包一层：
-    #   - 外环启动 / 停止 "只刷 lane_state 不下轮速" 的守护线程，是个有副作用的状态切换
-    #   - 走 /v1/execute + target=car + name=start_lane_feed 太绕，TS/前端写起来啰嗦
-    #   - 把动作 / 状态 / stop 三件事放在同一组 URL 下，便于外环做"启动→订阅→停止"编排
+    # lane_feed 守护线程：runtime init 默认自动启动（详见 runtime_service._create_car_locked），
+    # 这里不暴露 start/stop 端点 —— 比赛阶段 lane_state 必须持续更新。
 
-    @router_v1.post("/vision/lane/feed")
-    def v1_vision_lane_feed_start(payload: dict = Body(default={})):
-        """启动车端 lane 误差缓存守护线程。
+    @router_v1.get("/vision/lane/preview.jpg")
+    def v1_vision_lane_preview_jpg(cam_id: str = Query(default="cam1")):
+        """cam1 帧 + 车道误差 overlay 一次性 JPEG。
 
-        请求体（全部可选）：
-          {"hz": 20.0}      # 守护线程刷 lane_state 的频率（1~50Hz）
-
-        行为：
-          - 已经在跑时直接返回 {"started": false, "reason": "already_running", "hz": ...}
-          - 否则调用 car.start_lane_feed(hz=hz)，守护线程会持续跑 get_lane_results()，
-            把结果写入 streamer.set_lane_state(...)，让 /v1/vision/lane/state 持续更新
-          - 不会下发任何轮速，不会和客户端外环抢 car_lock
+        设计目的：lane_feed 守护线程已经不再 cv2.putText 主帧流，
+        但调试时仍然想看到 "d_e:... d_a:..." 字样。这个端点：
+          1) 读 streamer.frames[cam_id] 缓存（不读摄像头，不抢 _capture_loop）
+          2) 读 lane_state 拿 (error_y, error_angle)
+          3) 调 cv2.putText × 2 一次性画字（白底+绿字，和之前调试期一致）
+          4) imencode JPEG 返回
+        端点不抢摄像头、不污染 cam1 主帧流，前端 <img> 默认走
+        /video_feed/cam1 拿干净流；想看叠加就切到本端点。
         """
-        hz = float(payload.get("hz", 20.0))
-        result = _execute_sync(
-            service,
-            target="car",
-            name="start_lane_feed",
-            kwargs={"hz": hz},
-            timeout=10,
-        )
-        return {
-            "ok": True,
-            "started": True,
-            "hz": hz,
-            "result": result,
-            "state_url": "/v1/vision/lane/state",
-        }
-
-    @router_v1.post("/vision/lane/feed/stop")
-    def v1_vision_lane_feed_stop():
-        """停止车端 lane 误差缓存守护线程。
-
-        - 已经在停止状态时返回 {"stopped": false, "reason": "not_running"}
-        - 不会动轮速，只是不再更新 lane_state
-        """
-        result = _execute_sync(
-            service,
-            target="car",
-            name="stop_lane_feed",
-            timeout=10,
-        )
-        return {"ok": True, "stopped": True, "result": result}
-
-    @router_v1.get("/vision/lane/feed")
-    def v1_vision_lane_feed_status():
-        """读当前 lane_feed 守护线程状态。
-
-        注意：runtime 没有维护 start/stop 的状态机，直接读 lane_state 的 updated_at
-        推断"是否有人在刷"。age < 2s 视为 alive，否则 stale。
-        """
-        state = camera_stream_service.get_lane_state()
-        updated_at = state.get("updated_at")
-        if updated_at is None:
-            return {
-                "ok": True,
-                "running": False,
-                "reason": "no_data",
-                "state_url": "/v1/vision/lane/state",
-            }
-        age = max(time.time() - float(updated_at), 0.0)
-        return {
-            "ok": True,
-            "running": age < 2.0,
-            "age": round(age, 3),
-            "mode": state.get("mode"),
-            "active": state.get("active"),
-            "updated_at": updated_at,
-            "state_url": "/v1/vision/lane/state",
-        }
+        if not _HAS_CV2:
+            raise HTTPException(status_code=503, detail="cv2 不可用，无法生成 overlay")
+        normalized = camera_stream_service.normalize_cam_id(cam_id)
+        frame = camera_stream_service.get_frame(normalized)
+        if frame is None:
+            raise HTTPException(status_code=409, detail="摄像头当前没有可用的帧")
+        # 拷贝再画字，避免污染缓存
+        try:
+            drawn = frame.copy()
+        except Exception:
+            drawn = frame
+        state = camera_stream_service.get_lane_state() or {}
+        ey = state.get("error_y")
+        ea = state.get("error_angle")
+        if ey is not None and ea is not None:
+            try:
+                label = f"d_e:{float(ey):7.5f}  d_a:{float(ea):7.5f}"
+                # 与 get_lane_results 旧实现一致：白底厚 + 绿字薄（双重 putText 防锯齿）
+                cv2.putText(drawn, label, (20, 40),
+                            cv2.FONT_HERSHEY_TRIPLEX, 1.0, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.putText(drawn, label, (20, 40),
+                            cv2.FONT_HERSHEY_TRIPLEX, 1.0, (0, 255, 0), 1, cv2.LINE_AA)
+            except cv2.error:
+                # cv2 putText 偶发在 copy 后的非连续数组上失败，忽略 overlay 即可
+                drawn = frame
+        try:
+            ret, buf = cv2.imencode(
+                ".jpg", drawn,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+            )
+        except cv2.error:
+            raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
+        if not ret:
+            raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
+        return Response(content=buf.tobytes(), media_type="image/jpeg")
 
     @router_v1.post("/vision/task")
     def v1_vision_task(payload: dict = Body(default={})):
@@ -814,6 +922,16 @@ def create_runtime_router(service, camera_stream_service):
     def v1_job(job_id: str):
         return _get_job(service, job_id)
 
+    @router_v1.post("/jobs/{job_id}/stop")
+    def v1_job_stop(job_id: str):
+        """D.6 协作取消：触发 job 的 _stop_event + 车端 _stop_flag。
+
+        SDK 在下个 PID 循环检测到 _stop_flag 后协作退出，job 状态置 failed
+        （参考 emergency_stop 模式）。立即返回，不等 SDK 完成。
+        """
+        cancelled = bool(service.cancel_job(job_id))
+        return {"ok": True, "cancelled": cancelled, "job_id": job_id}
+
     @router_v1.post("/control/init", status_code=202)
     def v1_init(payload: dict = Body(default={})):
         return _submit_init_job(service, payload)
@@ -855,6 +973,30 @@ def create_runtime_router(service, camera_stream_service):
             return {"ok": True, "encoders": service.get_wheel_encoders()}
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/lane/state")
+    def v1_realtime_lane_state():
+        """外环 50Hz 轮询 lane 误差。读 lane_feed 守护线程缓存的 lane_state。
+
+        比 `get_lane_results` action 路径轻得多——不走 job_queue、不打 ZMQ、
+        不持 car_lock。响应字段见 `camera_stream_service.get_lane_state`。
+        """
+        try:
+            return {"ok": True, "lane_state": service.get_lane_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/arm/state")
+    def v1_realtime_arm_state():
+        """调试/UI 用:读 arm_feed 守护线程缓存的机械臂 y/x 位置。
+
+        与 /v1/realtime/lane/state 完全同构:不走 job_queue、不打 ZMQ、不持 car_lock,
+        只取 meta_lock(极快),20Hz+ 轮询安全。响应字段见 `camera_stream_service.get_arm_state`。
+        """
+        try:
+            return {"ok": True, "arm_state": service.get_arm_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @router_v1.post("/realtime/chassis-velocity")
     def v1_realtime_chassis_velocity(payload: dict = Body(default={})):
@@ -976,6 +1118,8 @@ def create_runtime_router(service, camera_stream_service):
                     "health": {"op": "health", "snapshot": 0},
                     "subscribe_lane": {"op": "subscribe_lane", "note": "持续 push lane_state"},
                     "unsubscribe_lane": {"op": "unsubscribe_lane"},
+                    "subscribe_arm_state": {"op": "subscribe_arm_state", "note": "持续 push arm_state (y/x 位置)"},
+                    "unsubscribe_arm_state": {"op": "unsubscribe_arm_state"},
                     "realtime_chassis_velocity": {"op": "realtime/chassis_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0},
                     "realtime_wheel_speeds": {"op": "realtime/wheel_speeds", "speeds": [0,0,0,0]},
                 },
@@ -988,6 +1132,10 @@ def create_runtime_router(service, camera_stream_service):
         lane_push_task = None
         lane_subscribed = False
         lane_push_hz = 20.0  # 默认 20Hz 轮询 lane_state，更新才推
+        # ---- arm_state push 后台任务(同 lane 模式)----
+        arm_push_task = None
+        arm_subscribed = False
+        arm_push_hz = 20.0
 
         async def _lane_push_loop():
             last_updated_at = None
@@ -1028,6 +1176,45 @@ def create_runtime_router(service, camera_stream_service):
                     pass
             lane_push_task = None
 
+        # ---- arm_state push loop ----
+        async def _arm_push_loop():
+            last_updated_at = None
+            interval = 1.0 / max(float(arm_push_hz), 1.0)
+            while True:
+                try:
+                    state = service.get_arm_state()
+                except Exception:
+                    state = None
+                updated_at = state.get("updated_at") if state else None
+                if state and updated_at is not None and updated_at != last_updated_at:
+                    last_updated_at = updated_at
+                    try:
+                        await websocket.send_json(
+                            {"ok": True, "op": "arm_state", "data": state}
+                        )
+                    except Exception:
+                        return
+                await _asyncio.sleep(interval)
+
+        async def _start_arm_push():
+            nonlocal arm_push_task, arm_subscribed
+            if arm_subscribed and arm_push_task is not None and not arm_push_task.done():
+                return False
+            arm_subscribed = True
+            arm_push_task = _asyncio.create_task(_arm_push_loop())
+            return True
+
+        async def _stop_arm_push():
+            nonlocal arm_push_task, arm_subscribed
+            arm_subscribed = False
+            if arm_push_task is not None and not arm_push_task.done():
+                arm_push_task.cancel()
+                try:
+                    await arm_push_task
+                except (_asyncio.CancelledError, Exception):
+                    pass
+            arm_push_task = None
+
         while True:
             try:
                 payload = await websocket.receive_json()
@@ -1059,6 +1246,23 @@ def create_runtime_router(service, camera_stream_service):
                     {"ok": True, "op": "unsubscribe_lane", "subscribed": False}
                 )
                 continue
+            if op == "subscribe_arm_state":
+                started = await _start_arm_push()
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "op": "subscribe_arm_state",
+                        "subscribed": started,
+                        "hz": arm_push_hz,
+                    }
+                )
+                continue
+            if op == "unsubscribe_arm_state":
+                await _stop_arm_push()
+                await websocket.send_json(
+                    {"ok": True, "op": "unsubscribe_arm_state", "subscribed": False}
+                )
+                continue
 
             request_id = payload.get("request_id")
             try:
@@ -1073,6 +1277,7 @@ def create_runtime_router(service, camera_stream_service):
 
         # ---- disconnect 清理 ----
         await _stop_lane_push()
+        await _stop_arm_push()
 
     router.include_router(router_v1)
     return router
