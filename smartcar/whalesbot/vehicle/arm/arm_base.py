@@ -557,7 +557,15 @@ class ArmController:
                 if estop is not None and estop.is_set():
                     logger.warning("reset_x: 收到急停,中止找墙")
                     break
+                # 全局超时:在循环顶部,任何分支外都生效 — 之前版本只在撞墙分支检查,
+                # 导致车不动时不进任何分支 = 死循环,runtime 一直打 auto_init。
                 t_now = time.time()
+                if t_now - start > TIMEOUT:
+                    logger.error(
+                        "reset_x: 全局超时 %.1fs,推了 %.1fmm (期望 ≥ 50mm),强制停车"
+                        % (TIMEOUT, abs(self.x_get_position() - start_pos) * 1000)
+                    )
+                    break
                 cur = self.x_get_position()
                 samples.append((t_now, cur))
                 # 滑窗裁剪
@@ -565,6 +573,12 @@ class ArmController:
                     samples.pop(0)
                 # 至少要 window 充满才判定(避免单点抖动)
                 if len(samples) < 3:
+                    self.x_speed(VELOCITY)
+                    time.sleep(0.01)
+                    continue
+                # 预触发距离闸:车必须真的走出 ≥ MIN_PRE_TRIGGER_DISP 才能判撞墙。
+                # 否则电机扭矩不够编码器不动 → ratio=0 → 假撞墙,reset 提前误退出。
+                if abs(self.x_get_position() - start_pos) < MIN_PRE_TRIGGER_DISP:
                     self.x_speed(VELOCITY)
                     time.sleep(0.01)
                     continue
@@ -632,10 +646,7 @@ class ArmController:
                 triggered_at = None  # 重置触发计时
                 self.x_speed(VELOCITY)
                 time.sleep(0.01)
-                # 超时
-                if t_now - start > TIMEOUT:
-                    logger.error("reset_x: 撞墙 %.1fs 超时(ratio=%.2f),强制停车" % (TIMEOUT, ratio))
-                    break
+                # 超时检查已移到循环顶部(对所有分支生效),这里不再重复。
         finally:
             self._x_seeking_wall = False
             self.x_speed(0)

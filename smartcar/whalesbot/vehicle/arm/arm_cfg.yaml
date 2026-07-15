@@ -36,10 +36,12 @@ horiz_cfg:
   top_slow_m: 0.02
   top_slow_velocity: 0.1
   reset_target_m: 0.34
-  # reset_velocity: 0.02 m/s (2cm/s) — 极慢。低速下电机扭矩 vs 撞墙力矩差距小,
-  # motor_280 撞墙后立刻 stall,编码器不打滑。速度太低会让 reset 变慢(0.32m / 0.02 = 16s),
-  # 所以 reset_timeout 同步拉到 25s。
-  reset_velocity: 0.02
+  # reset_velocity: 0.05 m/s (5cm/s)。实测最小可驱动速度:
+  #   - 0.02/0.03 m/s 电机扭矩过不了静摩擦,编码器不动 → 触发误报
+  #   - 0.05 m/s 能驱动,且不撞墙反弹 — 之前 reset_x 测试这个速度稳
+  # 配合 arm_base.py 的 MIN_PRE_TRIGGER_DISP=50mm 预触发距离闸:
+  #   车必须真走出 50mm 才能进入撞墙判据,杜绝"电机没动但 ratio=0 误判撞墙"
+  reset_velocity: 0.05
   reset_dwell_time: 0.15
   reset_timeout: 25.0
   wall_ratio_threshold: 0.2

@@ -332,19 +332,17 @@ class CarRuntimeService:
         if reset_arm:
             car.arm.reset_position()
         else:
-            # 即使外部没要求 reset_arm,每次 init 仍要 y/x 归零:
-            # 控制器重启/USB 重连后 y/x 编码器基准点丢失,不清零 move_* 会在错误基准上跑。
-            # 失败不抛(可能机械臂在不允许动的状态),仅记 last_error。
+            # 默认 init 只归 y(x 不归):
+            #   - y 轴有磁感触底,reset_y 几秒就完,可靠 → 自动跑
+            #   - x 轴没有独立物理参考,reset_x 撞墙会空转/编码器漂移/反复 hang
+            #     之前 auto-init 默认调 reset_x 触发 25s 超时 + auto_init 反复重建 → pm2 疯转
+            # 现在 x 轴位置由视觉闭环控制:move_to_detection_target + subscribe_task_detection
+            # 需要显式归零的话,通过 car.execute_arm_action("reset_x", sync=True) 单独调
             try:
                 car.arm.reset_y()
             except Exception as exc:
                 self.last_error = "arm reset_y 失败: {}".format(exc)
                 logger.warning("init 时 reset_y 失败: %s" % exc)
-            try:
-                car.arm.reset_x()
-            except Exception as exc:
-                self.last_error = "arm reset_x 失败: {}".format(exc)
-                logger.warning("init 时 reset_x 失败: %s" % exc)
         if reset_position:
             car.reset_position()
         self.car = car
