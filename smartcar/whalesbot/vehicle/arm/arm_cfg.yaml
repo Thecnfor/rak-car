@@ -29,9 +29,28 @@ horiz_cfg:
     output_limits:
     - -0.2
     - 0.2
+  # 软限位: x_threshold 旧值 [0, 0.315] 是单调正方向(只允许正位移),
+  # 实际 x 撞墙=0、远离墙=正、反向撞另一侧墙=负。业务层有 soft_x_min_mm/soft_x_max_mm,
+  # 此处 SDK 阈值取业务软上限:左墙=0,右墙=soft_x_max。
+  # 旧 [0, 0.315] 把负向钳掉,导致 move_x(-X) 被错误拦截,已修正。
   threshold:
-  - 0
-  - 0.315
+  - -0.32
+  - 0.32
+  # 末段减速带:x 接近 |x_wall| 时, PWM 限幅降到 slow_velocity 防过冲(仅 move_x_position 生效)。
+  # x 无传感器,靠"编码器持续不动"判定到墙,过冲会误判。
+  slow_band_m: 0.020
+  slow_velocity: 0.04
+  # 顶段减速带:x 接近反向墙时减速防失步(同 y 顶段逻辑)
+  top_slow_m: 0.020
+  top_slow_velocity: 0.06
+  # reset_x 配置:reset 用 0.05 m/s 慢速撞墙
+  reset_target_m: 0.34       # 比软上限略大,保证能撞墙
+  reset_velocity: 0.05
+  reset_dwell_time: 0.10     # 撞墙后 dwell 确认(秒)
+  reset_timeout: 8.0
+  # 撞墙判据:连续 reset_stall_count 次编码器变化 < reset_stall_threshold 算到墙
+  reset_stall_count: 5
+  reset_stall_threshold: 0.0005  # 0.5mm
 pos_cfg:
   pose_enable: true
   pose_horiz: 0.0

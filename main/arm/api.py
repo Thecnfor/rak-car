@@ -135,8 +135,8 @@ class ArmClient:
             x_origin_m=float(data.get("x_origin_m", 0.0)),
             x_wall=str(data.get("x_wall", "left")),
             soft_y_max_m=float(data.get("soft_y_max_m", 0.20)),
-            soft_x_min_m=float(data.get("soft_x_min_m", 0.005)),
-            soft_x_max_m=float(data.get("soft_x_max_m", 0.30)),
+            soft_x_min_m=float(data.get("soft_x_min_m", -0.32)),
+            soft_x_max_m=float(data.get("soft_x_max_m", 0.32)),
             calibrated_at=str(data.get("calibrated_at", "")),
         )
 
@@ -393,8 +393,8 @@ class ArmClient:
             x_origin_m=st["raw_x_m"],
             x_wall=x_wall,
             soft_y_max_m=self.origin.soft_y_max_m if self.origin else 0.18,
-            soft_x_min_m=self.origin.soft_x_min_m if self.origin else 0.005,
-            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.30,
+            soft_x_min_m=self.origin.soft_x_min_m if self.origin else -0.32,
+            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.32,
             calibrated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         self.save_origin(new_origin)

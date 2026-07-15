@@ -351,14 +351,19 @@ class ArmController:
         # 完成后把本次 delta 累加确认（actual vs prev_pos）
         self._y_expected_total_delta += abs(final - prev_pos) - abs(target - prev_pos)
 
-    def x_params_init(self, motor, pid, threshold):
-        """
-        初始化水平方向电机参数
+    def x_params_init(self, motor, pid, threshold,
+                      slow_band_m=0.020, slow_velocity=0.04,
+                      top_slow_m=0.020, top_slow_velocity=0.06,
+                      reset_target_m=0.34, reset_velocity=0.05,
+                      reset_dwell_time=0.10, reset_timeout=8.0,
+                      reset_stall_count=5, reset_stall_threshold=0.0005,
+                      **_extra):
+        """初始化水平方向电机参数。
 
-        Args:
-            motor: 电机配置
-            pid: PID参数
-            threshold: 位置阈值
+        slow_band_m/slow_velocity/top_slow_m/top_slow_velocity: 分段减速,仅 move_x_position 用。
+        reset_* 参数:reset_x 用。撞墙是机械硬限位,无传感器,靠"编码器持续不动 reset_stall_count 次"
+        + reset_dwell_time dwell 判定。
+        _extra 吸收未来新增键,避免 **horiz_cfg unpack 时 TypeError。
         """
         # 定义水平移动电机,PID参数
         self.motor_x = MotorWrap(**motor)
@@ -373,6 +378,26 @@ class ArmController:
 
         self.x_stop_flag = CountRecord(10)
         self.x_pid_flag = CountRecord(5)
+        # 末段减速带
+        self.x_slow_band_m = float(slow_band_m)
+        self.x_slow_velocity = float(slow_velocity)
+        # 顶段减速带
+        self.x_top_slow_m = float(top_slow_m)
+        self.x_top_slow_velocity = float(top_slow_velocity)
+        # reset_x 配置
+        self.x_reset_target_m = float(reset_target_m)
+        self.x_reset_velocity = float(reset_velocity)
+        self.x_reset_dwell_time = float(reset_dwell_time)
+        self.x_reset_timeout = float(reset_timeout)
+        self.x_reset_stall_count = int(reset_stall_count)
+        self.x_reset_stall_threshold = float(reset_stall_threshold)
+        # 丢步核对(与 y 对称):reset_x 后记录 ref_encoder,move_x_position 完成后核对
+        self._x_ref_encoder_at_zero = None
+        self._x_expected_total_delta = 0.0
+        # seek 模式:True 时 x_speed 撞墙门对正速度放行(reset_x 必须真撞墙才算成功)
+        self._x_seeking_wall = False
+        # 撞哪侧墙: "left" / "right" / None(未知)
+        self._x_wall = None
 
     def x_stop_check(self):
         """
@@ -418,11 +443,26 @@ class ArmController:
 
     def move_x_position(self, target, out_time = 6.0):
         """
-        移动水平方向指定位置
+        移动水平方向指定位置。带软限位 + 丢步核对 + 兜底。
 
-        Args:
-            target: 目标位置
+        1) 入口:软限位 limit_val (基于 x_threshold,默认 [-0.32, 0.32]);
+        2) 命令位移记录:本次指令 delta = target - current,记录累积预期位移;
+        3) PID 闭环到 < 1mm 或 out_time 超时或堵转跳出;
+        4) 命令/编码器核对:偏差 > 5mm 报警;
+        5) 完成后 actual vs target 偏差 > 2mm 报警。
+
+        方向约定:target=0 在撞墙位置,远离墙为正(默认右侧)。
         """
+        # 1) 软限位(y_threshold 自动 fallback 已在 y 轴;x 同样:若 [0,0.315] 错配则 [-0.32,0.32])
+        if self.x_threshold[0] >= 0 and self.x_threshold[1] > 0:
+            x_lo, x_hi = -0.32, 0.32
+        else:
+            x_lo, x_hi = self.x_threshold[0], self.x_threshold[1]
+        target = limit_val(target, x_lo, x_hi)
+        # 2) 命令位移记录
+        prev_pos = self.x_get_position()
+        self._x_expected_total_delta += abs(target - prev_pos)
+
         end_time = time.time()+out_time
         self.x_pid.setpoint = target
         while True:
@@ -431,33 +471,114 @@ class ArmController:
             if self.x_pid_moveto(target):
                 break
             if self.x_stop_check():
+                # 兼容旧行为:撞墙时校准 x_pose_start
                 dis = self.motor_x.get_dis()
-                if dis <0.15:
+                if dis < 0.15:
                     self.x_pose_start = dis
                 else:
                     self.x_pose_start = dis - 0.31
+                self._x_wall = "left" if dis < 0.15 else "right"
                 break
             time.sleep(0.05)
         self.x_speed(0)
+
+        # 3) 命令/编码器核对(仅在已知 ref 时)
+        if self._x_ref_encoder_at_zero is not None:
+            actual_disp = abs(self.motor_x.get_dis() - self._x_ref_encoder_at_zero)
+            disp_err = abs(actual_disp - self._x_expected_total_delta)
+            STEP_LOSS_TOL_M = 0.005
+            if disp_err > STEP_LOSS_TOL_M:
+                logger.warning(
+                    f"move_x_position 疑似丢步: 累积预期={self._x_expected_total_delta*1000:.1f}mm "
+                    f"编码器={actual_disp*1000:.1f}mm 偏差={disp_err*1000:.1f}mm, 建议重置原点"
+                )
+
+        final = self.x_get_position()
+        if abs(final - target) > 0.002:
+            logger.error(
+                f"move_x_position 丢步严重: target={target:.4f} final={final:.4f} "
+                f"diff={(final-target)*1000:.1f}mm, 建议重新定原点"
+            )
+        # 把实际 delta 累加确认
+        self._x_expected_total_delta += abs(final - prev_pos) - abs(target - prev_pos)
 
 
 
     def reset_x(self):
         """
-        重置水平方向位置
+        重置水平方向位置:慢速撞右墙(正向 = 远离左墙 = 向右),用"编码器持续不动 + dwell"判定撞墙。
+
+        旧实现 `reset_x` 用 `x_stop_check`(连续 10 次编码器不动)作为撞墙凭证,
+        但与 y 同理:PID 自然减速 + 接近目标时编码器会暂时不动 → 误判假撞墙。
+        新实现:慢速 + 撞墙计数 + dwell,失败不伪归零(返回 False)。
+
+        x 无传感器,只能靠"连续 N 次编码器变化 < 阈值"作为撞墙凭证。
+        必须用低速撞墙,避免过冲失步。
         """
-        target = -0.33
-        self.x_pid.output_limits = (-0.06, 0.06)
-        self.x_pid.setpoint = target
-        while True:
-            if self.x_pid_moveto(target):
-                break
-            if self.x_stop_check():
-                self.x_pose_start = self.motor_x.get_dis()
-                self.x_pose_now = 0
-                self.x_pose_last = 0
-                break
-        self.x_speed(0)
+        # === 配置 ===
+        TARGET_M = self.x_reset_target_m       # 撞墙目标距离
+        VELOCITY = self.x_reset_velocity        # 撞墙速度
+        DWELL = self.x_reset_dwell_time         # 撞墙后 dwell 确认
+        STALL_COUNT = self.x_reset_stall_count  # 连续 N 次不动判撞墙
+        STALL_THRESH = self.x_reset_stall_threshold
+        TIMEOUT = self.x_reset_timeout
+
+        self._x_seeking_wall = True
+        start = time.time()
+        stall_runs = 0           # 连续不动次数
+        triggered_at = None      # 撞墙触发点
+        last_pos = self.x_get_position()
+
+        try:
+            # 直接慢速撞墙,不走 PID
+            self.x_speed(VELOCITY)
+            while True:
+                # 急停优先
+                estop = getattr(self, "_estop", None)
+                if estop is not None and estop.is_set():
+                    logger.warning("reset_x: 收到急停，中止找墙")
+                    break
+                cur = self.x_get_position()
+                # 撞墙判据:连续 STALL_COUNT 次 |delta| < STALL_THRESH
+                if abs(cur - last_pos) < STALL_THRESH:
+                    stall_runs += 1
+                else:
+                    stall_runs = 0
+                    last_pos = cur
+                if stall_runs >= STALL_COUNT:
+                    # 撞墙 → dwell 确认
+                    if triggered_at is None:
+                        triggered_at = time.time()
+                    elif time.time() - triggered_at >= DWELL:
+                        # 成功
+                        ref = self.motor_x.get_dis()
+                        self.x_pose_start = ref
+                        self.x_pose_now = 0
+                        self.x_pose_last = 0
+                        self._x_ref_encoder_at_zero = ref
+                        self._x_expected_total_delta = 0.0
+                        self._x_wall = "right"
+                        logger.info(
+                            "reset_x: 撞右墙+dwell通过,ref_encoder=%.6f,耗时%.2fs"
+                            % (ref, time.time() - start)
+                        )
+                        self.x_speed(0)
+                        return True
+                    # dwell 中
+                    self.motor_x.set_linear(0)
+                    time.sleep(0.01)
+                    continue
+                # 未撞墙:持续推
+                self.x_speed(VELOCITY)
+                time.sleep(0.01)
+                # 超时
+                if time.time() - start > TIMEOUT:
+                    logger.error("reset_x: 撞墙 %.1fs 超时, 强制停车" % TIMEOUT)
+                    break
+        finally:
+            self._x_seeking_wall = False
+            self.x_speed(0)
+        return False
 
     def hand_params_init(self, hand, hand2, grap):
         """
@@ -542,6 +663,8 @@ class ArmController:
         if estop is not None and estop.is_set():
             velocity = 0
         # === 末段减速 / 顶段减速：根据当前位置分档限幅 ===
+        # 注意:必须先分档限幅,最后再做 velocity_limit (主限幅)
+        # 否则当 slow_velocity < velocity_limit 时,主限幅会把 slow 限制"放大"回去
         cur = self.y_get_position()
         if self.y_slow_band_m > 0 and cur >= -self.y_slow_band_m and cur < 0.0:
             # 已进入末段（接近磁感，y >= -slow_band 且 y < 0）
@@ -568,6 +691,26 @@ class ArmController:
         estop = getattr(self, "_estop", None)
         if estop is not None and estop.is_set():
             velocity = 0
+        # === 末段减速 / 顶段减速：根据当前位置分档限幅 ===
+        # 注意:必须先分档限幅,最后再做 velocity_limit (主限幅)
+        # 否则当 slow_velocity < velocity_limit 时,主限幅会把 slow 限制"放大"回去
+        cur = self.x_get_position()
+        # x 单边坐标: 撞墙=0,远离=正;负=撞另一侧墙(异常或 reset_x 走反方向时)
+        wall_pos = self.x_reset_target_m
+        if self.x_slow_band_m > 0 and cur >= (wall_pos - self.x_slow_band_m):
+            # 接近正向墙: 减速
+            velocity = limit_val(velocity, -self.x_slow_velocity, self.x_slow_velocity)
+        elif self.x_top_slow_m > 0 and cur <= -(self.x_top_slow_m):
+            # 接近反向墙(很负): 减速防失步
+            velocity = limit_val(velocity, -self.x_top_slow_velocity, self.x_top_slow_velocity)
+        # === 撞墙安全门:已撞墙(已在 _x_wall 侧)且 velocity 往墙方向 → 0 ===
+        # 正常 move_x 不应撞墙,但限位被错误配置时会,这里兜底
+        # seek_wall 模式:reset_x 期间放行(必须真撞墙才算成功)
+        if not self._x_seeking_wall:
+            if self._x_wall == "right" and velocity > 0:
+                velocity = 0
+            elif self._x_wall == "left" and velocity < 0:
+                velocity = 0
         velocity = limit_val(velocity, *self.x_velocity_limit)
         self.motor_x.set_linear(velocity)
 

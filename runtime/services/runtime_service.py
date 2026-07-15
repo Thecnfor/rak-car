@@ -290,14 +290,19 @@ class CarRuntimeService:
         if reset_arm:
             car.arm.reset_position()
         else:
-            # 即使外部没要求 reset_arm,每次 init 仍要 y 轴归零:
-            # 控制器重启/USB 重连后 y 编码器基准点丢失,不清零 move_y 会在错误基准上跑。
+            # 即使外部没要求 reset_arm,每次 init 仍要 y/x 归零:
+            # 控制器重启/USB 重连后 y/x 编码器基准点丢失,不清零 move_* 会在错误基准上跑。
             # 失败不抛(可能机械臂在不允许动的状态),仅记 last_error。
             try:
                 car.arm.reset_y()
             except Exception as exc:
                 self.last_error = "arm reset_y 失败: {}".format(exc)
                 logger.warning("init 时 reset_y 失败: %s" % exc)
+            try:
+                car.arm.reset_x()
+            except Exception as exc:
+                self.last_error = "arm reset_x 失败: {}".format(exc)
+                logger.warning("init 时 reset_x 失败: %s" % exc)
         if reset_position:
             car.reset_position()
         self.car = car

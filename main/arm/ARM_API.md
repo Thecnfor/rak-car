@@ -231,10 +231,21 @@ class TrajectoryPlan:
 
 ## 软限位与行程
 
+### y 轴
+
 - **业务 y 上限**：`soft_y_max_mm` = **200 mm**（默认 200.0），即 `y ∈ [-200, 0] mm`。
 - **SDK y_threshold**：`arm_cfg.yaml` 的 `vert_cfg.threshold = [-0.20, 0.0]`,与业务层一致。
 - **硬件实测定**:从 0 走到 `-0.20` 仍有余量,未撞顶部机械硬限位。
 - **末段减速带**（`y >= -0.015`）:PWM 限幅 `0.02 m/s`,防过冲。
+
+### x 轴
+
+- **业务 x 区间**：`soft_x_min_mm` = **-320 mm**,`soft_x_max_mm` = **+320 mm**,即 `x ∈ [-320, +320] mm`(撞墙=0,远离为正)。
+- **SDK x_threshold**：`arm_cfg.yaml` 的 `horiz_cfg.threshold = [-0.32, 0.32]`,与业务层一致。
+- **末段减速带**（`x >= wall_pos - 0.02 = 0.32`）:PWM 限幅 `0.04 m/s`,防过冲。
+- **顶段减速带**（`x <= -0.02`）:PWM 限幅 `0.06 m/s`,防失步。
+- **撞墙判据**(x 无传感器):连续 5 次编码器变化 < 0.5mm 判到墙 + 100ms dwell 确认。
+- ⚠️ **历史错配**:`x_threshold` 旧值 `[0, 0.315]`(单调正方向)已修正为 `[-0.32, 0.32]`,同步 `arm_origin.soft_x_min/max_m`。
 - **顶段减速带**（`y <= -0.035`）:PWM 限幅 `0.03 m/s`,防失步。**仅 `move_y_position` 往上走时生效**;`reset_y` 永不下行,不走此分支。
 
 > 历史:旧版 `soft_y_max_mm=180` + `threshold=[0, 0.2]`（错配,正方向）已统一改为 `200` + `[-0.20, 0.0]`。
@@ -286,16 +297,70 @@ while 没超时:
 | 编码器持续不动 | `reset_y: 编码器持续 2.0s 不动, 疑似失步/卡死` → 撞顶失步或机械卡死 |
 | 收工 y ≠ 0 | 物理磁感触发点比机械底高 ~10-15mm,属正常,需要绝对精度时看 `ref_encoder` |
 
+## `reset_x` 行为(**撞墙是唯一到墙凭证**)
+
+> x 与 y 关键区别:**x 没有磁感/限位传感器**,撞墙靠"编码器持续不动 + dwell"判定。
+
+### 触发场景(同 reset_y)
+
+| 入口 | 行为 |
+| --- | --- |
+| HTTP `POST /v1/execute {"target":"arm","name":"reset_x"}` | 直接调,只复位 x 不动 y |
+| `car.reset_position()` | 内部开线程调 `reset_y` + `reset_x` |
+| **`runtime _create_car_locked`** | 每次 init 默认调 `reset_x`（同 `reset_y`） |
+
+### 算法
+
+```
+_x_seeking_wall = True            # 让 x_speed 撞墙门对正向速度放行
+直接 x_speed(0.05) 慢速撞右墙     # 不用 PID
+while 没超时:
+  if 急停: 中止
+  cur = x_get_position()
+  if |cur - last_pos| < 0.5mm:     # 连续 5 次不动 = 撞墙
+    stall_runs += 1
+  else:
+    stall_runs = 0; last_pos = cur
+  if stall_runs >= 5:              # 撞墙 → dwell 确认
+    if triggered_at: 记时间
+    elif dwell(100ms) 通过: 归零 + 记 ref_encoder + _x_wall="right" + return True
+  else:
+    继续推(撞墙还没到)
+```
+
+### 关键不变量
+
+- **唯一撞墙凭证**:`连续 5 次编码器变化 < 0.5mm` + `100ms dwell`,与 y 的"磁感 + 50ms dwell"对称
+- 必须**慢速撞墙**(`0.05 m/s`),高速撞会撞坏机械
+- 失败(超时/急停)**不伪归零** — 返回 `False`,`x_pose_start` 保持原值
+- 收工**必 `x_speed(0)`** — 绝不残留速度
+- `move_x_position` 中撞墙会标 `_x_wall`(`left`/`right`),`x_speed` 撞墙门会阻止继续往已撞侧推
+
+### 返回值
+
+- `True`  = 撞墙 + dwell 通过,已归零
+- `False` = 超时/急停,未归零
+
+### 失败诊断
+
+| 现象 | 看哪 |
+| --- | --- |
+| 永远 8s 超时 | `arm_base.py reset_x: 撞墙 %.1fs 超时` → 机械卡死 / 编码器坏 |
+| 撞墙后归零 x ≠ 0 | 编码器读数漂移,看 `motor_x.get_dis()` 是否真为 0 |
+| 撞墙门误判 | `_x_wall` 设错侧,可能机械反向撞 |
+
+> 旧实现 `reset_x` 用 `x_stop_check`(连续 10 次不动)撞墙,但与 y 同理:PID 自然减速 + 接近目标时编码器会暂时不动 → 误判假撞墙。新实现改为慢速 + 5 次 + dwell,失败不伪归零。
+
 ## 启动归零（init 流程）
 
 `runtime _create_car_locked` 每次创建 `MyCar` 后:
 
-1. `reset_arm=False`(默认):**只调 `reset_y`**,不调 `reset_position`(不动 x/角度/底盘)
-2. `reset_arm=True`:调 `reset_position` 完整复位(含 `reset_y`)
+1. `reset_arm=False`(默认):**只调 `reset_y` + `reset_x`**,不调 `reset_position`(不动 x/角度/底盘)
+2. `reset_arm=True`:调 `reset_position` 完整复位(含 `reset_y` + `reset_x`)
 
-为何默认 y 归零?
-- 控制器重启/USB 重连后 y 编码器基准点丢失
-- 不归零的话后续 `move_y` 会在错误基准上跑,导致距离全错
+为何默认 y/x 归零?
+- 控制器重启/USB 重连后 y/x 编码器基准点丢失
+- 不归零的话后续 `move_y` / `move_x` 会在错误基准上跑,导致距离全错
 - 失败不抛 init(避免 1 次瞬态故障阻断整个 runtime),仅记 `last_error`
 
 ## 丢步核对

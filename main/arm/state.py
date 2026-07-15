@@ -41,8 +41,8 @@ class ArmOrigin:
     x_origin_m: float = 0.0           # x 撞墙时的原始 motor_x.get_dis() 值
     x_wall: str = "left"              # 上次撞的是哪一侧
     soft_y_max_m: float = 0.20        # 业务软上限（m）,实测行程可达 -200mm 还有富余
-    soft_x_min_m: float = 0.005
-    soft_x_max_m: float = 0.30
+    soft_x_min_m: float = -0.32       # 负=反向墙,允许 [-soft_x_max, soft_x_max] 双向行程
+    soft_x_max_m: float = 0.32
     # 丢步/位置偏差阈值（mm）：move_x / move_y 完成后对比 actual vs target，超此值 warn。
     # y 是步进电机，堵转/失步较常见，默认 2mm（≈1 step）；x 是编码器闭环，默认 5mm。
     step_loss_y_mm: float = 2.0
