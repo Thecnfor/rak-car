@@ -358,17 +358,44 @@ enable_encoder_reset: true    # 撞墙后是否物理清零编码器
 INFO: reset_x: 撞右墙+model判据(ratio=0.00,speed=0.0000)+dwell通过,耗时0.17s,enc_物理清零
 ```
 
-### ⚠️ `move_x_position` 已知问题
+### ⚠️ 修复记录:撞墙门死循环(v3)
 
-当前 `move_x_position` 走 PID + `x_stop_check`,撞墙 calibrate 分支在 PID 收敛前可能误触,把 `x_pose_start` 重新设回 dis → `x_get_position` 出现非预期归零。**等 v3 改造为开环 time-based(类似 reset_x)再彻底解决**。当前调试建议:**只在简单位移(<50mm)用 `move_x_position`**,大范围位移请重做 reset_x 然后走小步增量。
+**症状**:第一次 `reset_x` 后 `move_x_position` 立刻卡死,任何方向都推不动。
+
+**根因**:旧 `x_speed` 用 `_x_wall` 撞墙门:一旦撞墙 calibrate 设了 `_x_wall="right"`,后续任何 `velocity>0` 都被钳 0 → motor 不动 → `x_stop_check` 命中(编码器不动) → 触发 calibrate → 又设 `_x_wall="right"` → **死循环**。
+
+**修复**(v3):`x_speed` 撞墙门改为**软限位边界自然停**(用 `x_threshold`):
+```python
+if cur >= x_hi - BOUNDARY and velocity > 0: velocity = 0
+elif cur <= x_lo + BOUNDARY and velocity < 0: velocity = 0
+```
+
+效果:
+- `move_x` 能自由推,到软限位边界 5mm 内自动停
+- `reset_x` 设 `target=0.34` 大于软限位 0.32 → 不被 boundary 拦截,继续推到物理右墙
+- 不再有死循环,`x_get_position` 真实反映位移
+
+### `move_x_position` 已知问题
+
+`move_x_position` 走 PID + `x_stop_check`,当撞墙/PID 收敛时会 calibrate `x_pose_start`,可能导致 `x_get_position` 短期归零(R2/R5 因为已经在 boundary 内,move_x 不动)。**v4 改造方向:开环 time-based**(同 reset_x 模式)。
 
 ### 已知移动问题诊断
 
 | 现象 | 可能原因 |
 | --- | --- |
-| `move_x(-200)` 完成后 x=0 | PID x_stop_check 误触发 + calibrate 把 x_pose_start 设回 ≈0 |
-| `move_x(0.32)` 后 x 异常小 | 同上 |
-| 解决 | v3 改造:开环 time-based(目标位置/速度 → t=v×dis → sleep(t) → x_speed(0),不走 PID) |
+| `move_x(+200)` 完成后 x=0 | 已在 boundary 内,软限位自然停(move_x 没真的推) |
+| `move_x(+200)` 6.52s 推 200mm | 正常 ✓ |
+| 修复 | 当前 v3 移除了撞墙门死循环,move_x 在 boundary 外可自由走 |
+
+### 5 轮实测日志(R5 关键)
+
+```
+INFO: reset_x: 开始,起点 x=0.0000 m (ref=0.2006),_x_wall=right
+INFO: reset_x: 撞右墙+model判据(ratio=0.04,speed=0.0021)+dwell通过,
+               耗时 0.44s,推了 206.2mm,ref_encoder=0.206153
+```
+
+**reset_x 真的能撞到最边**(推 206.2mm)。
 
 ## 启动归零（init 流程）
 

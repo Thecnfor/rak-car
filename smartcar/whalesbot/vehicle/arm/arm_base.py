@@ -481,18 +481,10 @@ class ArmController:
             if self.x_pid_moveto(target):
                 break
             if self.x_stop_check():
-                # v2: 撞墙时物理清零编码器(同 reset_x 行为)
-                # 旧实现用 "x_pose_start = dis - 0.31" 数学补偿,误差大且依赖行程常量
+                # 撞墙 calibrate: 与 reset_x 一致用相对零点(不调 motor.reset — 副作用锁电机)
                 dis = self.motor_x.get_dis()
-                if self.x_enable_encoder_reset:
-                    try:
-                        self.motor_x.motor.reset()
-                        self.x_pose_start = 0.0
-                    except Exception as exc:
-                        logger.warning("move_x_position: reset 失败(%s),走 fallback" % exc)
-                        self.x_pose_start = dis
-                else:
-                    self.x_pose_start = dis if dis < 0.15 else (dis - 0.31)
+                self.x_pose_start = dis
+                self._x_ref_encoder_at_zero = dis
                 self._x_wall = "left" if dis < 0.15 else "right"
                 break
             time.sleep(0.05)
@@ -553,6 +545,9 @@ class ArmController:
         # 速度滑窗(用于速度对照判据)
         samples = []   # [(t, pos), ...] 最多保留 window_ms 内
         triggered_at = None
+        start_pos = self.x_get_position()
+        logger.info("reset_x: 开始,起点 x=%.4f m (ref=%.4f),_x_wall=%s"
+                    % (start_pos, self._x_ref_encoder_at_zero or -1, self._x_wall))
 
         try:
             self.x_speed(VELOCITY)
@@ -592,12 +587,12 @@ class ArmController:
                     if triggered_at is None:
                         triggered_at = t_now
                     elif t_now - triggered_at >= DWELL:
-                        # 撞墙成功 → 可选物理清零编码器(Motor.reset() 协议层在 ctl_id=2 走 encoder_2.reset)
-                        if ENABLE_ENC_RESET:
-                            try:
-                                self.motor_x.motor.reset()
-                            except Exception as exc:
-                                logger.warning("reset_x: motor.reset 失败(%s),走 fallback" % exc)
+                        # 撞墙成功 → 相对零点:撞墙时的编码器值作为 ref,x_pose_start = ref
+                        # 注:不再调 motor.reset() — ctl_id=2 走 encoder_2.reset 后电机可能被锁,
+                        # 后续 set_angular 无视 → 推 0mm,看似撞墙实则锁死。相对零点更稳。
+                        ref = self.motor_x.get_dis()
+                        self.x_pose_start = ref
+                        self._x_ref_encoder_at_zero = ref
                         # 物理清零后:编码器值就是 0,直接 x_pose_start = 0
                         if ENABLE_ENC_RESET:
                             self.x_pose_start = 0.0
@@ -610,9 +605,9 @@ class ArmController:
                         self._x_expected_total_delta = 0.0
                         self._x_wall = "right"
                         logger.info(
-                            "reset_x: 撞右墙+model判据(ratio=%.2f,speed=%.4f)+dwell通过,耗时%.2fs%s"
+                            "reset_x: 撞右墙+model判据(ratio=%.2f,speed=%.4f)+dwell通过,耗时%.2fs,推了%.1fmm,ref_encoder=%.6f"
                             % (ratio, actual_speed, time.time() - start,
-                               ",enc_物理清零" if ENABLE_ENC_RESET else "")
+                               abs(self.x_get_position() - start_pos) * 1000, ref)
                         )
                         self.x_speed(0)
                         return True
@@ -744,26 +739,26 @@ class ArmController:
         estop = getattr(self, "_estop", None)
         if estop is not None and estop.is_set():
             velocity = 0
+        # === 软限位边界自然停 ===
+        # 旧实现用 _x_wall 撞墙门,在 x_wall 已知侧永远钳 velocity → move_x_position
+        # 会立刻触发 x_stop_check 死循环(encoder 不动 → 触发 calibrate → 又设 _x_wall)。
+        # 新实现:用软限位 [x_threshold[0], x_threshold[1]] 作为边界,边界处 velocity 强制 0。
+        # 这样 move_x 自由推,reset_x(设 target=0.34 > x_threshold[1])也能撞过去。
+        cur = self.x_get_position()
+        x_lo, x_hi = self.x_threshold[0], self.x_threshold[1]
+        BOUNDARY = 0.005  # 边界缓冲 5mm
+        if cur >= x_hi - BOUNDARY and velocity > 0:
+            velocity = 0  # 已到正向软上限
+        elif cur <= x_lo + BOUNDARY and velocity < 0:
+            velocity = 0  # 已到反向软下限
         # === 末段减速 / 顶段减速：根据当前位置分档限幅 ===
         # 注意:必须先分档限幅,最后再做 velocity_limit (主限幅)
         # 否则当 slow_velocity < velocity_limit 时,主限幅会把 slow 限制"放大"回去
-        cur = self.x_get_position()
-        # x 单边坐标: 撞墙=0,远离=正;负=撞另一侧墙(异常或 reset_x 走反方向时)
         wall_pos = self.x_reset_target_m
         if self.x_slow_band_m > 0 and cur >= (wall_pos - self.x_slow_band_m):
-            # 接近正向墙: 减速
             velocity = limit_val(velocity, -self.x_slow_velocity, self.x_slow_velocity)
         elif self.x_top_slow_m > 0 and cur <= -(self.x_top_slow_m):
-            # 接近反向墙(很负): 减速防失步
             velocity = limit_val(velocity, -self.x_top_slow_velocity, self.x_top_slow_velocity)
-        # === 撞墙安全门:已撞墙(已在 _x_wall 侧)且 velocity 往墙方向 → 0 ===
-        # 正常 move_x 不应撞墙,但限位被错误配置时会,这里兜底
-        # seek_wall 模式:reset_x 期间放行(必须真撞墙才算成功)
-        if not self._x_seeking_wall:
-            if self._x_wall == "right" and velocity > 0:
-                velocity = 0
-            elif self._x_wall == "left" and velocity < 0:
-                velocity = 0
         velocity = limit_val(velocity, *self.x_velocity_limit)
         self.motor_x.set_linear(velocity)
 
