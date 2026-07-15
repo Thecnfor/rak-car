@@ -32,6 +32,11 @@ class RuntimeApiClient:
 
     def _request(self, method, path, payload=None, timeout=None):
         timeout = timeout or self.settings.request_timeout
+        # 拆 connect / read: 主机不可达时立即失败,不必等完整个 timeout。
+        # 默认 connect ≤ 5s,read 用传入值。tuple 形态原样保留(给上层想自己配的)。
+        if isinstance(timeout, (int, float)):
+            connect_to = min(5.0, float(timeout))
+            timeout = (connect_to, float(timeout))
         response = requests.request(
             method=method,
             url=self.build_url(path),

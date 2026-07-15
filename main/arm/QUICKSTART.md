@@ -71,7 +71,7 @@ TrajectoryPlan((0.0,0.0) -> (100.0,80.0) mm, T=2.30s, peak_vx=120.0 peak_vy=80.0
 
 | 报错 | 原因 | 处理 |
 | --- | --- | --- |
-| `ValueError: y_mm=200 超出软上限 180mm` | y 超出 `arm_origin.yaml` 软限位 | 改 `soft_y_max_m` 后重 calibrate |
+| `ValueError: y_mm=200 超出软区间 [-180, 0]mm` | y 超出 `arm_origin.yaml` 软限位 | 改 `soft_y_max_m` 后重 calibrate |
 | `RuntimeError: 等待小车初始化超时` | runtime 没起来 | `pm2 restart rak-car-api` |
 | `执行超时: arm.goto_position` | 硬件堵转 / 编码器漂移 | `arm.reset_origin("left")` 重新定原点 |
 | 动作全部从 0 开始（坐标系没标定） | 没跑 `01_calibrate_origin.py` | 先跑一次 |

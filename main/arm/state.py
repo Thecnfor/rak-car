@@ -22,7 +22,7 @@ class ArmOrigin:
     y_origin_m: float = 0.0           # y 触底时的原始 motor_y.get_dis() 值
     x_origin_m: float = 0.0           # x 撞墙时的原始 motor_x.get_dis() 值
     x_wall: str = "left"              # 上次撞的是哪一侧
-    soft_y_max_m: float = 0.18        # 业务软上限（m）
+    soft_y_max_m: float = 0.18        # y 业务上限 magnitude（m）：实际 y ∈ [-180, 0]mm，0=顶
     soft_x_min_m: float = 0.005
     soft_x_max_m: float = 0.30
     calibrated_at: str = ""           # ISO 8601
@@ -56,6 +56,7 @@ class ArmState:
     x_origin_valid: bool = False
 
     # 软限位（从 ArmOrigin 拷过来）
+    # y 语义:0 = 上限(top), -180 = 触底(bottom)
     soft_y_max_mm: float = 180.0
     soft_x_min_mm: float = 5.0
     soft_x_max_mm: float = 300.0
@@ -74,10 +75,13 @@ class ArmState:
     # ---- 校验 ----
 
     def in_safe_box(self, x_mm: float, y_mm: float) -> bool:
-        """给定 (x, y) 是否在业务软限位内（含）。"""
+        """给定 (x, y) 是否在业务软限位内（含）。
+
+        y 区间翻转后：[-soft_y_max_mm, 0]
+        """
         return (
             self.soft_x_min_mm <= x_mm <= self.soft_x_max_mm
-            and 0.0 <= y_mm <= self.soft_y_max_mm
+            and -self.soft_y_max_mm <= y_mm <= 0.0
         )
 
     def is_ready(self) -> bool:
@@ -92,5 +96,5 @@ class ArmState:
             f"side={self.side}, hand={self.hand}, grasp={self.grasping}, "
             f"y_valid={self.y_origin_valid}, x_valid={self.x_origin_valid}, "
             f"safe=[{self.soft_x_min_mm:.0f}..{self.soft_x_max_mm:.0f} x "
-            f"0..{self.soft_y_max_mm:.0f}]mm)"
+            f"-{self.soft_y_max_mm:.0f}..0]mm)"
         )

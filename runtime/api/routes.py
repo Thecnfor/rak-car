@@ -18,6 +18,47 @@ except ModuleNotFoundError as exc:  # pragma: no cover
 
 from runtime.core import settings
 
+import os
+import time
+import traceback as _traceback_mod
+from threading import Lock as _Lock
+
+# ---- DEBUG hook: 抓 read_bus_servo 的 traceback,可通过 /v1/debug/bus-servo/last-error 取回 ----
+_BUS_SERVO_LAST_ERROR: dict = {"ts": 0.0, "exc_type": None, "exc_msg": None,
+                                "tb": None, "port": None, "count": 0}
+_BUS_SERVO_ERROR_LOCK = _Lock()
+_BUS_SERVO_LOG_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    ".remember", "logs",
+)
+
+
+def _capture_bus_servo_traceback(exc, port: int) -> None:
+    """把 read_bus_servo 的异常 traceback 落到内存 + 文件,供 debug 端点拉取。"""
+    tb_text = "".join(_traceback_mod.format_exception(type(exc), exc, exc.__traceback__))
+    with _BUS_SERVO_ERROR_LOCK:
+        _BUS_SERVO_LAST_ERROR.update({
+            "ts": time.time(),
+            "exc_type": type(exc).__name__,
+            "exc_msg": str(exc),
+            "tb": tb_text,
+            "port": int(port),
+            "count": _BUS_SERVO_LAST_ERROR["count"] + 1,
+        })
+        # 落盘(便于 ssh 不到时也能看)
+        try:
+            os.makedirs(_BUS_SERVO_LOG_DIR, exist_ok=True)
+            log_path = os.path.join(_BUS_SERVO_LOG_DIR, "bus_servo_last_error.log")
+            with open(log_path, "w", encoding="utf-8") as f:
+                f.write(f"=== {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                        f"port={port} ===\n")
+                f.write(f"exc_type: {type(exc).__name__}\n")
+                f.write(f"exc_msg : {str(exc)}\n")
+                f.write(f"count   : {_BUS_SERVO_LAST_ERROR['count']}\n\n")
+                f.write(tb_text)
+        except Exception:
+            pass
+
 
 def get_public_links():
     api_base = settings.get_public_api_base()
@@ -833,6 +874,48 @@ def create_runtime_router(service, camera_stream_service):
             return {"ok": True, "angle": service.read_bus_servo(port)}
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except Exception as exc:
+            # DEBUG hook: 抓 traceback,落盘 + 可通过 debug 端点取回
+            _capture_bus_servo_traceback(exc, port=port)
+            raise HTTPException(
+                status_code=500,
+                detail=f"unhandled exception in read_bus_servo(port={port}): "
+                       f"{type(exc).__name__}: {str(exc)[:200]}"
+            ) from exc
+
+    @router_v1.get("/debug/bus-servo/last-error")
+    def v1_debug_bus_servo_last_error(include_tb: bool = Query(True)):
+        """拉取 read_bus_servo 最近一次未捕获异常的 traceback。
+
+        用法: 先触发一次 500 (跑 test_side_diag.py),然后 curl 这个端点。
+        """
+        with _BUS_SERVO_ERROR_LOCK:
+            data = dict(_BUS_SERVO_LAST_ERROR)
+        if data["ts"] == 0.0:
+            return {"ok": True, "empty": True,
+                    "hint": "no captured error yet; trigger a 500 first"}
+        resp = {
+            "ok": True,
+            "ts": data["ts"],
+            "ts_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(data["ts"])),
+            "exc_type": data["exc_type"],
+            "exc_msg": data["exc_msg"],
+            "port": data["port"],
+            "count": data["count"],
+            "log_path": os.path.join(_BUS_SERVO_LOG_DIR, "bus_servo_last_error.log"),
+        }
+        if include_tb:
+            resp["traceback"] = data["tb"]
+        return resp
+
+    @router_v1.post("/debug/bus-servo/clear-error")
+    def v1_debug_bus_servo_clear_error():
+        with _BUS_SERVO_ERROR_LOCK:
+            _BUS_SERVO_LAST_ERROR.update({
+                "ts": 0.0, "exc_type": None, "exc_msg": None,
+                "tb": None, "port": None, "count": 0,
+            })
+        return {"ok": True, "cleared": True}
 
     @router_v1.get("/realtime/analog")
     def v1_realtime_analog(port: int = Query(...)):

@@ -231,7 +231,11 @@ class ArmClient:
         return self._call_arm("set_hand_angle", timeout=timeout, angle=hand, speed=speed)
 
     def grasp(self, on: bool, timeout: float = 10.0) -> dict:
-        return self._call_arm("grasp", bool(on), timeout=timeout)
+        # ⚠️ 之前 "grasp", bool(on), timeout=timeout 会让 bool(on)
+        # 喂给 _call_arm 的 timeout 位置参数,触发
+        # "multiple values for argument 'timeout'"。
+        # 改成 kwargs value=... 避开冲突,且对得上底层 arm.grasp(value: bool)。
+        return self._call_arm("grasp", timeout=timeout, value=bool(on))
 
     # ---- reset ----
 
@@ -283,14 +287,24 @@ class ArmClient:
 
     def get_state(self) -> ArmState:
         raw = self._read_raw_state()
-        st_job = self._call_car("get_arm_state", timeout=10.0)
+        # 30s 对齐 reset_x/y/reset_y 的默认,bus 舵机运动中读快照可能 5~10s
+        st_job = self._call_car("get_arm_state", timeout=30.0)
         st_data = st_job.get("result") if isinstance(st_job, dict) else {}
         if not isinstance(st_data, dict):
             st_data = {}
         side = str(st_data.get("side", "MID")).upper()
-        hand = str(st_data.get("hand_angle", "UP")).upper()
-        if hand not in HANDS:
-            hand = "UP"
+        # ⚠️ car.get_arm_state() 只回 hand_angle (int),没有 "hand" 字符串字段。
+        # 之前 st_data.get("hand_angle") → str(-90)="-90" 不在 HANDS 里 → 一直 fallback "UP",
+        # 导致 set_hand 之后再读 hand 永远是 UP。
+        # 修法:用 arm_cfg.yaml:hand_cfg.hand2.angle_list 的真值表把 int 反查成 UP/MID/DOWN。
+        # 如果以后跑分赛道,这表要从 arm_cfg.yaml 读而不能写死。
+        _HAND_ANGLE_TO_NAME = {-90: "UP", -37: "MID", 0: "DOWN"}
+        hand_angle_raw = st_data.get("hand_angle")
+        try:
+            hand_angle_int = int(hand_angle_raw) if hand_angle_raw is not None else None
+        except (TypeError, ValueError):
+            hand_angle_int = None
+        hand = _HAND_ANGLE_TO_NAME.get(hand_angle_int, "UP")
         if side not in SIDES:
             side = "MID"
         origin = self.origin or ArmOrigin()
@@ -325,9 +339,11 @@ class ArmClient:
 
     def _check_safe(self, x_mm: Optional[float] = None, y_mm: Optional[float] = None) -> None:
         origin = self.origin or ArmOrigin()
-        if y_mm is not None and not (0.0 <= y_mm <= origin.soft_y_max_mm):
+        # y 轴语义翻转:y=0 是上限(top),y=-soft_y_max_mm 是触底(bottom)
+        if y_mm is not None and not (-origin.soft_y_max_mm <= y_mm <= 0.0):
             raise ValueError(
-                f"y_mm={y_mm} 超出软上限 {origin.soft_y_max_mm}mm（触底=0, top={origin.soft_y_max_mm:.0f}mm）"
+                f"y_mm={y_mm} 超出软区间 [-{origin.soft_y_max_mm:.0f}, 0]mm"
+                f"（触底=-{origin.soft_y_max_mm:.0f}mm, top=0）"
             )
         if x_mm is not None and not (origin.soft_x_min_mm <= x_mm <= origin.soft_x_max_mm):
             raise ValueError(
