@@ -98,10 +98,12 @@ def subscribe_lane_state(
             #              M = [[1, -1, -r], [-1, 1, -r], [-1, -1, -r], [1, 1, -r]]
             vy = 0.0
             omega = 0.0
+            vx_eff = 0.0
             if smooth_y is not None and smooth_angle is not None:
+                vx_eff = vx * max(0.35, 1.0 - abs(smooth_angle))
                 vy = -kp_y * smooth_y
                 omega = kp_theta * smooth_angle
-                target_speeds = mecanum_inverse(vx, vy, omega, r_eff)
+                target_speeds = mecanum_inverse(vx_eff, vy, omega, r_eff)
             else:
                 # 无有效误差 → 零速，不贸然前进
                 target_speeds = [0.0, 0.0, 0.0, 0.0]
@@ -117,7 +119,7 @@ def subscribe_lane_state(
             print(
                 f"error_y={error_y!s:>10}  smooth_y={smooth_y!s:>10}  "
                 f"error_angle={error_angle!s:>10}  smooth_angle={smooth_angle!s:>10}  "
-                f"vx={vx:.3f}  vy={vy!s:>8}  omega={omega!s:>8}  "
+                f"vx={vx_eff:.3f}  vy={vy!s:>8}  omega={omega!s:>8}  "
                 f"v1={v1:>8.4f}  v2={v2:>8.4f}  v3={v3:>8.4f}  v4={v4:>8.4f}"
             )
     except KeyboardInterrupt:
