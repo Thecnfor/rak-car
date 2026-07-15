@@ -20,7 +20,7 @@ from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 
 def step_b3_arm_to_seed(client: ArmClient, runner: ArmRunner,
-                       seed_x_mm: float, hover_y_mm: float = 5.0) -> dict:
+                       seed_x_mm: float, hover_y_mm: float = -5.0) -> dict:
     """B3:移到种子上方。"""
     print("=== [B3] 机械臂移到种子正上方 ===")
     print(f"  [arm] move_xy(x={seed_x_mm:.1f}mm, y={hover_y_mm:.1f}mm)")

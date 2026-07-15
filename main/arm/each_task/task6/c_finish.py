@@ -16,7 +16,7 @@ def step_c_finish(client: ArmClient, runner: ArmRunner) -> dict:
     print("  [arm]  set_hand(UP) + set_side(MID) 货物暂存")
     runner.set_hand("UP", timeout=10)
     runner.set_side("MID", timeout=10)
-    runner.move_y(y_mm=60.0)  # 抬到一个安全高度
+    runner.move_y(y_mm=-60.0)  # 抬到一个安全高度
     print("  [note] 货物吸着进入 task7")
     print("=== [C] 完成 ===\n")
     return {"done": True, "next": "task7_deliver"}

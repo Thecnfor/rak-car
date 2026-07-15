@@ -45,7 +45,7 @@ def run_one_seed(client: ArmClient, runner: ArmRunner,
     step_b2_arm_prep(client, runner, side=side, hand="DOWN")
     step_b3_arm_to_seed(client, runner, seed_x_mm=seed["x_mm"])
     step_b4_pick(client, runner)
-    step_b5_lift(client, runner, safe_y_mm=80.0)
+    step_b5_lift(client, runner, safe_y_mm=-80.0)
     step_b6_drive_to_target(client, runner,
                             target_x_mm=200.0 + seed_index * 30.0)
     step_b7_place(client, runner,

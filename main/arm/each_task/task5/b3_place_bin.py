@@ -30,7 +30,7 @@ def step_b3_place_bin(client: ArmClient, runner: ArmRunner,
     runner.grasp(False, timeout=10)
     # 抬起脱离
     print("  [arm]  move_y(80) 抬起")
-    runner.move_y(y_mm=80.0)
+    runner.move_y(y_mm=-80.0)
     if is_high:
         print("  [note] 这是高位仓,需要后续 y 复位以适应下一轮")
     print("=== [B3] 完成 ===\n")
@@ -40,7 +40,7 @@ def step_b3_place_bin(client: ArmClient, runner: ArmRunner,
 def main() -> None:
     client = ArmClient.connect()
     runner = ArmRunner(client)
-    step_b3_place_bin(client, runner, target_x_mm=100.0, target_y_mm=120.0, is_high=True)
+    step_b3_place_bin(client, runner, target_x_mm=100.0, target_y_mm=-120.0, is_high=True)
 
 
 if __name__ == "__main__":

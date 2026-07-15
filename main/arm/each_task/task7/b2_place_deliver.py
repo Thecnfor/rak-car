@@ -14,20 +14,20 @@ from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 
 def step_b2_place_deliver(client: ArmClient, runner: ArmRunner,
-                         house_x_mm: float, house_y_mm: float = 30.0) -> dict:
+                         house_x_mm: float, house_y_mm: float = -30.0) -> dict:
     print("=== [B2] 放下货物到配送点 ===")
     # 底盘走到配送点前方
     print(f"  [底盘] 走到配送点 x={house_x_mm:.0f}")
     # client._call_car("move_to_position", house_x_mm / 1000, 0, 0)
     # arm 移到配送点上方
     print(f"  [arm]  move_xy(x={house_x_mm:.0f}, y={house_y_mm+5:.0f})")
-    runner.move_xy(x_mm=house_x_mm, y_mm=house_y_mm + 5.0)
-    print(f"  [arm]  move_y({house_y_mm:.0f})  放到平板上")
-    runner.move_y(y_mm=house_y_mm)
+    runner.move_xy(x_mm=house_x_mm, y_mm=-house_y_mm - 5.0)
+    print(f"  [arm]  move_y({-house_y_mm:.0f})  放到平板上")
+    runner.move_y(y_mm=-house_y_mm)
     print("  [arm]  grasp(False) 释放货物")
     runner.grasp(False, timeout=10)
     print("  [arm]  move_y(80) 抬起脱离")
-    runner.move_y(y_mm=80.0)
+    runner.move_y(y_mm=-80.0)
     print("=== [B2] 完成 ===\n")
     return {"delivered": True}
 

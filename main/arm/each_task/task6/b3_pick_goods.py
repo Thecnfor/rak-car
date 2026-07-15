@@ -26,20 +26,20 @@ def step_b3_pick_goods(client: ArmClient, runner: ArmRunner,
     # boxes = client._call_car("get_detection_results", label=goods_name)
     # 简化:假设货在 x=80
     goods_x_mm = 80.0
-    shelf_y_mm = 60.0  # 货架有高度
+    shelf_y_mm = -60.0  # 货架有高度
     # arm 准备
     print("  [arm]  set_hand(DOWN) + set_side(MID)")
     runner.set_side("MID", timeout=10)
     runner.set_hand("DOWN", timeout=10)
     print(f"  [arm]  move_xy(x={goods_x_mm}, y={shelf_y_mm+5})")
-    runner.move_xy(x_mm=goods_x_mm, y_mm=shelf_y_mm + 5.0)
+    runner.move_xy(x_mm=goods_x_mm, y_mm=shelf_y_mm - 5.0)
     print(f"  [arm]  move_y({shelf_y_mm}) 下降到货架面")
-    runner.move_y(y_mm=shelf_y_mm)
+    runner.move_y(y_mm=-shelf_y_mm)
     time.sleep(0.3)
     print("  [arm]  grasp(True) 吸取")
     runner.grasp(True, timeout=10)
     print("  [arm]  move_y(80) 抬起")
-    runner.move_y(y_mm=80.0)
+    runner.move_y(y_mm=-80.0)
     print("=== [B3] 完成 ===\n")
     return {"picked": goods_name}
 

@@ -21,7 +21,7 @@ def step_b3_store_fruit(client: ArmClient, runner: ArmRunner) -> dict:
     # client._call_car("move_to_position", 0, 0, 0)
     # arm 把果实放到储存仓开口
     print("  [arm]  move_xy(x=0, y=40)  储存仓开口高度")
-    runner.move_xy(x_mm=0.0, y_mm=40.0)
+    runner.move_xy(x_mm=0.0, y_mm=-40.0)
     print("  [arm]  grasp(False) 释放")
     runner.grasp(False, timeout=10)
     print("  [底盘] car.set_storage(close) 关仓门")

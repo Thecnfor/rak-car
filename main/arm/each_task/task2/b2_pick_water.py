@@ -25,7 +25,7 @@ def step_b2_pick_water(client: ArmClient, runner: ArmRunner) -> dict:
     runner.set_hand("DOWN", timeout=10)
     # 移到水块上方
     print("  [arm]  move_xy(x=60, y=5)")
-    runner.move_xy(x_mm=60.0, y_mm=5.0)
+    runner.move_xy(x_mm=60.0, y_mm=-5.0)
     # 下降 + 吸取
     print("  [arm]  move_y(0) + grasp(True)")
     runner.move_y(y_mm=0.0)
@@ -33,7 +33,7 @@ def step_b2_pick_water(client: ArmClient, runner: ArmRunner) -> dict:
     runner.grasp(True, timeout=10)
     # 抬起
     print("  [arm]  move_y(80) 抬起")
-    runner.move_y(y_mm=80.0)
+    runner.move_y(y_mm=-80.0)
     print("=== [B2] 完成 ===\n")
     return {"picked": True}
 

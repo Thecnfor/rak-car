@@ -15,7 +15,7 @@ from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 
 def step_b3_place_water(client: ArmClient, runner: ArmRunner,
-                        tower_x_mm: float, tower_y_mm: float = 60.0) -> dict:
+                        tower_x_mm: float, tower_y_mm: float = -60.0) -> dict:
     """tower_y_mm 是水塔平板高度(假设 60mm),不是 0。"""
     print("=== [B3] 放到水塔 ===")
     # 底盘走到水塔前方
@@ -29,7 +29,7 @@ def step_b3_place_water(client: ArmClient, runner: ArmRunner,
     runner.grasp(False, timeout=10)
     # 抬起脱离
     print(f"  [arm]  move_y(80) 抬起来")
-    runner.move_y(y_mm=80.0)
+    runner.move_y(y_mm=-80.0)
     print("=== [B3] 完成 ===\n")
     return {"placed": True, "at": (tower_x_mm, tower_y_mm)}
 

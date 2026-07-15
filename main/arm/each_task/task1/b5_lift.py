@@ -17,7 +17,7 @@ from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 
 def step_b5_lift(client: ArmClient, runner: ArmRunner,
-                safe_y_mm: float = 80.0) -> dict:
+                safe_y_mm: float = -80.0) -> dict:
     """B5:抬起种子到安全高度。"""
     print("=== [B5] 抬起种子 ===")
     print(f"  [arm] move_y({safe_y_mm:.1f}mm)  抬到安全高度")

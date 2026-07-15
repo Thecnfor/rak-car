@@ -34,7 +34,7 @@ def step_b1_detect(client: ArmClient, runner: ArmRunner) -> dict:
         "label": "seed_large",
         "diameter_mm": 100.0,
         "x_mm": 120.0,    # 业务坐标,需要像素→mm 标定
-        "y_mm": 5.0,      # 落地高度
+        "y_mm": -5.0,      # 落地高度
     }
 
     # ---- 底盘对齐 ----

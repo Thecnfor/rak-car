@@ -21,11 +21,11 @@ from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 
 def step_b7_place(client: ArmClient, runner: ArmRunner,
-                 target_x_mm: float, safe_y_mm: float = 80.0) -> dict:
+                 target_x_mm: float, safe_y_mm: float = -80.0) -> dict:
     """B7:放到白点。"""
     print("=== [B7] 放到白点 ===")
     print(f"  [arm] move_xy(x={target_x_mm:.1f}mm, y=5.0mm)  移到白点正上方")
-    runner.move_xy(x_mm=target_x_mm, y_mm=5.0)
+    runner.move_xy(x_mm=target_x_mm, y_mm=-5.0)
     print("  [arm] move_y(0)  下降触底")
     runner.move_y(y_mm=0.0)
     print("  [arm] grasp(False)  关真空泵,种子落下")

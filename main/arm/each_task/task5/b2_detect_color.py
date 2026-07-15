@@ -19,8 +19,8 @@ from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 # 赛前公布(占位)
 COLOR_TO_BIN = {
-    "red":   {"bin": "high",  "x_mm": 100.0, "y_mm": 120.0},  # 高位
-    "green": {"bin": "low",   "x_mm": 200.0, "y_mm":  40.0},  # 低位
+    "red":   {"bin": "high",  "x_mm": 100.0, "y_mm": -120.0},  # 高位
+    "green": {"bin": "low",   "x_mm": 200.0, "y_mm":  -40.0},  # 低位
 }
 
 
