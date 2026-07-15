@@ -108,6 +108,9 @@ class CameraStreamService:
                 if source_updated_at:
                     frame_age = round(max(time.time() - float(source_updated_at), 0.0), 3)
                     stale = frame_age > self.stale_timeout
+                # USB autosuspend 状态：read 一下对应 USB 设备的 power/control。
+                # 用于 /stream/health 一眼看出"摄像头为啥又黑屏了"。
+                usb_power = self._read_usb_power(cam_id)
                 cameras[cam_id] = {
                     "active": cam_id in self.frames and not stale,
                     "stale": stale,
@@ -116,6 +119,9 @@ class CameraStreamService:
                     "last_source_update_at": source_updated_at,
                     "last_recover_at": meta.get("last_recover_at"),
                     "last_issue": meta.get("last_issue"),
+                    "usb_power_control": usb_power["control"],
+                    "usb_autosuspend": usb_power["autosuspend"],
+                    "usb_power_warn": usb_power["warn"],
                 }
         return {
             "status": "running" if self.running else "stopped",
@@ -125,6 +131,46 @@ class CameraStreamService:
             "stale_timeout": self.stale_timeout,
             "cameras": cameras,
         }
+
+    @staticmethod
+    def _usb_dev_for_cam(cam_id):
+        """把 cam1/cam2 翻译成 /dev/videoN（和 smartcar Camera 类 _linux_source_candidates 一致）。"""
+        from pathlib import Path
+        try:
+            cam_index = {"cam1": 1, "cam2": 2}.get(cam_id)
+            if cam_index is None:
+                return None
+            primary = Path("/dev/cam")  # type: ignore
+            primary_full = Path(str(primary) + str(cam_index))
+            if primary_full.exists():
+                return str(primary_full)
+            fallback_idx = max((cam_index - 1) * 2, 0)
+            fallback = "/dev/video" + str(fallback_idx)
+            if os.path.exists(fallback):
+                return fallback
+        except Exception:
+            return None
+        return None
+
+    @classmethod
+    def _read_usb_power(cls, cam_id):
+        """读 /dev/videoN 对应 USB 设备的 power/control 和 autosuspend；读不到返回 None。
+        给 health 端用，明确告诉用户是不是 autosuspend 在搞事。"""
+        try:
+            from smartcar.whalesbot.tools.camera import read_usb_power_state
+        except Exception:
+            return {"control": None, "autosuspend": None, "warn": "camera 模块加载失败"}
+        dev_node = cls._usb_dev_for_cam(cam_id)
+        if dev_node is None:
+            return {"control": None, "autosuspend": None, "warn": "设备节点不存在"}
+        control, autosuspend = read_usb_power_state(dev_node)
+        warn = None
+        if control is None:
+            warn = "无法读取 sysfs（多半 udev 没装/没权限）"
+        elif control != "on":
+            # auto / suspend 都是危险状态；默认内核是 auto + autosuspend=2s = 随时挂
+            warn = "power/control={}（建议 udev 规则禁用 autosuspend）".format(control)
+        return {"control": control, "autosuspend": autosuspend, "warn": warn}
 
     def get_stream_info(self, base_url):
         base = str(base_url).rstrip("/")
@@ -183,7 +229,7 @@ class CameraStreamService:
     def get_frame_or_placeholder(self, cam_id):
         normalized = self.normalize_cam_id(cam_id)
         frame = self.get_frame(normalized)
-        if frame is not None and self._frame_is_fresh(normalized):
+        if frame is not None and self._frame_is_fresh(normalized) and self._is_valid_image(frame):
             return frame
         if frame is not None:
             self.clear_frame(normalized, preserve_meta=True)
@@ -225,6 +271,13 @@ class CameraStreamService:
     def update_frame(self, image, cam_id, source_updated_at=None):
         if image is None:
             return
+        if not self._is_valid_image(image):
+            self._update_frame_meta(
+                self.normalize_cam_id(cam_id),
+                last_issue="empty image",
+                last_issue_at=time.time(),
+            )
+            return
         normalized = self.normalize_cam_id(cam_id)
         captured_at = time.time()
         if source_updated_at is None:
@@ -241,6 +294,17 @@ class CameraStreamService:
             )
             self.frame_meta[normalized] = meta
 
+    @staticmethod
+    def _is_valid_image(image):
+        if not hasattr(image, "size") or not hasattr(image, "shape"):
+            return False
+        try:
+            if int(image.size) <= 0 or len(image.shape) < 2:
+                return False
+        except Exception:
+            return False
+        return True
+
     def stream_frames(self, cam_id):
         normalized = self.normalize_cam_id(cam_id)
         last_frame_time = 0.0
@@ -250,11 +314,16 @@ class CameraStreamService:
                 time.sleep(0.01)
                 continue
             frame = self.get_frame_or_placeholder(normalized)
-            ret, buffer = cv2.imencode(
-                ".jpg",
-                frame,
-                [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
-            )
+            try:
+                ret, buffer = cv2.imencode(
+                    ".jpg",
+                    frame,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+                )
+            except cv2.error:
+                self.clear_frame(normalized, preserve_meta=True)
+                time.sleep(0.05)
+                continue
             if ret:
                 last_frame_time = current_time
                 yield (
@@ -268,11 +337,20 @@ class CameraStreamService:
     def encode_jpeg_bytes(self, cam_id, quality=None):
         frame = self.get_frame_or_placeholder(cam_id)
         quality = self.quality if quality is None else int(quality)
-        ret, buffer = cv2.imencode(
-            ".jpg",
-            frame,
-            [int(cv2.IMWRITE_JPEG_QUALITY), quality],
-        )
+        try:
+            ret, buffer = cv2.imencode(
+                ".jpg",
+                frame,
+                [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+            )
+        except cv2.error:
+            self.clear_frame(self.normalize_cam_id(cam_id), preserve_meta=True)
+            placeholder = self._build_waiting_frame(self.normalize_cam_id(cam_id))
+            ret, buffer = cv2.imencode(
+                ".jpg",
+                placeholder,
+                [int(cv2.IMWRITE_JPEG_QUALITY), quality],
+            )
         if not ret:
             raise RuntimeError("JPEG 编码失败")
         return buffer.tobytes()
@@ -322,229 +400,176 @@ class CameraStreamService:
                 <meta name="viewport" content="width=device-width, initial-scale=1.0">
                 <title>智能车监控系统</title>
                 <style>
-                    * {
-                        margin: 0;
-                        padding: 0;
-                        box-sizing: border-box;
-                    }
+                    * { margin: 0; padding: 0; box-sizing: border-box; }
                     body {
                         font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
-                        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+                        background: #0f1419;
                         min-height: 100vh;
                         color: #e0e0e0;
-                        padding: 20px;
                     }
-                    .container {
-                        max-width: 1400px;
-                        margin: 0 auto;
-                    }
-                    header {
+                    /* ---- 极简状态栏 ---- */
+                    .statusbar {
+                        position: sticky;
+                        top: 0;
+                        z-index: 10;
                         display: flex;
-                        justify-content: space-between;
                         align-items: center;
-                        margin-bottom: 20px;
-                        padding: 15px 20px;
-                        background: rgba(255, 255, 255, 0.05);
-                        border-radius: 15px;
-                        border: 1px solid rgba(255, 255, 255, 0.1);
-                        backdrop-filter: blur(10px);
+                        gap: 18px;
+                        padding: 8px 16px;
+                        background: rgba(20, 25, 35, 0.92);
+                        border-bottom: 1px solid rgba(255,255,255,0.08);
+                        font-size: 13px;
+                        font-family: 'SF Mono', Consolas, monospace;
+                        backdrop-filter: blur(8px);
                     }
-                    h1 {
-                        font-size: 1.5em;
-                        background: linear-gradient(90deg, #00d4ff, #7b2cbf, #ff006e);
+                    .statusbar .brand {
+                        font-weight: 600;
+                        background: linear-gradient(90deg, #00d4ff, #7b2cbf);
                         -webkit-background-clip: text;
                         -webkit-text-fill-color: transparent;
-                        background-clip: text;
                     }
-                    .key-panel-title {
-                        font-size: 0.9em;
-                        color: #8892b0;
+                    .statusbar .lane-dot {
+                        display: inline-block;
+                        width: 9px;
+                        height: 9px;
+                        border-radius: 50%;
+                        background: #555;
+                        margin-right: 6px;
+                        vertical-align: middle;
+                        transition: background 0.2s;
+                    }
+                    .statusbar .lane-dot.ok { background: #00e676; box-shadow: 0 0 8px #00e67688; }
+                    .statusbar .lane-dot.warn { background: #ffb300; }
+                    .statusbar .lane-dot.err { background: #ff5252; }
+                    .statusbar .err { color: #8892b0; }
+                    .statusbar .err b { color: #e6f1ff; font-weight: 500; }
+                    .statusbar .key {
+                        margin-left: auto;
+                        color: #ff5252;
+                        font-weight: 600;
+                        min-width: 24px;
+                        text-align: right;
+                        transition: transform 0.15s;
+                    }
+                    .statusbar .key.active { transform: scale(1.4); }
+
+                    /* ---- 原始流（无任何 overlay / 状态卡）---- */
+                    .streams {
                         display: flex;
-                        align-items: center;
-                        gap: 10px;
+                        gap: 2px;
+                        padding: 2px;
                     }
-                    .key-panel-title .key-icon,
-                    .key-panel-title #floatKeyDisplay {
-                        font-size: 2.2em;
-                    }
-                    .key-panel-title #floatKeyDisplay.active {
-                        transform: scale(1.2);
-                    }
-                    .stream-container {
-                        display: flex;
-                        justify-content: space-between;
-                        gap: 20px;
-                        margin-top: 20px;
-                        width: 100%;
-                    }
-                    .status-grid {
-                        display: grid;
-                        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-                        gap: 12px;
-                        margin-top: 20px;
-                    }
-                    .status-card {
-                        background: rgba(255, 255, 255, 0.03);
-                        border: 1px solid rgba(255, 255, 255, 0.1);
-                        border-radius: 12px;
-                        padding: 12px 14px;
-                    }
-                    .status-card .label {
-                        font-size: 0.85em;
-                        color: #8892b0;
-                        margin-bottom: 6px;
-                    }
-                    .status-card .value {
-                        font-size: 1.1em;
-                        color: #e6f1ff;
-                        font-family: monospace;
-                    }
-                    .stream-box {
-                        background: rgba(255, 255, 255, 0.03);
-                        border: 2px solid rgba(255, 255, 255, 0.1);
-                        border-radius: 15px;
-                        padding: 15px;
+                    .stream-cell {
                         flex: 1;
-                        min-width: 300px;
-                        backdrop-filter: blur(5px);
+                        min-width: 0;
+                        background: #000;
+                        position: relative;
                     }
-                    .stream-box h3 {
-                        text-align: center;
-                        margin-bottom: 15px;
-                        color: #ccd6f6;
-                        font-size: 1.2em;
-                    }
-                    .stream-box img {
-                        max-width: 100%;
+                    .stream-cell img {
+                        display: block;
+                        width: 100%;
                         height: auto;
-                        border-radius: 10px;
-                        border: 2px solid rgba(0, 0, 0, 0.3);
-                        box-shadow: 0 5px 20px rgba(0, 0, 0, 0.5);
                     }
-                    footer {
-                        text-align: center;
-                        margin-top: 30px;
-                        color: #495670;
-                        font-size: 0.9em;
-                    }
-                    @media (max-width: 1100px) {
-                        .stream-container {
-                            flex-direction: column;
-                            align-items: center;
-                        }
-                        .stream-box {
-                            width: 100%;
-                            max-width: 600px;
-                        }
+                    .stream-cell .label {
+                        position: absolute;
+                        top: 6px;
+                        left: 8px;
+                        font-size: 11px;
+                        color: #fff;
+                        background: rgba(0,0,0,0.55);
+                        padding: 2px 6px;
+                        border-radius: 4px;
+                        font-family: monospace;
                     }
                 </style>
             </head>
             <body>
-                <div class="container">
-                    <header>
-                        <h1>智能车监控系统</h1>
-                        <h4 class="key-panel-title">
-                            <span id="floatKeyDisplay"></span>
-                            <span class="key-icon">⌨️</span>
-                        </h4>
-                    </header>
-                    <div class="status-grid">
-                        <div class="status-card">
-                            <div class="label">Lane 状态</div>
-                            <div class="value" id="laneActive">idle</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="label">横向误差</div>
-                            <div class="value" id="laneError">--</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="label">角度误差</div>
-                            <div class="value" id="laneAngle">--</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="label">横移速度</div>
-                            <div class="value" id="laneYSpeed">--</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="label">角速度</div>
-                            <div class="value" id="laneAngleSpeed">--</div>
-                        </div>
-                        <div class="status-card">
-                            <div class="label">累计距离</div>
-                            <div class="value" id="laneDistance">--</div>
-                        </div>
+                <div class="statusbar">
+                    <span class="brand">RAK-CAR</span>
+                    <span>
+                        <span class="lane-dot" id="laneDot"></span>
+                        <span id="laneText">lane: --</span>
+                    </span>
+                    <span class="err">
+                        ey=<b id="laneEy">--</b>
+                        ea=<b id="laneEa">--</b>
+                    </span>
+                    <span id="lastKey" class="key"></span>
+                </div>
+                <div class="streams">
+                    <div class="stream-cell">
+                        <span class="label">cam1 / front</span>
+                        <img src="/video_feed/cam1" alt="front camera">
                     </div>
-                    <div class="stream-container">
-                        <div class="stream-box">
-                            <h3>前视画面 (cam1 / front)</h3>
-                            <img src="/video_feed/cam1" alt="front camera">
-                        </div>
-                        <div class="stream-box">
-                            <h3>侧视画面 (cam2 / side)</h3>
-                            <img src="/video_feed/cam2" alt="side camera">
-                        </div>
+                    <div class="stream-cell">
+                        <span class="label">cam2 / side</span>
+                        <img src="/video_feed/cam2" alt="side camera">
                     </div>
-                    <footer>
-                        <p>Powered by FastAPI & OpenCV</p>
-                    </footer>
                 </div>
                 <script>
-                    let isPageActive = false;
-                    document.body.addEventListener('click', function() {
-                        isPageActive = true;
-                    });
-                    document.addEventListener('keydown', function(event) {
-                        if (!isPageActive) {
-                            return;
+                    // 状态栏 lane 状态轮询（1Hz，轻量；MJPEG 自带 20Hz）
+                    const laneDot = document.getElementById('laneDot');
+                    const laneText = document.getElementById('laneText');
+                    const laneEy = document.getElementById('laneEy');
+                    const laneEa = document.getElementById('laneEa');
+                    const lastKey = document.getElementById('lastKey');
+                    let lastKeyText = '';
+                    let keyTimer = null;
+
+                    function fmt(v) {
+                        if (v === null || v === undefined) return '--';
+                        if (typeof v !== 'number') return String(v);
+                        return v.toFixed(4);
+                    }
+
+                    async function pollLane() {
+                        try {
+                            const r = await fetch('/v1/vision/lane/state');
+                            const d = await r.json();
+                            // 点颜色
+                            const age = d.updated_at ? (Date.now()/1000 - d.updated_at) : 999;
+                            if (!d.updated_at || age > 2) {
+                                laneDot.className = 'lane-dot err';
+                            } else if (d.active) {
+                                laneDot.className = 'lane-dot ok';
+                            } else {
+                                laneDot.className = 'lane-dot warn';
+                            }
+                            laneText.textContent = 'lane: ' + (d.active ? (d.mode || 'on') : 'idle');
+                            laneEy.textContent = fmt(d.error_y);
+                            laneEa.textContent = fmt(d.error_angle);
+                        } catch (e) {
+                            laneDot.className = 'lane-dot err';
+                            laneText.textContent = 'lane: err';
                         }
+                    }
+                    pollLane();
+                    setInterval(pollLane, 1000);  // 1Hz 足够（MJPEG 已经 20Hz）
+
+                    // 键盘按键转发（保留）
+                    let pageActive = false;
+                    document.body.addEventListener('click', () => { pageActive = true; });
+                    document.addEventListener('keydown', (ev) => {
+                        if (!pageActive) return;
                         fetch('/keypress', {
                             method: 'POST',
                             headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ key: event.key })
+                            body: JSON.stringify({ key: ev.key })
                         })
-                        .then(response => response.json())
-                        .then(data => {
-                            const keyElement = document.getElementById('floatKeyDisplay');
-                            keyElement.innerText = data.received || '';
-                            keyElement.classList.remove('active');
-                            void keyElement.offsetWidth;
-                            keyElement.classList.add('active');
+                        .then(r => r.json())
+                        .then(d => {
+                            if (lastKeyText) lastKey.textContent = '';
+                            lastKeyText = d.received || '';
+                            lastKey.textContent = lastKeyText;
+                            lastKey.classList.remove('active');
+                            void lastKey.offsetWidth;
+                            lastKey.classList.add('active');
+                            clearTimeout(keyTimer);
+                            keyTimer = setTimeout(() => { lastKey.textContent = ''; lastKeyText = ''; }, 1500);
                         })
-                        .catch(function(err) {
-                            console.error('发送失败:', err);
-                        });
-                        if (['F5', 'F12'].includes(event.key)) {
-                            event.preventDefault();
-                        }
+                        .catch(err => console.error('keypress err:', err));
+                        if (['F5', 'F12'].includes(ev.key)) ev.preventDefault();
                     });
-
-                    function formatNum(value, digits = 4) {
-                        if (value === null || value === undefined) {
-                            return '--';
-                        }
-                        if (typeof value !== 'number') {
-                            return String(value);
-                        }
-                        return value.toFixed(digits);
-                    }
-
-                    async function refreshLaneState() {
-                        try {
-                            const response = await fetch('/v1/vision/lane/state');
-                            const data = await response.json();
-                            document.getElementById('laneActive').innerText = data.active ? (data.mode || 'tracking') : 'idle';
-                            document.getElementById('laneError').innerText = formatNum(data.error_y);
-                            document.getElementById('laneAngle').innerText = formatNum(data.error_angle);
-                            document.getElementById('laneYSpeed').innerText = formatNum(data.lateral_speed);
-                            document.getElementById('laneAngleSpeed').innerText = formatNum(data.angular_speed);
-                            document.getElementById('laneDistance').innerText = formatNum(data.distance, 3);
-                        } catch (error) {
-                            console.error('lane state 获取失败:', error);
-                        }
-                    }
-
-                    refreshLaneState();
-                    setInterval(refreshLaneState, 300);
                 </script>
             </body>
         </html>

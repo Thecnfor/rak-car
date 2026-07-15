@@ -167,7 +167,11 @@ class ArmController:
 
     def reset_y(self):
         """
-        重置竖直方向位置
+        重置竖直方向位置。
+
+        业务约定（与 main/arm 一致）：y>0=向下（朝磁感触底），y<0=向上（远离触底）。
+        业务层 move_y 直传 target 给车端，不取反；负值目标 → 车端朝磁感方向走。
+        因此 reset_y 用 setpoint=-0.25 主动朝磁感方向找触底。
         """
         self.y_pid.setpoint = -0.25
         while True:
@@ -181,20 +185,49 @@ class ArmController:
 
     def move_y_position(self, target):
         """
-        移动竖直方向指定距离
-
-        Args:
-            target: 目标位置
+        移动竖直方向指定距离。带丢步兜底：
+        1) 第一轮 PID 闭环到 < 1mm（或堵转跳出）；
+        2) 完成后比对 actual vs target，偏差 > 1mm 时再发一轮 setpoint，最多 2 轮；
+        3) 若仍偏差 > 2mm（步距）则视为异常，仅 warn 不抛错。
         """
+        # 第一轮（保持原行为）
         self.y_pid.setpoint = target
         while True:
             if self.y_pid_moveto(target):
-                logger.info(f"移动到高度{target}")
+                logger.info(f"移动到高度{target}（PID 收敛）")
                 break
             if self.y_stop_check():
                 logger.info(f"移到高度{target}过程中检测到停止")
                 break
         self.y_speed(0)
+
+        # ---- 丢步/堵转补偿（最多 2 轮） ----
+        for round_idx in range(2):
+            actual = self.y_get_position()
+            err = target - actual
+            if abs(err) <= 0.001:
+                return
+            # 磁感已触发且 setpoint 已在触底方向 → 已经触底到位
+            if self.y_reset_check() and target >= 0.0:
+                return
+            logger.warning(
+                f"move_y_position 丢步兜底 round={round_idx}: "
+                f"target={target:.4f} actual={actual:.4f} err={err*1000:.1f}mm, 再发一次"
+            )
+            self.y_pid.setpoint = target
+            while True:
+                if self.y_pid_moveto(target):
+                    break
+                if self.y_stop_check():
+                    break
+            self.y_speed(0)
+
+        final = self.y_get_position()
+        if abs(final - target) > 0.002:
+            logger.error(
+                f"move_y_position 丢步严重: target={target:.4f} final={final:.4f} "
+                f"diff={(final-target)*1000:.1f}mm, 建议重新定原点"
+            )
 
     def x_params_init(self, motor, pid, threshold):
         """
@@ -372,9 +405,20 @@ class ArmController:
         """
         设置竖直方向速度
 
+        业务约定（与 main/arm 一致）：y>0=向下（朝触底），y<0=向上（远离触底）。
+        业务层 move_y 直传 target 给车端，不取反；车端 motor 方向由 reverse 标志决定。
+        velocity 符号与物理方向的具体对应见实测（业务侧只关心 y<0=向上、y>0=向下）。
+
+        磁感安全门：磁感触发时把 velocity 强制置 0，
+        防止继续朝磁感方向硬推。
+
         Args:
             velocity: 速度值
         """
+        # === 磁感安全门：磁感触发 + velocity<0 时 velocity=0，不再朝磁感方向推进 ===
+        if velocity < 0 and self.y_reset_check():
+            logger.warning("y_speed: 磁感触发，禁止继续推进，velocity=0")
+            velocity = 0
         velocity = limit_val(velocity, *self.y_velocity_limit)
         self.motor_y.set_velocity(velocity)
 
@@ -398,26 +442,6 @@ class ArmController:
         self.y_pose_start = self.y_pose_now
         self.x_pose_start = self.x_pose_now
         self.save_config()
-
-    def set_manually(self):
-        """
-        使用【4键】控制机械臂
-        """
-        self.key = Key4Btn(4)
-        logger.info("Using 4 keys to control arm...")
-        while True:
-            value = self.key.get_key()
-            if value == 1:
-                self.y_speed(0.1)  # 向上
-            elif value == 3:
-                self.y_speed(-0.1)  # 向下
-            elif value == 4:
-                self.x_speed(0.1)  # 向右
-            elif value == 2:
-                self.x_speed(-0.1)  # 向左
-            else:
-                self.x_speed(0)
-                self.y_speed(0)
 
     def reset_position(self):
         """

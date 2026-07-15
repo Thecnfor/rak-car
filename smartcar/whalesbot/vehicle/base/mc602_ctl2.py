@@ -329,7 +329,7 @@ class Key4Btn_2(AnalogInput_2):
     
     def __init__(self, port_id=None) -> None:
         super().__init__(port_id=port_id)
-        self.key_map = {3:355,1:1366,2:2137, 4:2988}
+        self.key_map = {3:357,1:1388,2:2015, 4:3014}
         self.threshold = 0.1
 
         for i in range(5):

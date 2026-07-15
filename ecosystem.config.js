@@ -20,7 +20,7 @@ module.exports = {
         RAK_CAR_PUBLIC_STREAM_PORT: "5050",
         RAK_CAR_PUBLIC_STREAM_PATH: "/stream/",
         RAK_CAR_AUTO_INIT: "1",
-        RAK_CAR_RESET_ARM: "0",
+        RAK_CAR_RESET_ARM: "1",
         RAK_CAR_RESET_POSITION_ON_INIT: "1",
         RAK_CAR_STOP_AFTER_ACTION: "0",
         RAK_CAR_INFER_AUTO_START: "1",

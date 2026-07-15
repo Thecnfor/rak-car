@@ -6,6 +6,7 @@
 **/dataset/
 **/test.py
 incoming/
+smartcar/paddlebaidu/models/
 
 
 
@@ -150,5 +151,5 @@ cython_debug/
 **/logs
 .dbg/
 
-main/test
+**/test/**
 main/arm/arm_origin.yaml

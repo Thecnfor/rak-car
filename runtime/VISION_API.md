@@ -273,6 +273,148 @@ curl -sS http://127.0.0.1:5050/v1/vision/lane/state
 - `distance`
   - 当前累计行驶距离
 
+### 外环专用：`/v1/vision/lane/feed` + WebSocket `subscribe_lane`
+
+> **外环 = 不在车端、但要稳定拿到 `(error_y, error_angle)` 做控制**。
+> 用法分两步：先开 feed 守护线程（让 `lane_state` 持续更新），再订阅 WS push 或 HTTP 轮询拿数据。
+
+#### `POST /v1/vision/lane/feed`
+
+启动车端 lane 误差缓存守护线程。
+
+请求体（全部可选）：
+
+```json
+{ "hz": 20.0 }
+```
+
+- `hz` — 守护线程刷新 lane_state 的频率（1~50Hz，默认 20）
+
+行为：
+- 已经在跑 → 返回 `{started: false, reason: "already_running"}`
+- 否则 → 守护线程持续跑 `get_lane_results()`，把结果写入 `streamer.set_lane_state(...)`
+- **不会下发任何轮速**，不会与客户端外环抢 `car_lock`
+
+示例：
+
+```bash
+curl -sS -X POST http://192.168.3.60:5050/v1/vision/lane/feed \
+  -H 'Content-Type: application/json' -d '{"hz":20}'
+```
+
+返回：
+
+```json
+{ "ok": true, "started": true, "hz": 20.0, "state_url": "/v1/vision/lane/state" }
+```
+
+#### `POST /v1/vision/lane/feed/stop`
+
+停止守护线程。已经在停 → `{stopped: false, reason: "not_running"}`。
+
+#### `GET /v1/vision/lane/feed`
+
+读守护线程状态（按 `lane_state.updated_at` 推断）：
+
+```json
+{
+  "ok": true,
+  "running": true,
+  "age": 0.025,
+  "mode": "external_feed",
+  "active": true,
+  "updated_at": 1784032461.516
+}
+```
+
+- `running` — `age < 2.0` 视为 alive
+- `age` — 距离上一次更新的秒数
+
+#### WebSocket `subscribe_lane`（**推荐外环用这个**）
+
+通过 `/v1/ws`（WebSocket）订阅服务端主动 push。
+
+用法：
+
+```python
+import json, websocket
+ws = websocket.create_connection('ws://192.168.3.60:5050/v1/ws')
+ws.recv()  # welcome
+
+ws.send(json.dumps({"op": "subscribe_lane"}))
+print(json.loads(ws.recv()))  # {ok, subscribed, hz}
+
+while True:
+    msg = json.loads(ws.recv())
+    if msg.get("op") == "lane_state":
+        d = msg["data"]
+        # d 跟 GET /v1/vision/lane/state 返回完全一致
+        error_y, error_angle = d["error_y"], d["error_angle"]
+        # ... 你的外环控制 ...
+```
+
+服务端行为：
+- 后台起 asyncio 任务，按 20Hz 轮询 `get_lane_state()`，**只在 `updated_at` 变化时 push**
+- 5 秒实测 ~80 次 push（受 lane_feed 频率上限约束）
+- `op: unsubscribe_lane` 或连接断开时自动 cancel 任务
+
+下发轮速用同一个 WS（不走 job_queue，50Hz 友好；走 car_lock 同步路径）：
+
+**推荐：`op: realtime/chassis_velocity` 直接发 (vx, vy, wz)**，服务端 IK 反算 4 轮速、绕开 set_velocity 的里程计耦合：
+
+```python
+ws.send(json.dumps({
+    "op": "realtime/chassis_velocity",
+    "vx": 0.3, "vy": 0.0, "wz": 0.0    # m/s 和 rad/s
+}))
+```
+
+**备选：`op: realtime/wheel_speeds` 直接发 4 轮速**（你自己算好 IK）：
+
+```python
+ws.send(json.dumps({
+    "op": "realtime/wheel_speeds",
+    "speeds": [v1, v2, v3, v4]   # 4 个轮速（m/s）
+}))
+```
+
+HTTP 也行（同步路径一样）：
+
+```bash
+curl -X POST http://192.168.3.60:5050/v1/realtime/chassis-velocity \
+     -H 'Content-Type: application/json' \
+     -d '{"vx":0.3,"vy":0,"wz":0}'
+```
+
+#### 完整外环骨架（Python）
+
+```python
+import json, websocket
+
+ws = websocket.create_connection('ws://192.168.3.60:5050/v1/ws')
+ws.recv()  # welcome
+
+ws.send(json.dumps({"op": "subscribe_lane"}))
+ws.recv()  # subscribe ack
+
+while True:
+    msg = json.loads(ws.recv())
+    if msg.get("op") != "lane_state":
+        continue
+    d = msg["data"]
+    ey, ea = d["error_y"], d["error_angle"]
+    if ey is None: continue
+    # === 你的外环控制律 ===
+    vx = 0.3                          # 前向速度
+    vy = -0.5 * ey                    # 横移修正
+    wz = -0.8 * ea                    # 转向修正
+    # 直发 (vx, vy, wz)，服务端 IK 反算 4 轮速
+    ws.send(json.dumps({
+        "op": "realtime/chassis_velocity",
+        "vx": vx, "vy": vy, "wz": wz,
+    }))
+```
+
 ## 3. 目标检测结果
 
 ### `POST /v1/vision/task`

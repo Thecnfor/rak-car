@@ -65,17 +65,75 @@ class ArmRunner:
         )
         return job
 
-    def move_x(self, x_mm: float, timeout: Optional[float] = None) -> dict:
-        return self.client.move_x(x_mm=x_mm, timeout=timeout or self.default_timeout_s)
+    def move_x(self, x_mm: float, timeout: Optional[float] = None,
+               verify: bool = True) -> dict:
+        """移动 x 轴（撞墙=0，远离为正）。
 
-    def move_y(self, y_mm: float, timeout: Optional[float] = None) -> dict:
-        return self.client.move_y(y_mm=y_mm, timeout=timeout or self.default_timeout_s)
+        verify=True 时：move 后对比 actual vs target，
+        偏差 > origin.step_loss_x_mm 时 warn（不重发，因为 x 是 motor_280 闭环，
+        跑偏通常是机械卡阻，重发没意义）。
+        """
+        job = self.client.move_x(x_mm=x_mm, timeout=timeout or self.default_timeout_s)
+        if verify:
+            self._verify_x(x_mm=x_mm)
+        return job
+
+    def move_y(self, y_mm: float, timeout: Optional[float] = None,
+               verify: bool = True) -> dict:
+        """移动 y 轴（触底=0，向下为正、向上为负）。
+
+        驱动层（arm_base.move_y_position）已经自带丢步兜底，调用一次就收敛。
+        verify=True 时：上层再读一次 actual，超阈值时 warn（不重发，避免和驱动打架）。
+        """
+        job = self.client.move_y(y_mm=y_mm, timeout=timeout or self.default_timeout_s)
+        if verify:
+            self._verify_y(y_mm=y_mm)
+        return job
+
+    def _verify_y(self, y_mm: float) -> None:
+        """y 上层校验（驱动层已闭环，仅做 sanity check）。"""
+        origin = self.client.origin
+        threshold = origin.step_loss_y_mm if origin else 2.0
+        try:
+            state = self.client.get_state()
+        except Exception as e:
+            logger.warning("verify_y: 读状态失败: %s", e)
+            return
+        err = y_mm - state.y_mm
+        if abs(err) > threshold:
+            logger.warning(
+                "verify_y: target=%.1f actual=%.1f err=%.1fmm（驱动层应已兜底，"
+                "若反复看到建议 reset_y）", y_mm, state.y_mm, err,
+            )
+
+    def _verify_x(self, x_mm: float) -> None:
+        """x 上层校验（x 是编码器闭环，正常不跑偏；偏差大多是机械卡阻）。"""
+        origin = self.client.origin
+        threshold = origin.step_loss_x_mm if origin else 5.0
+        try:
+            state = self.client.get_state()
+        except Exception as e:
+            logger.warning("verify_x: 读状态失败: %s", e)
+            return
+        err = x_mm - state.x_mm
+        if abs(err) > threshold:
+            logger.warning(
+                "verify_x: target=%.1f actual=%.1f err=%.1fmm", x_mm, state.x_mm, err,
+            )
 
     def set_side(self, side: str, timeout: Optional[float] = None) -> dict:
         return self.client.set_side(side, timeout=timeout or self.default_timeout_s)
 
     def set_hand(self, hand: str, timeout: Optional[float] = None) -> dict:
         return self.client.set_hand(hand, timeout=timeout or self.default_timeout_s)
+
+    def set_storage(self, side: str, timeout: Optional[float] = None) -> dict:
+        """切换存储仓到 LEFT/RIGHT（写死角度的两档枚举）。"""
+        return self.client.set_storage(side, timeout=timeout or self.default_timeout_s)
+
+    def get_storage(self) -> str:
+        """只读当前存储仓档位（客户端缓存，不会下发舵机动作）。"""
+        return self.client.get_storage()
 
     def grasp(self, on: bool, timeout: Optional[float] = None) -> dict:
         return self.client.grasp(on, timeout=timeout or self.default_timeout_s)
@@ -85,6 +143,22 @@ class ArmRunner:
         self.client.set_hand("UP", timeout=10)
         self.client.set_side("MID", timeout=10)
         return self.move_xy(0.0, 0.0)
+
+    # ---- 复位 ----
+
+    def reset_y(self, timeout: float = 30.0) -> dict:
+        """y 步进电机触底复位（车端跑 reset_position，会同时触发 x 复位）。
+
+        仅在 y 跑偏严重（补偿不收敛）时调。
+        """
+        return self.client._call_arm("reset_position", timeout=timeout)
+
+    def reset_x(self, timeout: float = 30.0) -> dict:
+        """x 编码器电机堵转复位。
+
+        仅在 x 跑偏严重（卡阻、打滑）时调。
+        """
+        return self.client._call_arm("reset_x", timeout=timeout)
 
     # ---- 业务组合 ----
 

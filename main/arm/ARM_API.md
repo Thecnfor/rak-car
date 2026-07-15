@@ -96,6 +96,8 @@ class ArmState:
 | `move_y(y_mm)` | 单轴 | mm |
 | `set_side(side)` | 大臂方向 | enum |
 | `set_hand(hand)` | 手爪角度 | enum |
+| `set_storage(side)` | 存储仓档位（LEFT/RIGHT，写死角度） | enum |
+| `get_storage()` | 只读当前存储仓档位（客户端缓存，不会下发舵机动作） | — |
 | `grasp(on)` | 吸盘 | bool |
 | `go_home()` | 回 y=0, x=0, hand=UP, side=MID | — |
 | `pick(side, x_mm, y_mm)` | set_side + move_xy + grasp(True) | enum, mm, mm |
@@ -197,8 +199,30 @@ class TrajectoryPlan:
 | 单轴移动 | `ArmClient.move_x/move_y` |
 | 改大臂方向 | `ArmClient.set_side("LEFT")` |
 | 改手爪角度 | `ArmClient.set_hand("DOWN")` |
+| 切存储仓档位 | `ArmClient.set_storage("RIGHT")` |
+| 读存储仓档位 | `ArmClient.get_storage()` |
 | 抓取 | `ArmClient.grasp(True)` |
 | 释放 | `ArmClient.grasp(False)` |
 | 读位姿 | `ArmClient.get_state()` |
 | 算 S 曲线（不下发） | `TrajectoryGenerator().plan_xy(...)` |
 | 完整 pick-and-place | `examples/04_grasp_template.py` |
+
+## 10. 存储仓 set_storage 角度范围
+
+存储仓是独立 PWM 舵机（port=1），LEFT/RIGHT 角度写死：
+
+- `STORAGE_DEFAULT_LEFT_ANGLE = -42°`
+- `STORAGE_DEFAULT_RIGHT_ANGLE = 90°`
+
+下发时 `ServoPwm` wrapper 把 `angle` 转成 `int(angle/180*180 + 90) = angle + 90`：
+
+- LEFT → 协议值 `48`
+- RIGHT → 协议值 `180`（临界）
+
+协议层说明：
+
+- `mc601` 自动 clamp 到 0~180，安全
+- `mc602` **不 clamp**，超出 0~180 会触发舵机瞬间回中/回弹
+- 历史事故：`RIGHT=165° → 协议值 255`，舵机"摆一下就回弹"
+
+**改角度常量时务必保证 `angle + 90 ∈ [0, 180]`**。否则 `car_wrap_2026.set_storage` 直接抛 `ValueError`。
