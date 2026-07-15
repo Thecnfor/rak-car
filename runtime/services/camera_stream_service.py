@@ -75,6 +75,9 @@ class CameraStreamService:
         # 避免每个连接独立 cv2.imencode 抢占 CPU。
         self._jpeg_cache = {}
         self.lane_state = self._default_lane_state()
+        # 机械臂 y/x 位置缓存：与 lane_state 同生命周期(meta_lock 保护),
+        # 由 car.start_arm_feed 守护线程持续刷新,subscribe_arm_state WS op 推送。
+        self.arm_state = self._default_arm_state()
 
     def start(self):
         if self.running:
@@ -814,5 +817,37 @@ class CameraStreamService:
             "angular_speed": None,
             "distance": None,
             "frame_shape": None,
+            "updated_at": None,
+        }
+
+    # === arm 位置缓存（供 subscribe_arm_state WS op 推送）===
+    def set_arm_state(self, **updates):
+        """由 car.start_arm_feed 守护线程持续刷新的机械臂 y/x 位置。
+
+        y_mm/x_mm: 业务坐标,触底=0,撞墙=0;负=向上/向左,正=向下/向右。
+        y_m/x_m:   SDK 原始坐标(m),精度更高。
+        ref_encoder: 最近一次 reset_y 后的编码器零点,丢步核对用。
+        """
+        with self.meta_lock:
+            state = dict(self.arm_state)
+            for key, value in updates.items():
+                state[key] = value
+            state["updated_at"] = time.time()
+            self.arm_state = state
+            return dict(state)
+
+    def get_arm_state(self):
+        with self.meta_lock:
+            state = dict(self.arm_state)
+        return state
+
+    def _default_arm_state(self):
+        return {
+            "active": False,
+            "y_m": None,         # SDK 原始(m)
+            "x_m": None,         # SDK 原始(m)
+            "y_mm": None,        # 业务(mm)
+            "x_mm": None,        # 业务(mm)
+            "ref_encoder": None, # 丢步核对 ref
             "updated_at": None,
         }

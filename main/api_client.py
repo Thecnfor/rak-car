@@ -266,6 +266,17 @@ class RuntimeApiClient:
         """
         return self._request("GET", f"{self.api_prefix}/realtime/lane/state")
 
+    def get_arm_state(self):
+        """读机械臂实时 y/x 位置(arm_feed 守护线程缓存,默认 20Hz 刷新)。
+
+        与 get_lane_state 完全同构:不进 job_queue、不打 ZMQ、不抢 car_lock,
+        只取 streamer 的 meta_lock(极快)。
+
+        返回 `{"arm_state": {"y_m": ..., "x_m": ..., "y_mm": ..., "x_mm": ..., "ref_encoder": ..., "active": ...}}`。
+        字段为 None 时说明 arm_feed 未运行或刚启动。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/arm/state")
+
     def run_task(self, name, *args, **kwargs):
         return self.create_job("task", name, args=list(args), kwargs=kwargs)
 

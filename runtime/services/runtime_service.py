@@ -289,6 +289,15 @@ class CarRuntimeService:
         time.sleep(1)
         if reset_arm:
             car.arm.reset_position()
+        else:
+            # 即使外部没要求 reset_arm,每次 init 仍要 y 轴归零:
+            # 控制器重启/USB 重连后 y 编码器基准点丢失,不清零 move_y 会在错误基准上跑。
+            # 失败不抛(可能机械臂在不允许动的状态),仅记 last_error。
+            try:
+                car.arm.reset_y()
+            except Exception as exc:
+                self.last_error = "arm reset_y 失败: {}".format(exc)
+                logger.warning("init 时 reset_y 失败: %s" % exc)
         if reset_position:
             car.reset_position()
         self.car = car
@@ -302,6 +311,12 @@ class CarRuntimeService:
             car.start_lane_feed(hz=20.0)
         except Exception as exc:  # pragma: no cover - 不让 init 失败
             logger.warning("lane_feed auto-start failed: {}".format(exc))
+        # 默认启 arm_feed 守护线程:持续刷新 streamer.arm_state(y/x 位置),
+        # 供 WS subscribe_arm_state 实时推送,调试机械臂必备
+        try:
+            car.start_arm_feed(hz=20.0)
+        except Exception as exc:
+            logger.warning("arm_feed auto-start failed: {}".format(exc))
         return car
 
     def _ensure_infer_ready(self):
@@ -341,6 +356,11 @@ class CarRuntimeService:
                         self.car.start_lane_feed(hz=20.0)
                     except Exception as exc:  # pragma: no cover
                         logger.warning("lane_feed auto-start (reused) failed: {}".format(exc))
+                    # arm_feed 同理
+                    try:
+                        self.car.start_arm_feed(hz=20.0)
+                    except Exception as exc:
+                        logger.warning("arm_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()
@@ -399,18 +419,33 @@ class CarRuntimeService:
         self.infer_service.stop()
 
     def emergency_stop(self):
-        with self.car_lock:
-            if self.car is None:
-                return False
-            self.car._stop_flag = True
-            self.car.stop()
+        # 关键：不持 car_lock。worker 跑长动作（reset_position / move_* / 巡线）时
+        # car_lock 被占，若这里也抢 car_lock 会排队等长动作结束 → 急停失效。
+        # 停车指令走串口层自带锁，与 worker 并发安全；car.emergency_stop 内部
+        # 置 _stop_flag/_estop 让正在跑的循环协作退出，并直接停三轴。
+        car = self.car
+        if car is None:
+            return False
+        try:
+            return bool(car.emergency_stop())
+        except AttributeError:
+            # 兼容旧 car（无 emergency_stop）：至少置标志 + 停底盘
+            car._stop_flag = True
+            try:
+                car.stop()
+            except Exception:
+                pass
             return True
 
     def reset_stop_flag(self):
-        with self.car_lock:
-            if self.car is None:
-                return False
-            self.car._stop_flag = False
+        # 同样不持 car_lock，保证急停恢复不被卡住的长动作阻塞
+        car = self.car
+        if car is None:
+            return False
+        try:
+            return bool(car.clear_stop())
+        except AttributeError:
+            car._stop_flag = False
             return True
 
     # === 实时硬件控制（car_lock 同步路径，绕过 job_queue，50Hz 友好） ===
@@ -470,6 +505,19 @@ class CarRuntimeService:
         if self.stream_service is None:
             raise RuntimeError("stream_service 未注入（runtime 启动异常）")
         return self.stream_service.get_lane_state()
+
+    def get_arm_state(self):
+        """调试/UI 专用：读 streamer 缓存的 arm_state（机械臂 y/x 位置）。
+
+        数据来源：`arm_feed` 守护线程（runtime 启动后默认 20Hz）通过
+        `car.streamer.set_arm_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 `meta_lock`（极快）。
+        20Hz+ 轮询安全。
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_arm_state()
 
     def set_single_motor(self, port, speed, reverse=1):
         with self.car_lock:
@@ -570,8 +618,11 @@ class CarRuntimeService:
             }
 
     def get_car_for_stream(self):
-        with self.car_lock:
-            return self.car
+        # 不持 car_lock：capture_loop 在机械臂长动作期间会被卡住 5+s，
+        # 导致 stream 缓存不更新,前端 MJPEG/frame 一直吐最后那帧(画面卡死)。
+        # self.car 是单实例属性，读取是 GIL 原子操作,无撕裂风险。
+        # 切换 self.car 仅发生在 init/recover 流程,且会同步停止 capture_loop 一拍。
+        return self.car
 
     def list_actions(self):
         return {

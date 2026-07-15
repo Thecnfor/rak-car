@@ -244,18 +244,48 @@ class RuntimeWsClient:
           # ... 运行若干秒 ...
           stop()  # 断开订阅连接
         """
-        # 幂等：同一 client 多次订阅返回同一个 unsubscribe 句柄
-        existing = getattr(self, "_lane_subscriber", None)
+        return self._subscribe_push(
+            slot_attr="_lane_subscriber",
+            subscribe_op="subscribe_lane",
+            push_op="lane_state",
+            on_state=on_state,
+            hz=hz,
+        )
+
+    def subscribe_arm_state(self, on_state, hz=20.0):
+        """订阅 arm_state 推送——机械臂 y/x 实时位置。
+
+        行为与 `subscribe_lane` 完全一致:
+          - 独立 WS 连接,服务端按 `arm_feed` 节奏(默认 20Hz)推 `arm_state` dict
+          - 字段:`y_m`/`x_m`(SDK m),`y_mm`/`x_mm`(业务 mm),`ref_encoder`(丢步核对)
+
+        用法:
+          stop = client.subscribe_arm_state(lambda s: print(s['y_mm'], s['x_mm']))
+          # ...
+          stop()
+        """
+        return self._subscribe_push(
+            slot_attr="_arm_subscriber",
+            subscribe_op="subscribe_arm_state",
+            push_op="arm_state",
+            on_state=on_state,
+            hz=hz,
+        )
+
+    def _subscribe_push(self, slot_attr, subscribe_op, push_op, on_state, hz):
+        """通用推送订阅,被 subscribe_lane / subscribe_arm_state 共用。"""
+        existing = getattr(self, slot_attr, None)
         if existing is not None and existing.is_alive():
             return existing.stop
-
-        sub = _LaneStateSubscriber(
+        sub = _PushSubscriber(
             ws_url=self.ws_url,
             on_state=on_state,
             poll_interval=max(1.0 / max(float(hz), 1.0), 0.001),
+            subscribe_op=subscribe_op,
+            push_op=push_op,
         )
         sub.start()
-        self._lane_subscriber = sub
+        setattr(self, slot_attr, sub)
         return sub.stop
 
     @property
@@ -263,19 +293,26 @@ class RuntimeWsClient:
         sub = getattr(self, "_lane_subscriber", None)
         return sub is not None and sub.is_alive()
 
+    @property
+    def arm_subscription_active(self):
+        sub = getattr(self, "_arm_subscriber", None)
+        return sub is not None and sub.is_alive()
 
-class _LaneStateSubscriber:
-    """独立 WebSocket 连接，只负责收 lane_state 推送。
 
-    独立连接的设计目的：避免推送帧和主连接的 req/rep 流相互抢占——
-    websocket-client 是单 conn 单 recv，独立连接让两条流零干扰。
+class _PushSubscriber:
+    """独立 WebSocket 连接,通用推送订阅(lane_state / arm_state 共用)。
+
+    独立连接的设计目的:避免推送帧和主连接的 req/rep 流相互抢占——
+    websocket-client 是单 conn 单 recv,独立连接让两条流零干扰。
     服务端 asyncio 同时跑 N 条 WS 连接的代价可忽略。
     """
 
-    def __init__(self, ws_url, on_state, poll_interval):
+    def __init__(self, ws_url, on_state, poll_interval, subscribe_op, push_op):
         self._ws_url = ws_url
         self._on_state = on_state
         self._poll_interval = poll_interval
+        self._subscribe_op = subscribe_op
+        self._push_op = push_op
         self._stop_event = threading.Event()
         self._thread = None
         self._conn = None
@@ -284,7 +321,7 @@ class _LaneStateSubscriber:
 
     def start(self):
         self._thread = threading.Thread(
-            target=self._run, name="lane-subscriber", daemon=True
+            target=self._run, name="ws-subscriber-" + self._subscribe_op, daemon=True
         )
         self._thread.start()
 
@@ -293,7 +330,6 @@ class _LaneStateSubscriber:
 
     def stop(self):
         self._stop_event.set()
-        # 关连接让阻塞的 recv() 立刻抛异常，线程退出
         conn = self._conn
         if conn is not None:
             try:
@@ -306,15 +342,15 @@ class _LaneStateSubscriber:
     def _run(self):
         try:
             self._conn = create_connection(self._ws_url, timeout=2.0)
-            # server 立刻发 welcome，先吃掉
+            # server 立刻发 welcome,先吃掉
             try:
                 self._conn.settimeout(2.0)
                 self._conn.recv()
             except Exception:
                 pass
-            # 发订阅请求；服务端的 ack 也会通过同一个连接回，先吃掉
+            # 发订阅请求;服务端的 ack 也会通过同一个连接回,先吃掉
             self._conn.send(
-                json.dumps({"op": "subscribe_lane", "hz": 1.0 / self._poll_interval})
+                json.dumps({"op": self._subscribe_op, "hz": 1.0 / self._poll_interval})
             )
             try:
                 self._conn.settimeout(2.0)
@@ -324,7 +360,7 @@ class _LaneStateSubscriber:
                     return
             except Exception:
                 return
-            # 主循环：等推送
+            # 主循环:等推送
             while not self._stop_event.is_set():
                 try:
                     self._conn.settimeout(1.0)
@@ -342,12 +378,12 @@ class _LaneStateSubscriber:
                     data = json.loads(raw)
                 except Exception:
                     continue
-                if data.get("op") != "lane_state":
+                if data.get("op") != self._push_op:
                     continue
                 self.push_count += 1
-                lane_state = data.get("data") or {}
+                payload = data.get("data") or {}
                 try:
-                    self._on_state(lane_state)
+                    self._on_state(payload)
                 except Exception:
                     # 回调抛异常不能让订阅线程死
                     self.error_count += 1

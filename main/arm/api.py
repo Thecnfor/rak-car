@@ -134,7 +134,7 @@ class ArmClient:
             y_origin_m=float(data.get("y_origin_m", 0.0)),
             x_origin_m=float(data.get("x_origin_m", 0.0)),
             x_wall=str(data.get("x_wall", "left")),
-            soft_y_max_m=float(data.get("soft_y_max_m", 0.18)),
+            soft_y_max_m=float(data.get("soft_y_max_m", 0.20)),
             soft_x_min_m=float(data.get("soft_x_min_m", 0.005)),
             soft_x_max_m=float(data.get("soft_x_max_m", 0.30)),
             calibrated_at=str(data.get("calibrated_at", "")),
@@ -302,7 +302,7 @@ class ArmClient:
 
         只接受两个档位：
           - "LEFT"  → 写死角度 STORAGE_DEFAULT_LEFT_ANGLE（-42°，与初始化复位角度一致）
-          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（90°，车端 servo_1_angle_list[1]）
+          - "RIGHT" → 写死角度 STORAGE_DEFAULT_RIGHT_ANGLE（165°）
 
         底层走 car.set_storage(bool)，它在 car_wrap_2026.sensor_init 阶段已构造。
         之所以走 car（而不是 arm）是因为这块舵机不属于机械臂（arm），属于车体外设。
@@ -320,9 +320,8 @@ class ArmClient:
         side = _normalize_storage_side(side)
         if side is None:
             raise ValueError(f"set_storage 必须给 {STORAGE_SIDES}")
-        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 90°（RIGHT 档），
+        # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 165°（RIGHT 档），
         # False → servo_1_angle_list[0] = -42°（LEFT 档）。
-        # （历史曾用 165°，协议值 255 超 0~180，mc602 会回弹，已统一为 90°）
         open_flag = side == "RIGHT"
         job = self._call_car("set_storage", timeout=timeout, state=open_flag)
 

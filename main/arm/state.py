@@ -40,7 +40,7 @@ class ArmOrigin:
     y_origin_m: float = 0.0           # y 触底时的原始 motor_y.get_dis() 值
     x_origin_m: float = 0.0           # x 撞墙时的原始 motor_x.get_dis() 值
     x_wall: str = "left"              # 上次撞的是哪一侧
-    soft_y_max_m: float = 0.18        # 业务软上限（m）
+    soft_y_max_m: float = 0.20        # 业务软上限（m）,实测行程可达 -200mm 还有富余
     soft_x_min_m: float = 0.005
     soft_x_max_m: float = 0.30
     # 丢步/位置偏差阈值（mm）：move_x / move_y 完成后对比 actual vs target，超此值 warn。
@@ -81,7 +81,7 @@ class ArmState:
     x_origin_valid: bool = False
 
     # 软限位（从 ArmOrigin 拷过来）
-    soft_y_max_mm: float = 180.0
+    soft_y_max_mm: float = 200.0
     soft_x_min_mm: float = 5.0
     soft_x_max_mm: float = 300.0
 

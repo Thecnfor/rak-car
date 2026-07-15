@@ -35,7 +35,7 @@ horiz_cfg:
 pos_cfg:
   pose_enable: true
   pose_horiz: 0.0
-  pose_vert: 0.009800000000000001
+  pose_vert: 0.002195
   side: RIGHT
 vert_cfg:
   motor:
@@ -51,7 +51,18 @@ vert_cfg:
     output_limits:
     - -0.1
     - 0.1
+  # 软限位 + 分段减速参数。
+  # threshold 必须为 [-soft_y_max, 0]（负=向上, 0=触底）;
+  # 旧值 [0, 0.2] 把负向全部钳掉,导致 move_y(-0.18) 被错误拦截,已修正。
+  # 行程上限设为 -200mm,实测仍有富余。
   threshold:
-  - 0
-  - 0.2
+  - -0.20
+  - 0.0
+  # 末段减速带：y >= -slow_band 时（接近磁感）, PWM 限幅降到 slow_velocity 防过冲。
+  slow_band_m: 0.015
+  slow_velocity: 0.02
+  # 顶段减速带：y <= -(slow_band + top_slow) 时（远离磁感,接近顶部机械硬限位）, 减速防失步。
+  # 仅用于 move_y_position 往上走;reset_y 永不下行,不走此分支。
+  top_slow_m: 0.020
+  top_slow_velocity: 0.03
 arm_length: 0.23

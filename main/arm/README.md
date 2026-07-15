@@ -36,14 +36,14 @@
 - SDK 实际行为（用户实测确认）：`move_y(-50mm)` 机械臂向上走 50mm，`move_y(+50mm)` 朝磁感方向走 50mm（被安全门堵住）。
 - 业务层 `move_y(y_mm)` 直传 `target=y_mm/1000` 给车端，**不在客户端取反**。
 - 业务层注释/文档/软限位检查全部按 `y<0=向上、y>0=向下、y=0=触底、[-soft_y_max, 0]` 写，与 SDK 完全一致。
-- 软限位常量名 `soft_y_max_mm` 是「**绝对值上限**」（180mm），不是带符号上限。
-  - 业务层 valid range: `0 ≥ y_mm ≥ -soft_y_max_mm`（即 `y_mm ∈ [-180, 0]` mm）。
+- 软限位常量名 `soft_y_max_mm` 是「**绝对值上限**」（200mm），不是带符号上限。
+  - 业务层 valid range: `0 ≥ y_mm ≥ -soft_y_max_mm`（即 `y_mm ∈ [-200, 0]` mm）。
 
 软限位（首次 calibrate 时手调，写入 `arm_origin.yaml`）：
 
 | 项 | 默认值 | 含义 |
 | --- | --- | --- |
-| `soft_y_max_mm` | 180 | y 业务上限 |
+| `soft_y_max_mm` | 200 | y 业务上限（实测行程 -200mm 还有富余） |
 | `soft_x_min_mm` | 5 | x 业务下界（防止撞墙） |
 | `soft_x_max_mm` | 300 | x 业务上限 |
 
@@ -125,7 +125,7 @@ ArmState(
     x_mm=0.0, y_mm=0.0,
     side="MID", hand="UP", grasping=False,
     y_origin_valid=False, x_origin_valid=False,
-    soft_y_max_mm=180.0, soft_x_min_mm=5.0, soft_x_max_mm=300.0,
+    soft_y_max_mm=200.0, soft_x_min_mm=5.0, soft_x_max_mm=300.0,
     raw_x_m=0.0, raw_y_m=0.0,
     arm_angle=None, hand_angle=None,
     fetched_at=1761234567.89,
@@ -197,3 +197,4 @@ main/arm/
 - 10 行起步：[QUICKSTART.md](./QUICKSTART.md)
 - 全部接口速查：[main/API.md](../API.md)
 - 底层细节：[smartcar/whalesbot/vehicle/arm/arm_base.py](../../smartcar/whalesbot/vehicle/arm/arm_base.py)
+- **软件急停 / `reset_y` 找底方向 / 急停 HTTP 端点：[SOFTWARE_ESTOP.md](./SOFTWARE_ESTOP.md)**

@@ -228,3 +228,193 @@ class TrajectoryPlan:
 - 历史事故：`RIGHT=165° → 协议值 255`，舵机"摆一下就回弹"
 
 **改角度常量时务必保证 `angle + 90 ∈ [0, 180]`**。否则 `car_wrap_2026.set_storage` 直接抛 `ValueError`。
+
+## 软限位与行程
+
+- **业务 y 上限**：`soft_y_max_mm` = **200 mm**（默认 200.0），即 `y ∈ [-200, 0] mm`。
+- **SDK y_threshold**：`arm_cfg.yaml` 的 `vert_cfg.threshold = [-0.20, 0.0]`,与业务层一致。
+- **硬件实测定**:从 0 走到 `-0.20` 仍有余量,未撞顶部机械硬限位。
+- **末段减速带**（`y >= -0.015`）:PWM 限幅 `0.02 m/s`,防过冲。
+- **顶段减速带**（`y <= -0.035`）:PWM 限幅 `0.03 m/s`,防失步。**仅 `move_y_position` 往上走时生效**;`reset_y` 永不下行,不走此分支。
+
+> 历史:旧版 `soft_y_max_mm=180` + `threshold=[0, 0.2]`（错配,正方向）已统一改为 `200` + `[-0.20, 0.0]`。
+
+## `reset_y` 行为（**磁感是唯一到底凭证**）
+
+> 这是与过去所有版本最大的区别。务必读懂再用。
+
+### 触发场景
+
+| 入口 | 行为 |
+| --- | --- |
+| HTTP `POST /v1/execute {"target":"arm","name":"reset_y"}` | 直接调,绕开 `reset_position`（不重启 x/角度） |
+| `car.reset_position()` | 内部开线程调 `reset_y` + `reset_x` |
+| **`runtime _create_car_locked`** | 每次 init 默认调 `reset_y`（除非 `reset_arm=True` 此时会跑 `reset_position` 包含 `reset_y`） |
+
+### 算法
+
+```
+_y_seeking_bottom = True        # 让 y_speed 磁感门对正速度放行
+while 没超时:
+  if 急停: 中止
+  if 磁感触发:
+    if 首次触发: 记 triggered_at
+    elif dwell(50ms) 通过: 归零 + 记 ref_encoder + return True
+  else:
+    按当前 y 选档:
+      cur >= -slow_band(15mm): v = +0.02 m/s  # 末段极慢
+      else:                    v = +0.08 m/s  # 远段快
+    y_speed(v)                 # 包含末段限幅
+```
+
+**关键不变量**:
+- 找底期间**只有正向速度**(向下),`v > 0`。
+- 成功条件**只有真磁感触发 + 50ms dwell**;`y_stop_check` 已被新实现**完全忽略**(旧实现被它误判导致"假到底")。
+- 失败(超时/急停/卡死)**不伪归零**——返回 `False`,`y_pose_start` 保持原值,后续 `move_y_position` 会发现偏差并 warn。
+- 收工**必 `y_speed(0)`**——绝不残留速度。
+
+### 返回值
+
+- `True`  = 磁感触发 + dwell 通过,已归零
+- `False` = 超时/急停/卡死,未归零(y_pose_now 保持搜索前值)
+
+### 失败时的诊断
+
+| 现象 | 看哪 |
+| --- | --- |
+| 永远 10s 超时 | `arm_base.py reset_y: 找底 %.1fs 超时未触发磁感` → 磁感线/磁铁松脱 |
+| 编码器持续不动 | `reset_y: 编码器持续 2.0s 不动, 疑似失步/卡死` → 撞顶失步或机械卡死 |
+| 收工 y ≠ 0 | 物理磁感触发点比机械底高 ~10-15mm,属正常,需要绝对精度时看 `ref_encoder` |
+
+## 启动归零（init 流程）
+
+`runtime _create_car_locked` 每次创建 `MyCar` 后:
+
+1. `reset_arm=False`(默认):**只调 `reset_y`**,不调 `reset_position`(不动 x/角度/底盘)
+2. `reset_arm=True`:调 `reset_position` 完整复位(含 `reset_y`)
+
+为何默认 y 归零?
+- 控制器重启/USB 重连后 y 编码器基准点丢失
+- 不归零的话后续 `move_y` 会在错误基准上跑,导致距离全错
+- 失败不抛 init(避免 1 次瞬态故障阻断整个 runtime),仅记 `last_error`
+
+## 丢步核对
+
+`move_y_position` 完成后会自动核对:
+
+- 用 `reset_y` 记录的 `ref_encoder` + 累积命令位移 vs 编码器实际位移
+- 偏差 > 5mm → `move_y_position 疑似丢步` warn(不抛错,业务层可订阅日志)
+- 偏差 > 2mm × N 次 → 建议手动重置原点(`reset_y`)
+
+## 相关文档
+
+- **软件急停 / `reset_y` 找底方向 / HTTP 急停端点**：[SOFTWARE_ESTOP.md](./SOFTWARE_ESTOP.md)
+- 子包总览：[README.md](./README.md) · 快速起步：[QUICKSTART.md](./QUICKSTART.md)
+
+## 实时 y/x 位置接口
+
+机械臂 y/x 位置由 runtime 启动时**默认**开启的 `arm_feed` 守护线程持续刷新到 `streamer.arm_state`,然后通过 HTTP / WS 暴露。**所有路径都不抢 car_lock**,调试/UI 轮询 20Hz+ 安全。
+
+### HTTP 一次性读取
+
+```bash
+curl http://192.168.6.231:5050/v1/realtime/arm/state
+```
+
+返回：
+
+```json
+{
+  "ok": true,
+  "arm_state": {
+    "active": true,
+    "mode": "arm_feed",
+    "y_m": 0.0,            // SDK 原始坐标(米)
+    "x_m": 0.0,
+    "y_mm": 0.0,           // 业务坐标(毫米),与 main.arm 一致
+    "x_mm": 0.0,           // 业务坐标,负=向左,正=向右
+    "ref_encoder": 0.0115, // 最近一次 reset_y 后的编码器零点
+    "updated_at": 1784099908.66
+  }
+}
+```
+
+### WebSocket 实时推送(推荐用于调试/UI)
+
+`/v1/ws` 端点新增两个 op,与 `subscribe_lane` 完全同构:
+
+| op | 方向 | 说明 |
+| --- | --- | --- |
+| `subscribe_arm_state` | client → server | 订阅 arm_state 推送,服务端按 `updated_at` 变化推 |
+| `unsubscribe_arm_state` | client → server | 取消订阅,server 关闭推送 task |
+| `arm_state` | server → client | 推送数据,字段同 HTTP 响应 |
+| `realtime/arm_state` | client → server | 一次性读取(等价于 HTTP) |
+
+### `RuntimeWsClient.subscribe_arm_state` 用法
+
+```python
+from main.ws_client import RuntimeWsClient
+client = RuntimeWsClient("ws://192.168.6.231:5050/v1/ws")
+client.connect()
+
+def on_arm(state):
+    y_mm = state.get("y_mm")
+    x_mm = state.get("x_mm")
+    print(f"y={y_mm:.1f}mm  x={x_mm:.1f}mm  ref={state.get('ref_encoder'):.4f}")
+
+stop = client.subscribe_arm_state(on_arm, hz=20.0)
+# ... 跑机械臂 ...
+stop()  # 断开订阅
+```
+
+### `RuntimeApiClient.get_arm_state` 一次性查询
+
+```python
+from main.api_client import RuntimeApiClient
+client = RuntimeApiClient("http://192.168.6.231:5050")
+state = client.get_arm_state()["arm_state"]
+print(state["y_mm"], state["x_mm"])
+```
+
+### 字段语义
+
+| 字段 | 类型 | 含义 |
+| --- | --- | --- |
+| `y_m` / `x_m` | float / None | SDK 内部坐标,**米**,与 `arm.y_get_position()` 一致 |
+| `y_mm` / `x_mm` | float / None | 业务坐标,**毫米**,=`y_m*1000` / `x_m*1000` |
+| `ref_encoder` | float / None | 最近 `reset_y` 触发磁感时的编码器值,丢步核对用 |
+| `active` | bool | `arm_feed` 守护线程是否在跑 |
+| `mode` | str | `"arm_feed"`(运行中)/ `"idle"`(已停) |
+| `updated_at` | float / None | unix 时间戳,WS 推送用它判"是否新数据" |
+
+> 业务坐标系与 SDK 完全一致:触底/撞墙=0,负=向上/向左(远离触底/远离墙)。
+
+### HTTP/WS 速查
+
+```
+GET  /v1/realtime/arm/state              一次性读 (curl 调试)
+
+WS   /v1/ws
+  -> {"op": "subscribe_arm_state", "hz": 20.0}
+  <- {"ok": true, "op": "subscribe_arm_state", "subscribed": true, "hz": 20.0}
+  <- {"ok": true, "op": "arm_state", "data": {...}}   # 持续推送
+  -> {"op": "unsubscribe_arm_state"}
+  <- {"ok": true, "op": "unsubscribe_arm_state", "subscribed": false}
+
+WS   /v1/ws
+  -> {"op": "realtime/arm_state"}
+  <- {"ok": true, "op": "realtime/arm_state", "data": {"arm_state": {...}}}
+```
+
+### 行为约束
+
+- **不抢 car_lock**:取数据走 `meta_lock`,机械臂长动作期间不卡帧
+- **不污染主帧流**:`arm_feed` 不读摄像头、不写 `frames`,仅写 `arm_state` meta
+- **init 时自动启**:`runtime _create_car_locked` 默认起 `arm_feed`(20Hz),除非 `arm_feed 启动失败` 才会缺失
+- **手动启停**:`car.start_arm_feed(hz=20)` / `car.stop_arm_feed()`,幂等
+- **disconnect 自动清理**:WS 断连时 `arm_push_task` 自动 cancel
+
+## 相关文档
+
+- **软件急停 / `reset_y` 找底方向 / HTTP 急停端点**：[SOFTWARE_ESTOP.md](./SOFTWARE_ESTOP.md)
+- 子包总览：[README.md](./README.md) · 快速起步：[QUICKSTART.md](./QUICKSTART.md)

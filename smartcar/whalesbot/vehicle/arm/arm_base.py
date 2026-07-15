@@ -87,15 +87,15 @@ class ArmController:
         self.position_params_init(**self.config["pos_cfg"])
 
 
-    def y_params_init(self, motor, limit_port, pid, threshold):
+    def y_params_init(self, motor, limit_port, pid, threshold,
+                      slow_band_m=0.015, slow_velocity=0.02,
+                      top_slow_m=0.020, top_slow_velocity=0.03, **_extra):
         """
-        初始化竖直方向电机参数
+        初始化竖直方向电机参数。
 
-        Args:
-            motor: 电机配置
-            limit_port: 限位传感器端口
-            pid: PID参数
-            threshold: 位置阈值
+        接受 slow_band_m/slow_velocity/top_slow_m/top_slow_velocity 等新参数（默认 0.015/0.02/0.02/0.03）。
+        新参数仅用于 y_speed 的分段限幅；旧配置文件里没有这些键时走默认。
+        _extra 吸收未来新增键,避免 **vert_cfg unpack 时 TypeError。
         """
         self.motor_y = StepperWrap(**motor)
         self.y_limit_sensor = AnalogInput(limit_port)
@@ -110,6 +110,20 @@ class ArmController:
 
         self.y_pid_flag = CountRecord(5)
         self.y_stop_flag = CountRecord(10)
+        # 末段减速带：距磁感触发前 slow_band_m 米内，PWM 限幅降到 slow_velocity。
+        # 解决"接近磁感时 PID 自然减速 → 编码器不动 → y_stop_check 误判堵转 → reset_y 假到底"的 bug。
+        self.y_slow_band_m = float(slow_band_m)
+        self.y_slow_velocity = float(slow_velocity)
+        # 顶段减速带：|y| > top_slow_m (绝对值) 时，PWM 限幅降到 top_slow_velocity。
+        # 顶部是机械硬限位,无传感器,降低失步概率。
+        self.y_top_slow_m = float(top_slow_m)
+        self.y_top_slow_velocity = float(top_slow_velocity)
+        # 丢步核对：reset_y 后记录 ref_encoder，move_y_position 完成后用编码器核对总位移
+        self._y_ref_encoder_at_zero = None
+        self._y_expected_total_delta = 0.0
+        # seek 模式：True 时 y_speed 磁感安全门对正速度放行(允许穿入磁感),
+        # 因为 reset_y 必须真正压到磁感才算成功,磁感门挡了它就停不下来了
+        self._y_seeking_bottom = False
 
     def y_reset_check(self):
         """
@@ -167,29 +181,124 @@ class ArmController:
 
     def reset_y(self):
         """
-        重置竖直方向位置。
+        重置竖直方向位置：朝磁感方向下压找触底，【磁感触发】是唯一成功凭证。
 
-        业务约定（与 main/arm 一致）：y>0=向下（朝磁感触底），y<0=向上（远离触底）。
-        业务层 move_y 直传 target 给车端，不取反；负值目标 → 车端朝磁感方向走。
-        因此 reset_y 用 setpoint=-0.25 主动朝磁感方向找触底。
+        方向约定（实测）：setpoint>0/velocity>0 = 向下（朝磁感）。
+
+        三段速度曲线，避免 PID 接近时减速被 y_stop_check 误判为堵转：
+          1) 远段 (y < -slow_band - top_slow)：SLOW_VELOCITY 0.08 m/s 直驱；
+          2) 末段 (y >= -slow_band 且 y < 0)：SLOW_VELOCITY 0.02 m/s 极慢贴底；
+          3) 触底 (y_reset_check() 真触发)：保持 0.05s dwell 确认不是抖动，立即归零。
+        找底期间 y_speed 的磁感门放行（_y_seeking_bottom=True），允许正速度穿入磁感。
+
+        退出条件：
+          - 成功：磁感触发后 dwell 通过 → 编码器 ref 记录 + y_pose_start 重置 + True；
+          - 失败：超时（10s）未触发磁感 → 强制停车 + 报警 + False（**绝不**伪归零）；
+          - 急停：_estop 置位 → 立即退出 + False。
+
+        返回：是否成功（bool）。失败时 **不** 更新 y_pose_start，y_pose_now 保持搜索前值，
+        后续 move_y_position 会发现偏差并 warn。
         """
-        self.y_pid.setpoint = -0.25
-        while True:
-            if self.y_pid_moveto(-0.25):
-                break
-            if self.y_reset_check():
-                self.y_pose_start = self.motor_y.get_dis()
-                self.y_pose_now = 0
-                break
+        # === 配置 ===
+        FAST_VELOCITY = 0.08    # 远段快速接近速度
+        SLOW_VELOCITY = self.y_slow_velocity   # 末段贴底速度（0.02 m/s 默认）
+        DWELL_TIME = 0.05       # 磁感触发后确认 dwell（秒）
+        SEEK_TIMEOUT = 10.0     # 总找底超时
+        slow_band = self.y_slow_band_m
+
+        # 入口前先把 _y_seeking_bottom 设 True，让 y_speed 对正速度放行
+        self._y_seeking_bottom = True
+        start = time.time()
+        triggered_at = None
+        prev_pos = self.y_get_position()
+        no_move_since = time.time()   # 编码器持续不动的最早时刻
+        NO_MOVE_HARD_TIMEOUT = 2.0    # 长时间不动 → 强制停车报警
+
+        try:
+            while True:
+                # 1) 急停优先
+                estop = getattr(self, "_estop", None)
+                if estop is not None and estop.is_set():
+                    logger.warning("reset_y: 收到急停，中止找底")
+                    break
+                # 2) 磁感触发 → 记录 dwell 起点
+                if self.y_reset_check():
+                    if triggered_at is None:
+                        triggered_at = time.time()
+                    elif time.time() - triggered_at >= DWELL_TIME:
+                        # 成功！dwell 通过
+                        ref = self.motor_y.get_dis()
+                        self.y_pose_start = ref
+                        self.y_pose_now = 0
+                        self._y_ref_encoder_at_zero = ref
+                        self._y_expected_total_delta = 0.0
+                        logger.info(
+                            "reset_y: 磁感触发+dwell通过,ref_encoder=%.6f,耗时%.2fs"
+                            % (ref, time.time() - start)
+                        )
+                        self.y_speed(0)
+                        return True
+                    # dwell 中,维持贴底慢速
+                    self.motor_y.set_velocity(0)
+                    time.sleep(0.01)
+                    continue
+                # 还没触发：按当前 y 选档。reset_y 永远往下找底，不走顶段减速分支。
+                cur = self.y_get_position()
+                # 失步/卡死保护：连续 2s 编码器不动 → 强制停车报警
+                if abs(cur - prev_pos) < 1e-5:
+                    if time.time() - no_move_since > NO_MOVE_HARD_TIMEOUT:
+                        logger.error(
+                            "reset_y: 编码器持续 %.1fs 不动, 疑似失步/卡死, 强制停车" %
+                            NO_MOVE_HARD_TIMEOUT
+                        )
+                        break
+                else:
+                    no_move_since = time.time()
+                    prev_pos = cur
+                # 速度档位：reset_y 永远正向（向下）找底。
+                # 末段（cur >= -slow_band）：极慢贴底；中/远段：快速下压。
+                # 【绝不】走顶段减速分支（那是给 move_y_position 往上走用的），
+                # 否则机械臂已在 -120mm 时会被错误赋负速度 = 向上 = 撞顶。
+                if cur >= -slow_band:
+                    v = SLOW_VELOCITY  # 末段：极慢贴底
+                else:
+                    v = FAST_VELOCITY  # 中/远段
+                # 直接走 y_speed：它会按当前 cur 重新选末段限幅 + limit_val
+                self.y_speed(v)
+                time.sleep(0.01)
+                # 总超时
+                if time.time() - start > SEEK_TIMEOUT:
+                    logger.error("reset_y: 找底 %.1fs 超时未触发磁感, 强制停车" % SEEK_TIMEOUT)
+                    break
+        finally:
+            self._y_seeking_bottom = False
+            self.y_speed(0)  # 必停
+        return False
         self.y_speed(0)
 
     def move_y_position(self, target):
         """
-        移动竖直方向指定距离。带丢步兜底：
-        1) 第一轮 PID 闭环到 < 1mm（或堵转跳出）；
-        2) 完成后比对 actual vs target，偏差 > 1mm 时再发一轮 setpoint，最多 2 轮；
-        3) 若仍偏差 > 2mm（步距）则视为异常，仅 warn 不抛错。
+        移动竖直方向指定距离。带软限位 + 丢步核对 + 兜底：
+        1) 入口：soft_y_max 软限位 limit_val(基于 arm_origin.soft_y_max_m,默认 0.18m)；
+        2) 命令位移记录：本次指令 delta = target - current，记录累积预期位移；
+        3) 第一轮 PID 闭环到 < 1mm（或堵转跳出）；
+        4) 完成后比对 actual vs target，偏差 > 1mm 时再发一轮 setpoint，最多 2 轮；
+        5) 命令/编码器核对：|编码器 delta - 累积预期| > STEP_LOSS_TOL_M（默认 0.005m）→ 报警；
+        6) 若仍偏差 > 2mm（步距）则视为异常，仅 warn 不抛错。
+
+        方向约定：target < 0 = 向上, target > 0 = 向下；软区间 [-soft_y_max_m, 0]。
         """
+        # 1) 软限位（用 self.y_threshold，但只信任负向区间；若 y_threshold 配置为 [0, 0.2] 错误,
+        #    则自动回退到 [-0.18, 0]）
+        if self.y_threshold[0] >= 0 and self.y_threshold[1] > 0:
+            # 配置错误（[0, 0.2] 这种）,回退默认
+            y_lo, y_hi = -0.18, 0.0
+        else:
+            y_lo, y_hi = self.y_threshold[0], self.y_threshold[1]
+        target = limit_val(target, y_lo, y_hi)
+        # 2) 命令位移记录
+        prev_pos = self.y_get_position()
+        self._y_expected_total_delta += abs(target - prev_pos)
         # 第一轮（保持原行为）
         self.y_pid.setpoint = target
         while True:
@@ -206,10 +315,10 @@ class ArmController:
             actual = self.y_get_position()
             err = target - actual
             if abs(err) <= 0.001:
-                return
+                break
             # 磁感已触发且 setpoint 已在触底方向 → 已经触底到位
             if self.y_reset_check() and target >= 0.0:
-                return
+                break
             logger.warning(
                 f"move_y_position 丢步兜底 round={round_idx}: "
                 f"target={target:.4f} actual={actual:.4f} err={err*1000:.1f}mm, 再发一次"
@@ -222,12 +331,25 @@ class ArmController:
                     break
             self.y_speed(0)
 
+        # ---- 命令/编码器核对（仅在已知 ref 时） ----
+        if self._y_ref_encoder_at_zero is not None:
+            actual_disp = abs(self.motor_y.get_dis() - self._y_ref_encoder_at_zero)
+            disp_err = abs(actual_disp - self._y_expected_total_delta)
+            STEP_LOSS_TOL_M = 0.005
+            if disp_err > STEP_LOSS_TOL_M:
+                logger.warning(
+                    f"move_y_position 疑似丢步: 累积预期={self._y_expected_total_delta*1000:.1f}mm "
+                    f"编码器={actual_disp*1000:.1f}mm 偏差={disp_err*1000:.1f}mm, 建议重置原点"
+                )
+
         final = self.y_get_position()
         if abs(final - target) > 0.002:
             logger.error(
                 f"move_y_position 丢步严重: target={target:.4f} final={final:.4f} "
                 f"diff={(final-target)*1000:.1f}mm, 建议重新定原点"
             )
+        # 完成后把本次 delta 累加确认（actual vs prev_pos）
+        self._y_expected_total_delta += abs(final - prev_pos) - abs(target - prev_pos)
 
     def x_params_init(self, motor, pid, threshold):
         """
@@ -415,8 +537,21 @@ class ArmController:
         Args:
             velocity: 速度值
         """
-        # === 磁感安全门：磁感触发 + velocity<0 时 velocity=0，不再朝磁感方向推进 ===
-        if velocity < 0 and self.y_reset_check():
+        # === 急停门：外部置位急停时强制 0，任何 y 运动都被此 chokepoint 拦死 ===
+        estop = getattr(self, "_estop", None)
+        if estop is not None and estop.is_set():
+            velocity = 0
+        # === 末段减速 / 顶段减速：根据当前位置分档限幅 ===
+        cur = self.y_get_position()
+        if self.y_slow_band_m > 0 and cur >= -self.y_slow_band_m and cur < 0.0:
+            # 已进入末段（接近磁感，y >= -slow_band 且 y < 0）
+            velocity = limit_val(velocity, -self.y_slow_velocity, self.y_slow_velocity)
+        elif self.y_top_slow_m > 0 and cur <= -self.y_top_slow_m:
+            # 已进入顶段（远离磁感，y <= -top_slow）：减速防失步
+            velocity = limit_val(velocity, -self.y_top_slow_velocity, self.y_top_slow_velocity)
+        # === 磁感安全门：磁感触发 + velocity>0 时 velocity=0，不再朝磁感方向推进 ===
+        # seek_bottom 模式下放行(让 reset_y 能真正压到磁感)。注意 seek 结束后立刻置 False。
+        if velocity > 0 and self.y_reset_check() and not self._y_seeking_bottom:
             logger.warning("y_speed: 磁感触发，禁止继续推进，velocity=0")
             velocity = 0
         velocity = limit_val(velocity, *self.y_velocity_limit)
@@ -429,6 +564,10 @@ class ArmController:
         Args:
             velocity: 速度值
         """
+        # === 急停门：外部置位急停时强制 0 ===
+        estop = getattr(self, "_estop", None)
+        if estop is not None and estop.is_set():
+            velocity = 0
         velocity = limit_val(velocity, *self.x_velocity_limit)
         self.motor_x.set_linear(velocity)
 

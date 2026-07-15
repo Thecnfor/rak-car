@@ -487,6 +487,20 @@ def _ws_op_realtime_lane_state(service, _payload):
     return {"ok": True, "op": "realtime/lane_state", "data": {"lane_state": lane_state}}
 
 
+def _ws_op_realtime_arm_state(service, _payload):
+    """WS op=realtime/arm_state: 读 streamer 缓存的 arm_state 一次。
+
+    数据来源是 arm_feed 守护线程(runtime 启动后默认 20Hz)通过
+    `car.streamer.set_arm_state(...)` 持续刷新的内存缓存。
+    不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock(极快)。
+    """
+    try:
+        arm_state = service.get_arm_state()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/arm_state", "data": {"arm_state": arm_state}}
+
+
 # op string → handler。统一 `(service, payload) -> dict`。
 _WS_OP_DISPATCH = {
     "ping": _ws_op_ping,
@@ -514,6 +528,7 @@ _WS_OP_DISPATCH = {
     "realtime/analog": _ws_op_realtime_analog,
     "realtime/analog2": _ws_op_realtime_analog2,
     "realtime/lane_state": _ws_op_realtime_lane_state,
+    "realtime/arm_state": _ws_op_realtime_arm_state,
 }
 
 
@@ -677,6 +692,17 @@ def create_runtime_router(service, camera_stream_service):
     @router_v1.get("/infer/state")
     def v1_infer_state():
         return {"ok": True, "infer": service.get_infer_state()}
+
+    @router_v1.post("/estop")
+    def v1_estop(payload: dict = Body(default={})):
+        # 软件急停：直达 service.emergency_stop()，不进 job_queue、不抢 car_lock，
+        # 因此能在 worker 跑长动作时立刻抢占（详见 runtime_service.emergency_stop）。
+        return {"ok": True, "stopped": service.emergency_stop()}
+
+    @router_v1.post("/estop/clear")
+    def v1_estop_clear(payload: dict = Body(default={})):
+        # 解除急停，同样走无锁直达路径。急停后须调用本端点才能恢复运动。
+        return {"ok": True, "stopped": not service.reset_stop_flag()}
 
     @router_v1.get("/vision/models")
     def v1_vision_models():
@@ -938,6 +964,18 @@ def create_runtime_router(service, camera_stream_service):
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @router_v1.get("/realtime/arm/state")
+    def v1_realtime_arm_state():
+        """调试/UI 用:读 arm_feed 守护线程缓存的机械臂 y/x 位置。
+
+        与 /v1/realtime/lane/state 完全同构:不走 job_queue、不打 ZMQ、不持 car_lock,
+        只取 meta_lock(极快),20Hz+ 轮询安全。响应字段见 `camera_stream_service.get_arm_state`。
+        """
+        try:
+            return {"ok": True, "arm_state": service.get_arm_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     @router_v1.post("/realtime/chassis-velocity")
     def v1_realtime_chassis_velocity(payload: dict = Body(default={})):
         """(vx, vy, wz) 直发，绕开 set_velocity 里程计耦合。供外环 50Hz 用。"""
@@ -1058,6 +1096,8 @@ def create_runtime_router(service, camera_stream_service):
                     "health": {"op": "health", "snapshot": 0},
                     "subscribe_lane": {"op": "subscribe_lane", "note": "持续 push lane_state"},
                     "unsubscribe_lane": {"op": "unsubscribe_lane"},
+                    "subscribe_arm_state": {"op": "subscribe_arm_state", "note": "持续 push arm_state (y/x 位置)"},
+                    "unsubscribe_arm_state": {"op": "unsubscribe_arm_state"},
                     "realtime_chassis_velocity": {"op": "realtime/chassis_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0},
                     "realtime_wheel_speeds": {"op": "realtime/wheel_speeds", "speeds": [0,0,0,0]},
                 },
@@ -1070,6 +1110,10 @@ def create_runtime_router(service, camera_stream_service):
         lane_push_task = None
         lane_subscribed = False
         lane_push_hz = 20.0  # 默认 20Hz 轮询 lane_state，更新才推
+        # ---- arm_state push 后台任务(同 lane 模式)----
+        arm_push_task = None
+        arm_subscribed = False
+        arm_push_hz = 20.0
 
         async def _lane_push_loop():
             last_updated_at = None
@@ -1110,6 +1154,45 @@ def create_runtime_router(service, camera_stream_service):
                     pass
             lane_push_task = None
 
+        # ---- arm_state push loop ----
+        async def _arm_push_loop():
+            last_updated_at = None
+            interval = 1.0 / max(float(arm_push_hz), 1.0)
+            while True:
+                try:
+                    state = service.get_arm_state()
+                except Exception:
+                    state = None
+                updated_at = state.get("updated_at") if state else None
+                if state and updated_at is not None and updated_at != last_updated_at:
+                    last_updated_at = updated_at
+                    try:
+                        await websocket.send_json(
+                            {"ok": True, "op": "arm_state", "data": state}
+                        )
+                    except Exception:
+                        return
+                await _asyncio.sleep(interval)
+
+        async def _start_arm_push():
+            nonlocal arm_push_task, arm_subscribed
+            if arm_subscribed and arm_push_task is not None and not arm_push_task.done():
+                return False
+            arm_subscribed = True
+            arm_push_task = _asyncio.create_task(_arm_push_loop())
+            return True
+
+        async def _stop_arm_push():
+            nonlocal arm_push_task, arm_subscribed
+            arm_subscribed = False
+            if arm_push_task is not None and not arm_push_task.done():
+                arm_push_task.cancel()
+                try:
+                    await arm_push_task
+                except (_asyncio.CancelledError, Exception):
+                    pass
+            arm_push_task = None
+
         while True:
             try:
                 payload = await websocket.receive_json()
@@ -1141,6 +1224,23 @@ def create_runtime_router(service, camera_stream_service):
                     {"ok": True, "op": "unsubscribe_lane", "subscribed": False}
                 )
                 continue
+            if op == "subscribe_arm_state":
+                started = await _start_arm_push()
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "op": "subscribe_arm_state",
+                        "subscribed": started,
+                        "hz": arm_push_hz,
+                    }
+                )
+                continue
+            if op == "unsubscribe_arm_state":
+                await _stop_arm_push()
+                await websocket.send_json(
+                    {"ok": True, "op": "unsubscribe_arm_state", "subscribed": False}
+                )
+                continue
 
             request_id = payload.get("request_id")
             try:
@@ -1155,6 +1255,7 @@ def create_runtime_router(service, camera_stream_service):
 
         # ---- disconnect 清理 ----
         await _stop_lane_push()
+        await _stop_arm_push()
 
     router.include_router(router_v1)
     return router
