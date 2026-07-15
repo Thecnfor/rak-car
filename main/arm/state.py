@@ -40,7 +40,7 @@ class ArmOrigin:
     y_origin_m: float = 0.0           # y 触底时的原始 motor_y.get_dis() 值
     x_origin_m: float = 0.0           # x 撞墙时的原始 motor_x.get_dis() 值
     x_wall: str = "left"              # 上次撞的是哪一侧
-    soft_y_max_m: float = 0.18        # y 业务上限 magnitude（m）：实际 y ∈ [-180, 0]mm，0=顶
+    soft_y_max_m: float = 0.18        # 业务软上限（m）
     soft_x_min_m: float = 0.005
     soft_x_max_m: float = 0.30
     # 丢步/位置偏差阈值（mm）：move_x / move_y 完成后对比 actual vs target，超此值 warn。
@@ -81,7 +81,6 @@ class ArmState:
     x_origin_valid: bool = False
 
     # 软限位（从 ArmOrigin 拷过来）
-    # y 语义:0 = 上限(top), -180 = 触底(bottom)
     soft_y_max_mm: float = 180.0
     soft_x_min_mm: float = 5.0
     soft_x_max_mm: float = 300.0
@@ -102,9 +101,7 @@ class ArmState:
     def in_safe_box(self, x_mm: float, y_mm: float) -> bool:
         """给定 (x, y) 是否在业务软限位内（含）。
 
-        y 业务坐标：触底=0（y 物理上是极限位置=magnetic sensor 触点），
-        y<0 = 向上（远离触底），y>0 = 向下（朝磁感方向）；
-        区间 [-soft_y_max_mm, 0]，即上限 magnitude 是 soft_y_max。
+        y 业务坐标：触底=0，向下取正、向上取负；区间 [-soft_y_max_mm, 0]。
         """
         return (
             self.soft_x_min_mm <= x_mm <= self.soft_x_max_mm
