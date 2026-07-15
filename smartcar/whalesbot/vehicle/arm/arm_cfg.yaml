@@ -36,11 +36,12 @@ horiz_cfg:
   top_slow_m: 0.02
   top_slow_velocity: 0.1
   reset_target_m: 0.34
-  # reset_velocity: 撞墙前全速。降到 0.05 m/s(5cm/s) — motor_280 没刹车,太冲会撞坏;
-  # 触发后由代码降到 30% (=0.015 m/s = 1.5cm/s) 温柔推。
-  reset_velocity: 0.05
+  # reset_velocity: 0.02 m/s (2cm/s) — 极慢。低速下电机扭矩 vs 撞墙力矩差距小,
+  # motor_280 撞墙后立刻 stall,编码器不打滑。速度太低会让 reset 变慢(0.32m / 0.02 = 16s),
+  # 所以 reset_timeout 同步拉到 25s。
+  reset_velocity: 0.02
   reset_dwell_time: 0.15
-  reset_timeout: 15.0
+  reset_timeout: 25.0
   wall_ratio_threshold: 0.2
   min_velocity_ratio: 0.3
   wall_window_ms: 200
