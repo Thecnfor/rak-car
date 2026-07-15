@@ -297,59 +297,78 @@ while 没超时:
 | 编码器持续不动 | `reset_y: 编码器持续 2.0s 不动, 疑似失步/卡死` → 撞顶失步或机械卡死 |
 | 收工 y ≠ 0 | 物理磁感触发点比机械底高 ~10-15mm,属正常,需要绝对精度时看 `ref_encoder` |
 
-## `reset_x` 行为(**撞墙是唯一到墙凭证**)
+## `reset_x` 行为(**撞墙是唯一到墙凭证,v2 模型驱动**)
 
-> x 与 y 关键区别:**x 没有磁感/限位传感器**,撞墙靠"编码器持续不动 + dwell"判定。
+> x 与 y 关键区别:**x 只有编码器**,没有磁感/限位传感器,撞墙靠**模型驱动 + 物理清零**判定。
 
-### 触发场景(同 reset_y)
-
-| 入口 | 行为 |
-| --- | --- |
-| HTTP `POST /v1/execute {"target":"arm","name":"reset_x"}` | 直接调,只复位 x 不动 y |
-| `car.reset_position()` | 内部开线程调 `reset_y` + `reset_x` |
-| **`runtime _create_car_locked`** | 每次 init 默认调 `reset_x`（同 `reset_y`） |
-
-### 算法
+### v2 撞墙判据(三层组合,任一持续 200ms 命中即认定)
 
 ```
-_x_seeking_wall = True            # 让 x_speed 撞墙门对正向速度放行
-直接 x_speed(0.05) 慢速撞右墙     # 不用 PID
-while 没超时:
-  if 急停: 中止
+loop:
   cur = x_get_position()
-  if |cur - last_pos| < 0.5mm:     # 连续 5 次不动 = 撞墙
-    stall_runs += 1
-  else:
-    stall_runs = 0; last_pos = cur
-  if stall_runs >= 5:              # 撞墙 → dwell 确认
-    if triggered_at: 记时间
-    elif dwell(100ms) 通过: 归零 + 记 ref_encoder + _x_wall="right" + return True
-  else:
-    继续推(撞墙还没到)
+ 滑窗 samples(过去 200ms 的 [t, pos])
+ 期望位移 = |velocity| × dt
+ 实际位移 = |pos[-1] - pos[0]|
+
+判定条件(主):
+  actual_disp / expected_disp < 0.20   # 位移比 = 实测/期望
+  # 撞墙/失步 → 实际几乎不动 → 比值→0
+
+判定条件(辅):
+  actual_speed / |velocity| < 0.30     # 速度比
+  # 防丢步:失步时编码器可能"追着命令走",位移比接近 1.0
+  # 但滑窗速度低于命令 → 速度对照异常
+
+一旦触发 + 100ms dwell → 撞墙确认
+  → 调 motor_x.motor.reset() 物理清零编码器
+  → x_pose_start = 0, x_pose_now = 0
+  → ref_encoder = 0
 ```
 
-### 关键不变量
+### 与 v1 对比
 
-- **唯一撞墙凭证**:`连续 5 次编码器变化 < 0.5mm` + `100ms dwell`,与 y 的"磁感 + 50ms dwell"对称
-- 必须**慢速撞墙**(`0.05 m/s`),高速撞会撞坏机械
-- 失败(超时/急停)**不伪归零** — 返回 `False`,`x_pose_start` 保持原值
-- 收工**必 `x_speed(0)`** — 绝不残留速度
-- `move_x_position` 中撞墙会标 `_x_wall`(`left`/`right`),`x_speed` 撞墙门会阻止继续往已撞侧推
+| | v1 (旧) | v2 (现) |
+| --- | --- | --- |
+| 撞墙判据 | 5×0.5mm stall | 位移比 0.20 + 速度比 0.30,200ms 滑窗 |
+| 撞墙后归零 | `x_pose_start = get_dis() - 0.31`(数学补偿) | `motor_x.motor.reset()`(MC602 ctl_id=2 走 encoder_2.reset) |
+| 失步误判防护 | ❌ 无 | ✅ 位移比 + 速度对照 |
+| 失败行为 | 强制归零 | **不伪归零**,返回 False |
+
+### 可调参数(`arm_cfg.yaml → horiz_cfg → reset_*`)
+
+```yaml
+reset_target_m: 0.34          # 撞墙目标距离(应略 > 软上限)
+reset_velocity: 0.05          # 撞墙速度(m/s),必须慢
+reset_dwell_time: 0.10        # 撞墙后 dwell(秒)
+reset_timeout: 8.0            # 总超时
+wall_ratio_threshold: 0.20    # 位移比阈值
+min_velocity_ratio: 0.30      # 速度比阈值
+wall_window_ms: 200           # 滑窗时长
+enable_encoder_reset: true    # 撞墙后是否物理清零编码器
+```
 
 ### 返回值
 
-- `True`  = 撞墙 + dwell 通过,已归零
-- `False` = 超时/急停,未归零
+- `True`  = 撞墙 + dwell 通过 + 编码器物理清零
+- `False` = 超时/急停/撞墙条件不满足
 
-### 失败诊断
+### 硬件实测日志
 
-| 现象 | 看哪 |
+```
+INFO: reset_x: 撞右墙+model判据(ratio=0.00,speed=0.0000)+dwell通过,耗时0.17s,enc_物理清零
+```
+
+### ⚠️ `move_x_position` 已知问题
+
+当前 `move_x_position` 走 PID + `x_stop_check`,撞墙 calibrate 分支在 PID 收敛前可能误触,把 `x_pose_start` 重新设回 dis → `x_get_position` 出现非预期归零。**等 v3 改造为开环 time-based(类似 reset_x)再彻底解决**。当前调试建议:**只在简单位移(<50mm)用 `move_x_position`**,大范围位移请重做 reset_x 然后走小步增量。
+
+### 已知移动问题诊断
+
+| 现象 | 可能原因 |
 | --- | --- |
-| 永远 8s 超时 | `arm_base.py reset_x: 撞墙 %.1fs 超时` → 机械卡死 / 编码器坏 |
-| 撞墙后归零 x ≠ 0 | 编码器读数漂移,看 `motor_x.get_dis()` 是否真为 0 |
-| 撞墙门误判 | `_x_wall` 设错侧,可能机械反向撞 |
-
-> 旧实现 `reset_x` 用 `x_stop_check`(连续 10 次不动)撞墙,但与 y 同理:PID 自然减速 + 接近目标时编码器会暂时不动 → 误判假撞墙。新实现改为慢速 + 5 次 + dwell,失败不伪归零。
+| `move_x(-200)` 完成后 x=0 | PID x_stop_check 误触发 + calibrate 把 x_pose_start 设回 ≈0 |
+| `move_x(0.32)` 后 x 异常小 | 同上 |
+| 解决 | v3 改造:开环 time-based(目标位置/速度 → t=v×dis → sleep(t) → x_speed(0),不走 PID) |
 
 ## 启动归零（init 流程）
 

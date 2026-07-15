@@ -356,7 +356,11 @@ class ArmController:
                       top_slow_m=0.020, top_slow_velocity=0.06,
                       reset_target_m=0.34, reset_velocity=0.05,
                       reset_dwell_time=0.10, reset_timeout=8.0,
-                      reset_stall_count=5, reset_stall_threshold=0.0005,
+                      # v2 撞墙判据参数(模型驱动)
+                      wall_ratio_threshold=0.20,
+                      min_velocity_ratio=0.30,
+                      wall_window_ms=200,
+                      enable_encoder_reset=True,
                       **_extra):
         """初始化水平方向电机参数。
 
@@ -389,8 +393,14 @@ class ArmController:
         self.x_reset_velocity = float(reset_velocity)
         self.x_reset_dwell_time = float(reset_dwell_time)
         self.x_reset_timeout = float(reset_timeout)
-        self.x_reset_stall_count = int(reset_stall_count)
-        self.x_reset_stall_threshold = float(reset_stall_threshold)
+        # v2 撞墙判据(模型驱动 + 物理清零)
+        self.x_wall_ratio_threshold = float(wall_ratio_threshold)
+        self.x_min_velocity_ratio = float(min_velocity_ratio)
+        self.x_wall_window_ms = float(wall_window_ms)
+        self.x_enable_encoder_reset = bool(enable_encoder_reset)
+        # 兼容老字段名(v1)
+        self.x_reset_stall_count = 5  # v2 不再用
+        self.x_reset_stall_threshold = 0.0005
         # 丢步核对(与 y 对称):reset_x 后记录 ref_encoder,move_x_position 完成后核对
         self._x_ref_encoder_at_zero = None
         self._x_expected_total_delta = 0.0
@@ -471,12 +481,18 @@ class ArmController:
             if self.x_pid_moveto(target):
                 break
             if self.x_stop_check():
-                # 兼容旧行为:撞墙时校准 x_pose_start
+                # v2: 撞墙时物理清零编码器(同 reset_x 行为)
+                # 旧实现用 "x_pose_start = dis - 0.31" 数学补偿,误差大且依赖行程常量
                 dis = self.motor_x.get_dis()
-                if dis < 0.15:
-                    self.x_pose_start = dis
+                if self.x_enable_encoder_reset:
+                    try:
+                        self.motor_x.motor.reset()
+                        self.x_pose_start = 0.0
+                    except Exception as exc:
+                        logger.warning("move_x_position: reset 失败(%s),走 fallback" % exc)
+                        self.x_pose_start = dis
                 else:
-                    self.x_pose_start = dis - 0.31
+                    self.x_pose_start = dis if dis < 0.15 else (dis - 0.31)
                 self._x_wall = "left" if dis < 0.15 else "right"
                 break
             time.sleep(0.05)
@@ -506,74 +522,111 @@ class ArmController:
 
     def reset_x(self):
         """
-        重置水平方向位置:慢速撞右墙(正向 = 远离左墙 = 向右),用"编码器持续不动 + dwell"判定撞墙。
+        重置水平方向位置:慢速撞右墙,v2 模型驱动 + 物理清零。
 
-        旧实现 `reset_x` 用 `x_stop_check`(连续 10 次编码器不动)作为撞墙凭证,
-        但与 y 同理:PID 自然减速 + 接近目标时编码器会暂时不动 → 误判假撞墙。
-        新实现:慢速 + 撞墙计数 + dwell,失败不伪归零(返回 False)。
+        与 y 轴核心区别:x 没有磁感/限位传感器,只能靠 encoder 推断撞墙。
+        三层撞墙判据(任一持续 wall_window_ms 命中即认定):
+          1) **位移比** = 实际位移 / 期望位移 (期望 = velocity * dt)
+             - 正常: 比值 ≈ 1.0(实测速度 ≈ 命令速度)
+             - 撞墙/失步: 比值 → 0(堵转不动) — **主判据**
+          2) **速度比** = 滑窗实测速度 / 命令速度
+             - 步进电机失步时编码器位置仍变化(走空了),位移比可能仍是 1.0,
+               但滑窗速度会因为 "命令速度 = 期望速度" 而差距大 → **防丢步误判**
+          3) 撞墙后 **物理清零编码器** (Motor.reset())
+             - encoder_2.reset() 让编码器真正归零,x_pose_start/x_pose_now 直接 0
+             - 替代旧的"x_pose_start = motor_x.get_dis() - 0.31" 数学调整,
+               消除"行程常量"假设误差。
 
-        x 无传感器,只能靠"连续 N 次编码器变化 < 阈值"作为撞墙凭证。
-        必须用低速撞墙,避免过冲失步。
+        失败不伪归零(返回 False)。超时 / 急停 / 撞墙条件不满足都算失败。
         """
         # === 配置 ===
-        TARGET_M = self.x_reset_target_m       # 撞墙目标距离
-        VELOCITY = self.x_reset_velocity        # 撞墙速度
-        DWELL = self.x_reset_dwell_time         # 撞墙后 dwell 确认
-        STALL_COUNT = self.x_reset_stall_count  # 连续 N 次不动判撞墙
-        STALL_THRESH = self.x_reset_stall_threshold
+        VELOCITY = self.x_reset_velocity
+        DWELL = self.x_reset_dwell_time
         TIMEOUT = self.x_reset_timeout
+        RATIO_THRESH = self.x_wall_ratio_threshold
+        VEL_RATIO_THRESH = self.x_min_velocity_ratio
+        WINDOW_MS = self.x_wall_window_ms
+        ENABLE_ENC_RESET = bool(self.x_enable_encoder_reset)
 
         self._x_seeking_wall = True
         start = time.time()
-        stall_runs = 0           # 连续不动次数
-        triggered_at = None      # 撞墙触发点
-        last_pos = self.x_get_position()
+        # 速度滑窗(用于速度对照判据)
+        samples = []   # [(t, pos), ...] 最多保留 window_ms 内
+        triggered_at = None
 
         try:
-            # 直接慢速撞墙,不走 PID
             self.x_speed(VELOCITY)
             while True:
                 # 急停优先
                 estop = getattr(self, "_estop", None)
                 if estop is not None and estop.is_set():
-                    logger.warning("reset_x: 收到急停，中止找墙")
+                    logger.warning("reset_x: 收到急停,中止找墙")
                     break
+                t_now = time.time()
                 cur = self.x_get_position()
-                # 撞墙判据:连续 STALL_COUNT 次 |delta| < STALL_THRESH
-                if abs(cur - last_pos) < STALL_THRESH:
-                    stall_runs += 1
-                else:
-                    stall_runs = 0
-                    last_pos = cur
-                if stall_runs >= STALL_COUNT:
-                    # 撞墙 → dwell 确认
+                samples.append((t_now, cur))
+                # 滑窗裁剪
+                while samples and (t_now - samples[0][0]) * 1000.0 > WINDOW_MS:
+                    samples.pop(0)
+                # 至少要 window 充满才判定(避免单点抖动)
+                if len(samples) < 3:
+                    self.x_speed(VELOCITY)
+                    time.sleep(0.01)
+                    continue
+                t_start, pos_start = samples[0]
+                t_end, pos_end = samples[-1]
+                dt = t_end - t_start
+                if dt <= 0:
+                    self.x_speed(VELOCITY)
+                    time.sleep(0.01)
+                    continue
+                actual_disp = abs(pos_end - pos_start)
+                expected_disp = abs(VELOCITY) * dt
+                ratio = actual_disp / expected_disp if expected_disp > 1e-9 else 0.0
+                # 判据 1: 位移比过低(撞墙/失步)
+                hit_ratio = ratio < RATIO_THRESH
+                # 判据 2: 速度比过低(补强)
+                actual_speed = actual_disp / dt
+                hit_speed = actual_speed < abs(VELOCITY) * VEL_RATIO_THRESH
+                if hit_ratio or hit_speed:
                     if triggered_at is None:
-                        triggered_at = time.time()
-                    elif time.time() - triggered_at >= DWELL:
-                        # 成功
-                        ref = self.motor_x.get_dis()
-                        self.x_pose_start = ref
+                        triggered_at = t_now
+                    elif t_now - triggered_at >= DWELL:
+                        # 撞墙成功 → 可选物理清零编码器(Motor.reset() 协议层在 ctl_id=2 走 encoder_2.reset)
+                        if ENABLE_ENC_RESET:
+                            try:
+                                self.motor_x.motor.reset()
+                            except Exception as exc:
+                                logger.warning("reset_x: motor.reset 失败(%s),走 fallback" % exc)
+                        # 物理清零后:编码器值就是 0,直接 x_pose_start = 0
+                        if ENABLE_ENC_RESET:
+                            self.x_pose_start = 0.0
+                        else:
+                            ref = self.motor_x.get_dis()
+                            self.x_pose_start = ref
                         self.x_pose_now = 0
                         self.x_pose_last = 0
-                        self._x_ref_encoder_at_zero = ref
+                        self._x_ref_encoder_at_zero = self.x_pose_start
                         self._x_expected_total_delta = 0.0
                         self._x_wall = "right"
                         logger.info(
-                            "reset_x: 撞右墙+dwell通过,ref_encoder=%.6f,耗时%.2fs"
-                            % (ref, time.time() - start)
+                            "reset_x: 撞右墙+model判据(ratio=%.2f,speed=%.4f)+dwell通过,耗时%.2fs%s"
+                            % (ratio, actual_speed, time.time() - start,
+                               ",enc_物理清零" if ENABLE_ENC_RESET else "")
                         )
                         self.x_speed(0)
                         return True
-                    # dwell 中
+                    # dwell 中(已触发,等 dwell 满)
                     self.motor_x.set_linear(0)
                     time.sleep(0.01)
                     continue
                 # 未撞墙:持续推
+                triggered_at = None  # 重置触发计时
                 self.x_speed(VELOCITY)
                 time.sleep(0.01)
                 # 超时
-                if time.time() - start > TIMEOUT:
-                    logger.error("reset_x: 撞墙 %.1fs 超时, 强制停车" % TIMEOUT)
+                if t_now - start > TIMEOUT:
+                    logger.error("reset_x: 撞墙 %.1fs 超时(ratio=%.2f),强制停车" % (TIMEOUT, ratio))
                     break
         finally:
             self._x_seeking_wall = False
