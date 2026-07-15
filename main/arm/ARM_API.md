@@ -20,7 +20,7 @@ from main.arm import (
 约定：
 
 - 单位：**mm**（API 层进车端时换算 m）
-- 坐标系：`x` 水平，`y` 垂直；**`y=0` 为上限（顶），`y=-180` 为触底**（语义已翻转）
+- 坐标系：`x` 水平，`y` 垂直；`y=0` 为触底
 - 合法枚举：`side ∈ {LEFT, MID, RIGHT}`，`hand ∈ {UP, MID, DOWN}`
 
 ## 2. ArmClient 业务动作
