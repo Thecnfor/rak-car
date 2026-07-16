@@ -327,16 +327,19 @@ class CarRuntimeService:
         if reset_arm:
             car.arm.reset_position()
         else:
-            # 默认 init 只归 y(x 不归):
-            #   - y 轴有磁感触底,reset_y 几秒就完,可靠 → 自动跑
-            #   - x 轴没有软件复位（reset_x 已整体删除）：x 位置由视觉闭环控制
-            #     (move_to_detection_target + subscribe_task_detection),
-            #     物理墙由 move_x_position 的 x_stop_check 触发 calibrate 兜底
+            # 默认 init 走 reset_all:
+            #   - 大臂(set_arm_angle) + 手爪(set_hand_angle) + x 撞墙定原点
+            #     三路 ThreadPoolExecutor 并行,最后 reset_y 触底串行。
+            #   - 物理顺序:大臂+手爪+x 三个独立动作并行 → y 触底(必须等前面三个到位)。
+            #   - reset_x 不抛异常(logger.warning 兜底),即使撞墙 calibrate 失败也不会
+            #     触发 _should_probe_controller 的 recover loop(commit fb24b1a 的隐患已规避)。
+            # 显式 reset_arm=True 走 reset_position 兼容老路径(手爪+大臂+y,不含 x 撞墙)。
             try:
-                car.arm.reset_y()
+                results = car.arm.reset_all()
+                logger.info("init reset_all: %s" % results)
             except Exception as exc:
-                self.last_error = "arm reset_y 失败: {}".format(exc)
-                logger.warning("init 时 reset_y 失败: %s" % exc)
+                self.last_error = "arm reset_all 失败: {}".format(exc)
+                logger.warning("init 时 reset_all 失败: %s" % exc)
         if reset_position:
             car.reset_position()
         self.car = car

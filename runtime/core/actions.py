@@ -47,6 +47,10 @@ CAR_ACTIONS = {
 ARM_ACTIONS = {
     "reset_position": lambda arm_obj, *args, **kwargs: arm_obj.reset_position(),
     "reset_y": lambda arm_obj, *args, **kwargs: arm_obj.reset_y(),
+    # 2026-07-16 新加：opt-in 撞墙复位 + 复合复位。
+    # 不接入 _create_car_locked / ensure_initialized / _auto_init_kwargs，避免 fb24b1a 描述的 pm2 循环。
+    "reset_x": lambda arm_obj, *args, **kwargs: arm_obj.reset_x(**kwargs),
+    "reset_all": lambda arm_obj, *args, **kwargs: arm_obj.reset_all(**kwargs),
     "set_arm_pose": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_pose(*args, **kwargs),
     "set_hand_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_hand_angle(*args, **kwargs),
     "set_arm_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_angle(*args, **kwargs),
