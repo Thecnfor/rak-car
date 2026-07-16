@@ -3,7 +3,9 @@
 
 设计要点（按需求）：
 1. 当 ``error_angle``（弧度偏差）大幅变动时，线速度 ``vx`` 立即放慢、转向角速度 ``omega`` 加力；
-2. 只有当 ``error_angle`` 与 ``error_y`` 同时足够小、并稳定一段时间后，才恢复标称 ``vx``。
+2. 只有当 ``error_angle`` 与 ``error_y`` 同时足够小、并稳定一段时间后，才恢复标称 ``vx``；
+3. 横移 / 转向互斥（v6+）：直线段靠 ``vy`` 修偏差（朝向不变、质心斜向），
+   弯道段靠 ``omega`` 转向（后轮做轴、前轮差速旋转），二者不同时存在。
 
 实现策略：
 - 把 "弧度偏差大幅变动" 量化为两个分量的加权和：
@@ -20,6 +22,12 @@
 - 恢复门控：维护 ``_straight_streak_ms``，仅当 ``|error_y| < ey_release`` 且
   ``|error_angle| < ea_release`` 持续 ``hold_ms`` 才把 vx 真正放回 ``v_max``；
   否则保持减速状态，避免在弯道末端一恢复就被下一波偏差甩飞。
+- axis_mix 互斥权重（v6+）：把 ``kappa`` 喂给数值稳定 sigmoid 得到 ``axis_mix ∈ [0,1]``，
+  当下发到 4 轮前按
+        vy_decided   = (1 - axis_mix) * vy_raw
+        omega_decided = axis_mix    * omega_raw
+  缩放，保证同一帧内横向修正与转向不会同时全开，与底盘期望「横向偏差下走斜向、转弯时绕后轴」
+  的行为一致。
 - 控制律在 chassis/state.py LaneState 之上，依赖 (state, dt) 即可，对底层 P / Stanley
   没有强耦合，可以单独替换使用。
 """
@@ -66,6 +74,12 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         ey_release: float = 0.02,
         ea_release: float = 0.05,
         hold_ms: float = 250.0,
+        # --- 横移 / 转向 互斥权重 ---
+        # axis_mix = sigmoid((kappa - kappa_axis_center) / kappa_axis_width)
+        # axis_mix ≈ 0 → 横向滑动主导（vy 全量, ω=0，朝向不变）
+        # axis_mix ≈ 1 → 转弯主导（vy=0, ω 全量，后轮做轴前轮差速旋转）
+        kappa_axis_center: float = 1.0,
+        kappa_axis_width: float = 0.5,
         # --- 麦轮几何 ---
         r_eff: float = 0.30,
     ) -> None:
@@ -82,6 +96,10 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self.ey_release = float(ey_release)
         self.ea_release = float(ea_release)
         self.hold_ms = float(hold_ms)
+        self.kappa_axis_center = float(kappa_axis_center)
+        self.kappa_axis_width = max(float(kappa_axis_width), 1e-3)
+        # 当前 axis_mix 缓存（每帧由 step() 刷新），供 debug_snapshot() 暴露
+        self._axis_mix: float = 0.0
         self.r_eff = float(r_eff)
 
         # 弧度偏差估计（EMA 平滑）
@@ -141,6 +159,23 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         vx = self.v_min + (self.v_max - self.v_min) * scale
         return max(self.v_min, min(self.v_max, vx))
 
+    # ---------- 横移 / 转向 互斥权重 ----------
+    def _axis_mix_from_kappa(self, kappa: float) -> float:
+        """数值稳定 sigmoid：kappa 越大 → 越偏向 ω 全权；越小 → 越偏向 vy 全权。
+
+        返回值 ∈ [0, 1]，用作 vy / omega 的「互斥」权重：
+            vy_decided   = (1 - axis_mix) * vy_raw
+            omega_decided = axis_mix    * omega_raw
+        """
+        z = (kappa - self.kappa_axis_center) / self.kappa_axis_width
+        if z >= 0:
+            # exp(-z) 在 z 大时仍然有界；正向分支走 1/(1+exp(-z))
+            ez = math.exp(-z)
+            return 1.0 / (1.0 + ez)
+        # 负向分支走 exp(z)/(1+exp(z))，避免 exp(-z) 数值溢出
+        ez = math.exp(z)
+        return ez / (1.0 + ez)
+
     # ---------- 恢复门控 ----------
     def _update_release(self, state: LaneState, dt: float) -> bool:
         """误差是否已经回到小值并稳定 hold_ms？返回 True → 允许全速。"""
@@ -174,7 +209,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             vx = self._vx_from_kappa(kappa)
 
         # 横向修正（沿用 P 思路）
-        vy = -self.kp_y * float(state.error_y)
+        vy_raw = -self.kp_y * float(state.error_y)
 
         # 转向 omega：
         #   基础 P 项 + 弧度大时的额外增益 + 弧度变化率进弯牵引
@@ -183,24 +218,33 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         # 故 kp_theta 项取正号（与现场验证过的 subscribe_lane_state.py 原版一致）。
         # kappa 封顶 1.5（之前 2.0），配合 omega_gain=0.35 → boost 最大 1.525x。
         boost = 1.0 + self.omega_gain * min(kappa, 1.5)
-        omega = (
+        omega_raw = (
             +self.kp_theta * float(state.error_angle) * boost
             + self.k_curvature * self._dkappa_ema * math.copysign(1.0, state.error_angle or 0.0)
         )
         # omega 软上限：避免急转弯瞬间单轮 r*omega 项把下位机电源拉爆。
         # 这是控制律层的"软闸"，下发层还有 WheelSmoother 做硬闸。
-        if omega > self.omega_cap:
-            omega = self.omega_cap
-        elif omega < -self.omega_cap:
-            omega = -self.omega_cap
+        if omega_raw > self.omega_cap:
+            omega_raw = self.omega_cap
+        elif omega_raw < -self.omega_cap:
+            omega_raw = -self.omega_cap
 
-        return mecanum_inverse(vx, vy, omega, self.r_eff)
+        # axis_mix 互斥：横向修偏差 vs 转弯
+        # 直线段 (kappa 小) → vy 接管、ω≈0 → 朝向不变，质心斜向滑动；
+        # 弯道段 (kappa 大) → ω 接管、vy≈0 → 后轮做轴、前轮差速旋转。
+        # 过渡带由 kappa_axis_width 控制，过分陡会让 vy/ω 互斥抖动。
+        self._axis_mix = self._axis_mix_from_kappa(kappa)
+        vy_decided = (1.0 - self._axis_mix) * vy_raw
+        omega_decided = self._axis_mix * omega_raw
+
+        return mecanum_inverse(vx, vy_decided, omega_decided, self.r_eff)
 
     # ---------- 调试辅助 ----------
     def debug_snapshot(self) -> dict:
-        """给 on_tick 回调用：暴露内部 curvature 估计 / 恢复状态。"""
+        """给 on_tick 回调用：暴露内部 curvature 估计 / 恢复状态 / 轴向互斥权重。"""
         return {
             "kappa_ema": self._kappa_ema,
             "dkappa_ema": self._dkappa_ema,
             "straight_streak_ms": self._straight_streak_ms,
+            "axis_mix": self._axis_mix,
         }
