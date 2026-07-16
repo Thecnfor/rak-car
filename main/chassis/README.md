@@ -165,7 +165,7 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
 | **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
 | **Pure Pursuit** | `PurePursuitOuterLoop` | 视觉误差当假想目标点 → 几何曲率 → omega | 占位骨架（需替换为目标轨迹） | ⭐⭐⭐ |
-| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa` | 弧度偏差 / 变化率自适应（弯道降速 + 加强转向） | ⭐⭐⭐ |
+| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_decided = (1-axis_mix) * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥（直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立） | ⭐⭐⭐ |
 
 **实测典型取值**（调参从这开始）：
 
@@ -186,11 +186,19 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | `kappa_full` / `dkappa_full` | 0.6 / 1.5 | 弧度偏差 / 变化率满量程（用于归一化） |
 | `kp_y` / `kp_theta` | 0.5 / 1.2 | 横向 / 转向基础 P 项 |
 | `omega_gain` / `k_curvature` | 0.35 / 0.25 | 弧度大时的 omega 增益 / 变化率牵引 |
-| `omega_cap` | 1.8 rad/s | omega 软上限；超过即截断，防下位机掉电压 |
+| `omega_cap` | 1.5 rad/s（example 04 显式保守值；类默认 1.8） | omega 软上限；超过即截断，防下位机掉电压 |
 | `ema_alpha` | 0.35 | curvature 估计的 EMA 平滑系数 |
 | `ey_release` / `ea_release` | 0.02 / 0.05 | 恢复门控误差阈值（m / rad） |
 | `hold_ms` | 250 ms | 误差小并稳定多久才放回 `v_max` |
+| `kappa_axis_center` / `kappa_axis_width` | 1.0 / 0.5 | `axis_mix` sigmoid 分水岭 / 过渡带宽度。<br/>`axis_mix ≈ 0` → 由 `vy` 接管（朝向不变、质心斜向滑动）；<br/>`axis_mix ≈ 1` → 由 `ω` 接管（后轮做轴、前轮差速旋转）。<br/>现场调：<ul><li>直线上小抖就触发到 ω → 调高 `kappa_axis_width` 到 0.7+</li><li>进弯后才打到 ω 全额 → 调低 `kappa_axis_center` 到 0.7</li></ul> |
 | `r_eff` | 0.30 m | 麦轮几何系数 |
+
+**`axis_mix` 是什么**：来自「轴向互斥」设计——直线段由 `vy` 修横向偏差（`ω=0`、
+朝向不变、质心在世界坐标系沿斜向移动）；弯道段由 `ω` 转向（`vy=0`、后轮
+做轴前轮差速旋转）。过渡是用 `kappa`（已存在的弧度偏差 + 变化率归一化）
+通过 sigmoid 平滑映射到 `[0, 1]` 实现的，避免同一帧内横向修正与转向全开互冲。
+`debug_snapshot()` 已暴露 `axis_mix` 键，可直接 `print(outer.debug_snapshot())`
+观察分布。
 
 **r_eff 是什么**：麦轮几何里"角速度 → 4 轮异速"的耦合系数。等于 `(track/2 + wheel_base/2)`，从 `cfg_vehicle.yaml` 算出来是 `(0.30/2 + 0.28/2) = 0.29`，代码里写 0.30 是凑整。
 
@@ -368,6 +376,12 @@ python3 -c "from main.chassis.examples import 01_minimal_p_lane; 01_minimal_p_la
 6. **`r_eff`**：换车体（轮距/轴距变）才需要改
 7. **`WheelSmoother`**：如果弯道掉电压 / 4 轮跳变严重，先把 `max_accel`
    收到 0.2~0.3 m/s/frame（=10~15 m/s²）；直线跟线稳后再往 0.4 放开
+8. **`kappa_axis_center` / `kappa_axis_width`**：弧度自适应轴向互斥阈值。
+   跑前先看 `debug_snapshot()["axis_mix"]`：
+   - 直线上稳定接近 0 → 表示由 `vy` 接管修正，正常
+   - 入弯瞬间平滑爬到 0.7-1.0 → 表示 ω 接管，正常
+   - 直线上小幅震荡就跳到 0.3+ → 把 `kappa_axis_width` 调到 0.7+
+   - 进弯一段时间 axis_mix 仍 < 0.5 → 把 `kappa_axis_center` 调到 0.7
 
 **调参时一定要打印这几个量**：
 

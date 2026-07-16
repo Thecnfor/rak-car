@@ -22,6 +22,10 @@ def subscribe_lane_state(
     ey_release: float = 0.02,
     ea_release: float = 0.05,
     hold_ms: float = 250.0,
+    # 轴向互斥权重（v6+）：直线段 axis_mix≈0 时 vy 接管（朝向不变、质心斜向），
+    # 弯道段 axis_mix≈1 时 ω 接管（后轮做轴、前轮差速旋转）。
+    kappa_axis_center: float = 1.0,
+    kappa_axis_width: float = 0.5,
     r_eff: float = 0.30,
     wheel_max_abs: float = 0.55,
     wheel_max_accel: float = 0.4,
@@ -47,6 +51,8 @@ def subscribe_lane_state(
         ey_release=ey_release,
         ea_release=ea_release,
         hold_ms=hold_ms,
+        kappa_axis_center=kappa_axis_center,
+        kappa_axis_width=kappa_axis_width,
         r_eff=r_eff,
     )
 
@@ -93,6 +99,7 @@ def subscribe_lane_state(
             print(
                 f"ey={state.error_y!s:>10}  ea={state.error_angle!s:>10}  "
                 f"kappa={dbg['kappa_ema']:.3f}  dkappa={dbg['dkappa_ema']:.3f}  "
+                f"axis_mix={dbg['axis_mix']:.3f}  "
                 f"streak={dbg['straight_streak_ms']:>5.0f}ms  "
                 f"v1={v1:>8.4f}  v2={v2:>8.4f}  v3={v3:>8.4f}  v4={v4:>8.4f}"
             )
