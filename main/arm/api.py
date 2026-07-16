@@ -169,8 +169,16 @@ class ArmClient:
         y_mm: Optional[float],
         timeout: float = 30.0,
     ) -> dict:
-        """一次设置 x/y（None 表示不动）。side/hand 已删（2026-07-16）。"""
-        x_m = _mm_to_m(x_mm) if x_mm is not None else None
+        """一次设置 x/y（None 表示不动）。side/hand 已删（2026-07-16）。
+
+        2026-07-16：x 轴控制已禁用（reset_x 删除后无初始值），传 x_mm 报错。
+        """
+        if x_mm is not None:
+            raise ValueError(
+                "set_pose 禁用 x 参数：x 没有初始值（reset_x 已删除），"
+                "无法定位当前位置。x 由视觉闭环 / 业务层另行控制。"
+            )
+        x_m = None
         y_m = _mm_to_m(y_mm) if y_mm is not None else None
         # set_pose 是纯移动，禁止在保护区调
         self._check_y_protected("set_pose")
@@ -191,11 +199,12 @@ class ArmClient:
     ) -> dict:
         """双轴同步移动到 (x_mm, y_mm)。
 
-        底层调 arm.goto_position（车端 PID）。
-        客户端用 TrajectoryGenerator 做 dry-run，给出预估时长。
-
-        x 轴软限位已取消（用户原话"灵活使用就好"），仅校验 y。
+        2026-07-16：x 轴控制已禁用，传 x_mm 报错。
         """
+        if x_mm is not None:
+            raise ValueError(
+                "move_xy 禁用 x 参数：x 没有初始值（reset_x 已删除）。"
+            )
         self._check_y_protected("move_xy")
         self._check_safe(y_mm=y_mm)
         state = self.get_state()
@@ -215,7 +224,7 @@ class ArmClient:
 
     def move_y(self, y_mm: float, v_max_mms: float = 80.0, timeout: float = 20.0) -> dict:
         # 业务坐标语义：y_mm=0 在磁感应触底，向下（朝触底）取正值，向上取负值；上限 = -soft_y_max_mm。
-        # move_y 走 y 步进电机（不动舵机），即使在保护区 [0, -80] 也可以调（用于出保护区）。
+        # move_y 走 y 步进电机（不动舵机），即使在保护区 [0, -30] 也可以调（用于出保护区）。
         self._check_safe(y_mm=y_mm)
         job = self._call_arm(
             "move_y_position",
@@ -243,10 +252,12 @@ class ArmClient:
         return job
 
     def move_x(self, x_mm: float, v_max_mms: float = 150.0, timeout: float = 20.0) -> dict:
-        # 业务坐标语义：x_mm=0 在初始化时的位置，远离为正。x 轴无软件软限位，
-        # 灵活使用；物理墙 ≈ 0.34m 由 move_x_position 的 x_stop_check 触发 calibrate 兜底。
-        # motor_280 是编码器闭环，正常不会丢步，但仍做一次回校以防打滑/卡阻。
-        self._check_y_protected("move_x")
+        # 2026-07-16：x 轴控制已禁用。reset_x 已删除，x 没有初始值，
+        # 业务层无法定位当前位置。所有 x 控制都 raise。
+        raise ValueError(
+            "move_x 禁用：x 没有初始值（reset_x 已删除）。"
+            "x 由视觉闭环（auto_navigate 等）/ 业务层另行控制。"
+        )
         job = self._call_arm(
             "move_x_position",
             timeout=timeout,
@@ -281,7 +292,7 @@ class ArmClient:
     # ---- 硬件安全门（防止误操作撞车） ----
     #
     # 经验规则（来自现场测试 + 比赛策略，2026-07-16）：
-    #   - y ∈ [0, -80]   ：保护区，禁止动舵机/臂（除 init 位置 hand UP / arm MID=0）
+    #   - y ∈ [0, -30]   ：保护区，禁止动舵机/臂（除 init 位置 hand UP=-90 / arm MID=0）
     #   - y ∈ [-80, -100]：放开一般舵机动作；set_storage 仍需 y < -100
     #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT)
     #   - 物理依据：y 离触底越近（接近 0），舵机摆动就越容易撞到地面或邻物
@@ -289,11 +300,11 @@ class ArmClient:
     #
     # 实现：每次关键操作前查 y，超阈就 raise ValueError。**不静默吞**。
 
-    _Y_PROTECTED_THRESHOLD_MM = -80.0     # y ∈ [0, -80] 是保护区
+    _Y_PROTECTED_THRESHOLD_MM = -30.0     # 2026-07-16: 收紧保护区 [0, -30]（之前 [0, -80] 太宽松）
     _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage
 
     def _check_y_protected(self, action: str, *, allow_init_position: bool = False) -> None:
-        """y 保护区检查：y ∈ [0, -80]mm 时禁止动舵机/臂（除 init 位置）。
+        """y 保护区检查：y ∈ [0, -30]mm 时禁止动舵机/臂（除 init 位置）。
 
         Args:
             action: 当前动作名（用于错误信息）。
@@ -309,7 +320,7 @@ class ArmClient:
             if allow_init_position:
                 return
             raise ValueError(
-                f"[{action}] y={y_mm:.1f}mm ∈ [0, -80] 安全保护区，禁止动。\n"
+                f"[{action}] y={y_mm:.1f}mm ∈ [0, -30] 安全保护区，禁止动。\n"
                 f"  规则: 接近触底时舵机摆动会撞车\n"
                 f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。\n"
                 f"  例外: set_hand('UP'/-90) / set_arm_angle('MID'/0) 初始化姿态允许。"
