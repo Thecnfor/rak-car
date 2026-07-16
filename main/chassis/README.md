@@ -165,7 +165,7 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
 | **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
 | **Pure Pursuit** | `PurePursuitOuterLoop` | 视觉误差当假想目标点 → 几何曲率 → omega | 占位骨架（需替换为目标轨迹） | ⭐⭐⭐ |
-| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_decided = (1-axis_mix) * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥（直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立） | ⭐⭐⭐ |
+| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥（直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力） | ⭐⭐⭐ |
 
 **实测典型取值**（调参从这开始）：
 
@@ -191,14 +191,20 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | `ey_release` / `ea_release` | 0.02 / 0.05 | 恢复门控误差阈值（m / rad） |
 | `hold_ms` | 250 ms | 误差小并稳定多久才放回 `v_max` |
 | `kappa_axis_center` / `kappa_axis_width` | 1.0 / 0.5 | `axis_mix` sigmoid 分水岭 / 过渡带宽度。<br/>`axis_mix ≈ 0` → 由 `vy` 接管（朝向不变、质心斜向滑动）；<br/>`axis_mix ≈ 1` → 由 `ω` 接管（后轮做轴、前轮差速旋转）。<br/>现场调：<ul><li>直线上小抖就触发到 ω → 调高 `kappa_axis_width` 到 0.7+</li><li>进弯后才打到 ω 全额 → 调低 `kappa_axis_center` 到 0.7</li></ul> |
+| `vy_floor` | 0.15 | **弯道段 vy 保底比例（修复 2026-07-16 弯内侧压边界）**：弯道段（axis_mix≈1）保留 `vy_raw * vy_floor` 的横向修正能力，否则 `error_y` 在长弯里完全不被修、弯内侧贴线/压边。`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`。<br/>现场调：<ul><li>弯内侧仍贴线 → 调到 0.20~0.25</li><li>弯里车头晃 / 旋转被稀释 → 调到 0.10</li><li>想回到原"轴向互斥"行为 → 设 0（不推荐）</li></ul> |
 | `r_eff` | 0.30 m | 麦轮几何系数 |
 
 **`axis_mix` 是什么**：来自「轴向互斥」设计——直线段由 `vy` 修横向偏差（`ω=0`、
 朝向不变、质心在世界坐标系沿斜向移动）；弯道段由 `ω` 转向（`vy=0`、后轮
 做轴前轮差速旋转）。过渡是用 `kappa`（已存在的弧度偏差 + 变化率归一化）
 通过 sigmoid 平滑映射到 `[0, 1]` 实现的，避免同一帧内横向修正与转向全开互冲。
-`debug_snapshot()` 已暴露 `axis_mix` 键，可直接 `print(outer.debug_snapshot())`
-观察分布。
+`debug_snapshot()` 已暴露 `axis_mix` / `vy_keep` / `vy_floor` 键，可直接
+`print(outer.debug_snapshot())` 观察分布。
+
+**`vy_floor` 是什么**：`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`。
+直线段 (`axis_mix=0`) `vy_keep=1` → 全量 vy；弯道段 (`axis_mix=1`)
+`vy_keep=vy_floor` → 保留 `vy_floor` 比例横向修正。**不设 vy_floor=0 即可避免
+弯内侧压边界**——纯 `axis_mix=1 → vy=0` 会让 error_y 在长弯里完全无修正机会。
 
 **r_eff 是什么**：麦轮几何里"角速度 → 4 轮异速"的耦合系数。等于 `(track/2 + wheel_base/2)`，从 `cfg_vehicle.yaml` 算出来是 `(0.30/2 + 0.28/2) = 0.29`，代码里写 0.30 是凑整。
 
@@ -382,6 +388,9 @@ python3 -c "from main.chassis.examples import 01_minimal_p_lane; 01_minimal_p_la
    - 入弯瞬间平滑爬到 0.7-1.0 → 表示 ω 接管，正常
    - 直线上小幅震荡就跳到 0.3+ → 把 `kappa_axis_width` 调到 0.7+
    - 进弯一段时间 axis_mix 仍 < 0.5 → 把 `kappa_axis_center` 调到 0.7
+9. **`vy_floor`**：弯内侧压边界时第一反应是调大它（0.15 → 0.20~0.25），
+   旋转被稀释（弯里车头晃）才调小（0.15 → 0.10）。跑前看
+   `debug_snapshot()["vy_keep"]`：直线上≈1.0、弯道里应≥`vy_floor`（不再为 0）。
 
 **调参时一定要打印这几个量**：
 

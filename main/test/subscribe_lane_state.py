@@ -1,11 +1,8 @@
 import time
 from typing import Optional
-
 from main.ws_client import RuntimeWsClient
 from main.chassis import CurvatureAdaptiveOuterLoop, WheelSmoother
 from main.chassis.state import LaneState
-
-
 def subscribe_lane_state(
     hz: float = 50.0,
     max_seconds: Optional[float] = 50.0,
@@ -26,6 +23,10 @@ def subscribe_lane_state(
     # 弯道段 axis_mix≈1 时 ω 接管（后轮做轴、前轮差速旋转）。
     kappa_axis_center: float = 1.0,
     kappa_axis_width: float = 0.5,
+    # 弯道段 vy 保底比例（修复 2026-07-16 弯内侧压边界）：
+    # axis_mix≈1 时保留 vy_raw * vy_floor 的横向修正能力，让 error_y 在长弯里仍能收敛。
+    # 经验区间：0.10~0.25。0=完全互斥（不推荐）；>0.4≈Stanley 全时修正。
+    vy_floor: float = 0.15,
     r_eff: float = 0.30,
     wheel_max_abs: float = 0.55,
     wheel_max_accel: float = 0.4,
@@ -53,6 +54,7 @@ def subscribe_lane_state(
         hold_ms=hold_ms,
         kappa_axis_center=kappa_axis_center,
         kappa_axis_width=kappa_axis_width,
+        vy_floor=vy_floor,
         r_eff=r_eff,
     )
 
@@ -99,7 +101,7 @@ def subscribe_lane_state(
             print(
                 f"ey={state.error_y!s:>10}  ea={state.error_angle!s:>10}  "
                 f"kappa={dbg['kappa_ema']:.3f}  dkappa={dbg['dkappa_ema']:.3f}  "
-                f"axis_mix={dbg['axis_mix']:.3f}  "
+                f"axis_mix={dbg['axis_mix']:.3f}  vy_keep={dbg['vy_keep']:.3f}  "
                 f"streak={dbg['straight_streak_ms']:>5.0f}ms  "
                 f"v1={v1:>8.4f}  v2={v2:>8.4f}  v3={v3:>8.4f}  v4={v4:>8.4f}"
             )
@@ -116,4 +118,4 @@ def subscribe_lane_state(
 
 
 if __name__ == "__main__":
-    subscribe_lane_state(hz=50.0, max_seconds=70.0, dry_run=False)
+    subscribe_lane_state(hz=50.0, max_seconds=80.0, dry_run=False)

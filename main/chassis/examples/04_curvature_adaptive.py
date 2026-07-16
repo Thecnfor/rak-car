@@ -46,6 +46,10 @@ def main(max_seconds: float = 20.0) -> None:
         # - 进弯后才打到 ω 全额 → 把 kappa_axis_center 调到 0.7 左右
         kappa_axis_center=1.0,
         kappa_axis_width=0.5,
+        # vy_floor（修复 2026-07-16 弯内侧压边界）：弯道段保留 15% 横向修正能力，
+        # 让 error_y 在长弯里仍能缓慢收敛，不会压内边界。
+        # 现场调：弯内侧仍贴线 → 调到 0.20~0.25；旋转被稀释（车在弯里晃）→ 调到 0.10
+        vy_floor=0.15,
     )
 
     # 最后一道闸：单轮 |v| 饱和到 0.55 m/s，单帧最大加速 0.4 m/s / 减速 0.6 m/s
@@ -56,7 +60,7 @@ def main(max_seconds: float = 20.0) -> None:
         print(
             f"ey={state.error_y:+.4f} ea={state.error_angle:+.4f} "
             f"kappa={dbg['kappa_ema']:.3f} dkappa={dbg['dkappa_ema']:.3f} "
-            f"axis_mix={dbg['axis_mix']:.3f} "
+            f"axis_mix={dbg['axis_mix']:.3f} vy_keep={dbg['vy_keep']:.3f} "
             f"streak={dbg['straight_streak_ms']:.0f}ms "
             f"v=[{speeds[0]:+.2f},{speeds[1]:+.2f},{speeds[2]:+.2f},{speeds[3]:+.2f}]"
         )

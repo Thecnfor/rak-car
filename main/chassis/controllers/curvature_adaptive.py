@@ -28,6 +28,14 @@
         omega_decided = axis_mix    * omega_raw
   缩放，保证同一帧内横向修正与转向不会同时全开，与底盘期望「横向偏差下走斜向、转弯时绕后轴」
   的行为一致。
+- **vy_floor（v6+，2026-07-16 加）**：上面 ``vy_decided`` 写法在弯道里（axis_mix→1）把
+  vy 完全压零，导致 error_y 在长弯里彻底没有修正机会，弯内侧（error_y 偏内一侧）
+  会持续贴线/压边界。修复：保留 ``vy_floor``（默认 0.15）作为保底——
+        vy_keep      = vy_floor + (1 - vy_floor) * (1 - axis_mix)
+        vy_decided   = vy_keep * vy_raw
+  这样 axis_mix=0（直线）保持 vy 全量、axis_mix=1（弯道）保留 15% 横向修正，
+  过渡带由 sigmoid 保持平滑。``vy_floor`` 调大（→0.3）更像 Stanley 全时修正、
+  error_y 收敛快但旋转略被稀释；调小（→0.05）更接近原「轴向互斥」行为。
 - 控制律在 chassis/state.py LaneState 之上，依赖 (state, dt) 即可，对底层 P / Stanley
   没有强耦合，可以单独替换使用。
 """
@@ -80,6 +88,11 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         # axis_mix ≈ 1 → 转弯主导（vy=0, ω 全量，后轮做轴前轮差速旋转）
         kappa_axis_center: float = 1.0,
         kappa_axis_width: float = 0.5,
+        # --- 弯道段 vy 保底比例（修复 2026-07-16 弯内侧压边界）---
+        # 弯道段（axis_mix≈1）保留 vy_raw * vy_floor 的横向修正能力，
+        # 让 error_y 在长弯里仍有机会被缓慢修正，否则弯内侧贴线/压边。
+        # 经验区间：0.10~0.25。0 = 还原成完全互斥（不推荐）；>0.4 ≈ Stanley 全时修正。
+        vy_floor: float = 0.15,
         # --- 麦轮几何 ---
         r_eff: float = 0.30,
     ) -> None:
@@ -98,6 +111,8 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self.hold_ms = float(hold_ms)
         self.kappa_axis_center = float(kappa_axis_center)
         self.kappa_axis_width = max(float(kappa_axis_width), 1e-3)
+        # vy 保底比例 ∈ [0, 1)；0 会让弯道里 vy 完全归零（原互斥行为）。
+        self.vy_floor = max(0.0, min(float(vy_floor), 1.0))
         # 当前 axis_mix 缓存（每帧由 step() 刷新），供 debug_snapshot() 暴露
         self._axis_mix: float = 0.0
         self.r_eff = float(r_eff)
@@ -233,8 +248,11 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         # 直线段 (kappa 小) → vy 接管、ω≈0 → 朝向不变，质心斜向滑动；
         # 弯道段 (kappa 大) → ω 接管、vy≈0 → 后轮做轴、前轮差速旋转。
         # 过渡带由 kappa_axis_width 控制，过分陡会让 vy/ω 互斥抖动。
+        # 2026-07-16: 弯道段保留 vy_floor（默认 0.15）作为 error_y 最小修正能力，
+        # 否则完全压零后弯内侧持续压边界。
         self._axis_mix = self._axis_mix_from_kappa(kappa)
-        vy_decided = (1.0 - self._axis_mix) * vy_raw
+        vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
+        vy_decided = vy_keep * vy_raw
         omega_decided = self._axis_mix * omega_raw
 
         return mecanum_inverse(vx, vy_decided, omega_decided, self.r_eff)
@@ -242,9 +260,12 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
     # ---------- 调试辅助 ----------
     def debug_snapshot(self) -> dict:
         """给 on_tick 回调用：暴露内部 curvature 估计 / 恢复状态 / 轴向互斥权重。"""
+        vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
         return {
             "kappa_ema": self._kappa_ema,
             "dkappa_ema": self._dkappa_ema,
             "straight_streak_ms": self._straight_streak_ms,
             "axis_mix": self._axis_mix,
+            "vy_keep": vy_keep,
+            "vy_floor": self.vy_floor,
         }
