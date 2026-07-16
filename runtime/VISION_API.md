@@ -276,7 +276,7 @@ curl -sS http://127.0.0.1:5050/v1/vision/lane/state
 ### 外环专用：WebSocket `subscribe_lane`
 
 > **外环 = 不在车端、但要稳定拿到 `(error_y, error_angle)` 做控制**。
-> lane_feed 守护线程（20Hz 刷 lane_state）由 `runtime/services/runtime_service.py` 在 init 时**默认启动**，
+> lane_feed 守护线程（**50Hz** 刷 lane_state，2026-07-16 上调，原 20Hz）由 `runtime/services/runtime_service.py` 在 init 时**默认启动**，
 > 不需要任何手动开关。直接连 WS 订阅 `lane_state` push 或 HTTP 轮询 `/v1/vision/lane/state` 即可。
 
 #### WebSocket `subscribe_lane`（**推荐外环用这个**）

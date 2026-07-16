@@ -1269,7 +1269,7 @@ class MyCar(MecanumDriver):
                 distance=self.get_distance(),
             )
 
-    def start_lane_feed(self, hz: float = 20.0):
+    def start_lane_feed(self, hz: float = 50.0):
         """
         启动 lane 误差缓存守护线程（只刷 lane_state，不下发轮速）。
 

@@ -61,7 +61,7 @@
 from main.chassis import ChassisClient, DoubleLoopRunner, POuterLoop
 
 api = ChassisClient.connect()                  # 1. 连 HTTP + WS（自动）
-# 注意：lane_feed 守护线程由 runtime init 默认启起来（20Hz），不用手动 start/stop。
+# 注意：lane_feed 守护线程由 runtime init 默认启起来（50Hz，2026-07-16 上调），不用手动 start/stop。
 runner = DoubleLoopRunner(
     api=api,
     outer=POuterLoop(vx=0.3),                  # 2. 控制律：P 起步
@@ -83,7 +83,7 @@ api.stop_wheel_speeds()                        # 4. 关轮速（必调）
 | 方法 | 底层 HTTP / WS | 返回 | 量纲 | 推荐频率 |
 | --- | --- | --- | --- | --- |
 | `connect()` | — | `ChassisClient` | — | 启动一次 |
-| `start_lane_feed(hz=20)` | runtime init 默认启（20Hz），无需手动调用 | `{started, hz}` | Hz | 自动 |
+| `start_lane_feed(hz=50)` | runtime init 默认启（50Hz，2026-07-16 上调），无需手动调用 | `{started, hz}` | Hz | 自动 |
 | `stop_lane_feed()` | 已禁用 —— lane_feed 由 runtime 一直跑 | `{stopped}` | — | 不调 |
 | `stop_wheel_speeds()` | `realtime/wheel_speeds [0,0,0,0]` | `{speeds: [0,0,0,0]}` | m/s | 退出必调 |
 | `emergency_stop()` | `POST /v1/control/emergency-stop` | `{stopped}` | — | 兜底 |
@@ -382,10 +382,10 @@ finally:
 | 项 | 实测值 | 备注 |
 | --- | --- | --- |
 | 外环频率 | 50Hz | 受 lane 推理 ~5-10ms + HTTP/WS RTT ~2-5ms 限制 |
-| `lane_feed` 推送频率 | 15-20Hz | 受 ZMQ 推理 + service 层 set_lane_state 限制 |
+| `lane_feed` 推送频率 | **50Hz**（2026-07-16 上调，原 15-20Hz） | 受 ZMQ 推理 + service 层 set_lane_state 限制。lane 模型 128x128 推理 ~15-20ms，50Hz 撑得住 |
 | 单轮端到端 RTT（WS） | ~5ms | ws 路径比 http 快 ~3-5ms |
 | 单轮端到端 RTT（HTTP） | ~10ms | 仍能跑 50Hz，但留余量小 |
-| WebSocket push 5s | ~80 次 | `subscribe_lane` 实测（受 lane_feed 频率上限约束） |
+| WebSocket push 5s | ~250 次 | `subscribe_lane` 实测 50Hz×5s（受 lane_feed 频率上限约束） |
 | lane_outer_loop.py 3.3s | 51 push + 51 下发 | 15.5 Hz 端到端 |
 
 ---

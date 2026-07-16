@@ -496,7 +496,7 @@ def _ws_op_realtime_analog2(service, payload):
 def _ws_op_realtime_lane_state(service, _payload):
     """外环最常用：读 streamer 缓存的 lane_state。
 
-    数据来源是 lane_feed 守护线程（runtime 启动后默认 20Hz）通过
+    数据来源是 lane_feed 守护线程（runtime 启动后默认 50Hz，2026-07-16 上调）通过
     `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
     不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock（极快），
     50Hz+ 外环轮询安全，不会和 lane_feed 守护线程或 MJPEG 推流抢锁。
@@ -1173,7 +1173,7 @@ def create_runtime_router(service, camera_stream_service):
         # 订阅存在则后台 task 一直在跑；disconnect / unsubscribe 时 cancel。
         lane_push_task = None
         lane_subscribed = False
-        lane_push_hz = 20.0  # 默认 20Hz 轮询 lane_state，更新才推
+        lane_push_hz = 50.0  # 默认 50Hz 轮询 lane_state（2026-07-16 上调），更新才推
         # ---- arm_state push 后台任务(同 lane 模式)----
         arm_push_task = None
         arm_subscribed = False

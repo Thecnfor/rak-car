@@ -297,7 +297,7 @@ class RuntimeApiClient:
         """外环最常用：读 lane_feed 守护线程缓存的 lane_state。
 
         不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
-        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 20Hz）的
+        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 50Hz，2026-07-16 上调）的
         更新频率解耦，所以轮询再快也只会读到同一份最新缓存。
 
         返回 `{"lane_state": {"error_y": ..., "error_angle": ..., "active": ..., ...}}`。
