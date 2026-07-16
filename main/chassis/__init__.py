@@ -8,6 +8,7 @@ from .controllers.base import OuterLoop
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
 from .controllers.pure_pursuit import PurePursuitOuterLoop
+from .tasks import auto_navigate  # 2026-07-16: 自动导航任务（外环 + 视觉 + 安全）
 
 __all__ = [
     "ChassisClient",
@@ -19,4 +20,5 @@ __all__ = [
     "POuterLoop",
     "StanleyOuterLoop",
     "PurePursuitOuterLoop",
+    "auto_navigate",
 ]
