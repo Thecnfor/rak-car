@@ -17,6 +17,8 @@ from runtime.core import settings
 from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS
 from runtime.hardware.controller_session import get_controller_session
 from runtime.services.inference_service import InferBackendService
+import logging  # 2026-07-16: init reset_all 日志用(避免循环 import smartcar.whalesbot.tools)
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
