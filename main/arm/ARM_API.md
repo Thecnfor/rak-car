@@ -55,14 +55,12 @@ from main.arm import (
 | 方法 | 用途 | 关键参数 | 底层 action / 端点 | 备注 |
 | --- | --- | --- | --- | --- |
 | `connect(load_origin=True)` | 建一个 client（HTTP 自动连、WS 选连） | — | — | 同步加载 `arm_origin.yaml` |
-| `set_pose(x_mm=None, y_mm=None, side=None, hand=None, timeout=30)` | 一次设 4 个轴，`None` 不动 | mm + 枚举 | `POST /v1/execute {target:arm, name:set_arm_pose}` | 超软限位 → `ValueError` |
+| `set_pose(x_mm, y_mm, timeout=30)` | 一次设 x/y（**side/hand 已删 2026-07-16**） | mm | `POST /v1/execute {target:arm, name:set_arm_pose}` | 保护区拦截 |
 | `move_xy(x_mm, y_mm, v_max=150, a_max=400, timeout=None)` | 双轴同步 | mm, mm/s, mm/s² | `arm.goto_position` | 客户端 S 曲线 dry-run 算 `plan.T`，自动超时 = `max(5, T*2+1)` |
 | `move_y(y_mm, v_max=80, timeout=20)` | 单轴 y | mm | `arm.move_y_position` | 完成后做丢步核对（驱动层 + 上层） |
 | `move_x(x_mm, v_max=150, timeout=20)` | 单轴 x | mm | `arm.move_x_position` | 编码器闭环，正常不丢步 |
-| `set_side(side, speed=80, timeout=10)` | 大臂方向（**LEFT 已禁**） | enum, speed | `arm.set_arm_angle` | MID/RIGHT，`LEFT` 报 `ValueError` |
-| `set_arm_angle(angle, speed=80, timeout=10)` | 大臂角度（**业务硬限 [0, -150]°**） | float | `arm.set_arm_angle` | angle > 0 或 < -150 报 `ValueError` |
-| `set_hand(hand, speed=80, timeout=10)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | enum, speed | `arm.set_hand_angle` | UP/MID/DOWN（透传），UP 是 init 位置（y ∈ [0, -80] 允许） |
-| `set_hand_angle(angle, speed=80, timeout=10)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90 是 init 位置（保护区允许） |
+| `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [0, -150]° + y 保护区**） | float（**必填**） | `arm.set_arm_angle` | angle > 0 / < -150 报 ValueError；0° (MID) 是 init 位置（保护区允许） |
+| `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
 | `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | 实际角度走 `ServoPwm` wrapper，参见 §6 |
 | `get_storage()` | 读当前档位（客户端缓存，**不下发舵机**） | — | — | 重建 client 后回 "UNKNOWN" |
@@ -223,8 +221,8 @@ class TrajectoryPlan:
 | ~~只重置 x~~ | ❌ reset_x 已删除（2026-07-16）；x 位置由视觉闭环控制，无软件复位 |
 | 双轴同步移动 | `ArmClient.move_xy(...)` / `ArmRunner.move_xy(...)` |
 | 单轴移动 | `ArmClient.move_x/move_y` |
-| 改大臂方向 | ~~`ArmClient.set_side("LEFT")`~~ ❌ LEFT 已禁；用 `ArmClient.set_arm_angle(-90)` |
-| 改手爪角度 | `ArmClient.set_hand("DOWN")` |
+| 改大臂角度 | `ArmClient.set_arm_angle(-90, speed=80, timeout=10)` |
+| 改手爪角度 | `ArmClient.set_hand_angle(-30, speed=80, timeout=10)` |
 | 切存储仓档位 | `ArmClient.set_storage("RIGHT")` |
 | 读存储仓档位 | `ArmClient.get_storage()` |
 | 抓取 | `ArmClient.grasp(True)` |

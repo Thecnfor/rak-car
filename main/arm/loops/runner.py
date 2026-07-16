@@ -121,9 +121,6 @@ class ArmRunner:
                 "verify_x: target=%.1f actual=%.1f err=%.1fmm", x_mm, state.x_mm, err,
             )
 
-    def set_side(self, side: str, timeout: Optional[float] = None) -> dict:
-        return self.client.set_side(side, timeout=timeout or self.default_timeout_s)
-
     def set_arm_angle(self, angle: float, speed: int = 80,
                       timeout: Optional[float] = None) -> dict:
         """大臂角度控制（业务层硬限 [0, -150]°）。
@@ -134,9 +131,6 @@ class ArmRunner:
             angle, speed=speed,
             timeout=timeout or self.default_timeout_s,
         )
-
-    def set_hand(self, hand: str, timeout: Optional[float] = None) -> dict:
-        return self.client.set_hand(hand, timeout=timeout or self.default_timeout_s)
 
     def set_storage(self, side: str, timeout: Optional[float] = None) -> dict:
         """切换存储仓到 LEFT/RIGHT（写死角度的两档枚举）。"""
@@ -150,9 +144,9 @@ class ArmRunner:
         return self.client.grasp(on, timeout=timeout or self.default_timeout_s)
 
     def go_home(self) -> dict:
-        """回到 y=0, x=0，hand=UP，side=MID。"""
-        self.client.set_hand("UP", timeout=10)
-        self.client.set_side("MID", timeout=10)
+        """回到 y=0, x=0，hand=UP（-90），arm=MID（0）。"""
+        self.client.set_hand_angle(-90.0, speed=80, timeout=10.0)
+        self.client.set_arm_angle(0.0, speed=80, timeout=10.0)
         return self.move_xy(0.0, 0.0)
 
     # ---- 复位 ----
@@ -167,14 +161,14 @@ class ArmRunner:
 
     # ---- 业务组合 ----
 
-    def pick(self, side: str, x_mm: float, y_mm: float) -> dict:
-        """set_side -> move_xy -> grasp(True)。"""
-        self.set_side(side)
+    def pick(self, arm_angle: float, x_mm: float, y_mm: float) -> dict:
+        """set_arm_angle -> move_xy -> grasp(True)。"""
+        self.set_arm_angle(arm_angle)
         self.move_xy(x_mm=x_mm, y_mm=y_mm)
         return self.grasp(True)
 
     def release(self, drop_x_mm: float = 0.0, drop_y_mm: float = 30.0) -> dict:
-        """set_hand(DOWN) -> move_xy -> grasp(False)。"""
-        self.set_hand("DOWN")
+        """set_hand_angle(DOWN=0) -> move_xy -> grasp(False)。"""
+        self.client.set_hand_angle(0.0, speed=80, timeout=10.0)
         self.move_xy(x_mm=drop_x_mm, y_mm=drop_y_mm)
         return self.grasp(False)

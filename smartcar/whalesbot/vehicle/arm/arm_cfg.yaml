@@ -1,15 +1,7 @@
 hand_cfg:
   hand:
-    angle_list:
-      LEFT: 93
-      MID: 0
-      RIGHT: -93
     port: 3
   hand2:
-    angle_list:
-      UP: -90
-      MID: -37
-      DOWN: 0
     port: 2
   grap:
     port_pump: 2
@@ -31,8 +23,8 @@ horiz_cfg:
 pos_cfg:
   pose_enable: true
   pose_horiz: 0.11973433378453424
-  pose_vert: 0
-  side: LEFT
+  pose_vert: 0.0
+  side: MID
 vert_cfg:
   motor:
     id: 3

@@ -56,8 +56,9 @@ def main():
     print("[3] grasp(True)")
     print(json.dumps(runner.grasp(True), ensure_ascii=False, indent=2))
 
-    print("[4] set_hand(DOWN)")
-    print(json.dumps(runner.set_hand("DOWN"), ensure_ascii=False, indent=2))
+    print("[4] set_hand_angle(DOWN=0)")
+    print(json.dumps(runner.client.set_hand_angle(0.0, speed=80, timeout=10.0),
+                     ensure_ascii=False, indent=2))
 
     print(f"[5] move_xy -> ({drop_x}, {drop_y})")
     print(json.dumps(runner.move_xy(drop_x, drop_y), ensure_ascii=False, indent=2))

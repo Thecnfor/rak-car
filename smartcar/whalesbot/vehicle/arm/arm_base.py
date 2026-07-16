@@ -490,9 +490,12 @@ class ArmController:
         # 修复:hand_servo 改回 ServoPwm(hand2["port"], mode=180),协议匹配 PWM d2;
         # 对应 yaml hand2.port=2(PWM),hand.port=3(Bus 大臂)。
         self.hand_servo = ServoPwm(hand2["port"], mode=180)
-        self.hand_angle_list2 = hand2["angle_list"]
+        # 2026-07-16: yaml 中 angle_list 已删（用户要求灵活使用，无预设）。
+        # SDK 字符串接口仍接受 "UP"/"MID"/"DOWN"/"LEFT"/"RIGHT"，但返回 None 让业务层报错。
+        # 业务层只走数字接口（set_arm_angle(-90) / set_hand_angle(-90)）。
+        self.hand_angle_list2 = hand2.get("angle_list", {}) or {}
         self.arm_servo = ServoBus(hand["port"])
-        self.hand_angle_list = hand["angle_list"]
+        self.hand_angle_list = hand.get("angle_list", {}) or {}
         self.pump = PoutD(grap["port_pump"])
         self.valve = PoutD(grap["port_valve"])
 
@@ -618,9 +621,11 @@ class ArmController:
         `MIN_PRE_TRIGGER_DISP` 未定义 NameError、25s 超时、空转/编码器漂移等
         问题，已整体删除 reset_x。x 轴位置由 move_to_detection_target +
         subscribe_task_detection 视觉闭环控制，不需要软件复位。
+
+        注（2026-07-16）：用数字接口而非 "UP"/"MID" 字符串（yaml angle_list 已删）。
         """
-        self.set_hand_angle("UP")      # 手爪初始 = -90 (UP)
-        self.set_arm_angle("MID")      # 大臂初始 = 0 (MID，避撞车)
+        self.set_hand_angle(-90)      # 手爪初始 = -90 (UP)
+        self.set_arm_angle(0)         # 大臂初始 = 0 (MID，避撞车)
         self.reset_y()
         self.y = 0
         self.save_config()

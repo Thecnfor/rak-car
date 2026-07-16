@@ -23,8 +23,6 @@ except ImportError:  # pragma: no cover
 from .state import (
     ArmState,
     ArmOrigin,
-    SIDES,
-    HANDS,
     STORAGE_SIDES,
     STORAGE_DEFAULT_LEFT_ANGLE,
     STORAGE_DEFAULT_RIGHT_ANGLE,
@@ -38,24 +36,6 @@ def _mm_to_m(v_mm: float) -> float:
 
 def _m_to_mm(v_m) -> float:
     return float(v_m) * 1000.0
-
-
-def _normalize_side(side: Optional[str]) -> Optional[str]:
-    if side is None:
-        return None
-    s = side.upper()
-    if s not in SIDES:
-        raise ValueError(f"side 必须是 {SIDES} 之一，收到: {side!r}")
-    return s
-
-
-def _normalize_hand(hand: Optional[str]) -> Optional[str]:
-    if hand is None:
-        return None
-    h = hand.upper()
-    if h not in HANDS:
-        raise ValueError(f"hand 必须是 {HANDS} 之一，收到: {hand!r}")
-    return h
 
 
 def _normalize_storage_side(side: Optional[str]) -> Optional[str]:
@@ -185,29 +165,20 @@ class ArmClient:
 
     def set_pose(
         self,
-        x_mm: Optional[float] = None,
-        y_mm: Optional[float] = None,
-        side: Optional[str] = None,
-        hand: Optional[str] = None,
+        x_mm: Optional[float],
+        y_mm: Optional[float],
         timeout: float = 30.0,
     ) -> dict:
-        """一次设置 x/y/side/hand，None 表示不动。"""
-        side = _normalize_side(side)
-        hand = _normalize_hand(hand)
+        """一次设置 x/y（None 表示不动）。side/hand 已删（2026-07-16）。"""
         x_m = _mm_to_m(x_mm) if x_mm is not None else None
         y_m = _mm_to_m(y_mm) if y_mm is not None else None
-        # set_pose 包含舵机 + 移动，禁止在保护区调（除非 init）
-        is_init_only = (
-            (side is None or side == "MID") and
-            (hand is None or hand == "UP")
-        )
-        self._check_y_protected("set_pose", allow_init_position=is_init_only)
+        # set_pose 是纯移动，禁止在保护区调
+        self._check_y_protected("set_pose")
         self._check_safe(y_mm=y_mm)
         return self._call_arm(
             "set_arm_pose",
             timeout=timeout,
             x=x_m, y=y_m,
-            arm=side, hand=hand,
         )
 
     def move_xy(
@@ -375,27 +346,13 @@ class ArmClient:
     _ARM_ANGLE_MIN = -150.0   # 业务层大臂角度下界（°）
     _ARM_ANGLE_MAX = 0.0      # 业务层大臂角度上界（°），>= 0 拒绝
 
-    def set_side(self, side: str, speed: int = 80, timeout: float = 10.0) -> dict:
-        side = _normalize_side(side)
-        if side is None:
-            raise ValueError("set_side 必须给 LEFT/MID/RIGHT")
-        if side == "LEFT":
-            raise ValueError(
-                "set_side('LEFT') 已禁用：LEFT=+93° 会撞车。\n"
-                "  规则: 大臂角度 ∈ [0, -150]°\n"
-                "  解决: 用 ArmClient.set_arm_angle(-90) 或其他负角度代替。"
-            )
-        # y 保护区：MID 是 init 位置（允许），RIGHT 需先出保护区
-        self._check_y_protected("set_side", allow_init_position=(side == "MID"))
-        return self._call_arm("set_arm_angle", timeout=timeout, angle=side, speed=speed)
-
-    def set_arm_angle(self, angle: float, speed: int = 80, timeout: float = 10.0) -> dict:
+    def set_arm_angle(self, angle: float, speed: int, timeout: float) -> dict:
         """大臂总线舵机角度控制（业务层，硬限 [0, -150]°）。
 
         Args:
-            angle: 目标角度（°）。LEFT=+93 已禁，只能 ≤ 0；物理下界 -150。
-            speed: 舵机速度（默认 80）。
-            timeout: HTTP 同步超时（秒）。
+            angle: 目标角度（°）。硬限 [0, -150]°（LEFT=+93 撞车已禁；<-180 撞车）。
+            speed: 舵机速度（必填，无默认）。
+            timeout: HTTP 同步超时（秒，必填，无默认）。
 
         Raises:
             ValueError: 当 angle > 0 或 angle < -150 时拒绝下发。
@@ -414,34 +371,23 @@ class ArmClient:
         self._check_y_protected("set_arm_angle", allow_init_position=(a == 0.0))
         return self._call_arm("set_arm_angle", timeout=timeout, angle=a, speed=speed)
 
-    def set_hand(self, hand: str, speed: int = 80, timeout: float = 10.0) -> dict:
-        hand = _normalize_hand(hand)
-        if hand is None:
-            raise ValueError("set_hand 必须给 UP/MID/DOWN")
-        # 业务硬限 [-90, 0]°：PWM 模式 180 物理范围 [-90, +165]，但 UP/MID/DOWN 三档
-        # 预设都是 ≤ 0，保持 [0, -90] 即可（避免物理撞车，2026-07-16）。
-        # y 保护区：UP 是 init 位置（允许），其他挡位需先出保护区。
-        self._check_y_protected("set_hand", allow_init_position=(hand == "UP"))
-        return self._call_arm("set_hand_angle", timeout=timeout, angle=hand, speed=speed)
-
     # ---- 手爪角度限位（业务层硬保护，2026-07-16 联调加） ----
     #
     # PWM 模式 180 物理范围 [-90, +165]（协议值 = angle + 90 ∈ [0, 255]）。
     # 业务层硬限 [-90, 0]°：
     #   - 上界 0°（DOWN）：防止手爪向下超过水平
     #   - 下界 -90°（UP）：防止手爪向上超过机械结构
-    # 数字接口 set_hand_angle(angle) 校验范围；字符串 set_hand("UP/MID/DOWN") 透传。
+    # 仅数字接口 set_hand_angle(angle)，无字符串预设（2026-07-16 用户要求）。
     _HAND_ANGLE_MIN = -90.0   # 业务层手爪角度下界（°）
     _HAND_ANGLE_MAX = 0.0     # 业务层手爪角度上界（°），> 0 拒绝
 
-    def set_hand_angle(self, angle: float, speed: int = 80, timeout: float = 10.0) -> dict:
+    def set_hand_angle(self, angle: float, speed: int, timeout: float) -> dict:
         """手爪 PWM 舵机角度控制（业务层，硬限 [-90, 0]°）。
 
         Args:
-            angle: 目标角度（°）。DOWN=0 / MID=-37 / UP=-90 是预设三档；
-                数字接口允许 [-90, 0] 范围内任意值。
-            speed: 舵机速度（默认 80）。
-            timeout: HTTP 同步超时（秒）。
+            angle: 目标角度（°）。数字接口，硬限 [-90, 0]°；UP=-90 是 init 位置。
+            speed: 舵机速度（必填，无默认）。
+            timeout: HTTP 同步超时（秒，必填，无默认）。
 
         Raises:
             ValueError: 当 angle > 0 或 angle < -90 时拒绝下发。
@@ -603,12 +549,9 @@ class ArmClient:
         st_data = st_job.get("result") if isinstance(st_job, dict) else {}
         if not isinstance(st_data, dict):
             st_data = {}
-        side = str(st_data.get("side", "MID")).upper()
-        hand = str(st_data.get("hand_angle", "UP")).upper()
-        if hand not in HANDS:
-            hand = "UP"
-        if side not in SIDES:
-            side = "MID"
+        # 2026-07-16: side/hand 字符串预设已删，get_state 直接透传车端返回值。
+        side = str(st_data.get("side", "MID"))
+        hand = str(st_data.get("hand_angle", "UP"))
         origin = self.origin or ArmOrigin()
         return ArmState(
             x_mm=_m_to_mm(raw["raw_x_m"]),
