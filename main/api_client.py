@@ -95,9 +95,9 @@ class RuntimeApiClient:
           - 适合：链式编排（`move_xy → grasp → release`），业务层要等结果才能下一步。
 
         用 `execute_arm_action` / `execute_car_action` / `call` 的旧调用方，arm 长动作
-        （reset_y / reset_x / reset_origin / move_xy / move_x / move_y / set_side /
+        （reset_y / reset_origin / move_xy / move_x / move_y / set_side /
         set_hand / set_storage / grasp）已显式加 sync=True（见 main/arm/api.py），行为
-        不变。
+        不变。注：reset_x 已删除（2026-07-16）。
         """
         payload = {
             "target": target,

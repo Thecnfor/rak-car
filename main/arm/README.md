@@ -44,8 +44,8 @@
 | 项 | 默认值 | 含义 |
 | --- | --- | --- |
 | `soft_y_max_mm` | 200 | y 业务上限（实测行程 -200mm 还有富余） |
-| `soft_x_min_mm` | -320 | x 业务下界（v3 双边行程，撞墙=0，可向左最多 -320mm） |
-| `soft_x_max_mm` | 320 | x 业务上限（撞墙=0，可向右最多 +320mm） |
+| `soft_x_min_mm` | None | x 轴软限位已取消（2026-07-16） |
+| `soft_x_max_mm` | None | x 轴软限位已取消（2026-07-16） |
 
 ## 关键环境变量
 
@@ -125,7 +125,7 @@ ArmState(
     x_mm=0.0, y_mm=0.0,
     side="MID", hand="UP", grasping=False,
     y_origin_valid=False, x_origin_valid=False,
-    soft_y_max_mm=200.0, soft_x_min_mm=5.0, soft_x_max_mm=300.0,
+    soft_y_max_mm=200.0, soft_x_min_mm=None, soft_x_max_mm=None,
     raw_x_m=0.0, raw_y_m=0.0,
     arm_angle=None, hand_angle=None,
     fetched_at=1761234567.89,

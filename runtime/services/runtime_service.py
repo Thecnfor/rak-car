@@ -334,10 +334,9 @@ class CarRuntimeService:
         else:
             # 默认 init 只归 y(x 不归):
             #   - y 轴有磁感触底,reset_y 几秒就完,可靠 → 自动跑
-            #   - x 轴没有独立物理参考,reset_x 撞墙会空转/编码器漂移/反复 hang
-            #     之前 auto-init 默认调 reset_x 触发 25s 超时 + auto_init 反复重建 → pm2 疯转
-            # 现在 x 轴位置由视觉闭环控制:move_to_detection_target + subscribe_task_detection
-            # 需要显式归零的话,通过 car.execute_arm_action("reset_x", sync=True) 单独调
+            #   - x 轴没有软件复位（reset_x 已整体删除）：x 位置由视觉闭环控制
+            #     (move_to_detection_target + subscribe_task_detection),
+            #     物理墙由 move_x_position 的 x_stop_check 触发 calibrate 兜底
             try:
                 car.arm.reset_y()
             except Exception as exc:

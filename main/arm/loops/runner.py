@@ -124,6 +124,17 @@ class ArmRunner:
     def set_side(self, side: str, timeout: Optional[float] = None) -> dict:
         return self.client.set_side(side, timeout=timeout or self.default_timeout_s)
 
+    def set_arm_angle(self, angle: float, speed: int = 80,
+                      timeout: Optional[float] = None) -> dict:
+        """大臂角度控制（业务层硬限 [0, -150]°）。
+
+        LEFT=+93 撞车、<-180 撞车，所以业务只允许 ≤ 0 且 ≥ -150。
+        """
+        return self.client.set_arm_angle(
+            angle, speed=speed,
+            timeout=timeout or self.default_timeout_s,
+        )
+
     def set_hand(self, hand: str, timeout: Optional[float] = None) -> dict:
         return self.client.set_hand(hand, timeout=timeout or self.default_timeout_s)
 
@@ -147,19 +158,12 @@ class ArmRunner:
     # ---- 复位 ----
 
     def reset_y(self, timeout: float = 30.0) -> dict:
-        """y 步进电机触底复位（车端跑 reset_y，**仅动 y，不动 x**）。
+        """y 步进电机触底复位（车端跑 reset_y，**仅动 y**）。
 
-        仅在 y 跑偏严重（补偿不收敛）时调。要同时归 x 请用 reset_position
-        路径（`ArmClient.reset_origin` / 显式调 `arm.reset_position`）。
+        仅在 y 跑偏严重（补偿不收敛）时调。
+        注：reset_x 已删除（2026-07-16）。x 位置由视觉闭环控制，无软件复位。
         """
         return self.client._call_arm("reset_y", timeout=timeout)
-
-    def reset_x(self, timeout: float = 30.0) -> dict:
-        """x 编码器电机堵转复位。
-
-        仅在 x 跑偏严重（卡阻、打滑）时调。
-        """
-        return self.client._call_arm("reset_x", timeout=timeout)
 
     # ---- 业务组合 ----
 

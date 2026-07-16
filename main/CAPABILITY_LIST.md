@@ -80,7 +80,7 @@
 
 - `arm.reset_position`
   - 机械臂整体回零
-- `arm.reset_x`
+- ~~`arm.reset_x`~~ ❌ 已删除（2026-07-16）
   - 机械臂横轴回零
 - `arm.move_x_position`
   - 横轴移动到指定位置

@@ -314,8 +314,8 @@ def crop_harvesting():
     作物采收
     """
     # 调整机械臂
+    # 注: x 轴无软件复位（reset_x 已删除），x 位置由视觉闭环控制。
     my_car.arm.move_y_position(0.2)
-    my_car.arm.reset_x()
     my_car.arm.set_arm_pose(arm="LEFT", hand="DOWN")
 
     my_car.set_storage(True)  # 抬起存储架

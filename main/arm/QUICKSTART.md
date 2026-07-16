@@ -9,9 +9,11 @@ export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 
 ## 2. 首次上电：runtime 自动定原点
 
-不需要任何手动操作。runtime 启动时（pm2 拉起 `rak-car-api`），`ecosystem.config.js` 默认把 `RAK_CAR_RESET_ARM=1` 注入环境变量；`runtime/core/settings.py:111-112` 看到后会在自动初始化阶段调一次 `arm.reset_position`，让 y 触底 / x 撞墙，并把当前编码器值落到 `main/arm/arm_origin.yaml`。
+不需要任何手动操作。runtime 启动时（pm2 拉起 `rak-car-api`），`ecosystem.config.js` 默认把 `RAK_CAR_RESET_ARM=1` 注入环境变量；`runtime/core/settings.py:111-112` 看到后会在自动初始化阶段调一次 `arm.reset_position`，让 y 触底，并把当前编码器值落到 `main/arm/arm_origin.yaml`。
 
-正常情况下你接好车、连上 `RAK_CAR_SERVER_ORIGIN`、跑业务就行；`arm_origin.yaml` 不存在也不会卡死 —— runtime 会用默认软限位（0.18 / 0.005 / 0.30），下次 reset 后被覆盖。
+> 注（2026-07-16）：reset_x 已删除，`reset_position` 只归 y；x 位置由视觉闭环控制。
+
+正常情况下你接好车、连上 `RAK_CAR_SERVER_ORIGIN`、跑业务就行；`arm_origin.yaml` 不存在也不会卡死 —— runtime 会用默认软限位（仅 y 软上限），下次 reset 后被覆盖。
 
 只有当机械臂"漂移严重 / PID 范围卡死 / 编码器读数明显不对"时，才手动跑一次 reset：
 

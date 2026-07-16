@@ -37,7 +37,7 @@ smartcar/test/
     ├── x_axis.py               # X 轴（水平）：move_x / x_pid / x_stop / x_get
     ├── grasp.py                # 气泵：grasp()
     ├── pose.py                 # 姿态：set_arm_pose / set_arm_angle / set_hand_angle / goto / go_for
-    ├── reset.py                # 复位：reset_position / reset_y / reset_x / switch_side
+    ├── reset.py                # 复位：reset_position / reset_y / switch_side（reset_x 已删除）
     └── speed.py                # 速度：y_speed / x_speed
 ```
 

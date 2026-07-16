@@ -36,14 +36,18 @@ STORAGE_DEFAULT_RIGHT_ANGLE = 165
 
 @dataclass
 class ArmOrigin:
-    """业务层坐标系软限位 + 标注（与 arm_cfg.yaml:pos_cfg 是两套）。"""
+    """业务层坐标系原点 + 软限位 + 标注（与 arm_cfg.yaml:pos_cfg 是两套）。
+
+    注：x 轴软限位已取消（2026-07-16 用户原话："灵活使用就好，一般不会超"）。
+    soft_x_min_m / soft_x_max_m 字段保留为 None，仅为兼容旧 arm_origin.yaml 读盘。
+    """
 
     y_origin_m: float = 0.0           # y 触底时的原始 motor_y.get_dis() 值
-    x_origin_m: float = 0.0           # x 撞墙时的原始 motor_x.get_dis() 值
-    x_wall: str = "left"              # 上次撞的是哪一侧
+    x_origin_m: float = 0.0           # x 当前原点（reset_x 已删除，无撞墙校准，固定为 0）
+    x_wall: str = "left"              # 上次撞的是哪一侧（reset_x 已删除，仅历史标注）
     soft_y_max_m: float = 0.20        # 业务软上限（m）,实测行程可达 -200mm 还有富余
-    soft_x_min_m: float = -0.32       # 负=反向墙,允许 [-soft_x_max, soft_x_max] 双向行程
-    soft_x_max_m: float = 0.32
+    soft_x_min_m: Optional[float] = None   # 软限位已取消，固定 None
+    soft_x_max_m: Optional[float] = None   # 软限位已取消，固定 None
     # 丢步/位置偏差阈值（mm）：move_x / move_y 完成后对比 actual vs target，超此值 warn。
     # y 是步进电机，堵转/失步较常见，默认 2mm（≈1 step）；x 是编码器闭环，默认 5mm。
     step_loss_y_mm: float = 2.0
@@ -55,12 +59,14 @@ class ArmOrigin:
         return self.soft_y_max_m * 1000.0
 
     @property
-    def soft_x_min_mm(self) -> float:
-        return self.soft_x_min_m * 1000.0
+    def soft_x_min_mm(self) -> Optional[float]:
+        """x 轴软限位已取消；保留返回 None 以兼容旧代码读取路径。"""
+        return None
 
     @property
-    def soft_x_max_mm(self) -> float:
-        return self.soft_x_max_m * 1000.0
+    def soft_x_max_mm(self) -> Optional[float]:
+        """x 轴软限位已取消；保留返回 None 以兼容旧代码读取路径。"""
+        return None
 
 
 @dataclass
@@ -79,17 +85,13 @@ class ArmState:
 
     # 坐标系可信度
     y_origin_valid: bool = False
-    x_origin_valid: bool = False
+    x_origin_valid: bool = False  # reset_x 已删除，固定 False
 
     # 软限位（从 ArmOrigin 拷过来）。
-    # 默认值必须与 ArmOrigin 一致（v3 双边行程）：
-    #   soft_y_max_mm = 200    （y ∈ [-200, 0] mm）
-    #   soft_x_min_mm = -320   （x ∈ [-320, +320] mm，撞墙=0）
-    #   soft_x_max_mm = 320
-    # 旧版 (5 / 300) 是 v1 单边残留，已修正。
+    # x 轴软限位已取消，固定 None；y 轴保留 [-soft_y_max_mm, 0] mm。
     soft_y_max_mm: float = 200.0
-    soft_x_min_mm: float = -320.0
-    soft_x_max_mm: float = 320.0
+    soft_x_min_mm: Optional[float] = None
+    soft_x_max_mm: Optional[float] = None
 
     # 原始坐标（车端读数，调试用；单位 m）
     raw_x_m: float = 0.0
@@ -107,16 +109,14 @@ class ArmState:
     def in_safe_box(self, x_mm: float, y_mm: float) -> bool:
         """给定 (x, y) 是否在业务软限位内（含）。
 
-        y 业务坐标：触底=0，向下取正、向上取负；区间 [-soft_y_max_mm, 0]。
+        x 轴软限位已取消（永远返回 True）；y 业务坐标：触底=0，向下取正、
+        向上取负；区间 [-soft_y_max_mm, 0]。
         """
-        return (
-            self.soft_x_min_mm <= x_mm <= self.soft_x_max_mm
-            and -self.soft_y_max_mm <= y_mm <= 0.0
-        )
+        return -self.soft_y_max_mm <= y_mm <= 0.0
 
     def is_ready(self) -> bool:
-        """是否所有坐标系都可信 + 都在安全区内。"""
-        if not (self.y_origin_valid and self.x_origin_valid):
+        """是否所有坐标系都可信 + y 在安全区内。x 轴软限位已取消，无校验。"""
+        if not self.y_origin_valid:
             return False
         return self.in_safe_box(self.x_mm, self.y_mm)
 
@@ -125,6 +125,5 @@ class ArmState:
             f"ArmState(x={self.x_mm:.1f}mm, y={self.y_mm:.1f}mm, "
             f"side={self.side}, hand={self.hand}, grasp={self.grasping}, "
             f"y_valid={self.y_origin_valid}, x_valid={self.x_origin_valid}, "
-            f"safe=[{self.soft_x_min_mm:.0f}..{self.soft_x_max_mm:.0f} x "
-            f"-{self.soft_y_max_mm:.0f}..0]mm)"
+            f"safe=[x:无, -{self.soft_y_max_mm:.0f}..0]mm)"
         )

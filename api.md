@@ -26,12 +26,12 @@
 
 | 动作 | 参数（`args`, `kwargs`） | 用途 | 备注 |
 | --- | --- | --- | --- |
-| `reset_position` | — | y 触底 + x 撞墙整体复位 | `ArmClient.reset_origin` 走这条 + 写 yaml |
+| `reset_position` | — | y 触底复位（reset_x 已删除，仅归 y） | `ArmClient.reset_origin` 走这条 + 写 yaml |
 | `reset_y` | — | 仅 y 触底复位（不动 x） | 磁感独证；失败不伪归零 |
-| `reset_x` | — | 仅 x 撞墙复位（不动 y） | **需 y < -100**（`ArmClient.reset_x` 安全门） |
+| ~~`reset_x`~~ | — | ❌ 已删除（2026-07-16） | — |
 | `set_arm_pose` | `x=?, y=?, arm=?, hand=?` | 一次设 4 个轴，None 不动 | 越界抛 `ValueError` |
 | `set_hand_angle` | `angle="UP"/"MID"/"DOWN"/int, speed=80` | 手爪 PWM 舵机 | — |
-| `set_arm_angle` | `angle="LEFT"/"MID"/"RIGHT"/int, speed=80` | 大臂总线舵机 | — |
+| `set_arm_angle` | `angle="MID"/"RIGHT"/int(-150~0), speed=80` | 大臂总线舵机 | 业务层 `ArmClient.set_arm_angle` 硬限 [0, -150]°，`LEFT`/`angle>0`/`angle<-150` 报 ValueError |
 | `move_x_position` | `target=m, out_time=6.0` | x 轴定位（带软限位 + 丢步核对） | target 单位**米** |
 | `move_y_position` | `target=m` | y 轴定位（带软限位 + 丢步核对） | target 单位**米** |
 | `goto_position` | `x=?, y=?, time_run=?, speed=[0.15, 0.04]` | 双轴定位（PID 闭环） | — |
@@ -43,7 +43,7 @@
 | `y_get_position` | — | 读 y（米） | — |
 
 > ⚠️ `arm.*` 业务层常用单位 mm。`ArmClient` 自动换算；直调 `/v1/execute` 时单位是**米**。
-> ⚠️ `move_x_position` / `move_y_position` / `reset_x` / `set_arm_pose` 内部已做软限位 + 丢步核对。
+> ⚠️ `move_y_position` / `set_arm_pose` 内部已做 y 软限位 + 丢步核对；x 轴软限位已取消（2026-07-16），`move_x_position` 仅做丢步核对。
 
 ### 1.2 `car` 动作（36 个）— `target="car"`
 
@@ -222,7 +222,7 @@ curl http://localhost:5050/v1/health
 {
   "task": ["auto_lane_tracing", "auto_seeding", ...],
   "car":  ["beep", "stop", "reset_position", ...],
-  "arm":  ["reset_position", "reset_y", "reset_x", ...],
+  "arm":  ["reset_position", "reset_y", ...],
   "system": ["init", "close", "set_stop_mode", "reset_stop_flag", "emergency_stop"]
 }
 ```
@@ -686,7 +686,7 @@ curl -X POST http://localhost:5050/v1/execute \
 - `RIGHT = 165°` → 协议值 255（**超 0~180**，mc602 协议层不识别，舵机实际行为由 mc602 固件决定）
 - 业务层**只允许 LEFT/RIGHT 二选一**（`set_storage_angle` 任意角度已注册但业务层禁用）
 
-**y < -100 硬件安全门**：set_storage / reset_x / reset_origin 在 y >= -100 时**直接 raise ValueError**，不下发硬件命令。详见 `main/arm/api.py:_check_y_safe_for_storage`。
+**y < -100 硬件安全门**：set_storage 在 y >= -100 时**直接 raise ValueError**，不下发硬件命令。详见 `main/arm/api.py:_check_y_safe_for_storage`。（reset_x 已删除，不再涉及此门。）
 
 ### 5.4 `cancel_job` 已知 SDK 限制
 

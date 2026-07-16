@@ -135,8 +135,6 @@ class ArmClient:
             x_origin_m=float(data.get("x_origin_m", 0.0)),
             x_wall=str(data.get("x_wall", "left")),
             soft_y_max_m=float(data.get("soft_y_max_m", 0.20)),
-            soft_x_min_m=float(data.get("soft_x_min_m", -0.32)),
-            soft_x_max_m=float(data.get("soft_x_max_m", 0.32)),
             calibrated_at=str(data.get("calibrated_at", "")),
         )
 
@@ -151,8 +149,6 @@ class ArmClient:
                     "x_origin_m": origin.x_origin_m,
                     "x_wall": origin.x_wall,
                     "soft_y_max_m": origin.soft_y_max_m,
-                    "soft_x_min_m": origin.soft_x_min_m,
-                    "soft_x_max_m": origin.soft_x_max_m,
                     "calibrated_at": origin.calibrated_at,
                 },
                 f,
@@ -166,7 +162,7 @@ class ArmClient:
         """调车端 arm action。
 
         D 改造后默认 sync=True：
-          - 长动作（move_xy / reset_y / reset_x 等）业务语义就是「等完成才能走下一步」，
+          - 长动作（move_xy / reset_y 等）业务语义就是「等完成才能走下一步」，
             改 sync=False 会破坏现有链式编排。
           - 想 fire-and-forget（例如并发抓多个目标）显式传 sync=False。
         """
@@ -200,7 +196,7 @@ class ArmClient:
         hand = _normalize_hand(hand)
         x_m = _mm_to_m(x_mm) if x_mm is not None else None
         y_m = _mm_to_m(y_mm) if y_mm is not None else None
-        self._check_safe(x_mm=x_mm, y_mm=y_mm)
+        self._check_safe(y_mm=y_mm)
         return self._call_arm(
             "set_arm_pose",
             timeout=timeout,
@@ -220,8 +216,10 @@ class ArmClient:
 
         底层调 arm.goto_position（车端 PID）。
         客户端用 TrajectoryGenerator 做 dry-run，给出预估时长。
+
+        x 轴软限位已取消（用户原话"灵活使用就好"），仅校验 y。
         """
-        self._check_safe(x_mm=x_mm, y_mm=y_mm)
+        self._check_safe(y_mm=y_mm)
         state = self.get_state()
         plan = self.traj.plan_xy(
             x0=state.x_mm, y0=state.y_mm,
@@ -266,9 +264,9 @@ class ArmClient:
         return job
 
     def move_x(self, x_mm: float, v_max_mms: float = 150.0, timeout: float = 20.0) -> dict:
-        # 业务坐标语义：x_mm=0 在撞墙参考点（reset_x 堵转后），远离墙为正；区间 [soft_x_min, soft_x_max]。
+        # 业务坐标语义：x_mm=0 在初始化时的位置，远离为正。x 轴无软件软限位，
+        # 灵活使用；物理墙 ≈ 0.34m 由 move_x_position 的 x_stop_check 触发 calibrate 兜底。
         # motor_280 是编码器闭环，正常不会丢步，但仍做一次回校以防打滑/卡阻。
-        self._check_safe(x_mm=x_mm)
         job = self._call_arm(
             "move_x_position",
             timeout=timeout,
@@ -303,18 +301,19 @@ class ArmClient:
     # ---- 硬件安全门（防止误操作撞车） ----
     #
     # 经验规则（来自现场测试 + 比赛策略）：
-    #   - y ∈ [0, -100]  ：存储仓舵机保持默认 LEFT 位置（不要变）；reset_x 会撞墙
-    #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT) 和 reset_x
-    #   - 物理依据：y 离触底越近（接近 0），x 撞墙/舵机摆动就越容易撞到地面或邻物
+    #   - y ∈ [0, -100]  ：存储仓舵机保持默认 LEFT 位置（不要变）
+    #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT)
+    #   - 物理依据：y 离触底越近（接近 0），舵机摆动就越容易撞到地面或邻物
+    # 注：reset_x 已删除，不再涉及 x 撞墙。
     #
     # 实现：每次关键操作前查 y，超阈就 raise ValueError。**不静默吞**。
 
-    _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage / reset_x
+    _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage
 
     def _check_y_safe_for_storage(self, action: str) -> float:
-        """检查当前 y 是否允许做「会动 x 机械结构 / 存储仓舵机」的动作。
+        """检查当前 y 是否允许做「会动存储仓舵机」的动作。
 
-        action: "set_storage" | "reset_x" | "reset_origin"（任一）
+        action: "set_storage"
         返回：当前 y_mm（mm），供 caller 日志
         raise：ValueError 当 y >= _Y_STORAGE_SAFE_THRESHOLD_MM
         """
@@ -323,17 +322,59 @@ class ArmClient:
         if y_mm > self._Y_STORAGE_SAFE_THRESHOLD_MM:
             raise ValueError(
                 f"[{action}] 安全门拦截: 当前 y={y_mm:.1f}mm > {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm。\n"
-                f"  规则: y < {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm 才能切存储仓或 reset_x\n"
-                f"  (y ∈ [0, -100] 接近触底,横向动作会撞车)\n"
+                f"  规则: y < {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm 才能切存储仓\n"
+                f"  (y ∈ [0, -100] 接近触底,舵机摆动会撞车)\n"
                 f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。"
             )
         return y_mm
+
+    # ---- 大臂角度限位（业务层硬保护，2026-07-16 联调加） ----
+    #
+    # 经验规则（来自现场测试）：
+    #   - LEFT = +93° 撞车（机械臂结构挡住）
+    #   - angle < -180 撞车（机械臂结构挡住）
+    #   - 业务层硬限 [0, -150]：0 是最大（>= 0 不让），只能负值；-150 是物理安全下界
+    #
+    # 实现：set_side("LEFT") 拒绝；set_arm_angle(angle) 校验范围。
+    # 注意：这是业务层硬保护，HTTP /v1/execute 直调底层 action 不受此限（保留逃生口）。
+
+    _ARM_ANGLE_MIN = -150.0   # 业务层大臂角度下界（°）
+    _ARM_ANGLE_MAX = 0.0      # 业务层大臂角度上界（°），>= 0 拒绝
 
     def set_side(self, side: str, speed: int = 80, timeout: float = 10.0) -> dict:
         side = _normalize_side(side)
         if side is None:
             raise ValueError("set_side 必须给 LEFT/MID/RIGHT")
+        if side == "LEFT":
+            raise ValueError(
+                "set_side('LEFT') 已禁用：LEFT=+93° 会撞车。\n"
+                "  规则: 大臂角度 ∈ [0, -150]°\n"
+                "  解决: 用 ArmClient.set_arm_angle(-90) 或其他负角度代替。"
+            )
         return self._call_arm("set_arm_angle", timeout=timeout, angle=side, speed=speed)
+
+    def set_arm_angle(self, angle: float, speed: int = 80, timeout: float = 10.0) -> dict:
+        """大臂总线舵机角度控制（业务层，硬限 [0, -150]°）。
+
+        Args:
+            angle: 目标角度（°）。LEFT=+93 已禁，只能 ≤ 0；物理下界 -150。
+            speed: 舵机速度（默认 80）。
+            timeout: HTTP 同步超时（秒）。
+
+        Raises:
+            ValueError: 当 angle > 0 或 angle < -150 时拒绝下发。
+        """
+        try:
+            a = float(angle)
+        except (TypeError, ValueError):
+            raise ValueError(f"set_arm_angle angle 必须是数字，收到: {angle!r}")
+        if a > self._ARM_ANGLE_MAX or a < self._ARM_ANGLE_MIN:
+            raise ValueError(
+                f"set_arm_angle({a}) 超出业务硬限 [{self._ARM_ANGLE_MIN}, {self._ARM_ANGLE_MAX}]°。\n"
+                f"  规则: 大臂角度 ∈ [0, -150]°（LEFT=+93 撞车，<-180 撞车）\n"
+                f"  解决: 选 -90 (RIGHT 附近) / -120 / -150 等。"
+            )
+        return self._call_arm("set_arm_angle", timeout=timeout, angle=a, speed=speed)
 
     def set_hand(self, hand: str, speed: int = 80, timeout: float = 10.0) -> dict:
         hand = _normalize_hand(hand)
@@ -420,7 +461,11 @@ class ArmClient:
         return getattr(self, "_storage_side_cache", "UNKNOWN")
 
     def grasp(self, on: bool, timeout: float = 10.0) -> dict:
-        return self._call_arm("grasp", bool(on), timeout=timeout)
+        # 修复 bug：原来 `_call_arm("grasp", bool(on), timeout=timeout)` 会让
+        # `_call_arm(self, name, timeout=20.0, *args, ...)` 把 bool(on) 当成
+        # timeout 位置参，再传 timeout=timeout 报 "got multiple values"。
+        # 改为 keyword-only timeout 传参。
+        return self._call_arm("grasp", bool(on), sync=True, timeout=timeout)
 
     # ---- reset ----
 
@@ -434,35 +479,23 @@ class ArmClient:
         """
         return self._call_arm("reset_y", timeout=timeout)
 
-    def reset_x(self, timeout: float = 30.0) -> dict:
-        """仅归 x（撞墙 + 编码器物理清零）。
-
-        ⚠️ 安全门：y 必须 < -100mm 才能调。x 撞墙时机械臂会横向摆动，在 y ∈ [0, -100]
-        接近触底的位置撞车风险高。详见 [ARM_API.md §reset_x 行为](./ARM_API.md#reset_x-行为撞墙是唯一到墙凭证-v2-模型驱动)。
-        """
-        self._check_y_safe_for_storage("reset_x")
-        return self._call_arm("reset_x", timeout=timeout)
-
     def reset_origin(self, x_wall: str = "left", timeout: float = 60.0) -> dict:
-        """主动撞一侧墙 + 触底，作为业务坐标系新原点。
+        """主动触发车端 reset_position（仅 y 触底），作为业务坐标系新原点。
 
-        走 arm.reset_position (车端会 reset_y 触底 + reset_x 堵转)；
-        然后写 arm_origin.yaml。
+        行为变更（2026-07-16）：reset_x 已删除，x 轴无软件复位。
+        reset_position 现在只做 y 触底定原点；x 位置由视觉闭环控制。
+        x_origin_m 固定为 0.0（不再基于撞墙）。
         """
         if x_wall not in ("left", "right"):
             raise ValueError("x_wall 必须是 'left' 或 'right'")
-        # 同样 y 必须 < -100（reset_position 也包含 reset_x 撞墙）
-        self._check_y_safe_for_storage("reset_origin")
         job = self._call_arm("reset_position", timeout=timeout)
-        # 重新读一次 y/x 原始坐标，作为新原点
+        # 重新读一次 y 原始坐标作为新原点（x 固定为 0）
         st = self._read_raw_state()
         new_origin = ArmOrigin(
             y_origin_m=st["raw_y_m"],
-            x_origin_m=st["raw_x_m"],
-            x_wall=x_wall,
-            soft_y_max_m=self.origin.soft_y_max_m if self.origin else 0.18,
-            soft_x_min_m=self.origin.soft_x_min_m if self.origin else -0.32,
-            soft_x_max_m=self.origin.soft_x_max_m if self.origin else 0.32,
+            x_origin_m=0.0,
+            x_wall=x_wall,  # 保留字段兼容，但语义已无意义
+            soft_y_max_m=self.origin.soft_y_max_m if self.origin else 0.20,
             calibrated_at=time.strftime("%Y-%m-%dT%H:%M:%S"),
         )
         self.save_origin(new_origin)
@@ -505,10 +538,10 @@ class ArmClient:
             hand=hand,
             grasping=False,  # 车端没暴露 grasping 字段
             y_origin_valid=bool(st_data.get("y_limit", False)),  # 注意：y_limit 字段语义是 "达到限位"
-            x_origin_valid=False,
+            x_origin_valid=False,  # reset_x 已删除，x 无撞墙校准
             soft_y_max_mm=origin.soft_y_max_mm,
-            soft_x_min_mm=origin.soft_x_min_mm,
-            soft_x_max_mm=origin.soft_x_max_mm,
+            soft_x_min_mm=None,  # x 轴软限位已取消
+            soft_x_max_mm=None,  # x 轴软限位已取消
             raw_x_m=raw["raw_x_m"],
             raw_y_m=raw["raw_y_m"],
             arm_angle=st_data.get("arm_angle"),
@@ -528,16 +561,18 @@ class ArmClient:
     # ---- 安全 ----
 
     def _check_safe(self, x_mm: Optional[float] = None, y_mm: Optional[float] = None) -> None:
+        """软限位校验（仅 y；x 轴软限位已取消）。
+
+        y 业务坐标：触底=0，向下（朝触底）取正值，向上（远离触底）取负值；
+        区间 [-soft_y_max_mm, 0]。
+
+        x 参数保留签名兼容，但不再校验（用户原话"灵活使用就好"）。
+        """
         origin = self.origin or ArmOrigin()
-        # y 业务坐标：触底=0，向下（朝触底）取正值，向上（远离触底）取负值；区间 [-soft_y_max_mm, 0]。
         if y_mm is not None and not (-origin.soft_y_max_mm <= y_mm <= 0.0):
             raise ValueError(
                 f"y_mm={y_mm} 超出软区间 [-{origin.soft_y_max_mm:.0f}, 0] mm"
                 f"（触底=0, 顶部=-{origin.soft_y_max_mm:.0f}mm）"
-            )
-        if x_mm is not None and not (origin.soft_x_min_mm <= x_mm <= origin.soft_x_max_mm):
-            raise ValueError(
-                f"x_mm={x_mm} 超出软区间 [{origin.soft_x_min_mm}, {origin.soft_x_max_mm}] mm"
             )
 
     def emergency_stop(self) -> dict:
