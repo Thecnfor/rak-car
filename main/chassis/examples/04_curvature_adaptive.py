@@ -50,6 +50,15 @@ def main(max_seconds: float = 20.0) -> None:
         # 让 error_y 在长弯里仍能缓慢收敛，不会压内边界。
         # 现场调：弯内侧仍贴线 → 调到 0.20~0.25；旋转被稀释（车在弯里晃）→ 调到 0.10
         vy_floor=0.15,
+        # ki_y / ey_int_cap / ey_int_decay（修复 2026-07-16 直行稳态误差）：
+        # 纯 P 控制遇到恒定 bias 永远需要稳态 error_y 维持修正力 → "过偏才矫正"。
+        # leaky 积分项消除稳态偏差；ki_y=0 退化到纯 P。
+        # 现场调：直行还有稳态偏移 → 调大 ki_y 到 1.0~1.5；
+        #         过弯出弯后车头晃 → 调大 ey_int_decay 到 1.0（半衰期≈0.7s）；
+        #         抗饱和 cap 默认 0.10 m 足够
+        ki_y=0.6,
+        ey_int_cap=0.10,
+        ey_int_decay=0.5,
     )
 
     # 最后一道闸：单轮 |v| 饱和到 0.55 m/s，单帧最大加速 0.4 m/s / 减速 0.6 m/s
@@ -61,6 +70,7 @@ def main(max_seconds: float = 20.0) -> None:
             f"ey={state.error_y:+.4f} ea={state.error_angle:+.4f} "
             f"kappa={dbg['kappa_ema']:.3f} dkappa={dbg['dkappa_ema']:.3f} "
             f"axis_mix={dbg['axis_mix']:.3f} vy_keep={dbg['vy_keep']:.3f} "
+            f"ey_int={dbg['ey_int']:+.4f} "
             f"streak={dbg['straight_streak_ms']:.0f}ms "
             f"v=[{speeds[0]:+.2f},{speeds[1]:+.2f},{speeds[2]:+.2f},{speeds[3]:+.2f}]"
         )
