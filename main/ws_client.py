@@ -153,10 +153,6 @@ class RuntimeWsClient:
     def realtime_wheel_encoders(self, timeout=None):
         return self.request("realtime/wheel_encoders", request_timeout=timeout)
 
-    def realtime_lane_state(self, timeout=None):
-        resp = self.request("realtime/lane_state", request_timeout=timeout)
-        return (resp.get("data") or {}).get("lane_state") or {}
-
     def realtime_motor_speed(self, port, speed, reverse=1, timeout=None):
         return self.request(
             "realtime/motor_speed",
@@ -223,7 +219,8 @@ class RuntimeWsClient:
         返回 `{"lane_state": {"error_y": ..., "error_angle": ..., "active": ..., ...}}`。
         `error_y`/`error_angle` 为 None 时说明 lane_feed 未运行或刚刚启动。
         """
-        return self.request("realtime/lane_state", request_timeout=timeout)
+        resp = self.request("realtime/lane_state", request_timeout=timeout)
+        return (resp.get("data") or {}).get("lane_state") or {}
 
     # === 推送订阅 ===
 
