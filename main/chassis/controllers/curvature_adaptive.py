@@ -36,6 +36,15 @@
   这样 axis_mix=0（直线）保持 vy 全量、axis_mix=1（弯道）保留 15% 横向修正，
   过渡带由 sigmoid 保持平滑。``vy_floor`` 调大（→0.3）更像 Stanley 全时修正、
   error_y 收敛快但旋转略被稀释；调小（→0.05）更接近原「轴向互斥」行为。
+- **横向 I 项（v6+，2026-07-16 加）**：纯 P 控制遇到恒定干扰（视觉 bias / 机械零漂 /
+  地面不平）时永远需要一个稳态 error_y 才能维持修正力，看起来就是"过偏了才矫正"。
+  修复：加 leaky 积分项——
+        vy_raw = -kp_y * error_y - ki_y * I
+        I(t+dt) = I(t) * exp(-ey_int_decay * dt) + error_y * dt
+        I 夹到 [-ey_int_cap, +ey_int_cap]
+  leaky 衰减保证曲线段积分残留不会带到直线段。``ki_y=0`` 退化到纯 P 控制。
+  ``ki_y`` 调大（→1.0~1.5）消除稳态偏差更快，但过弯出弯后车头略晃；
+  ``ey_int_decay`` 调大（→1.0）半衰期更短（≈ 0.7s），过弯残留衰减更快。
 - 控制律在 chassis/state.py LaneState 之上，依赖 (state, dt) 即可，对底层 P / Stanley
   没有强耦合，可以单独替换使用。
 """
@@ -67,6 +76,15 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         # kp_theta 从 1.8 降到 1.2：弯道转向不再"打满舵"，给内环 PID 留修正余地
         kp_y: float = 0.5,
         kp_theta: float = 1.2,
+        # --- I 项（修复 2026-07-16 直行稳态误差）---
+        # 纯 P 控制遇到恒定干扰（视觉 bias / 机械零漂 / 地面不平）时永远需要一个
+        # 稳态 error_y 才能维持修正力，看起来就是"过偏了才矫正"。
+        # 加 leaky 积分项消除稳态偏差：积分累积 - 衰减 → bias 长时间存在时积分增长，
+        # 偏差回零后自动衰减，避免曲线段积分饱和把直线段冲飞。
+        # 经验起步：ki_y=0.6 / ey_int_cap=0.10 / ey_int_decay=0.5
+        ki_y: float = 0.6,
+        ey_int_cap: float = 0.10,
+        ey_int_decay: float = 0.5,
         # --- 弧度变化驱动的额外 omega 增益 ---
         # omega_gain 从 0.6 降到 0.35、kappa 上限从 2.0 收到 1.5：
         # 大弧度差时 boost 最大 ≈ 1.5x（之前 2.2x），单轮阶跃幅度减半
@@ -102,6 +120,11 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self.dkappa_full = max(float(dkappa_full), 1e-3)
         self.kp_y = float(kp_y)
         self.kp_theta = float(kp_theta)
+        # 积分项：leaky 积分状态 + 抗饱和上限
+        self.ki_y = float(ki_y)
+        self.ey_int_cap = max(float(ey_int_cap), 0.0)
+        self.ey_int_decay = max(float(ey_int_decay), 0.0)
+        self._ey_integral: float = 0.0
         self.omega_gain = float(omega_gain)
         self.k_curvature = float(k_curvature)
         self.omega_cap = max(float(omega_cap), 1e-3)
@@ -204,18 +227,44 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             self._straight_streak_ms = 0.0
         return self._straight_streak_ms >= self.hold_ms
 
+    # ---------- 横向 I 项（leaky 积分） ----------
+    def _update_ey_integral(self, state: LaneState, dt: float) -> None:
+        """leaky 积分 + 抗饱和。
+
+        为什么 leaky 而不是纯积分：
+        - 纯积分在曲线段会"记住"稳态偏差（error_y 不为零很正常），
+          过弯后突然反向 → 直线段过冲。
+        - leaky 衰减只在持续 bias 上累积：连续多个 frame 同号小偏差才积分起来。
+        - 偏差回零后自动衰减（半衰期 ≈ ln(2)/decay），旧的偏差残留不带到下一段。
+
+        抗饱和：用 ey_int_cap 把累积量夹到 [-cap, +cap]，避免 vision 卡死或
+        长时间离线导致积分爆炸，下车后会自然衰减。
+        """
+        ey = float(state.error_y)
+        # leaky 累积：I(t+dt) = I(t) * exp(-decay*dt) + ey * dt
+        self._ey_integral = (
+            self._ey_integral * math.exp(-self.ey_int_decay * dt)
+            + ey * dt
+        )
+        if self._ey_integral > self.ey_int_cap:
+            self._ey_integral = self.ey_int_cap
+        elif self._ey_integral < -self.ey_int_cap:
+            self._ey_integral = -self.ey_int_cap
+
     # ---------- 主 step ----------
     def step(self, state: LaneState, dt: float) -> List[float]:
         if not state.has_error:
-            # 没误差也要清掉恢复门控，避免上一帧的 streak 残留
+            # 没误差也要清掉恢复门控和积分项，避免上一帧的 streak / 偏差残留
             self._straight_streak_ms = 0.0
             self._prev_ea = None
             self._prev_ea_t = None
+            self._ey_integral = 0.0
             return self._safe_zero()
 
         now = time.monotonic()
         kappa = self._update_curvature(state, now)
         released = self._update_release(state, dt)
+        self._update_ey_integral(state, dt)
 
         # 基础 vx 来自 curvature 曲线；如果误差已稳定放行 → 直接全速
         if released:
@@ -223,8 +272,8 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         else:
             vx = self._vx_from_kappa(kappa)
 
-        # 横向修正（沿用 P 思路）
-        vy_raw = -self.kp_y * float(state.error_y)
+        # 横向修正 = P 项（瞬时偏差）+ I 项（消除稳态 bias）
+        vy_raw = -self.kp_y * float(state.error_y) - self.ki_y * self._ey_integral
 
         # 转向 omega：
         #   基础 P 项 + 弧度大时的额外增益 + 弧度变化率进弯牵引
@@ -259,7 +308,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
 
     # ---------- 调试辅助 ----------
     def debug_snapshot(self) -> dict:
-        """给 on_tick 回调用：暴露内部 curvature 估计 / 恢复状态 / 轴向互斥权重。"""
+        """给 on_tick 回调用：暴露内部 curvature 估计 / 恢复状态 / 轴向互斥权重 / 积分状态。"""
         vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
         return {
             "kappa_ema": self._kappa_ema,
@@ -268,4 +317,6 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             "axis_mix": self._axis_mix,
             "vy_keep": vy_keep,
             "vy_floor": self.vy_floor,
+            "ey_int": self._ey_integral,
+            "ki_y": self.ki_y,
         }

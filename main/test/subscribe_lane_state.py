@@ -27,6 +27,13 @@ def subscribe_lane_state(
     # axis_mix≈1 时保留 vy_raw * vy_floor 的横向修正能力，让 error_y 在长弯里仍能收敛。
     # 经验区间：0.10~0.25。0=完全互斥（不推荐）；>0.4≈Stanley 全时修正。
     vy_floor: float = 0.15,
+    # 横向 I 项（修复 2026-07-16 直行稳态误差）：
+    # 纯 P 控制遇到恒定 bias 永远需要稳态 error_y 维持修正力，看起来就是过偏才矫正。
+    # leaky 积分项消除稳态偏差。ki_y=0 退化到纯 P。
+    # 经验：ki_y=0.6（与 kp_y=0.65 同量纲）, ey_int_cap=0.10 m（抗饱和）, ey_int_decay=0.5（半衰期≈1.4s）
+    ki_y: float = 0.6,
+    ey_int_cap: float = 0.10,
+    ey_int_decay: float = 0.5,
     r_eff: float = 0.30,
     wheel_max_abs: float = 0.55,
     wheel_max_accel: float = 0.4,
@@ -55,6 +62,9 @@ def subscribe_lane_state(
         kappa_axis_center=kappa_axis_center,
         kappa_axis_width=kappa_axis_width,
         vy_floor=vy_floor,
+        ki_y=ki_y,
+        ey_int_cap=ey_int_cap,
+        ey_int_decay=ey_int_decay,
         r_eff=r_eff,
     )
 
@@ -102,6 +112,7 @@ def subscribe_lane_state(
                 f"ey={state.error_y!s:>10}  ea={state.error_angle!s:>10}  "
                 f"kappa={dbg['kappa_ema']:.3f}  dkappa={dbg['dkappa_ema']:.3f}  "
                 f"axis_mix={dbg['axis_mix']:.3f}  vy_keep={dbg['vy_keep']:.3f}  "
+                f"ey_int={dbg['ey_int']:+.4f}  "
                 f"streak={dbg['straight_streak_ms']:>5.0f}ms  "
                 f"v1={v1:>8.4f}  v2={v2:>8.4f}  v3={v3:>8.4f}  v4={v4:>8.4f}"
             )
@@ -118,4 +129,4 @@ def subscribe_lane_state(
 
 
 if __name__ == "__main__":
-    subscribe_lane_state(hz=50.0, max_seconds=80.0, dry_run=False)
+    subscribe_lane_state(hz=50.0, max_seconds=85.0, dry_run=False)

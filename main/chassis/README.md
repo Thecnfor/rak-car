@@ -165,7 +165,7 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
 | **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
 | **Pure Pursuit** | `PurePursuitOuterLoop` | 视觉误差当假想目标点 → 几何曲率 → omega | 占位骨架（需替换为目标轨迹） | ⭐⭐⭐ |
-| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥（直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力） | ⭐⭐⭐ |
+| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_raw = -kp_y*ey - ki_y*Σey*dt*decay`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥 + 横向 I 项（消除稳态偏差）。直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力 | ⭐⭐⭐ |
 
 **实测典型取值**（调参从这开始）：
 
@@ -192,6 +192,7 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 | `hold_ms` | 250 ms | 误差小并稳定多久才放回 `v_max` |
 | `kappa_axis_center` / `kappa_axis_width` | 1.0 / 0.5 | `axis_mix` sigmoid 分水岭 / 过渡带宽度。<br/>`axis_mix ≈ 0` → 由 `vy` 接管（朝向不变、质心斜向滑动）；<br/>`axis_mix ≈ 1` → 由 `ω` 接管（后轮做轴、前轮差速旋转）。<br/>现场调：<ul><li>直线上小抖就触发到 ω → 调高 `kappa_axis_width` 到 0.7+</li><li>进弯后才打到 ω 全额 → 调低 `kappa_axis_center` 到 0.7</li></ul> |
 | `vy_floor` | 0.15 | **弯道段 vy 保底比例（修复 2026-07-16 弯内侧压边界）**：弯道段（axis_mix≈1）保留 `vy_raw * vy_floor` 的横向修正能力，否则 `error_y` 在长弯里完全不被修、弯内侧贴线/压边。`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`。<br/>现场调：<ul><li>弯内侧仍贴线 → 调到 0.20~0.25</li><li>弯里车头晃 / 旋转被稀释 → 调到 0.10</li><li>想回到原"轴向互斥"行为 → 设 0（不推荐）</li></ul> |
+| `ki_y` / `ey_int_cap` / `ey_int_decay` | 0.6 / 0.10 m / 0.5 | **横向 I 项（修复 2026-07-16 直行稳态误差）**：纯 P 控制遇到恒定 bias（视觉零漂 / 机械零漂 / 地面不平）时永远需要稳态 error_y 维持修正力，看起来就是"过偏了才矫正"。leaky 积分项消除稳态偏差：`I(t+dt) = I(t)*exp(-decay*dt) + ey*dt`，夹到 `[-cap, +cap]`。<br/>现场调：<ul><li>直行还有稳态偏移 → 调大 `ki_y` 到 1.0~1.5</li><li>过弯出弯后车头晃 → 调大 `ey_int_decay` 到 1.0（半衰期≈0.7s）</li><li>想回到纯 P → 设 `ki_y=0`</li></ul> |
 | `r_eff` | 0.30 m | 麦轮几何系数 |
 
 **`axis_mix` 是什么**：来自「轴向互斥」设计——直线段由 `vy` 修横向偏差（`ω=0`、
@@ -205,6 +206,10 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 直线段 (`axis_mix=0`) `vy_keep=1` → 全量 vy；弯道段 (`axis_mix=1`)
 `vy_keep=vy_floor` → 保留 `vy_floor` 比例横向修正。**不设 vy_floor=0 即可避免
 弯内侧压边界**——纯 `axis_mix=1 → vy=0` 会让 error_y 在长弯里完全无修正机会。
+
+**`ki_y` 是什么**：横向 I 项增益。纯 P 控制遇到恒定 bias（视觉零漂 / 机械零漂 /
+地面不平）时永远需要稳态 error_y 维持修正力，看起来就是"过偏了才矫正"。leaky
+积分项在持续小偏差上累积，bias 消除后自动衰减（半衰期 ≈ ln(2)/decay）。
 
 **r_eff 是什么**：麦轮几何里"角速度 → 4 轮异速"的耦合系数。等于 `(track/2 + wheel_base/2)`，从 `cfg_vehicle.yaml` 算出来是 `(0.30/2 + 0.28/2) = 0.29`，代码里写 0.30 是凑整。
 
@@ -391,6 +396,11 @@ python3 -c "from main.chassis.examples import 01_minimal_p_lane; 01_minimal_p_la
 9. **`vy_floor`**：弯内侧压边界时第一反应是调大它（0.15 → 0.20~0.25），
    旋转被稀释（弯里车头晃）才调小（0.15 → 0.10）。跑前看
    `debug_snapshot()["vy_keep"]`：直线上≈1.0、弯道里应≥`vy_floor`（不再为 0）。
+10. **`ki_y` / `ey_int_decay`**：直行稳态偏移时第一反应是调大 `ki_y`
+    （0.6 → 1.0~1.5）；过弯出弯后车头晃才调大 `ey_int_decay`
+    （0.5 → 1.0，半衰期≈0.7s）。跑前看 `debug_snapshot()["ey_int"]`：
+    直线上稳态 offset 存在时 `|ey_int|` 应逐渐增长到非零稳态值（≤ cap）；
+    出弯后应明显衰减（→0）。
 
 **调参时一定要打印这几个量**：
 
