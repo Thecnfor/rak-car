@@ -61,7 +61,8 @@ from main.arm import (
 | `move_x(x_mm, v_max=150, timeout=20)` | 单轴 x | mm | `arm.move_x_position` | 编码器闭环，正常不丢步 |
 | `set_side(side, speed=80, timeout=10)` | 大臂方向（**LEFT 已禁**） | enum, speed | `arm.set_arm_angle` | MID/RIGHT，`LEFT` 报 `ValueError` |
 | `set_arm_angle(angle, speed=80, timeout=10)` | 大臂角度（**业务硬限 [0, -150]°**） | float | `arm.set_arm_angle` | angle > 0 或 < -150 报 `ValueError` |
-| `set_hand(hand, speed=80, timeout=10)` | 手爪角度 | enum, speed | `arm.set_hand_angle` | UP/MID/DOWN |
+| `set_hand(hand, speed=80, timeout=10)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | enum, speed | `arm.set_hand_angle` | UP/MID/DOWN（透传），UP 是 init 位置（y ∈ [0, -80] 允许） |
+| `set_hand_angle(angle, speed=80, timeout=10)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
 | `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | 实际角度走 `ServoPwm` wrapper，参见 §6 |
 | `get_storage()` | 读当前档位（客户端缓存，**不下发舵机**） | — | — | 重建 client 后回 "UNKNOWN" |
@@ -487,6 +488,9 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 ### 7.1 y 轴
 
 - **业务 y 区间**：`y ∈ [-soft_y_max_mm, 0]` = `[-200, 0]` mm。
+- **保护区 y ∈ [0, -80]mm**（2026-07-16 加）：舵机摆动会撞车。
+  - **允许**：set_hand('UP') / set_arm_angle('MID'/0)（init 姿态）；move_y 任意值
+  - **拦截**：move_xy / move_x / set_pose / set_hand（非 UP）/ set_hand_angle（非 -90）/ set_arm_angle（非 0）
 - **SDK y_threshold**：`arm_cfg.yaml` 的 `vert_cfg.threshold = [-0.20, 0.0]`，与业务层一致。
 - **硬件实测定**：从 0 走到 `-0.20` 仍有余量，未撞顶部机械硬限位。
 - **末段减速带**（`y >= -0.015`）：PWM 限幅 `0.02 m/s`，防过冲。

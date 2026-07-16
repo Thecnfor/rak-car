@@ -609,13 +609,18 @@ class ArmController:
         """
         重置机械臂位置（仅 y 触底定原点；x 轴无软件复位，由视觉闭环控制位置）。
 
+        初始化姿态（2026-07-16 联调改）：
+          - 大臂：MID (0°) — 居中，避免 RIGHT=-93 撞车
+          - 手爪：UP (-90°) — 物理上限位置
+          - y：reset_y 触底定原点
+
         历史：旧版本并行跑 reset_y + reset_x 双线程，因为 reset_x 撞墙存在
         `MIN_PRE_TRIGGER_DISP` 未定义 NameError、25s 超时、空转/编码器漂移等
         问题，已整体删除 reset_x。x 轴位置由 move_to_detection_target +
         subscribe_task_detection 视觉闭环控制，不需要软件复位。
         """
-        self.set_hand_angle("UP")
-        self.set_arm_angle("RIGHT")
+        self.set_hand_angle("UP")      # 手爪初始 = -90 (UP)
+        self.set_arm_angle("MID")      # 大臂初始 = 0 (MID，避撞车)
         self.reset_y()
         self.y = 0
         self.save_config()

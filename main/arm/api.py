@@ -196,6 +196,12 @@ class ArmClient:
         hand = _normalize_hand(hand)
         x_m = _mm_to_m(x_mm) if x_mm is not None else None
         y_m = _mm_to_m(y_mm) if y_mm is not None else None
+        # set_pose 包含舵机 + 移动，禁止在保护区调（除非 init）
+        is_init_only = (
+            (side is None or side == "MID") and
+            (hand is None or hand == "UP")
+        )
+        self._check_y_protected("set_pose", allow_init_position=is_init_only)
         self._check_safe(y_mm=y_mm)
         return self._call_arm(
             "set_arm_pose",
@@ -219,6 +225,7 @@ class ArmClient:
 
         x 轴软限位已取消（用户原话"灵活使用就好"），仅校验 y。
         """
+        self._check_y_protected("move_xy")
         self._check_safe(y_mm=y_mm)
         state = self.get_state()
         plan = self.traj.plan_xy(
@@ -237,6 +244,7 @@ class ArmClient:
 
     def move_y(self, y_mm: float, v_max_mms: float = 80.0, timeout: float = 20.0) -> dict:
         # 业务坐标语义：y_mm=0 在磁感应触底，向下（朝触底）取正值，向上取负值；上限 = -soft_y_max_mm。
+        # move_y 走 y 步进电机（不动舵机），即使在保护区 [0, -80] 也可以调（用于出保护区）。
         self._check_safe(y_mm=y_mm)
         job = self._call_arm(
             "move_y_position",
@@ -267,6 +275,7 @@ class ArmClient:
         # 业务坐标语义：x_mm=0 在初始化时的位置，远离为正。x 轴无软件软限位，
         # 灵活使用；物理墙 ≈ 0.34m 由 move_x_position 的 x_stop_check 触发 calibrate 兜底。
         # motor_280 是编码器闭环，正常不会丢步，但仍做一次回校以防打滑/卡阻。
+        self._check_y_protected("move_x")
         job = self._call_arm(
             "move_x_position",
             timeout=timeout,
@@ -300,15 +309,40 @@ class ArmClient:
 
     # ---- 硬件安全门（防止误操作撞车） ----
     #
-    # 经验规则（来自现场测试 + 比赛策略）：
-    #   - y ∈ [0, -100]  ：存储仓舵机保持默认 LEFT 位置（不要变）
+    # 经验规则（来自现场测试 + 比赛策略，2026-07-16）：
+    #   - y ∈ [0, -80]   ：保护区，禁止动舵机/臂（除 init 位置 hand UP / arm MID=0）
+    #   - y ∈ [-80, -100]：放开一般舵机动作；set_storage 仍需 y < -100
     #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT)
     #   - 物理依据：y 离触底越近（接近 0），舵机摆动就越容易撞到地面或邻物
     # 注：reset_x 已删除，不再涉及 x 撞墙。
     #
     # 实现：每次关键操作前查 y，超阈就 raise ValueError。**不静默吞**。
 
+    _Y_PROTECTED_THRESHOLD_MM = -80.0     # y ∈ [0, -80] 是保护区
     _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage
+
+    def _check_y_protected(self, action: str, *, allow_init_position: bool = False) -> None:
+        """y 保护区检查：y ∈ [0, -80]mm 时禁止动舵机/臂（除 init 位置）。
+
+        Args:
+            action: 当前动作名（用于错误信息）。
+            allow_init_position: True 时允许 init 位置（hand UP=-90 / arm MID=0）。
+        """
+        try:
+            st = self.get_state()
+            y_mm = float(st.y_mm)
+        except Exception:
+            # 读不到 y（init 阶段或底层异常）不阻断，避免死锁
+            return
+        if y_mm > self._Y_PROTECTED_THRESHOLD_MM:
+            if allow_init_position:
+                return
+            raise ValueError(
+                f"[{action}] y={y_mm:.1f}mm ∈ [0, -80] 安全保护区，禁止动。\n"
+                f"  规则: 接近触底时舵机摆动会撞车\n"
+                f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。\n"
+                f"  例外: set_hand('UP'/-90) / set_arm_angle('MID'/0) 初始化姿态允许。"
+            )
 
     def _check_y_safe_for_storage(self, action: str) -> float:
         """检查当前 y 是否允许做「会动存储仓舵机」的动作。
@@ -351,6 +385,8 @@ class ArmClient:
                 "  规则: 大臂角度 ∈ [0, -150]°\n"
                 "  解决: 用 ArmClient.set_arm_angle(-90) 或其他负角度代替。"
             )
+        # y 保护区：MID 是 init 位置（允许），RIGHT 需先出保护区
+        self._check_y_protected("set_side", allow_init_position=(side == "MID"))
         return self._call_arm("set_arm_angle", timeout=timeout, angle=side, speed=speed)
 
     def set_arm_angle(self, angle: float, speed: int = 80, timeout: float = 10.0) -> dict:
@@ -374,13 +410,56 @@ class ArmClient:
                 f"  规则: 大臂角度 ∈ [0, -150]°（LEFT=+93 撞车，<-180 撞车）\n"
                 f"  解决: 选 -90 (RIGHT 附近) / -120 / -150 等。"
             )
+        # y 保护区：0° (MID) 是 init 位置（允许），其他需先出保护区
+        self._check_y_protected("set_arm_angle", allow_init_position=(a == 0.0))
         return self._call_arm("set_arm_angle", timeout=timeout, angle=a, speed=speed)
 
     def set_hand(self, hand: str, speed: int = 80, timeout: float = 10.0) -> dict:
         hand = _normalize_hand(hand)
         if hand is None:
             raise ValueError("set_hand 必须给 UP/MID/DOWN")
+        # 业务硬限 [-90, 0]°：PWM 模式 180 物理范围 [-90, +165]，但 UP/MID/DOWN 三档
+        # 预设都是 ≤ 0，保持 [0, -90] 即可（避免物理撞车，2026-07-16）。
+        # y 保护区：UP 是 init 位置（允许），其他挡位需先出保护区。
+        self._check_y_protected("set_hand", allow_init_position=(hand == "UP"))
         return self._call_arm("set_hand_angle", timeout=timeout, angle=hand, speed=speed)
+
+    # ---- 手爪角度限位（业务层硬保护，2026-07-16 联调加） ----
+    #
+    # PWM 模式 180 物理范围 [-90, +165]（协议值 = angle + 90 ∈ [0, 255]）。
+    # 业务层硬限 [-90, 0]°：
+    #   - 上界 0°（DOWN）：防止手爪向下超过水平
+    #   - 下界 -90°（UP）：防止手爪向上超过机械结构
+    # 数字接口 set_hand_angle(angle) 校验范围；字符串 set_hand("UP/MID/DOWN") 透传。
+    _HAND_ANGLE_MIN = -90.0   # 业务层手爪角度下界（°）
+    _HAND_ANGLE_MAX = 0.0     # 业务层手爪角度上界（°），> 0 拒绝
+
+    def set_hand_angle(self, angle: float, speed: int = 80, timeout: float = 10.0) -> dict:
+        """手爪 PWM 舵机角度控制（业务层，硬限 [-90, 0]°）。
+
+        Args:
+            angle: 目标角度（°）。DOWN=0 / MID=-37 / UP=-90 是预设三档；
+                数字接口允许 [-90, 0] 范围内任意值。
+            speed: 舵机速度（默认 80）。
+            timeout: HTTP 同步超时（秒）。
+
+        Raises:
+            ValueError: 当 angle > 0 或 angle < -90 时拒绝下发。
+        """
+        try:
+            a = float(angle)
+        except (TypeError, ValueError):
+            raise ValueError(f"set_hand_angle angle 必须是数字，收到: {angle!r}")
+        if a > self._HAND_ANGLE_MAX or a < self._HAND_ANGLE_MIN:
+            raise ValueError(
+                f"set_hand_angle({a}) 超出业务硬限 [{self._HAND_ANGLE_MIN}, {self._HAND_ANGLE_MAX}]°。\n"
+                f"  规则: 手爪角度 ∈ [-90, 0]°（PWM 物理范围 [-90, +165]，"
+                f"业务只允许 ≤ 0 防止撞车）\n"
+                f"  解决: 选 0 (DOWN) / -37 (MID) / -90 (UP)。"
+            )
+        # y 保护区：UP=-90 是 init 位置（允许），其他需先出保护区
+        self._check_y_protected("set_hand_angle", allow_init_position=(a == -90.0))
+        return self._call_arm("set_hand_angle", timeout=timeout, angle=a, speed=speed)
 
     # ---- 存储仓（二选一档位） ----
 
