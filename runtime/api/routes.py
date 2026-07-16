@@ -207,11 +207,10 @@ def _build_runtime_snapshot(service):
 
 
 def _create_job_from_payload(service, payload):
-    # 2026-07-16 改：删 "task" target，runtime 只暴露 car/arm action。
-    # 调用方必须显式指定 target（"car" / "arm"）。
+    # 2026-07-16: target 允许 "car" / "arm" / "system"（system 用于 reset_stop_flag 等系统动作）
     target = payload.get("target")
-    if target not in ("car", "arm"):
-        raise HTTPException(status_code=400, detail="target 必须是 'car' 或 'arm'")
+    if target not in ("car", "arm", "system"):
+        raise HTTPException(status_code=400, detail="target 必须是 'car' / 'arm' / 'system'")
     name = payload.get("name")
     args = payload.get("args", [])
     kwargs = dict(payload.get("kwargs", {}) or {})
@@ -226,10 +225,10 @@ def _create_job_from_payload(service, payload):
 
 
 def _execute_from_payload(service, payload):
-    # 2026-07-16 改：删 "task" target，runtime 只暴露 car/arm action。
+    # 2026-07-16: target 允许 "car" / "arm" / "system"
     target = payload.get("target")
-    if target not in ("car", "arm"):
-        raise HTTPException(status_code=400, detail="target 必须是 'car' 或 'arm'")
+    if target not in ("car", "arm", "system"):
+        raise HTTPException(status_code=400, detail="target 必须是 'car' / 'arm' / 'system'")
     name = payload.get("name")
     args = payload.get("args", [])
     kwargs = dict(payload.get("kwargs", {}) or {})

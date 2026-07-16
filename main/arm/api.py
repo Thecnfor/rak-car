@@ -172,16 +172,8 @@ class ArmClient:
         y_mm: Optional[float],
         timeout: float = 30.0,
     ) -> dict:
-        """一次设置 x/y（None 表示不动）。side/hand 已删（2026-07-16）。
-
-        2026-07-16：x 轴控制已禁用（reset_x 删除后无初始值），传 x_mm 报错。
-        """
-        if x_mm is not None:
-            raise ValueError(
-                "set_pose 禁用 x 参数：x 没有初始值（reset_x 已删除），"
-                "无法定位当前位置。x 由视觉闭环 / 业务层另行控制。"
-            )
-        x_m = None
+        """一次设置 x/y（None 表示不动）。side/hand 已删（2026-07-16）。"""
+        x_m = _mm_to_m(x_mm) if x_mm is not None else None
         y_m = _mm_to_m(y_mm) if y_mm is not None else None
         # set_pose 是纯移动，禁止在保护区调
         self._check_y_protected("set_pose")
@@ -196,18 +188,14 @@ class ArmClient:
         self,
         x_mm: float,
         y_mm: float,
-        v_max_mms: float = 150.0,
-        a_max_mms2: float = 400.0,
+        v_max_mms: float = 40.0,
+        a_max_mms2: float = 100.0,
         timeout: Optional[float] = None,
     ) -> dict:
         """双轴同步移动到 (x_mm, y_mm)。
 
-        2026-07-16：x 轴控制已禁用，传 x_mm 报错。
+        2026-07-16：v_max_mms 150 → 75 → 40（连续减半），a_max_mms2 400 → 200 → 100。
         """
-        if x_mm is not None:
-            raise ValueError(
-                "move_xy 禁用 x 参数：x 没有初始值（reset_x 已删除）。"
-            )
         self._check_y_protected("move_xy")
         self._check_safe(y_mm=y_mm)
         state = self.get_state()
@@ -254,17 +242,15 @@ class ArmClient:
             print(f"[move_y] 状态校验读取失败: {e}", flush=True)
         return job
 
-    def move_x(self, x_mm: float, v_max_mms: float = 150.0, timeout: float = 20.0) -> dict:
-        # 2026-07-16：x 轴控制已禁用。reset_x 已删除，x 没有初始值，
-        # 业务层无法定位当前位置。所有 x 控制都 raise。
-        raise ValueError(
-            "move_x 禁用：x 没有初始值（reset_x 已删除）。"
-            "x 由视觉闭环（auto_navigate 等）/ 业务层另行控制。"
-        )
+    def move_x(self, x_mm: float, v_max_mms: float = 40.0, out_time: float = 15.0,
+               timeout: float = 30.0) -> dict:
+        """2026-07-16: 启用 x 控制 + 速度减半。out_time 默认 15s（避免 PID 脉冲式）。"""
+        self._check_y_protected("move_x")
         job = self._call_arm(
             "move_x_position",
             timeout=timeout,
             target=_mm_to_m(x_mm),
+            out_time=out_time,
         )
         origin = self.origin or ArmOrigin()
         try:
