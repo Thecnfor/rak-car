@@ -850,7 +850,10 @@ class MyCar(MecanumDriver):
             except Exception as exc:
                 if self._end_flag:
                     return
-                logger.warning("按键线程退出，原因: {}".format(exc))
+                # 2026-07-16: 降级到 debug。controller 重建循环期间,_safe_close_locked
+                # 会触发 key thread 抛 ControllerNotReadyError;root cause 是 USB autosuspend
+                # (commit 已修)。这条日志噪音每秒 14 条污染 error log,不再 warn。
+                logger.debug("按键线程退出，原因: {}".format(exc))
                 return
             # print(key_val)
             if key_val == 3:
@@ -1266,7 +1269,7 @@ class MyCar(MecanumDriver):
                 distance=self.get_distance(),
             )
 
-    def start_lane_feed(self, hz: float = 20.0):
+    def start_lane_feed(self, hz: float = 50.0):
         """
         启动 lane 误差缓存守护线程（只刷 lane_state，不下发轮速）。
 
@@ -1455,14 +1458,21 @@ class MyCar(MecanumDriver):
         return {"stopped": True}
 
     # === 侧摄目标检测推送守护线程（实时 task 检测结果,给 WS subscribe_task_detection 订阅） ===
-    def start_task_feed(self, hz: float = 10.0):
+    def start_task_feed(self, hz: float = 30.0):
         """启动侧摄目标检测守护线程,持续刷新 streamer.task_state。
 
         与 start_lane_feed / start_arm_feed 模式一致:
           - 不抢 car_lock(读摄像头 + ZMQ 推理是独立 IO)
-          - 默认 10Hz（task 检测比 lane 慢,~50-100ms/次,hz 太高没意义且浪费 ZMQ）
+          - 默认 30Hz（task 模型 ~30-50ms/次,30Hz 是上限,适合机械臂动态捕捉目标）
           - 不会下发任何控制指令,只刷新 task_state 缓存
           - 订阅一次即可一直 push,disconnect / unsubscribe 时 cancel
+
+        2026-07-16 改造:
+          - 数据源改走 streamer.get_frame("cam2") (与 lane_feed 同模式),避免直接读摄像头
+            与 camera_stream_service._capture_loop 抢 GIL + frame_lock
+          - 默认 hz 10→30,适配机械臂实时动态捕捉目标场景
+          - 增加 fallback: 如果 streamer 取不到帧(摄像头掉线),fallback 到 cap_side.read()
+            (Camera.read 是同步阻塞等 camera.update 线程写 self.frame)
 
         业务场景:"边走边看"侧摄目标 — 不必每帧调 sync /v1/vision/task（5-15s 阻塞）,
         直接读 /v1/realtime/vision/task 缓存或订阅 WS subscribe_task_detection。
@@ -1481,17 +1491,23 @@ class MyCar(MecanumDriver):
             def _task_feed_loop():
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_task_state", None) if streamer else None
-                # 复用 self.cap_side + self.task_det,不重新初始化
-                get_frame = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
+                # 2026-07-16: 优先走 streamer.get_frame (camera_stream_service 维护的 cache),
+                # fallback 到 cap_side.read() (Camera.read 同步阻塞等 update 线程写 self.frame)
+                get_stream_frame = getattr(streamer, "get_frame", None) if streamer else None
+                get_fallback = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
                 consecutive_err = 0
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
                     try:
-                        if get_frame is None:
-                            stop_event.wait(period)
-                            continue
-                        img = get_frame()
+                        img = None
+                        if get_stream_frame is not None:
+                            try:
+                                img = get_stream_frame("cam2")
+                            except Exception:
+                                img = None
+                        if img is None and get_fallback is not None:
+                            img = get_fallback()
                         if img is None:
                             stop_event.wait(period)
                             continue
@@ -2009,8 +2025,10 @@ class MyCar(MecanumDriver):
         det_task.sort(
             key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
         )  # 按照距离由近及远排序
+        # 2026-07-16: 不再污染 cam2 主帧流 (跟 lane_feed 同样的回归修复)。
+        # 调试期想看 overlay 走 /v1/vision/task/preview.jpg (待实现,对照 /vision/lane/preview.jpg)。
         image = self.draw_detection_results(image, det_task)
-        self.streamer.update_frame(image, "cam2")
+        # self.streamer.update_frame(image, "cam2")  # ← 删:污染前端 /stream/frame/cam2.jpg
         # print(det_task)
         return det_task
 
@@ -2140,7 +2158,32 @@ class MyCar(MecanumDriver):
                 self.arm.x_speed(0)
                 return -1, "None"
 
-            dets = self.get_detection_results(sort_pos=sort_pos)
+            # 2026-07-16 改造:读 task_state cache 替代同步 ZMQ
+            # 原版每 50ms 调 get_detection_results -> cap_side.read() + self.task_det() (2s 超时),
+            # 与 task_feed 30Hz 守护线程共用 self.task_det REQ socket 串行排队,卡 arm 闭环
+            # 现读 streamer.task_state (task_feed 写,meta_lock 微秒级),detections 已经是
+            # task_feed 过滤过的最新结果;limit_x/limit_y 默认 1 不做过滤,sort_pos 按
+            # 中心距离排序保留。
+            state = self.streamer.get_task_state() if hasattr(self, "streamer") and self.streamer else None
+            raw_dets = (state or {}).get("detections", []) if state else []
+            # 转换 dict 格式 -> 旧 tuple 格式,保持后续 PID 逻辑不变
+            dets = []
+            for d in raw_dets:
+                bbox = d.get("bbox_norm", {}) or {}
+                dets.append((
+                    d.get("cls_id"),
+                    d.get("det_id"),
+                    d.get("label"),
+                    d.get("score"),
+                    bbox.get("x_center", 0.0),
+                    bbox.get("y_center", 0.0),
+                    bbox.get("width", 0.0),
+                    bbox.get("height", 0.0),
+                ))
+            # 按 sort_pos 距离排序 (中心 -> 远)
+            dets.sort(
+                key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
+            )
 
             if label is not None:
                 dets = [item for item in dets if item[2] == label]
@@ -2302,8 +2345,13 @@ class MyCar(MecanumDriver):
             self.stop_lane_feed()
         except Exception:
             pass
+        # 2026-07-16: 按键线程 join 超时由 1.0s 延长到 2.0s。controller 重建循环期间
+        # 老 key thread 可能卡在 get_key 等 serial 0.1s timeout,1.0s 不一定够。
+        # 仍 is_alive 时只 logger.debug 警告,不强杀 (daemon=True 会随进程退出)。
         if self.thread_key.is_alive():
-            self.thread_key.join(timeout=1.0)
+            self.thread_key.join(timeout=2.0)
+            if self.thread_key.is_alive():
+                logger.debug("按键线程未在 2.0s 内退出,残留为 daemon")
         try:
             super(MyCar, self).close()
         except Exception:

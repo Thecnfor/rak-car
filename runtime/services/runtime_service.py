@@ -17,6 +17,8 @@ from runtime.core import settings
 from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS
 from runtime.hardware.controller_session import get_controller_session
 from runtime.services.inference_service import InferBackendService
+import logging  # 2026-07-16: init reset_all 日志用(避免循环 import smartcar.whalesbot.tools)
+logger = logging.getLogger(__name__)
 
 try:
     import numpy as np
@@ -350,7 +352,7 @@ class CarRuntimeService:
         # 默认启 lane_feed 守护线程：比赛阶段 lane_state 必须持续更新
         # 供外环消费。start_lane_feed 幂等，重复调用立即返回。
         try:
-            car.start_lane_feed(hz=20.0)
+            car.start_lane_feed(hz=50.0)
         except Exception as exc:  # pragma: no cover - 不让 init 失败
             logger.warning("lane_feed auto-start failed: {}".format(exc))
         # 默认启 arm_feed 守护线程:持续刷新 streamer.arm_state(y/x 位置),
@@ -362,7 +364,7 @@ class CarRuntimeService:
         # 默认启 task_feed 守护线程:持续刷新 streamer.task_state(侧摄目标检测),
         # 供 WS subscribe_task_detection 实时推送,"边走边看"侧摄目标的必需组件
         try:
-            car.start_task_feed(hz=10.0)
+            car.start_task_feed(hz=30.0)
         except Exception as exc:
             logger.warning("task_feed auto-start failed: {}".format(exc))
         return car
@@ -400,7 +402,7 @@ class CarRuntimeService:
                     self.controller_generation = session.get("generation")
                     # 复用现有 car 时也确保 lane_feed 跑着（幂等）
                     try:
-                        self.car.start_lane_feed(hz=20.0)
+                        self.car.start_lane_feed(hz=50.0)
                     except Exception as exc:  # pragma: no cover
                         logger.warning("lane_feed auto-start (reused) failed: {}".format(exc))
                     # arm_feed 同理
@@ -410,7 +412,7 @@ class CarRuntimeService:
                         logger.warning("arm_feed auto-start (reused) failed: {}".format(exc))
                     # task_feed 同理
                     try:
-                        self.car.start_task_feed(hz=10.0)
+                        self.car.start_task_feed(hz=30.0)
                     except Exception as exc:
                         logger.warning("task_feed auto-start (reused) failed: {}".format(exc))
                     return self.car

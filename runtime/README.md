@@ -245,7 +245,7 @@ curl -X POST "http://localhost:5050/v1/jobs/$JOB/stop"
 curl -X POST http://localhost:5050/v1/control/reset-stop   # 清 _stop_flag
 curl -X POST http://localhost:5050/v1/execute \
   -H 'Content-Type: application/json' \
-  -d '{"target":"car","name":"start_lane_feed","kwargs":{"hz":20}}'   # 重启 lane_feed
+  -d '{"target":"car","name":"start_lane_feed","kwargs":{"hz":50}}'   # 重启 lane_feed (2026-07-16 上调 50Hz)
 ```
 
 arm_feed 通常由 runtime init 自动启，业务层无需手动控制。
