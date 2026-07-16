@@ -30,8 +30,6 @@ CAR_ACTIONS = {
     "get_distance": lambda car, *args, **kwargs: car.get_distance(*args, **kwargs),
     "get_ocr": lambda car, *args, **kwargs: car.get_ocr(*args, **kwargs),
     "get_det_ocr": lambda car, *args, **kwargs: car.get_det_ocr(*args, **kwargs),
-    "get_key_event": lambda car, *args, **kwargs: car.get_key_event(),
-    "get_key_state": lambda car, *args, **kwargs: car.get_key_state(),
     "get_bluetooth_pad": lambda car, *args, **kwargs: car.get_bluetooth_pad(),
     "get_battery_voltage": lambda car, *args, **kwargs: car.get_battery_voltage(),
     "get_ir_distance": lambda car, *args, **kwargs: car.get_ir_distance(*args, **kwargs),

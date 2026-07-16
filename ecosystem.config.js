@@ -27,6 +27,10 @@ module.exports = {
         RAK_CAR_INFER_POLL_INTERVAL: "1.0",
         RAK_CAR_INFER_READY_TIMEOUT: "45",
         RAK_CAR_INFER_HEALTH_TIMEOUT: "2.0",
+        // 抑制 Paddle C++ 端的 IR pass verbose (0=INFO, 1=WARNING, 2=ERROR, 3=FATAL)
+        GLOG_minloglevel: "2",
+        FLAGS_minloglevel: "2",
+        PYTHONWARNINGS: "ignore",
       },
     },
   ],

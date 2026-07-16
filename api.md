@@ -74,8 +74,6 @@
 | `get_distance` | `timeout=?` | 读累计行驶距离 | m |
 | `get_ocr` | `timeout=?` | 读 OCR 文本 | — |
 | `get_det_ocr` | `(det), label=?, time_out=?` | 读指定检测框的 OCR | — |
-| `get_key_event` | — | 读 4 键事件（不消费） | Key4Btn |
-| `get_key_state` | — | 读 4 键状态 | — |
 | `get_bluetooth_pad` | — | 读蓝牙手柄 | — |
 | `get_battery_voltage` | — | 读电池电压 | — |
 | `get_ir_distance` | `(port=?)` | 单路红外 | — |

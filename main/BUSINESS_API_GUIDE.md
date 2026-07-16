@@ -250,10 +250,6 @@ print(client.call("car", "get_odometry", timeout=20))
   - 返回 `{"left": ..., "right": ...}`
 - `car.get_battery_voltage`
   - 返回当前电池电压
-- `car.get_key_event`
-  - 返回按键事件
-- `car.get_key_state`
-  - 返回按键状态
 - `car.get_bluetooth_pad`
   - 返回手柄状态
 

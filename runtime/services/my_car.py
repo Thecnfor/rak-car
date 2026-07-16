@@ -14,7 +14,6 @@ import numpy as np
 from smartcar.whalesbot.vehicle import (
     ArmController,
     ScreenShow,
-    Key4Btn,
     Infrared,
     LedLight,
     MecanumDriver,
@@ -361,11 +360,8 @@ class MyCar(MecanumDriver):
         # 与 _stop_flag 一起构成"协作式取消"，可被 runtime 无锁抢占。
         self._estop_event = threading.Event()
         self.arm._estop = self._estop_event
-        # 按键线程结束标志
+        # 物理按键板 2026 年未启用（仅 arm jog 用，不再触发 _stop_flag）。
         self._end_flag = False
-        self.thread_key = threading.Thread(target=self.key_thread_func)
-        self.thread_key.daemon = True
-        self.thread_key.start()
 
         # lane 误差缓存守护线程：客户端外环用，车端不动轮速
         self._lane_feed_thread = None
@@ -443,7 +439,6 @@ class MyCar(MecanumDriver):
         """
         cfg_sensor = cfg["io"]
         # print(cfg_sensor)
-        self.key = Key4Btn(cfg_sensor["key"])
         self.light = LedLight(cfg_sensor["light"])
         self.left_sensor = Infrared(cfg_sensor["left_sensor"])
         self.right_sensor = Infrared(cfg_sensor["right_sensor"])
@@ -626,12 +621,6 @@ class MyCar(MecanumDriver):
         """读第二路模拟量（mc602 走 AnalogInput，dev_id=0x07 mode=0）。"""
         ai = self._get_realtime_instance("analog", port)
         return float(ai.read())
-
-    def get_key_event(self):
-        return self.key.get_key()
-
-    def get_key_state(self):
-        return self.key.read()
 
     def get_bluetooth_pad(self):
         return self.blue_pad.read()
@@ -832,55 +821,7 @@ class MyCar(MecanumDriver):
             if time.time() - start_time > time_hold:
                 break
 
-    # 按键检测线程
-    def key_thread_func(self):
-        """
-        按键检测线程
-
-        持续检测按键状态，当检测到按键3时设置停止标志。
-        """
-        while True:
-            if self._end_flag:
-                return
-            if self._stop_flag:
-                time.sleep(0.05)
-                continue
-            try:
-                key_val = self.key.get_key()
-            except Exception as exc:
-                if self._end_flag:
-                    return
-                # 2026-07-16: 降级到 debug。controller 重建循环期间,_safe_close_locked
-                # 会触发 key thread 抛 ControllerNotReadyError;root cause 是 USB autosuspend
-                # (commit 已修)。这条日志噪音每秒 14 条污染 error log,不再 warn。
-                logger.debug("按键线程退出，原因: {}".format(exc))
-                return
-            # print(key_val)
-            if key_val == 3:
-                self._stop_flag = True
-            # === 按键手动 jog：1=y↑ 3=y↓ 2=x← 4=x→ 松开都停 ===
-            try:
-                if key_val == 1:
-                    self.arm.y_speed(0.1)
-                    self.arm.x_speed(0)
-                elif key_val == 3:
-                    self.arm.y_speed(-0.1)
-                    self.arm.x_speed(0)
-                elif key_val == 2:
-                    self.arm.x_speed(-0.1)
-                    self.arm.y_speed(0)
-                elif key_val == 4:
-                    self.arm.x_speed(0.1)
-                    self.arm.y_speed(0)
-                else:
-                    # 无按键：停
-                    self.arm.x_speed(0)
-                    self.arm.y_speed(0)
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-    # 根据某个值获取列表中匹配的结果
+    # 按键检测线程已移除（2026年）：硬件按键仅做 arm jog,不再触发 _stop_flag。
     @staticmethod
     def get_list_by_val(list, index, val):
         """
@@ -2345,13 +2286,7 @@ class MyCar(MecanumDriver):
             self.stop_lane_feed()
         except Exception:
             pass
-        # 2026-07-16: 按键线程 join 超时由 1.0s 延长到 2.0s。controller 重建循环期间
-        # 老 key thread 可能卡在 get_key 等 serial 0.1s timeout,1.0s 不一定够。
-        # 仍 is_alive 时只 logger.debug 警告,不强杀 (daemon=True 会随进程退出)。
-        if self.thread_key.is_alive():
-            self.thread_key.join(timeout=2.0)
-            if self.thread_key.is_alive():
-                logger.debug("按键线程未在 2.0s 内退出,残留为 daemon")
+        # 按键线程已移除
         try:
             super(MyCar, self).close()
         except Exception:
@@ -2362,131 +2297,6 @@ class MyCar(MecanumDriver):
         if self._owns_streamer and self.streamer is not None:
             self.streamer.stop()
         # self.grap_cam.close()
-
-    def manage(self, programs_list: list, order_index=0):
-        """
-        程序管理方法
-
-        管理和执行程序列表，通过按键选择要执行的程序。
-
-        参数:
-            programs_list: 程序列表，包含要执行的函数
-            order_index: 初始选中的程序索引，默认为0
-        """
-
-        def all_task():
-            time.sleep(4)
-            for func in programs_list:
-                func()
-
-        def lane_test():
-            self.lane_dis_offset(0.3, 30)
-
-        programs_suffix = [all_task, lane_test, self.debug]
-        programs = programs_list.copy()
-        programs.extend(programs_suffix)
-        # print(programs)
-        # 选中的python脚本序号
-        # 当前选中的序号
-        win_num = 5
-        win_order = 0
-        # 把programs的函数名转字符串
-        logger.info(order_index)
-        programs_str = [str(i.__name__) for i in programs]
-        logger.info(programs_str)
-        dis_str = sellect_program(programs_str, order_index, win_order)
-        self.display.show(dis_str)
-
-        self.stop()
-        run_flag = False
-        stop_flag = False
-        stop_count = 0
-        while True:
-            # self.button_all.event()
-            btn = self.key.get_key()
-            # 短按1=1,2=2,3=3,4=4
-            # 长按1=5,2=6,3=7,4=8
-            # logger.info(btn)
-            # button_num = car.button_all.clicked()
-
-            if btn != 0:
-                # logger.info(btn)
-                # 长按1按键，退出
-                if btn == 5:
-                    # run_flag = True
-                    self._stop_flag = True
-                    self._end_flag = True
-                    break
-                else:
-                    if btn == 4:
-                        # 序号减1
-                        self.beep()
-                        if order_index == 0:
-                            order_index = len(programs) - 1
-                            win_order = win_num - 1
-                        else:
-                            order_index -= 1
-                            if win_order > 0:
-                                win_order -= 1
-                        # res = sllect_program(programs, num)
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.display.show(dis_str)
-
-                    elif btn == 2:
-                        self.beep()
-                        # 序号加1
-                        if order_index == len(programs) - 1:
-                            order_index = 0
-                            win_order = 0
-                        else:
-                            order_index += 1
-                            if len(programs) < win_num:
-                                win_num = len(programs)
-                            if win_order != win_num - 1:
-                                win_order += 1
-                        # res = sllect_program(programs, num)
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.display.show(dis_str)
-
-                    elif btn == 3:
-                        # 确定执行
-                        # 调用别的程序
-                        dis_str = "\n{} running......\n".format(
-                            str(programs_str[order_index])
-                        )
-                        self.display.show(dis_str)
-                        self.beep()
-                        self._stop_flag = False
-                        programs[order_index]()
-                        self._stop_flag = True
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.stop()
-                        self.beep()
-
-                        # 自动跳转下一条
-                        # if order_index == len(programs)-1:
-                        #     order_index = 0
-                        #     win_order = 0
-                        # else:
-                        #     order_index += 1
-                        #     if len(programs) < win_num:
-                        #         win_num = len(programs)
-                        #     if win_order != win_num-1:
-                        #         win_order += 1
-                        # res = sllect_program(programs, num)
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.display.show(dis_str)
-                    logger.info(programs_str[order_index])
-            else:
-                self.delay(0.02)
-
-            time.sleep(0.02)
-
-        for i in range(2):
-            self.beep()
-            time.sleep(0.4)
-        time.sleep(0.1)
-        self.close()
 
 
 def test_for_animal():
@@ -2557,7 +2367,6 @@ if __name__ == "__main__":
 
     # my_car.debug()
     # programs = [func1, func2, func3, func4, func5, func6]
-    # my_car.manage(programs)
     # import sys
     # test_ord = 0
     # if len(sys.argv) >= 2:
