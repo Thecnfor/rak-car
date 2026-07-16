@@ -58,7 +58,9 @@ from main.arm import (
 | `set_pose(x_mm, y_mm, timeout=30)` | 一次设 x/y（**side/hand 已删 2026-07-16**） | mm | `POST /v1/execute {target:arm, name:set_arm_pose}` | 保护区拦截 |
 | `move_xy(x_mm, y_mm, v_max=150, a_max=400, timeout=None)` | 双轴同步 | mm, mm/s, mm/s² | `arm.goto_position` | 客户端 S 曲线 dry-run 算 `plan.T`，自动超时 = `max(5, T*2+1)` |
 | `move_y(y_mm, v_max=80, timeout=20)` | 单轴 y | mm | `arm.move_y_position` | 完成后做丢步核对（驱动层 + 上层） |
-| `move_x(x_mm, v_max=150, timeout=20)` | 单轴 x | mm | `arm.move_x_position` | 编码器闭环，正常不丢步 |
+| `move_x(x_mm, v_max_mms=40, out_time=15.0, timeout=30)` | 单轴 x | mm | `arm.move_x_position` | `v_max_mms` 业务层限速（**2026-07-16 真正生效**：SDK 端临时收紧 PID 主限幅）。`out_time` 避免 PID 脉冲式，撞墙时 `x_stop_check` 自动 calibrate |
+| `reset_x(direction="right", reset_velocity_mms=20.0, timeout=30)` | x 撞墙定原点 | mm/s | `arm.reset_x` | **opt-in**（不进 auto-init）。单档极慢撞墙，编码器 stall 50ms dwell 触发 calibrate；详见 §9 |
+| `reset_all(arm_angle=0, hand_angle=-90, x_direction="right", reset_x_velocity_mms=20.0, timeout=120)` | 复合复位（**大臂+手爪+x 并行 → y 串行**） | — | `arm.reset_all` | ThreadPoolExecutor 并行三个独立动作，as_completed 后串行 `reset_y` 触底 |
 | `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [0, -150]° + y 保护区**） | float（**必填**） | `arm.set_arm_angle` | angle > 0 / < -150 报 ValueError；0° (MID) 是 init 位置（保护区允许） |
 | `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
@@ -215,10 +217,11 @@ class TrajectoryPlan:
 
 | 需求 | 接口 |
 | --- | --- |
-| 首次上电定原点 | 不用手动 —— runtime 在 `RAK_CAR_RESET_ARM=1` 时自动跑；漂移后再手跑 `examples/01_calibrate_origin.py` |
+| 首次上电定原点 | 不用手动 —— runtime 默认 init 跑 `reset_all`（**大臂+手爪+x 并行 → y 串行**，2026-07-16 起）。漂移后再手跑 `examples/01_calibrate_origin.py` |
 | 之后重置原点 | `ArmClient.reset_origin("left")`（仅 y 触底定原点，x 固定 0） |
 | 只重置 y | `ArmClient.reset_y()` / `ArmRunner.reset_y()` |
-| ~~只重置 x~~ | ❌ reset_x 已删除（2026-07-16）；x 位置由视觉闭环控制，无软件复位 |
+| 只重置 x（撞墙） | `ArmClient.reset_x(direction="right")`（**opt-in**，2026-07-16 恢复，详见 §9） |
+| 复合复位 | `ArmClient.reset_all()`（大臂+手爪+x 并行 → y 串行） |
 | 双轴同步移动 | `ArmClient.move_xy(...)` / `ArmRunner.move_xy(...)` |
 | 单轴移动 | `ArmClient.move_x/move_y` |
 | 改大臂角度 | `ArmClient.set_arm_angle(-90, speed=80, timeout=10)` |
@@ -373,11 +376,12 @@ WS   /v1/ws
 | --- | --- | --- |
 | `reset_position` | `arm.reset_position()` | — |
 | `reset_y` | `arm.reset_y()` | — |
-| ~~`reset_x`~~ | ~~`arm.reset_x()`~~ | ❌ 已删除（2026-07-16） |
+| `reset_x` | `arm.reset_x(direction="right", reset_velocity=0.02, ...)` | `direction?` (left/right), `reset_velocity?` (m/s), `seek_timeout?`, `no_move_hard_timeout?`, `min_pre_trigger_disp_m?` |
+| `reset_all` | `arm.reset_all(arm_angle=0, hand_angle=-90, ...)` | `arm_angle?`, `hand_angle?`, `x_direction?`, `reset_x_velocity?`, `timeout?` |
 | `set_arm_pose` | `arm.set_arm_pose(x=None, y=None, arm=None, hand=None)` | x?, y?, arm?, hand? |
 | `set_hand_angle` | `arm.set_hand_angle(angle, speed=80)` | `angle` (UP/MID/DOWN/int), `speed?` |
 | `set_arm_angle` | `arm.set_arm_angle(angle, speed=80)` | `angle` (LEFT/MID/RIGHT/int), `speed?` |
-| `move_x_position` | `arm.move_x_position(target, out_time=6.0)` | `target` (m), `out_time?` |
+| `move_x_position` | `arm.move_x_position(target, out_time=6.0, v_max_mms=None)` | `target` (m), `out_time?`, `v_max_mms?` (临时收紧 PID 主限幅,None=用 yaml 默认) |
 | `move_y_position` | `arm.move_y_position(target)` | `target` (m) |
 | `goto_position` | `arm.goto_position(x=None, y=None, time_run=None, speed=[0.15, 0.04])` | `x?`, `y?` (m) |
 | `go_for` | `arm.go_for(x_offset, y_offset, time_run=None, speed=[0.15, 0.04])` | 偏移 (m) |
@@ -420,12 +424,14 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 | 接口 | 用途 | 关键参数 |
 | --- | --- | --- |
-| `arm.reset_position` | 车端整体复位（仅 y 触底；reset_x 已删除） | — |
+| `arm.reset_position` | 车端整体复位（仅 y 触底） | — |
 | `arm.reset_y` | 仅归 y（磁感 + 50ms dwell，不动 x） | — |
+| `arm.reset_x` | 主动撞墙定 x 原点（**opt-in**，不进 auto-init） | `direction` `reset_velocity` `seek_timeout` `no_move_hard_timeout` `min_pre_trigger_disp_m` |
+| `arm.reset_all` | 复合复位（大臂+手爪+x 并行 → y 串行） | `arm_angle` `hand_angle` `x_direction` `reset_x_velocity` `timeout` |
 | `arm.set_arm_pose` | 一次设置 x/y/arm/hand | `x?` `y?` `arm?` `hand?` |
 | `arm.set_hand_angle` | 手爪角度 | `angle` `speed?` |
 | `arm.set_arm_angle` | 大臂角度 | `angle` `speed?` |
-| `arm.move_x_position` | x 轴定位 | `target` (m) `out_time?` |
+| `arm.move_x_position` | x 轴定位（**v_max_mms 业务限速生效**） | `target` (m) `out_time?` `v_max_mms?` |
 | `arm.move_y_position` | y 轴定位 | `target` (m) |
 | `arm.goto_position` | 双轴定位 | `x?` `y?` (m) |
 | `arm.go_for` | 相对位移 | 偏移 (m) |
@@ -443,15 +449,16 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 `runtime _create_car_locked` 每次创建 `MyCar` 后：
 
-1. `reset_arm=False`（默认）：**只调 `arm.reset_y` 触底定原点**，**不**调 `arm.reset_position`（不动角度 / 底盘）
-2. `reset_arm=True`：调 `arm.reset_position` 完整复位（仅 `reset_y`，`reset_x` 已删除）
+1. `reset_arm=False`（默认，**2026-07-16 改**）：调 `arm.reset_all` —— **大臂(set_arm_angle 0°) + 手爪(set_hand_angle -90°) + x(撞右墙 calibrate) 三路 ThreadPoolExecutor 并行**，收齐后串行 `reset_y()` 触底
+2. `reset_arm=True`：调 `arm.reset_position`（仅 `reset_y`，不含 x 撞墙；向后兼容）
 
-为何默认只归 y？
+为何默认走 reset_all？
 
-- y 轴有磁感触底，3-10s 可信定原点；x 轴无磁感/限位传感器，撞墙会空转/编码器漂移
-- 不归零 y 的话后续 `move_y` 会在错误基准上跑，导致距离全错
-- x 位置由视觉闭环控制（`move_to_detection_target` + `subscribe_task_detection`），不需要软件复位
-- 失败不抛 init（避免 1 次瞬态故障阻断整个 runtime），仅记 `last_error`
+- 用户原话："机器初始化时大臂 + 末端 PWM + x 轴到位后才 y 轴"（2026-07-16）
+- y 必须等前三个到位：reset_y 触底是绝对零点，前三个不完成 y 不能定
+- 大臂 + 手爪 + x 三个独立动作并行：x=motor_280、大臂=ServoBus(port=3)、手爪=ServoPwm(port=2)，serial_mc602.lock FIFO 串行化串口写入，Python 层三线程并发不冲突
+- reset_x 失败/超时/急停只 logger.warning 不抛（避免触发 `_should_probe_controller` recover loop，commit `fb24b1a` 描述的 PM2 死循环已规避）
+- auto-init retry 默认走 `reset_arm=True`（settings.get_reset_arm_on_auto_init() 默认 True），不走 reset_all 不撞墙
 
 复用现有 `MyCar` 时（`ensure_initialized` 走 reused 分支），同样会幂等调一次 `start_arm_feed(hz=20)`。
 
@@ -498,15 +505,20 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 > **x 轴软限位已取消（2026-07-16）**：用户原话"灵活使用就好，一般不会超"。
 > 业务层 `ArmClient._check_safe` 不再校验 x；SDK `move_x_position` / `x_speed` / `goto_position` 不再 clamp。
-> PID 主限幅 `horiz_cfg.pid.output_limits = [-0.4, 0.4]` m/s 仍生效，作为速度上限。
-> 物理墙 ≈ 0.34m 由 `move_x_position` 的 `x_stop_check` 触发 calibrate 兜底。
+> 默认 PID 主限幅 `horiz_cfg.pid.output_limits = [-0.4, 0.4]` m/s 仍生效，作为速度上限。
+> **2026-07-16 业务限速真正生效**：`move_x_position(target, out_time, v_max_mms=None)` 可选传入 mm/s 上限，
+> SDK 端临时收紧 `x_pid.output_limits` 和 `x_velocity_limit`，try/finally 还原。
+> 不传 = 用 yaml 默认 `[-0.4, 0.4]`（向后兼容）；传 40 → 实际 40mm/s 限幅（`ArmClient.move_x` 默认 `v_max_mms=40`）。
+> 物理墙由 `move_x_position` 的 `x_stop_check` 触发 calibrate 兜底；`reset_x` opt-in 主动撞墙（见 §9）。
 
 - **业务 x 区间**：无软件上限；灵活使用。
 - **SDK x 限位**：无。`arm_cfg.yaml:horiz_cfg` 已删除 `threshold` / `slow_band_m` / `slow_velocity` / `top_slow_m` / `top_slow_velocity` / `reset_*` / `wall_*`。
 - **撞墙判据**（x 无传感器）：`move_x_position` 中 `x_stop_check`（`STOP_CHECK_THRESHOLD` 控制）+ 100ms dwell 后自动 calibrate `x_pose_start`。
+- **业务限速**：用 `move_x(x_mm, v_max_mms=40)` 即可临时收紧（不影响 yaml 默认）。多次 `move_x` 之间互不污染（try/finally 还原）。
 - **历史错配**：`x_threshold` 旧值 `[0, 0.315]`（单调正方向）已取消；`arm_origin.soft_x_min/max_m` 字段保留但固定 None。
 
 > 历史：旧版 `soft_y_max_mm=180` + `threshold=[0, 0.2]`（错配，正方向）已统一改为 `200` + `[-0.20, 0.0]`。
+> **实测行程**：x 轴物理墙 ≈ ±119.5mm（2026-07-16 实测，之前注释里说 0.34m 是错的）。
 
 ---
 
@@ -562,36 +574,87 @@ while 没超时:
 
 ---
 
-## 9. ~~`reset_x`~~ 已删除（2026-07-16）
+## 9. `reset_x` / `reset_all` —— opt-in 撞墙复位（2026-07-16 恢复）
 
-> **x 轴无软件复位**。原因：x 没有磁感 / 限位传感器，撞墙会空转 / 编码器漂移；
-> 之前 `reset_x` 触发 25s 超时 + auto_init 反复重建 → pm2 疯转（commit `fb24b1a` 已规避）。
->
-> x 位置由视觉闭环控制：`move_to_detection_target` + `subscribe_task_detection`。
-> 物理墙由 `move_x_position` 的 `x_stop_check` 触发 calibrate 兜底（`x_pose_start = 当前 dis, _x_wall = left/right`）。
->
-> 删除内容：
-> - SDK `arm_base.reset_x()` 方法（~140 行，含三层撞墙判据 + 物理清零 + 滑窗 dwell）
-> - SDK `arm_base.x_speed` 边界自然停 + 末段 / 顶段减速带（依赖 `x_reset_target_m`）
-> - Runtime `ARM_ACTIONS["reset_x"]` 注册
-> - 业务 `ArmClient.reset_x()` / `ArmRunner.reset_x()`
-> - `arm_cfg.yaml:horiz_cfg` 中 `reset_*` / `wall_*` / `enable_encoder_reset` 字段
->
-> 顺带删除的 bug：`MIN_PRE_TRIGGER_DISP` NameError（`arm_base.py:581` 引用未定义常量）。
+> **x 轴有软件复位了**（opt-in，不进 auto-init）。
+> 历史 commit `bc6b5c9` / `fb24b1a` 整体删除 `reset_x`（auto-init 反复撞墙 → PM2 死循环）。
+> 这次重写为 **单档极慢撞墙 + 故障不抛** 安全版，仅 opt-in 触发，避免重蹈覆辙。
 
-> **历史参考**：以下内容已删除，仅供回溯。原 §9.1-§9.9 见 git history（commit `fb24b1a` 之前）。
->
-> x 与 y 关键区别：**x 只有编码器**，没有磁感 / 限位传感器，撞墙靠**模型驱动 + 物理清零**判定（v2）。
->
-> 三层撞墙判据（任一持续 200ms 命中即认定）：
-> - 位移比 = 实际位移 / 期望位移 < 0.20（主）
-> - 速度比 = 滑窗实测速度 / 命令速度 < 0.30（辅，防丢步误判）
-> - 100ms dwell 确认撞墙 → `motor_x.motor.reset()` 物理清零编码器
->
-> 与 v1 对比：v1 用 5×0.5mm stall 简单堵转判据 + 数学补偿 `x_pose_start = get_dis() - 0.31`；
-> v2 用位移比+速度比 200ms 滑窗 + 物理清零（MC602 ctl_id=2 走 `encoder_2.reset`）。
->
-> 修复记录（v3）：旧 `x_speed` 用 `_x_wall` 撞墙门，撞墙 calibrate 设 `_x_wall="right"` 后任何 `velocity>0` 被钳 0 → motor 不动 → `x_stop_check` 命中 → calibrate → 又设 `_x_wall="right"` 死循环。修复：撞墙门改为软限位边界自然停（`cur >= x_hi - 5mm & v>0 → velocity=0`），2026-07-16 随软限位取消一并删除。
+### 9.1 `reset_x` 单步撞墙
+
+`ArmClient.reset_x(direction="right", reset_velocity_mms=20.0, timeout=30)`
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `direction` | `"right"` | `"right"` (target 增大方向) 或 `"left"` |
+| `reset_velocity_mms` | `20.0` (mm/s) | 撞墙速度，业务层 mm/s → SDK 转 m/s。参考 commit `1d5990e` 实测最稳定档 |
+| `timeout` | `30` (s) | HTTP 同步超时，车端实际可能 7-15s，留余量 |
+
+**底层算法**（`arm_base.py:reset_x`）：
+
+1. 电机朝 `direction` 方向以 `reset_velocity` 速度驱动
+2. 循环检测编码器 stall（位移变化 < 1mm 视为不动）
+3. **`min_pre_trigger_disp_m=0.05`** 闸：电机必须先走过 ≥50mm 才允许触发撞墙（根治 commit `fb24b1a` 描述的"启动即误判 stall" bug）
+4. **stall dwell 50ms** 确认（防撞墙瞬间物理抖动误判）
+5. 撞墙成功 → `motor_x.set_linear(0)` hard-stop（绕开 PID 惯性），写 `x_pose_start = dis`、`_x_ref_encoder_at_zero = dis`、`_x_wall = direction`，返回 True
+6. 超时 15s / 急停 / 编码器死锁 2s → logger.warning + 返回 False（**绝不抛异常**）
+
+### 9.2 `reset_all` 复合复位（**大臂+手爪+x 并行 → y 串行**）
+
+`ArmClient.reset_all(arm_angle=0, hand_angle=-90, x_direction="right", reset_x_velocity_mms=20.0, timeout=120)`
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `arm_angle` | `0` (°, MID) | 大臂目标角度 |
+| `hand_angle` | `-90` (°, UP) | 手爪目标角度 |
+| `x_direction` | `"right"` | x 撞墙方向 |
+| `reset_x_velocity_mms` | `20.0` (mm/s) | x 撞墙速度 |
+| `timeout` | `120` (s) | 并行阶段总超时 |
+
+**并行原理**：
+
+- `ThreadPoolExecutor(max_workers=3)` 并行 `reset_x` + `set_arm_angle` + `set_hand_angle`
+- `as_completed` 收齐三路（无论成败）→ 串行 `reset_y()` 触底定绝对零点
+- 物理独立：x=motor_280(编码器电机) / 大臂=ServoBus(port=3) / 手爪=ServoPwm(port=2)
+- `serial_mc602.lock` FIFO 串行化串口写入 → Python 层三线程并发，舵机等待时 reset_x 循环不阻塞
+
+**返回**：`dict {"x": bool, "arm": bool, "hand": bool, "y": bool}`
+
+### 9.3 init 默认走 reset_all
+
+`_create_car_locked(reset_arm=False)` 默认分支改调 `reset_all`（2026-07-16）。完整复位：
+
+```
+[并行]  set_arm_angle(0)
+[并行]  set_hand_angle(-90)
+[并行]  reset_x(direction="right")
+        ↓ all done
+        reset_y()   ← 串行，触底定绝对零点
+```
+
+`reset_arm=True` 仍走 `reset_position`（仅 `reset_y`，不含 x 撞墙）向后兼容。
+
+`auto_init_kwargs` 默认 `reset_arm=True`，后台 retry 不撞墙。
+
+### 9.4 与视觉闭环的关系
+
+x 位置仍主要靠视觉闭环控制（`move_to_detection_target` + `subscribe_task_detection`）。
+`reset_x` 用于以下场景：
+- 视觉闭环失灵时人工恢复
+- 实物测试标定 x 物理行程边界（实测 ≈ ±119.5mm）
+- init 时跟 `reset_all` 一起跑，把 x 撞墙归零作为后续视觉闭环的起点
+
+### 9.5 实测结果（2026-07-16）
+
+| 速度 | 结果 | 耗时 |
+| --- | --- | --- |
+| 0.02 m/s | ✅ 撞墙 calibrate | 11-13s |
+| 0.03 m/s | ❌ 卡 35.5mm 处 stall | no_move_hard_timeout 2s 触发 |
+| 0.04 m/s | ✅ 撞墙 calibrate | 4-8s |
+
+0.03 失败的根因是 stall 判定阈值太严（1e-5m = 0.01mm），撞墙瞬间机械臂物理抖动幅度超过阈值，`stall_since` 反复重置凑不齐 DWELL_TIME。修复：阈值放宽到 1e-3m (1mm)。
+
+**推荐速度**：业务用 0.02 m/s（对电机最温柔），调试用 0.04 m/s（最快 4s）。
 
 ---
 
