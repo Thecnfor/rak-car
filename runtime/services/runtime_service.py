@@ -362,7 +362,7 @@ class CarRuntimeService:
         # 默认启 task_feed 守护线程:持续刷新 streamer.task_state(侧摄目标检测),
         # 供 WS subscribe_task_detection 实时推送,"边走边看"侧摄目标的必需组件
         try:
-            car.start_task_feed(hz=10.0)
+            car.start_task_feed(hz=30.0)
         except Exception as exc:
             logger.warning("task_feed auto-start failed: {}".format(exc))
         return car
@@ -410,7 +410,7 @@ class CarRuntimeService:
                         logger.warning("arm_feed auto-start (reused) failed: {}".format(exc))
                     # task_feed 同理
                     try:
-                        self.car.start_task_feed(hz=10.0)
+                        self.car.start_task_feed(hz=30.0)
                     except Exception as exc:
                         logger.warning("task_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
