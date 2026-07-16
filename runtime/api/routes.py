@@ -207,10 +207,15 @@ def _build_runtime_snapshot(service):
 
 
 def _create_job_from_payload(service, payload):
-    target = payload.get("target", "task")
+    # 2026-07-16 改：删 "task" target，runtime 只暴露 car/arm action。
+    # 调用方必须显式指定 target（"car" / "arm"）。
+    target = payload.get("target")
+    if target not in ("car", "arm"):
+        raise HTTPException(status_code=400, detail="target 必须是 'car' 或 'arm'")
     name = payload.get("name")
     args = payload.get("args", [])
-    kwargs = payload.get("kwargs", {})
+    kwargs = dict(payload.get("kwargs", {}) or {})
+    kwargs.pop("timeout", None)
     if not name:
         raise HTTPException(status_code=400, detail="缺少 name")
     try:
@@ -221,10 +226,15 @@ def _create_job_from_payload(service, payload):
 
 
 def _execute_from_payload(service, payload):
-    target = payload.get("target", "task")
+    # 2026-07-16 改：删 "task" target，runtime 只暴露 car/arm action。
+    target = payload.get("target")
+    if target not in ("car", "arm"):
+        raise HTTPException(status_code=400, detail="target 必须是 'car' 或 'arm'")
     name = payload.get("name")
     args = payload.get("args", [])
-    kwargs = payload.get("kwargs", {})
+    kwargs = dict(payload.get("kwargs", {}) or {})
+    # 2026-07-16：timeout 由 runtime 自己用（submit_job_and_wait），不让它透传给 SDK action
+    kwargs.pop("timeout", None)
     timeout = payload.get("timeout")
     # D 改造：默认异步（立即返回 job_id，状态查 /v1/jobs/{id}）。
     # 旧同步调用方传 sync=True 拿原语义（submit_job_and_wait，阻塞到完成）。

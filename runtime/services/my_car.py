@@ -41,8 +41,6 @@ import re
 
 from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
 
-# 添加上本地目录
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from smartcar import logger
 
 
@@ -338,8 +336,9 @@ class MyCar(MecanumDriver):
         self.streamer = streamer
         self.arm = ArmController()
 
-        # 获取自己文件所在的目录路径
-        self.path_dir = os.path.abspath(os.path.dirname(__file__))
+        # 获取 rak-car 根目录（runtime/services 的上两级）
+        # car_wrap_2026.py 原在根目录，现在搬到 runtime/services/，config_car.yml 仍在根目录
+        self.path_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.yaml_path = os.path.join(self.path_dir, "config_car.yml")
         # 获取配置
         cfg = get_yaml(self.yaml_path)

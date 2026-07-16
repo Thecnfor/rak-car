@@ -14,7 +14,7 @@ from pathlib import Path
 import yaml
 
 from runtime.core import settings
-from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS, TASK_ACTION_NAMES
+from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS
 from runtime.hardware.controller_session import get_controller_session
 from runtime.services.inference_service import InferBackendService
 
@@ -68,7 +68,6 @@ class CarRuntimeService:
     def __init__(self):
         self.car = None
         self._car_class = None
-        self._task_module = None
         self._camera_cfg = None
         self.shared_front_camera = None
         self.shared_side_camera = None
@@ -274,17 +273,14 @@ class CarRuntimeService:
             self.jobs[job_id].update(updates)
 
     def _get_car_class(self):
+        """返回 MyCar 类（迁移到 runtime.services.my_car）。"""
         if self._car_class is None:
-            self._car_class = importlib.import_module("car_wrap_2026").MyCar
+            from runtime.services.my_car import MyCar
+            self._car_class = MyCar
         return self._car_class
 
-    def _get_task_module(self):
-        if self._task_module is None:
-            self._task_module = importlib.import_module("car_task_function")
-        return self._task_module
-
-    def _bind_task_car(self, car):
-        self._get_task_module().bind_car(car)
+    # 2026-07-16 删 _get_task_module / _bind_task_car：任务逻辑由 main 层编排，
+    # runtime 只暴露底层 car/arm action 接口。
 
     def _probe_controller(self):
         return self._sync_controller_health_state(self.controller_session.snapshot())
@@ -326,7 +322,6 @@ class CarRuntimeService:
         )
         self._remember_shared_cameras(car)
         car.STOP_PARAM = self.stop_after_action
-        self._bind_task_car(car)
         car.beep()
         time.sleep(1)
         if reset_arm:
@@ -395,7 +390,6 @@ class CarRuntimeService:
                             reset_position=reset_position,
                         )
                     self.car.STOP_PARAM = self.stop_after_action
-                    self._bind_task_car(self.car)
                     if reset_arm:
                         self.car.arm.reset_position()
                     if reset_position:
@@ -700,7 +694,6 @@ class CarRuntimeService:
             car = self.car
         if car is None:
             return None
-        self._bind_task_car(car)
         return {
             "odometry": normalize_value(car.get_odometry()),
             "distance": normalize_value(car.get_distance()),
@@ -716,8 +709,8 @@ class CarRuntimeService:
         return self.car
 
     def list_actions(self):
+        # 2026-07-16 删 "task": 任务逻辑由 main 编排，runtime 只暴露 car/arm action。
         return {
-            "task": sorted(TASK_ACTION_NAMES),
             "car": sorted(CAR_ACTIONS.keys()),
             "arm": sorted(ARM_ACTIONS.keys()),
             "system": [
@@ -826,16 +819,10 @@ class CarRuntimeService:
         with self.job_lock:
             return self.jobs.get(job_id)
 
-    def _dispatch_task(self, name, args, kwargs):
-        task_module = self._get_task_module()
-        return getattr(task_module, name)(*args, **kwargs)
-
     def _dispatch_car(self, car, name, args, kwargs):
-        self._bind_task_car(car)
         return CAR_ACTIONS[name](car, *args, **kwargs)
 
     def _dispatch_arm(self, car, name, args, kwargs):
-        self._bind_task_car(car)
         return ARM_ACTIONS[name](car.arm, *args, **kwargs)
 
     def _dispatch_system(self, name, _args, kwargs):
@@ -943,11 +930,8 @@ class CarRuntimeService:
         持锁只在 `_dispatch` 入口处瞬时取 `car` 引用（A.2 改造），动作执行期间
         完全不持 runtime 锁。硬件层字节串行靠 SDK 的 `serial_mc602.lock`。
         """
-        self._bind_task_car(car)
         if car is not None:
             car.STOP_PARAM = self.stop_after_action
-        if target == "task":
-            return self._dispatch_task(name, args, kwargs)
         if target == "car":
             return self._dispatch_car(car, name, args, kwargs)
         if target == "arm":
