@@ -86,12 +86,13 @@
 
 ### 作业接口
 
-| 接口                      | 用途            | 说明                      |
-| ----------------------- | ------------- | ----------------------- |
-| `POST /v1/execute`      | 同步执行一个动作并等待结果 | 最常用                     |
-| `POST /v1/jobs`         | 创建异步任务        | 返回 `job.id`             |
-| `GET /v1/jobs`          | 查看任务列表        | 返回全部 jobs               |
-| `GET /v1/jobs/{job_id}` | 查看单个任务状态      | 看 `status/result/error` |
+| 接口                      | 用途                                       | 说明                                  |
+| ----------------------- | ---------------------------------------- | ----------------------------------- |
+| `POST /v1/execute`      | 执行一个动作（**默认异步**；传 `"sync": true` 同步阻塞到完成） | 异步：立即返回 `job_id`；同步：返回 status/result |
+| `POST /v1/jobs`         | 创建异步任务                                   | 返回 `job.id`                        |
+| `GET /v1/jobs`          | 查看任务列表                                   | 返回全部 jobs                            |
+| `GET /v1/jobs/{job_id}` | 查看单个任务状态                                 | 看 `status/result/error`           |
+| `POST /v1/jobs/{job_id}/stop` | 协作取消（set stop_event + car._stop_flag） | 立即返回 `cancelled: true`，arm 动作由 SDK 配合退出 |
 
 ### 控制接口
 
@@ -99,9 +100,9 @@
 | --------------------------------- | --------------- | ------------------------------------ |
 | `POST /v1/control/init`           | 手动初始化 runtime   | `force` `reset_arm` `reset_position` |
 | `POST /v1/control/stop-mode`      | 设置动作后是否自动停      | `enabled`                            |
-| `POST /v1/control/reset-stop`     | 清掉 stop 标记      | 无                                    |
+| `POST /v1/control/reset-stop`     | 清掉 stop 标记（恢复 `lane_feed` / `arm_feed`） | 无                                    |
 | `POST /v1/control/close`          | 关闭当前 runtime 实例 | 无                                    |
-| `POST /v1/control/emergency-stop` | 立即停车            | 无                                    |
+| `POST /v1/control/emergency-stop` | 立即停车（**会写 `car._stop_flag=True`**，停掉 `lane_feed`） | 无                                    |
 
 ## WebSocket
 
@@ -118,7 +119,7 @@
 | `runtime`        | 查询运行时快照      |
 | `actions`        | 查询动作清单       |
 | `config`         | 查询配置         |
-| `execute`        | 直接执行动作       |
+| `execute`        | 执行动作（支持 `"sync": true` 字段，行为同 HTTP） |
 | `create_job`     | 创建异步任务       |
 | `get_job`        | 查询任务         |
 | `init`           | 初始化          |
@@ -126,13 +127,15 @@
 | `reset_stop`     | 清 stop 标记    |
 | `close`          | 关闭 runtime   |
 | `emergency_stop` | 立即停车         |
+| `subscribe_arm_state` / `unsubscribe_arm_state` | 订阅/取消 `arm_state` 持续推送（默认 20Hz） |
+| `realtime/arm_state` | 一次性读 `arm_state`（等价于 HTTP `/v1/realtime/arm/state`） |
 
 ## 实时硬件控制（50Hz 直达路径）
 
 这一组跟 `car.*` 不一样：
 
 - 不进 `job_queue`，不走 `POST /v1/execute`
-- 同步在 `car_lock` 内执行，绕过 50Hz 业务循环的 FIFO 排队
+- 同步在 `_realtime_gate`（微秒级瞬持锁）内执行，**不被 arm 长动作挡住**——是「巡线 + 机械臂」并发的关键
 - 单次 RTT 在毫秒级，适合 50Hz 闭环
 - 出错返回 409（car 未初始化）或 400（参数错）
 
@@ -252,7 +255,7 @@
 | 接口名                   | 用途                  | 关键参数                           | 关键返回    |
 | --------------------- | ------------------- | ------------------------------ | ------- |
 | `arm.reset_position`  | 机械臂整体复位             | 无                              | 动作完成    |
-| `arm.reset_x`         | 只复位 X 轴             | 无                              | 动作完成    |
+| ~~`arm.reset_x`~~     | ❌ 已删除（2026-07-16）    | —                                | —          |
 | `arm.set_arm_pose`    | 一次设置 `x/y/arm/hand` | `x?` `y?` `arm?` `hand?`       | 动作完成    |
 | `arm.set_hand_angle`  | 设置手爪角度              | `angle` `speed?`               | 动作完成    |
 | `arm.set_arm_angle`   | 设置大臂角度              | `angle` `speed?`               | 动作完成    |
@@ -284,6 +287,40 @@
 
 ### `POST /v1/execute`
 
+**默认异步**（立即返回 `job_id`，机械臂长动作等场景不阻塞客户端）：
+
+请求体：
+
+```json
+{
+  "target": "arm",
+  "name": "goto_position",
+  "args": [],
+  "kwargs": {"x": 0.05, "y": -0.05},
+  "sync": false,
+  "timeout": 30
+}
+```
+
+返回（异步）：
+
+```json
+{
+  "ok": true,
+  "async": true,
+  "job": {
+    "id": "xxxx",
+    "target": "arm",
+    "name": "goto_position",
+    "status": "queued",
+    "result": null,
+    "error": null
+  }
+}
+```
+
+加 `"sync": true` 同步阻塞到完成（链式编排 / 老调用方）：
+
 ```json
 {
   "ok": true,
@@ -297,6 +334,8 @@
   }
 }
 ```
+
+> 客户端推荐用 `main.api_client.RuntimeApiClient.execute(target, name, kwargs, sync=False)`。要等结果用 `sync=True`。详见 [`main/arm/ARM_API.md §2`](./arm/ARM_API.md#2-runtime-http--ws-端点)。
 
 ### `GET /v1/runtime`
 

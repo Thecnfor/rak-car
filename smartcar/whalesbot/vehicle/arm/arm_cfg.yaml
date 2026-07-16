@@ -1,17 +1,8 @@
 hand_cfg:
   hand:
-    angle_list:
-      LEFT: 93
-      MID: 0
-      RIGHT: -93
-    port: 2
+    port: 3
   hand2:
-    angle_list:
-      UP: -90
-      MID: -37
-      DOWN: 0
     port: 2
-    mode: 180
   grap:
     port_pump: 2
     port_valve: 3
@@ -27,16 +18,13 @@ horiz_cfg:
     Kd: 0
     setpoint: 0
     output_limits:
-    - -0.2
-    - 0.2
-  threshold:
-  - 0
-  - 0.315
+    - -0.4
+    - 0.4
 pos_cfg:
   pose_enable: true
   pose_horiz: 0.0
-  pose_vert: 0.009800000000000001
-  side: RIGHT
+  pose_vert: 0.00018500000000000027
+  side: MID
 vert_cfg:
   motor:
     id: 3
@@ -52,6 +40,10 @@ vert_cfg:
     - -0.1
     - 0.1
   threshold:
-  - 0
-  - 0.2
+  - -0.2
+  - 0.0
+  slow_band_m: 0.015
+  slow_velocity: 0.02
+  top_slow_m: 0.02
+  top_slow_velocity: 0.03
 arm_length: 0.23

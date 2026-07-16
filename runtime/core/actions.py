@@ -1,21 +1,8 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-TASK_ACTION_NAMES = [
-    "auto_lane_tracing",
-    "auto_seeding",
-    "target_shooting_detection",
-    "water_tower_task",
-    "target_shooting",
-    "crop_harvesting",
-    "sort_and_store",
-    "get_order",
-    "order_delivery",
-]
-
-
-def get_task_actions(task_module):
-    return {name: getattr(task_module, name) for name in TASK_ACTION_NAMES}
-
+# 2026-07-16 重构：删 TASK_ACTION_NAMES 与 get_task_actions。
+# 任务逻辑（自动播种/灌溉/收割/订单）由 main/ 业务层用 CAR_ACTIONS/ARM_ACTIONS 编排，
+# runtime 只暴露底层 action 接口，不再负责"任务"。
 
 CAR_ACTIONS = {
     "beep": lambda car, *args, **kwargs: car.beep(),
@@ -59,7 +46,11 @@ CAR_ACTIONS = {
 
 ARM_ACTIONS = {
     "reset_position": lambda arm_obj, *args, **kwargs: arm_obj.reset_position(),
-    "reset_x": lambda arm_obj, *args, **kwargs: arm_obj.reset_x(),
+    "reset_y": lambda arm_obj, *args, **kwargs: arm_obj.reset_y(),
+    # 2026-07-16 新加：opt-in 撞墙复位 + 复合复位。
+    # 不接入 _create_car_locked / ensure_initialized / _auto_init_kwargs，避免 fb24b1a 描述的 pm2 循环。
+    "reset_x": lambda arm_obj, *args, **kwargs: arm_obj.reset_x(**kwargs),
+    "reset_all": lambda arm_obj, *args, **kwargs: arm_obj.reset_all(**kwargs),
     "set_arm_pose": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_pose(*args, **kwargs),
     "set_hand_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_hand_angle(*args, **kwargs),
     "set_arm_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_angle(*args, **kwargs),

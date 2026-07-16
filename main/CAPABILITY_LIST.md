@@ -48,7 +48,7 @@
 - `car.get_lane_results`
   - 读取前摄巡线误差和角度误差
 - `POST /v1/realtime/wheels/speeds`
-  - 4 轮线速度直达，绕过 set_chassis_velocity 的里程计耦合路径（car_lock 同步，50Hz 友好）
+  - 4 轮线速度直达，绕过 set_chassis_velocity 的里程计耦合路径（`_realtime_gate` 微秒级瞬持锁，**不被 arm 长动作挡住**——是「巡线 + 机械臂」并发的关键）
 - `GET /v1/realtime/wheels/encoders`
   - 4 轮编码器弧度累计值
 - `POST /v1/realtime/motor/speed`
@@ -80,7 +80,7 @@
 
 - `arm.reset_position`
   - 机械臂整体回零
-- `arm.reset_x`
+- ~~`arm.reset_x`~~ ❌ 已删除（2026-07-16）
   - 机械臂横轴回零
 - `arm.move_x_position`
   - 横轴移动到指定位置
@@ -258,7 +258,7 @@
 
 现在除了 HTTP，还支持 WebSocket 长连接：
 
-- `ws://192.168.3.60:5050/v1/ws`
+- `ws://192.168.6.231:5050/v1/ws`
 
 适合：
 

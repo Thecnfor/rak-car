@@ -240,7 +240,18 @@ class QuadricycleChassis(ChassisBase):
         self.transform_inverse = np.array([[s_th, -s_th, -s_th,  s_th],
                                            [s_th,  s_th, -s_th, -s_th],
                                            [   r,     r,     r,     r]])
-        
+
+# 2026-07-16 cherry-pick from feat/chassis-p0-mecanum-8.10 (732f2d5 A1):
+# 底盘类型注册表(替代 eval(chassis_type), 消除任意代码执行风险)
+CHASSIS_REGISTRY = {
+    "TricycleChassis": TricycleChassis,
+    "Diff2Chassis": Diff2Chassis,
+    "Diff4Chassis": Diff4Chassis,
+    "MecanumChassis": MecanumChassis,
+    "QuadricycleChassis": QuadricycleChassis,
+}
+
+
 class MapWrap():
     def __init__(self) -> None:
         pass
@@ -302,8 +313,14 @@ class CarBase():
             logger.info(chassis_type)
             chassis_params = cfg["vehicle_cfg"][chassis_type]["size"]
             motor_ports = cfg["vehicle_cfg"][chassis_type]["wheel"]["port_list"]
-            # 获取底盘参数
-            self.chassis:ChassisBase = eval(chassis_type)(**chassis_params)
+            # 2026-07-16 cherry-pick from feat/chassis-p0-mecanum-8.10 (732f2d5 A1+A2):
+            # 用 CHASSIS_REGISTRY 查表替代 eval(chassis_type)，消除任意代码执行风险
+            # （cfg 来源于 yaml，被篡改可注入 Python 代码）
+            if chassis_type not in CHASSIS_REGISTRY:
+                raise KeyError(
+                    "unknown chassis_type {!r}; known: {}".format(
+                        chassis_type, list(CHASSIS_REGISTRY)))
+            self.chassis:ChassisBase = CHASSIS_REGISTRY[chassis_type](**chassis_params)
             # 获取电机接口
             # self.motors_chassis = Motors(cfg["vehicle_cfg"][chassis_type]["motor_ports"])
             self.wheels_chassis = WheelWrap(motor_ports, **wheel_params1)
@@ -311,10 +328,12 @@ class CarBase():
             self.pid_x = PID(**cfg["pid_vel_params"]["pid_x"])
             self.pid_y = PID(**cfg["pid_vel_params"]["pid_y"])
             self.pid_yaw = PID(**cfg["pid_vel_params"]["pid_yaw"])
-        except:
-            logger.error("chassis cfg error")
-            while True:
-                time.sleep(1)
+        except Exception as e:
+            # 2026-07-16: 替代 bare except + while True: time.sleep(1) 挂死循环
+            # cfg 错误时 raise RuntimeError，让 systemd / 调用方感知失败
+            # （旧版 cfg 错时进程卡死无法被 pm2 拉起）
+            logger.error("chassis cfg error: {}".format(e))
+            raise RuntimeError("chassis init failed: {}".format(e)) from e
 
     @staticmethod
     def sp_world2car(vel_world, angle_car):

@@ -472,9 +472,14 @@ class ServoBus():
         return funcs[ctl_id](speed)
 
     def read_angle(self, port_id=None):
-        """读取总线舵机当前角度。mc601 路径当前未实现，会抛 AttributeError。"""
-        funcs = [self.servo_bus_1.read_angle, self.servo_bus_2.read_angle]
-        return funcs[ctl_id](port_id)
+        """读取总线舵机当前角度。mc601 路径当前未实现，会抛 NotImplementedError。"""
+        # 不用 list 推导,避免 funcs[0] 属性访问在 list 构造阶段就先抛 AttributeError。
+        # 直接按 ctl_id 分派:servo_bus_1 没 read_angle → 抛 NotImplementedError。
+        if ctl_id == 1:
+            return self.servo_bus_2.read_angle(port_id)
+        if ctl_id == 0:
+            raise NotImplementedError("read_angle 在 MC601 路径下未实现 (ServoBus_1 无此方法)")
+        raise NotImplementedError("未知 ctl_id=%d,无法 read_angle" % ctl_id)
 
 class PoutD():
     def __init__(self, port):
