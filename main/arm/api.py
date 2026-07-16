@@ -9,9 +9,12 @@ ArmClient：薄封装 RuntimeApiClient + RuntimeWsClient，专给机械臂用。
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 try:
     from main.api_client import RuntimeApiClient
@@ -303,13 +306,20 @@ class ArmClient:
     _Y_PROTECTED_THRESHOLD_MM = -30.0     # 2026-07-16: 收紧保护区 [0, -30]（之前 [0, -80] 太宽松）
     _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage
 
-    def _check_y_protected(self, action: str, *, allow_init_position: bool = False) -> None:
+    def _check_y_protected(
+        self, action: str, *,
+        allow_init_position: bool = False,
+        skip: bool = False,
+    ) -> None:
         """y 保护区检查：y ∈ [0, -30]mm 时禁止动舵机/臂（除 init 位置）。
 
         Args:
             action: 当前动作名（用于错误信息）。
             allow_init_position: True 时允许 init 位置（hand UP=-90 / arm MID=0）。
+            skip: True 时跳过保护区检查（用于"大臂已收起"等条件）。
         """
+        if skip:
+            return
         try:
             st = self.get_state()
             y_mm = float(st.y_mm)
@@ -357,6 +367,25 @@ class ArmClient:
     _ARM_ANGLE_MIN = -150.0   # 业务层大臂角度下界（°）
     _ARM_ANGLE_MAX = 0.0      # 业务层大臂角度上界（°），>= 0 拒绝
 
+    # 2026-07-16: 大臂在 [0, -30]° 区间时，y 保护区仍约束；
+    # 大臂在 [0, -30]° 之外时（即 > 0 或 < -30），大臂可"随便动"，跳过 y 保护区。
+    # 物理意义：大臂收起来（<= -30）时结构安全，可大动作；展开（>= 0）时撞车风险。
+    _ARM_SAFE_BAND_MIN = -30.0  # 大臂"安全姿态"下界（<= -30 算"收起来"）
+    _ARM_SAFE_BAND_MAX = 0.0    # 大臂"安全姿态"上界
+
+    def _is_arm_safe_position(self) -> bool:
+        """当前大臂角度是否在"安全姿态"（<= -30，即收起来）。"""
+        try:
+            st = self.get_state()
+        except Exception:
+            # 读不到 state 时按安全原则拒绝（保守）
+            return False
+        cur = st.arm_angle
+        if cur is None:
+            return False
+        # cur <= _ARM_SAFE_BAND_MIN 表示收起来（>= -30 是展开/撞车风险区）
+        return cur <= self._ARM_SAFE_BAND_MIN
+
     def set_arm_angle(self, angle: float, speed: int, timeout: float) -> dict:
         """大臂总线舵机角度控制（业务层，硬限 [0, -150]°）。
 
@@ -367,6 +396,9 @@ class ArmClient:
 
         Raises:
             ValueError: 当 angle > 0 或 angle < -150 时拒绝下发。
+
+        2026-07-16 y 保护区放宽：大臂在 [0, -30]° 之外（即 <= -30"收起来"）时，
+        即使 y ∈ [0, -30] 保护区也可"随便动"（用户新规则）。
         """
         try:
             a = float(angle)
@@ -378,8 +410,16 @@ class ArmClient:
                 f"  规则: 大臂角度 ∈ [0, -150]°（LEFT=+93 撞车，<-180 撞车）\n"
                 f"  解决: 选 -90 (RIGHT 附近) / -120 / -150 等。"
             )
+        # y 保护区放宽：大臂"收起来"（<= -30）时跳过 y 保护区
+        skip_y_protect = self._is_arm_safe_position()
+        if skip_y_protect:
+            logger.info("set_arm_angle: 大臂已 <= -30 (收起来)，跳过 y 保护区")
         # y 保护区：0° (MID) 是 init 位置（允许），其他需先出保护区
-        self._check_y_protected("set_arm_angle", allow_init_position=(a == 0.0))
+        self._check_y_protected(
+            "set_arm_angle",
+            allow_init_position=(a == 0.0),
+            skip=skip_y_protect,
+        )
         return self._call_arm("set_arm_angle", timeout=timeout, angle=a, speed=speed)
 
     # ---- 手爪角度限位（业务层硬保护，2026-07-16 联调加） ----
@@ -402,6 +442,7 @@ class ArmClient:
 
         Raises:
             ValueError: 当 angle > 0 或 angle < -90 时拒绝下发。
+            2026-07-16 新规则：当前大臂在 [0, -30]° 范围内时，手爪只允许 init=UP=-90。
         """
         try:
             a = float(angle)
@@ -414,8 +455,27 @@ class ArmClient:
                 f"业务只允许 ≤ 0 防止撞车）\n"
                 f"  解决: 选 0 (DOWN) / -37 (MID) / -90 (UP)。"
             )
-        # y 保护区：UP=-90 是 init 位置（允许），其他需先出保护区
-        self._check_y_protected("set_hand_angle", allow_init_position=(a == -90.0))
+        # 2026-07-16 新规则：当前大臂在 [0, -30]° 时手爪只允许 init (UP=-90)
+        # 物理意义：大臂展开时手爪不动（防机械结构碰车）
+        try:
+            st = self.get_state()
+            cur_arm = st.arm_angle
+        except Exception:
+            cur_arm = None
+        if cur_arm is not None and self._ARM_SAFE_BAND_MIN <= cur_arm <= self._ARM_SAFE_BAND_MAX:
+            # 当前大臂在 [0, -30]° "展开区"
+            if a != self._HAND_ANGLE_MIN:  # -90 UP
+                raise ValueError(
+                    f"set_hand_angle({a}) 拒绝：当前大臂在 [{self._ARM_SAFE_BAND_MIN}, "
+                    f"{self._ARM_SAFE_BAND_MAX}]° 展开区，手爪只允许 init (UP=-90°)。\n"
+                    f"  规则: 大臂展开时手爪禁止控制（防机械结构撞车）\n"
+                    f"  解决: 先 set_arm_angle(<=-30) 把大臂收起来，再调手爪。"
+                )
+            # UP=-90 是 init 位置，仍要走 y 保护区检查（init 允许）
+            self._check_y_protected("set_hand_angle", allow_init_position=True)
+        else:
+            # 当前大臂不在 [0, -30]（即收起来或错误）—— y 保护区正常走 init 例外
+            self._check_y_protected("set_hand_angle", allow_init_position=(a == -90.0))
         return self._call_arm("set_hand_angle", timeout=timeout, angle=a, speed=speed)
 
     # ---- 存储仓（二选一档位） ----
@@ -556,7 +616,8 @@ class ArmClient:
 
     def get_state(self) -> ArmState:
         raw = self._read_raw_state()
-        st_job = self._call_car("get_arm_state", timeout=10.0)
+        # sync=True 同步等 result（异步模式 result 在 job.result 而非顶层）
+        st_job = self._call_car("get_arm_state", timeout=10.0, sync=True)
         st_data = st_job.get("result") if isinstance(st_job, dict) else {}
         if not isinstance(st_data, dict):
             st_data = {}
