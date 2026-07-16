@@ -382,7 +382,7 @@ finally:
 | 项 | 实测值 | 备注 |
 | --- | --- | --- |
 | 外环频率 | 50Hz | 受 lane 推理 ~5-10ms + HTTP/WS RTT ~2-5ms 限制 |
-| `lane_feed` 推送频率 | **50Hz**（2026-07-16 上调，原 15-20Hz） | 受 ZMQ 推理 + service 层 set_lane_state 限制。lane 模型 128x128 推理 ~15-20ms，50Hz 撑得住 |
+| `lane_feed` 推送频率 | 守护线程 `hz=50`（2026-07-16 上调）；实测写入 ~15-20Hz | 受 ZMQ 推理 + cv2.imencode 限制。lane 模型 128x128 推理 ~20-30ms + ZMQ RTT，单循环跑超过 20ms 周期，实际写入频率是推理耗时倒数。**外环 50Hz 轮询 cache 仍能拿到每帧新值**（无重复帧），但 feed 写入频率上限约 20Hz |
 | 单轮端到端 RTT（WS） | ~5ms | ws 路径比 http 快 ~3-5ms |
 | 单轮端到端 RTT（HTTP） | ~10ms | 仍能跑 50Hz，但留余量小 |
 | WebSocket push 5s | ~250 次 | `subscribe_lane` 实测 50Hz×5s（受 lane_feed 频率上限约束） |
