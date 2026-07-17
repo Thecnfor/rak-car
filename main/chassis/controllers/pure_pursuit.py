@@ -9,7 +9,7 @@ import math
 from typing import List, Optional, Tuple
 
 from ..state import LaneState
-from .base import OuterLoop
+from .base import OuterLoop, mecanum_inverse
 
 
 class PurePursuitOuterLoop(OuterLoop):
@@ -38,9 +38,5 @@ class PurePursuitOuterLoop(OuterLoop):
         alpha = math.atan2(y, x)
         curvature = 2.0 * math.sin(alpha) / max(self.look_ahead_m, 1e-3)
         omega = self.vx * curvature
-        return [
-            self.vx + self.r_eff * omega,
-            -self.vx + self.r_eff * omega,
-            -self.vx + self.r_eff * omega,
-            self.vx + self.r_eff * omega,
-        ]
+        # 纯旋转 + 前向：vy=0
+        return mecanum_inverse(self.vx, 0.0, omega, self.r_eff)

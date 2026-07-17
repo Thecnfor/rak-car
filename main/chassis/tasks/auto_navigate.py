@@ -125,7 +125,6 @@ def run(
     next_tick = time.monotonic()
     watchdog = EmergencyWatchdog(threshold_ms=500.0)
     lost_line = LostLineDetector()
-    last_wheel = [0.0, 0.0, 0.0, 0.0]
     try:
         while time.monotonic() < deadline:
             steps += 1
@@ -170,7 +169,6 @@ def run(
             # 4. 外环 + 下发
             dt = 1.0 / max(cfg.hz, 1.0)
             speeds = outer.step(state, dt)
-            last_wheel = list(speeds)
             api.set_wheel_speeds(speeds)
             # 5. 调度
             next_tick += dt

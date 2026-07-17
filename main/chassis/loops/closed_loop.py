@@ -52,7 +52,6 @@ class DoubleLoopRunner:
         """阻塞：每 ~dt 跑一次外环 + 下发；任何异常路径都会 zero out 退出。"""
         deadline = time.monotonic() + max(0.0, float(max_seconds))
         next_tick = time.monotonic()
-        last_wheel = [0.0, 0.0, 0.0, 0.0]
         try:
             while not self._stop:
                 now = time.monotonic()
@@ -63,7 +62,6 @@ class DoubleLoopRunner:
                     self.api.emergency_stop()
                     break
                 speeds = self.outer.step(state, self.dt)
-                last_wheel = list(speeds)
                 self.api.set_wheel_speeds(speeds)
                 if self.on_tick is not None:
                     try:
@@ -78,7 +76,9 @@ class DoubleLoopRunner:
                     # 调度已经落后了，放弃补偿避免 catching up
                     next_tick = time.monotonic()
         finally:
+            # 任何路径退出前都发零速（Ctrl-C / emergency_stop / 正常 timeout），
+            # 否则车会以最后一帧轮速冲出去。
             try:
-                self.api.set_wheel_speeds(last_wheel if False else [0.0, 0.0, 0.0, 0.0])
+                self.api.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
             except Exception:
                 pass
