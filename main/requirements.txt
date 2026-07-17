@@ -1,2 +1,3 @@
 requests>=2.31,<3.0
 websocket-client>=1.8,<2.0
+textual>=8.0,<9.0            # TUI 仪表盘（lane_monitor_tui.py）
