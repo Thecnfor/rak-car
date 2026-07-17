@@ -15,7 +15,7 @@ import json
 def main():
     if len(sys.argv) < 3:
         x_mm = 100.0
-        y_mm = 80.0
+        y_mm = -80.0
     else:
         x_mm = float(sys.argv[1])
         y_mm = float(sys.argv[2])

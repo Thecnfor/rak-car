@@ -1,11 +1,18 @@
 #!/usr/bin/python3
 """test_x_axis.py
 x 轴单轴测试:依次走到指定 mm,读回实际位置,核对误差。
+
+方向约定(本仓库硬件实测):
+  reset_x 撞右墙 → x=0 在右墙位置
+  正方向 (+x) = 向物理右走
+  负方向 (-x) = 向物理左走 (有效行程 -320 ~ 0 mm)
+  TARGETS_MM 全为负 = 全部向左走
+
 要求:
   1) runtime 已起来(pm2 status rak-car-api)
-  2) 首次上电已跑过 python3 main/arm/examples/01_calibrate_origin.py left
+  2) 首次上电已跑过 python3 main/arm/examples/01_calibrate_origin.py
 运行:
-  export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
+  export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
   python3 main/arm/examples/test_x_axis.py
 """
 import os
@@ -19,8 +26,9 @@ if _ROOT not in sys.path:
 from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 
-# 测试点序列(mm):在 soft_x_min=5 .. soft_x_max=300 软限位内任选
-TARGETS_MM = [0.0, 100.0, 0.0, 200.0, 0.0]
+# 测试点序列(mm):在 [-320, +320] 软限位内(向左边,所以全部取负)
+# 0 → -100 → 0 → -200 → 0,模拟"向左走出再回来"的循环
+TARGETS_MM = [0.0, -100.0, 0.0, -200.0, 0.0]
 TOL_MM = 5.0   # 允许误差 mm(车端 PID 闭环,典型稳态误差 < 2mm)
 
 

@@ -35,9 +35,16 @@ ANGLE_TABLE = {False: -42, True: 165}
 
 
 def call_safe(c: RuntimeApiClient, target: str, name: str, *args, timeout: float = 15.0, **kwargs):
-    """单次调用,带超时 + 异常捕获(避免大臂那种无限挂起问题)。"""
+    """单次调用,带超时 + 异常捕获(避免大臂那种无限挂起问题)。
+
+    ⚠️ 关键:必须 sync=True。runtime 在 v2 改造后 /v1/execute 默认 async,会立刻
+    返回 status=queued/running,测试取不到 succeeded。同步 = 内部 polling 到
+    succeeded/failed,行为与改造前一致。漏 sync 时 13 个调用全部 fail 看起来像
+    "网络/舵机问题",其实是契约错位。
+    """
     try:
-        r = c.execute(target=target, name=name, args=list(args), kwargs=kwargs, timeout=timeout)
+        r = c.execute(target=target, name=name, args=list(args), kwargs=kwargs,
+                      timeout=timeout, sync=True)
         return r.get("status"), r.get("error"), r
     except Exception as e:
         return "exception", str(e)[:120], None

@@ -487,7 +487,11 @@ class ArmClient:
 
     def get_state(self) -> ArmState:
         raw = self._read_raw_state()
-        st_job = self._call_car("get_arm_state", timeout=10.0)
+        # sync=True 必传：get_arm_state 是读取动作,需要阻塞到 runtime 真把 result 写回 job,
+        # 否则 async 立即返回 status=queued/result=None,下面 st_data={} → side 兜底 MID
+        # arm_angle 拿到 None(就是 test_arm_servo.py 看到的现象的根因)。
+        # _call_car 默认 sync=False,get_state 是读路径必须显式 True。
+        st_job = self._call_car("get_arm_state", timeout=10.0, sync=True)
         st_data = st_job.get("result") if isinstance(st_job, dict) else {}
         if not isinstance(st_data, dict):
             st_data = {}

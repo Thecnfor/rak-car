@@ -682,11 +682,30 @@ class MyCar(MecanumDriver):
 
         _debug_emit("开始读取机械臂状态")
         #endregion debug-point runtime-init-queue-arm-state
+        # side 字段优先读 self.arm.side;若缺失/为 None,用 _arm_angle_last +
+        # hand_angle_list 反向映射兜底。触发场景:set_arm_angle(int) 直传数字时不会更新
+        # self.side(只在 str 分支赋值),但 _arm_angle_last 和 angle 都已写入,反查可得。
+        arm_obj = self.arm
+        side_val = getattr(arm_obj, "side", None)
+        if side_val not in ("LEFT", "MID", "RIGHT"):
+            last_angle = getattr(arm_obj, "_arm_angle_last", None)
+            if last_angle is None:
+                last_angle = getattr(arm_obj, "angle", None)
+            angle_list = getattr(arm_obj, "hand_angle_list", None)
+            if isinstance(angle_list, dict) and last_angle is not None:
+                for k, v in angle_list.items():
+                    if v == last_angle:
+                        side_val = k
+                        break
+        # arm_angle 优先 self.angle(set_arm_angle 主写字段),回退 _arm_angle_last。
+        arm_angle_val = getattr(arm_obj, "angle", None)
+        if arm_angle_val is None:
+            arm_angle_val = getattr(arm_obj, "_arm_angle_last", None)
         return {
             "x": self.arm.x_get_position(),
             "y": self.arm.y_get_position(),
-            "side": getattr(self.arm, "side", None),
-            "arm_angle": getattr(self.arm, "angle", None),
+            "side": side_val,
+            "arm_angle": arm_angle_val,
             "hand_angle": getattr(self.arm, "hand_angle", None),
             "y_limit": self.arm.y_reset_check(),
         }

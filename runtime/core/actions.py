@@ -73,4 +73,5 @@ ARM_ACTIONS = {
     "grasp": lambda arm_obj, *args, **kwargs: arm_obj.grasp(*args, **kwargs),
     "x_get_position": lambda arm_obj, *args, **kwargs: arm_obj.x_get_position(),
     "y_get_position": lambda arm_obj, *args, **kwargs: arm_obj.y_get_position(),
+    "x_set_origin": lambda arm_obj, *args, **kwargs: arm_obj.x_set_origin(),
 }
