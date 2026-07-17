@@ -1,8 +1,52 @@
-import time
+"""main/chassis/examples/05_subscribe_lane_state.py
+弧度偏差自适应巡线的"WS 直读"变体：
+
+与 04_curvature_adaptive.py 的差别
+-----------------------------------
+- 感知层：直接走 ``RuntimeWsClient.realtime_lane_state()``（realtime 通道，
+  不进 job_queue、不打 ZMQ、不抢 car_lock），而不是 HTTP 轮询。
+  通道路径与 04 完全一致（都读同一份 ``lane_feed`` 守护线程缓存），
+  只是传输层从 HTTP 换成 WS，单轮 RTT 从 ~10ms 降到 ~5ms。
+- 控制律：``CurvatureAdaptiveOuterLoop`` + ``WheelSmoother`` 手写内层循环，
+  而不是 ``DoubleLoopRunner``——便于 ``dry_run`` 开关与 ``on_tick`` 打印格式
+  自定义（按 1/50s 一行打印 curvature / axis_mix / vy_keep / ey_int / streak）。
+- ``set_wheel_speeds`` 走 ``ChassisClient.set_wheel_speeds``（已内置
+  WS 优先 + HTTP 回落）。
+
+适用场景
+--------
+- 想在调试时打开 dry_run 纯打印观察 ``kappa`` / ``dkappa`` / ``axis_mix``
+  / ``ey_int`` 分布，不让车真的跑；
+- 想拿 WS 通道 50Hz 的 RTT 优势（相比 04 的 HTTP 轮询，每轮省 ~5ms）；
+- 想在 chassis 控制律与 WS realtime op 之间做端到端 sanity 检查。
+
+用法
+----
+    python3 -m main.chassis.examples.05_subscribe_lane_state            # 默认 50Hz / 跑 85s
+    # 想 dry_run 纯打印不下发，直接改 __main__ 末尾：
+    #     subscribe_lane_state(hz=50.0, max_seconds=85.0, dry_run=True)
+    # 文件名以数字开头，子模块无法 `from main.chassis.examples import ...` 导入；
+    # 只走 `python3 -m main.chassis.examples.05_subscribe_lane_state` 或脚本顶层 `if __name__ == "__main__"`。
+
+依赖
+----
+全部走 ``main.chassis`` 公共 API：
+
+- ``ChassisClient`` — 统一 HTTP + WS 连接入口
+- ``CurvatureAdaptiveOuterLoop`` — 弧度偏差自适应外环
+- ``WheelSmoother`` — 下发前单轮 slew-rate 限幅
+- ``LaneState`` — lane 误差缓存视图（dataclass）
+"""
 from typing import Optional
-from main.ws_client import RuntimeWsClient
-from main.chassis import CurvatureAdaptiveOuterLoop, WheelSmoother
+
+from main.chassis import (
+    ChassisClient,
+    CurvatureAdaptiveOuterLoop,
+    WheelSmoother,
+)
 from main.chassis.state import LaneState
+
+
 def subscribe_lane_state(
     hz: float = 50.0,
     max_seconds: Optional[float] = 50.0,
@@ -39,12 +83,12 @@ def subscribe_lane_state(
     wheel_max_accel: float = 0.4,
     wheel_max_decel: float = 0.6,
 ) -> None:
-    ws = RuntimeWsClient()
-    try:
-        ws.connect()
-    except Exception as exc:
-        print(f"[subscribe_lane_state] WebSocket 连接失败: {exc!r}")
-        return
+    """按 50Hz 跑 curvature-adaptive 外环；详细参数说明见模块 docstring。"""
+    import time
+
+    api = ChassisClient.connect()
+    if not api.ws_ready:
+        print("[subscribe_lane_state] WS 连接失败，回退到 HTTP 轮询路径（lane 读取将改走 ChassisClient.get_lane_state）")
 
     outer = CurvatureAdaptiveOuterLoop(
         v_max=v_max,
@@ -79,7 +123,7 @@ def subscribe_lane_state(
 
     next_t = time.monotonic()
     print(
-        f"[subscribe_lane_state] start hz={hz:.1f} via WebSocket  "
+        f"[subscribe_lane_state] start hz={hz:.1f} via {'WS' if api.ws_ready else 'HTTP'}  "
         f"v_max={v_max:.2f} v_min={v_min:.2f} "
         f"kappa_full={kappa_full:.2f} hold_ms={hold_ms:.0f}"
     )
@@ -90,21 +134,26 @@ def subscribe_lane_state(
             if sleep > 0:
                 time.sleep(sleep)
             next_t += period
-            dt = period 
+            dt = period
 
             try:
-                payload = ws.realtime_lane_state() or {}
+                if api.ws_ready:
+                    payload = api.ws.realtime_lane_state() or {}
+                else:
+                    payload = api.get_lane_state() or {}
                 state = LaneState.from_lane_state_payload(payload)
             except Exception as exc:
-                print(f"[subscribe_lane_state] ws realtime_lane_state error: {exc!r}")
+                print(f"[subscribe_lane_state] lane_state read error: {exc!r}")
                 state = LaneState()
 
             target_speeds = outer.step(state, dt)
-
             target_speeds = smoother.step(target_speeds)
 
             if not dry_run:
-                ws.realtime_wheel_speeds(target_speeds)
+                try:
+                    api.set_wheel_speeds(target_speeds)
+                except Exception as exc:
+                    print(f"[subscribe_lane_state] set_wheel_speeds error: {exc!r}")
 
             v1, v2, v3, v4 = target_speeds
             dbg = outer.debug_snapshot()
@@ -119,13 +168,15 @@ def subscribe_lane_state(
     except KeyboardInterrupt:
         print("[subscribe_lane_state] KeyboardInterrupt -> exit")
     finally:
-
         if not dry_run:
             try:
-                ws.realtime_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+                api.stop_wheel_speeds()
             except Exception:
                 pass
-        ws.close()
+        try:
+            api.ws.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

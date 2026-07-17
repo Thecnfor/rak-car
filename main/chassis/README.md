@@ -218,7 +218,7 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 麦轮逆解 `[v1..v4] = vx ± vy ± r*omega` 在大弧度差急转弯瞬间，单轮目标能从
 `0.30 m/s` 直接跳到 `1.0+ m/s`（50Hz 外环下相当于 ~35 m/s² 阶跃），下位机
 电源扛不住 → 掉电压。`WheelSmoother` 对每轮独立做 (a) `|v| ≤ max_abs`
-(b) 单帧 `Δv ∈ [-max_decel, +max_accel]`，挂在 runner / `subscribe_lane_state`
+(b) 单帧 `Δv ∈ [-max_decel, +max_accel]`，挂在 runner / `examples/05_subscribe_lane_state.py`
 入口作为最后一道闸。
 
 ```python
@@ -362,6 +362,7 @@ track_target(api, label=None, time_out=3.0)
 | `02_stanley_lane.py` | 弯道、中速 | 50Hz | `StanleyOuterLoop` |
 | `03_p2p_with_vision.py` | 巡线 → 视觉终点微调（外环+内环切换） | 50Hz | `StanleyOuterLoop` + `track_target` |
 | `04_curvature_adaptive.py` | 弧度偏差自适应巡线（弯道降速 + 加强转向） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
+| `05_subscribe_lane_state.py` | 04 的 WS 直读变体（realtime WS 通道读 lane_state + 手写内层循环） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
 
 **用法**：
 
@@ -484,11 +485,12 @@ main/chassis/
 │   ├── follow_lane.py        ← 起 lane feed + 外环跑 N 秒
 │   ├── track_target.py       ← car.move_to_detection_target 包装
 │   └── back_to_line.py       ← 丢线恢复（直走 straight_seconds）
-└── examples/                 ← 4 个起步脚本
+└── examples/                 ← 5 个起步脚本
     ├── 01_minimal_p_lane.py
     ├── 02_stanley_lane.py
     ├── 03_p2p_with_vision.py
-    └── 04_curvature_adaptive.py
+    ├── 04_curvature_adaptive.py
+    └── 05_subscribe_lane_state.py
 ```
 
 ---

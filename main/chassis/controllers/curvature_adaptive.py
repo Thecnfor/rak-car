@@ -279,7 +279,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         #   基础 P 项 + 弧度大时的额外增益 + 弧度变化率进弯牵引
         # 符号约定：LaneState.error_angle "逆时针为正"，车体坐标系下逆时针 = 左转。
         # error_angle > 0 → 线相对车体轴向左偏 → 应左转（omega > 0），
-        # 故 kp_theta 项取正号（与现场验证过的 subscribe_lane_state.py 原版一致）。
+        # 故 kp_theta 项取正号（与现场验证过的 examples/05_subscribe_lane_state.py 原版一致）。
         # kappa 封顶 1.5（之前 2.0），配合 omega_gain=0.35 → boost 最大 1.525x。
         boost = 1.0 + self.omega_gain * min(kappa, 1.5)
         omega_raw = (
