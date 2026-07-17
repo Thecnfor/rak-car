@@ -539,8 +539,45 @@ class ArmClient:
 
         纯客户端缓存：每次 set_storage 成功后本地更新；
         **不会让舵机动作**。ArmClient 重建后状态归零，回到 "UNKNOWN"。
+        任意角度（set_storage_angle）会把缓存清成 "UNKNOWN"（不再是两档之一）。
         """
         return getattr(self, "_storage_side_cache", "UNKNOWN")
+
+    def set_storage_angle(self, angle: float, speed: int = 100,
+                          timeout: float = 10.0) -> dict:
+        """把存储仓舵机转到任意角度（绕开 LEFT/RIGHT 两档写死）。
+
+        与 set_storage(side) 的区别：后者只接受两档写死角度，这里接受任意角度，
+        供 main 层自由调试 / 标定。角度语义与底层 ServoPwm(mode=180) 一致：
+        协议值 = int(angle / 180 * 180 + 90) = angle + 90，落在 [0, 180] 才合法
+        （即 angle ∈ [-90, 90]），超出由舵机自然回弹——这是已知物理 trade-off，
+        与 set_storage 的 RIGHT=165° 同理，runtime/底层都不 clamp。
+
+        ⚠️ 安全门与 set_storage 相同：y 必须 < -100mm 才能动舵机
+        （y ∈ [0, -100] 接近触底，舵机摆动会撞车）。
+
+        底层走车端 car action "set_storage_angle"（runtime 已暴露，接受任意 angle）。
+
+        参数:
+            angle: 目标角度（°），见上文合法区间说明。
+            speed: 舵机速度，默认 100。
+            timeout: job 超时（秒）。
+
+        返回:
+            {"ok": bool, "angle": float, "raw_job": dict}
+        """
+        self._check_y_safe_for_storage("set_storage_angle")
+        job = self._call_car(
+            "set_storage_angle", timeout=timeout,
+            angle=angle, speed=speed, sync=True,
+        )
+        # 任意角度不属于 LEFT/RIGHT 两档，缓存清成 UNKNOWN 避免 get_storage() 误报。
+        self._storage_side_cache = "UNKNOWN"
+        return {
+            "ok": bool(isinstance(job, dict) and job.get("status") == "succeeded"),
+            "angle": float(angle),
+            "raw_job": job,
+        }
 
     def grasp(self, on: bool, timeout: float = 10.0) -> dict:
         # 修复 bug：原来 `_call_arm("grasp", bool(on), timeout=timeout)` 会让

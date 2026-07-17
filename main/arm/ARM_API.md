@@ -65,6 +65,7 @@ from main.arm import (
 | `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
 | `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | 实际角度走 `ServoPwm` wrapper，参见 §6 |
+| `set_storage_angle(angle, speed=100, timeout=10)` | 存储仓**任意角度**（绕开两档写死，调试/标定用） | float（**必填**） | **`car.set_storage_angle`（注意是 car）** | 同 set_storage 的 y 安全门；合法区间 `angle ∈ [-90, 90]`；调完 `get_storage()` 回 "UNKNOWN"，参见 §6 |
 | `get_storage()` | 读当前档位（客户端缓存，**不下发舵机**） | — | — | 重建 client 后回 "UNKNOWN" |
 | `reset_y(timeout=30)` | **仅**归 y（磁感触底） | — | `arm.reset_y` | 不动 x，详见 §7 |
 | `reset_origin(x_wall="left", timeout=60)` | 仅 y 触底定原点 + 写 `arm_origin.yaml` | `"left"`/`"right"` | `arm.reset_position` | `x_origin_m` 固定 0（x 无撞墙校准） |
@@ -464,9 +465,13 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 ---
 
-## 6. 存储仓 `set_storage` 角度范围
+## 6. 存储仓：`set_storage`（两档）与 `set_storage_angle`（任意角）
 
-存储仓是独立 PWM 舵机（`ServoPwm` wrapper，`port=1`），LEFT/RIGHT 角度写死：
+存储仓是独立 PWM 舵机（`ServoPwm` wrapper，`port=1`）。业务层提供两个入口：
+
+### 6.1 `set_storage(side)` —— 两档写死（竞赛流程用）
+
+LEFT/RIGHT 角度写死：
 
 - `STORAGE_DEFAULT_LEFT_ANGLE = -42°`
 - `STORAGE_DEFAULT_RIGHT_ANGLE = 90°`
@@ -484,7 +489,23 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 > **改角度常量时务必保证 `angle + 90 ∈ [0, 180]`**。否则 `car.set_storage` 直接抛 `ValueError`（在 `car_wrap_2026.set_storage:480`）。
 
-如果确实要任意角度，调 `car.set_storage_angle(angle, speed=100)`（CAR_ACTIONS 里有 `set_storage_angle`），但**业务层慎用**——它会绕开协议校验。
+### 6.2 `set_storage_angle(angle, speed=100)` —— 任意角度（调试/标定用）
+
+绕开两档写死，让 main 层自由变换角度。底层走车端已有的 `car.set_storage_angle`
+（`CAR_ACTIONS` 里有），runtime/底层都**不 clamp**。
+
+```python
+arm.move_y(-150)             # ① 先降到安全区（y < -100mm），否则安全门拦截
+arm.set_storage_angle(30)    # ② 任意角度（°）
+arm.set_storage_angle(-42)   # 也能手动回到原 LEFT 角
+```
+
+- **合法区间 `angle ∈ [-90, 90]`**（协议值 = `angle + 90` 落 `[0, 180]`）。超出会
+  被舵机自然回弹——与 `set_storage` 的 RIGHT=165° 同样的已知 trade-off。
+- **安全门**与 `set_storage` 相同：`y` 必须 `< -100mm` 才能动舵机（`y ∈ [0, -100]`
+  接近触底，舵机摆动会撞车），否则抛 `ValueError`。
+- 任意角度不属于 LEFT/RIGHT 两档，调完 `get_storage()` 返回 `"UNKNOWN"`。
+- 返回 `{"ok": bool, "angle": float, "raw_job": dict}`。
 
 ---
 
