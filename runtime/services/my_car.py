@@ -360,6 +360,10 @@ class MyCar(MecanumDriver):
         # 与 _stop_flag 一起构成"协作式取消"，可被 runtime 无锁抢占。
         self._estop_event = threading.Event()
         self.arm._estop = self._estop_event
+        # 硬件急停标志:emergency_stop() 触发;与 _stop_flag 不同 —— 硬件 loop 必须
+        # 响应(让底盘/arm 停转),但 lane_feed/arm_feed/task_feed 守护线程不受影响,
+        # 上位机视觉/推理持续对外提供数据流。需要 reset_stop 复位。
+        self._hardware_stop = False
         # 物理按键板 2026 年未启用（仅 arm jog 用，不再触发 _stop_flag）。
         self._end_flag = False
 
@@ -383,17 +387,23 @@ class MyCar(MecanumDriver):
 
     def emergency_stop(self):
         """
-        软件急停：立即停三轴 + 置协作停止标志。
+        软件急停：立即停三轴 + 置硬件协作停止标志。
 
         设计要点（配合 runtime 无锁调用）：
           - 底层串口每条指令自带锁并各自成包，即使 worker 线程正在跑长动作，
             这里并发下发停车指令也不会串包，故 runtime 侧无需再抢 car_lock；
-          - 置 _stop_flag / _estop_event 后：底盘巡线循环读到 _stop_flag 退出、
-            机械臂 y_speed/x_speed 被 _estop chokepoint 强制 0，正在跑的
-            reset_y / move_* 循环随即因电机不动而收敛退出，不会又把电机驱起来。
-        返回：True。
+          - 仅置 _hardware_stop / _estop_event：**不**再置 _stop_flag。两个标志分工：
+              · _hardware_stop（仅 emergency_stop 设置）→ 硬件 loop（move_base /
+                lane_base / reset_* 等）响应；feed 守护线程（lane_feed / arm_feed /
+                task_feed）不响应，上位机视觉/推理仍对外提供数据流。
+              · _stop_flag（仅 cancel_job 路径设置）→ feed 守护线程响应。
+            底盘/机械臂 PID 循环读到 _hardware_stop 退出、y_speed/x_speed 被
+            _estop chokepoint 强制 0,正在跑的 reset_y / move_* 循环随即因电
+            机不动而收敛退出,不会又把电机驱起来。
+
+        返回:True。
         """
-        self._stop_flag = True
+        self._hardware_stop = True
         self._estop_event.set()
         errors = []
         for label, fn in (
@@ -413,10 +423,20 @@ class MyCar(MecanumDriver):
         """
         解除软件急停：清除停止标志，允许后续动作重新驱动电机。
         急停后必须显式调用本方法（或 runtime reset_stop）才能恢复运动。
+        同时清 _hardware_stop 与 _stop_flag、_estop_event。
         """
         self._stop_flag = False
+        self._hardware_stop = False
         self._estop_event.clear()
         return True
+
+    def _must_exit(self):
+        """硬件控制循环退出条件：硬件急停或任务取消任一命中都退出。
+
+        Feed 守护线程只看 _stop_flag（emergency_stop 不杀它们），
+        硬件 loop 同时看两个标志，确保 emergency_stop 立即生效。
+        """
+        return self._hardware_stop or self._stop_flag
 
     def beep(self):
         """
@@ -816,7 +836,7 @@ class MyCar(MecanumDriver):
         """
         start_time = time.time()
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if time.time() - start_time > time_hold:
                 break
@@ -854,7 +874,7 @@ class MyCar(MecanumDriver):
         stop = self.resolve_stop(stop)
         self.set_velocity(sp[0], sp[1], sp[2])
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if end_fuction():
                 break
@@ -1044,7 +1064,7 @@ class MyCar(MecanumDriver):
         tar_index = 0
         flag_location = False
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if time.time() > end_time:
                 logger.info("time out")
@@ -1170,7 +1190,7 @@ class MyCar(MecanumDriver):
         """
         stop = self.resolve_stop(stop)
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 if hasattr(self.streamer, "set_lane_state"):
                     self.streamer.set_lane_state(
                         active=False,
@@ -1715,7 +1735,7 @@ class MyCar(MecanumDriver):
         text_out = None
         print(det)
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return text_out
             if time.time() > time_stop:
                 return text_out
@@ -1794,7 +1814,7 @@ class MyCar(MecanumDriver):
         text_count = CountRecord(3)
         text_out = None
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if time.time() > time_stop:
                 return None
@@ -2094,7 +2114,7 @@ class MyCar(MecanumDriver):
         pid_x = PID(kp_x, ki_x)
         pid_x.setpoint = delta_x
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
                 return -1, "None"
@@ -2188,7 +2208,7 @@ class MyCar(MecanumDriver):
         inference_flag = False
         grasp_flag = False
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
 
             keys_val = self.blue_pad.read()

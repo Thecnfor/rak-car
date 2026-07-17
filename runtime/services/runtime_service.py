@@ -17,7 +17,16 @@ from runtime.core import settings
 from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS
 from runtime.hardware.controller_session import get_controller_session
 from runtime.services.inference_service import InferBackendService
-import logging  # 2026-07-16: init reset_all 日志用(避免循环 import smartcar.whalesbot.tools)
+import logging
+# 2026-07-17: runtime_service.py 用 logging.getLogger(__name__),但 uvicorn 没
+# basicConfig,root logger 空 → logger.info() 静默被吞。
+# 方案:basicConfig 只在 root 还没 handler 时生效(幂等),不影响 smartcar 自己的
+# "my_logger" logger(have handler)。失败兜底保持原 behavior。
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s %(filename)s, line %(lineno)d, %(levelname)s:%(message)s',
+    )
 logger = logging.getLogger(__name__)
 
 try:
@@ -399,6 +408,49 @@ class CarRuntimeService:
                         self.car.arm.reset_position()
                     if reset_position:
                         self.car.reset_position()
+                    # 2026-07-17: 复用 init 路径补 reset_x 撞墙(此前只有首次 init 撞)。
+                    # 默认走(settings.get_reset_x_on_init()=1),重建风暴期可设
+                    # RAK_CAR_RESET_X_ON_INIT=0 临时关掉。reset_x 内部 try/except
+                    # 已兜底撞墙失败(logger.warning),不会阻塞 init 整体。
+                    if settings.get_reset_x_on_init() and self.car.arm is not None:
+                        # 2026-07-17: 防抖 cooldown。controller 状态在 UNKNOWN
+                        # ↔ PROGRAM_READY 之间反复抖动时,auto_init loop 会反复
+                        # 调 ensure_initialized → 复用路径反复撞墙(物理磨损)。
+                        # 撞墙后 N 秒内(默认 60s)不再撞,等到 controller 真正
+                        # 稳定或下次 manual init 再补一次。
+                        cooldown_s = float(os.getenv(
+                            "RAK_CAR_RESET_X_COOLDOWN_S", "60"
+                        ))
+                        now = time.time()
+                        last_at = getattr(self, "_last_init_reset_x_at", 0.0)
+                        if now - last_at < cooldown_s:
+                            logger.warning(
+                                "[init reset_x reuse path] cooldown skip"
+                                " (last={:.1f}s ago, cooldown={:.0f}s)".format(
+                                    now - last_at, cooldown_s
+                                )
+                            )
+                        else:
+                            try:
+                                # 2026-07-17: 用 RAK_CAR_RESET_X_VELOCITY 配的
+                                # 速度(默认 0.04 m/s),不用 reset_x 默认的 0.02
+                                # —— 默认值在赛道场景偏慢,撞墙瞬间电机还没
+                                # 充分建立 stall 判定窗口就会被弹回,造成
+                                # "动了一下子就停" 的假撞墙。
+                                init_x_v = float(os.getenv(
+                                    "RAK_CAR_RESET_X_VELOCITY", "0.04"
+                                ))
+                                self.car.arm.reset_x(reset_velocity=init_x_v)
+                                self._last_init_reset_x_at = now
+                                logger.warning(
+                                    "[init reset_x reuse path]: ok"
+                                    " (velocity={}m/s)".format(init_x_v)
+                                )
+                            except Exception as exc:
+                                logger.warning(
+                                    "[init reset_x reuse path] failed: {}"
+                                    .format(exc)
+                                )
                     self.controller_generation = session.get("generation")
                     # 复用现有 car 时也确保 lane_feed 跑着（幂等）
                     try:
@@ -476,15 +528,16 @@ class CarRuntimeService:
         # 关键：不持 car_lock。worker 跑长动作（reset_position / move_* / 巡线）时
         # car_lock 被占，若这里也抢 car_lock 会排队等长动作结束 → 急停失效。
         # 停车指令走串口层自带锁，与 worker 并发安全；car.emergency_stop 内部
-        # 置 _stop_flag/_estop 让正在跑的循环协作退出，并直接停三轴。
+        # 置 _hardware_stop / _estop 让正在跑的循环协作退出，并直接停三轴。
+        # **不**置 _stop_flag → 上位机视觉/推理 (lane_feed / arm_feed / task_feed) 不受影响。
         car = self.car
         if car is None:
             return False
         try:
             return bool(car.emergency_stop())
         except AttributeError:
-            # 兼容旧 car（无 emergency_stop）：至少置标志 + 停底盘
-            car._stop_flag = True
+            # 兼容旧 car（无 emergency_stop 方法）：至少置 _hardware_stop + 停底盘
+            car._hardware_stop = True
             try:
                 car.stop()
             except Exception:
@@ -554,7 +607,7 @@ class CarRuntimeService:
     def get_lane_state(self):
         """外环专用：读 streamer 缓存的 lane_state。
 
-        数据来源：`lane_feed` 守护线程（runtime 启动后默认 20Hz）通过
+        数据来源：`lane_feed` 守护线程（runtime 启动后默认 50Hz）通过
         `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
 
         不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
@@ -583,7 +636,7 @@ class CarRuntimeService:
     def get_task_state(self):
         """边走边看专用：读 streamer 缓存的 task_state（侧摄目标检测）。
 
-        数据来源：`task_feed` 守护线程（runtime 启动后默认 10Hz）通过
+        数据来源：`task_feed` 守护线程（runtime 启动后默认 30Hz）通过
         `car.streamer.set_task_state(...)` 持续刷新的内存缓存。
 
         不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
@@ -794,10 +847,15 @@ class CarRuntimeService:
         return self.wait_job(job["id"], timeout=timeout)
 
     def cancel_job(self, job_id):
-        """D.6 协作退出：set job 的 stop_event，并尝试触发 SDK _stop_flag。
+        """D.6 协作退出：set job 的 stop_event，并触发 SDK _hardware_stop + _stop_flag。
 
         立即返回 True/False，不阻塞。worker 的 SDK 循环会在下个 y/x_stop_check
-        检测到 _stop_flag → 协作退出（参考 emergency_stop 模式）。
+        检测到 _hardware_stop / _stop_flag → 协作退出。Feed 守护线程看到
+        _stop_flag 也会退出（取消正在跑的视觉/推理轮询）。
+
+        与 /v1/control/emergency-stop 的区别：
+          - cancel_job    → 同时置 _hardware_stop + _stop_flag (硬件 + 上位机都停)
+          - emergency_stop → 仅置 _hardware_stop (只停硬件，上位机仍对外提供数据)
         """
         with self.job_lock:
             stop_event = self.job_stop_events.get(job_id)
@@ -806,11 +864,12 @@ class CarRuntimeService:
             return False
         if stop_event is not None:
             stop_event.set()
-        # 同时触发车端 _stop_flag，让 SDK 协作退出
+        # 同时触发车端 _hardware_stop + _stop_flag，让硬件协作退出、feed 守护线程退出
         try:
             with self._realtime_gate:
                 car = self.car
             if car is not None:
+                setattr(car, "_hardware_stop", True)
                 setattr(car, "_stop_flag", True)
         except Exception:
             pass
@@ -851,7 +910,7 @@ class CarRuntimeService:
                 )
             }
         if name == "reset_stop_flag":
-            return {"stop_flag": self.reset_stop_flag()}
+            return {"cleared": self.reset_stop_flag()}
         if name == "emergency_stop":
             return {"stopped": self.emergency_stop()}
         raise KeyError(f"不支持的系统动作: {name}")
