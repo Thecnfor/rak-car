@@ -462,14 +462,18 @@ class MyCar(MecanumDriver):
         self.light = LedLight(cfg_sensor["light"])
         self.left_sensor = Infrared(cfg_sensor["left_sensor"])
         self.right_sensor = Infrared(cfg_sensor["right_sensor"])
-        # 存储仓舵机角度（对齐官方 baidu_smartcar_2026/car_wrap_2026.py:389）：
-        #   LEFT  = -42°（ServoPwm 协议值 = -42+90 = 48，合法）
-        #   RIGHT = 165°（ServoPwm 协议值 = 165+90 = 255，**超 0~180**，mc602 不 clamp 会回弹/回中，
-        #             这是已知 trade-off，参见 state.py 的 STORAGE_DEFAULT_RIGHT_ANGLE 注释）
-        # 业务层只暴露 LEFT/RIGHT 二选一，不允许传任意 angle（见 main/arm/api.py: set_storage）。
+        # 存储仓舵机：**raw 直传**(2026-07-17 用户原话"这个存储仓舵机不要任何软限制")。
+        #   raw=True → 绕过 ServoPwm wrapper 的 +90 公式,angle 直传 mc602 协议字段;
+        #   mc602 servo_pwm format 同时切到 "bbBb"(angle signed byte,范围 [-128, 127])。
+        # LEFT/RIGHT 角度常量 → 直接就是协议值,不再是 +90 偏移后的值。
+        #   LEFT  = -42  (原 -42° 业务角 + 90 = 48 协议值,raw 后变 -42 协议值)
+        #   RIGHT = 165  (原 165° 业务角 + 90 = 255 协议值,raw 后变 165 协议值,**超 signed byte 127 上限
+        #                  会回绕 → 业务层禁止再走 RIGHT 走这条路径,需用 set_storage_angle 直接传目标协议值)
+        # ⚠️ raw 模式下 LEFT/RIGHT 历史角度常量**已失效**,舵机物理位置由 caller 重新标定。
+        # 业务层 main/arm/api.py: set_storage / set_storage_angle 已取消 y 安全门。
         self.servo_1_angle_list = [-42, 165]
         self.servo_1_flag = 0
-        self.servo_1 = ServoPwm(1, 180)
+        self.servo_1 = ServoPwm(1, 180, raw=True)
         # 默认不主动写舵机：保留用户上一次 set_storage 留下的物理位置。
         # 需要"每次启动回到 LEFT"再把下面这行 set_angle(...) 注释打开。
         # self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
@@ -483,10 +487,12 @@ class MyCar(MecanumDriver):
 
         根据状态参数控制储存仓的开关。
 
-        角度常量来自 self.servo_1_angle_list（对齐官方 baidu_smartcar_2026 写法）：
-          - False → LEFT  = -42°（协议值 48，合法）
-          - True  → RIGHT = 165°（协议值 255，**超 0~180**，mc602 协议层不识别但实际舵机行为稳定）
-        物理碰撞由 ArmClient.set_storage 的 y < -100 安全门挡。
+        ⚠️ 2026-07-17 协议层改成 raw 直传（servo_1 以 `ServoPwm(1, 180, raw=True)` 构造）：
+          - angle 直传 mc602 协议字段,**不再 +90 偏移**
+          - mc602 servo_pwm format 切到 "bbBb",angle 是 signed byte (合法区间 [-128, 127])
+          - RIGHT=165 **超 signed byte 上限,业务层禁止走这条路径**
+            要"开仓更开"用 set_storage_angle(目标协议值) 直接标定。
+        物理碰撞由 ArmClient 取消 y 安全门,撞车风险 caller 自负。
 
         参数:
             state (bool): 储存仓状态。False 表示放下（LEFT），True 表示收起（RIGHT）。默认为 False。
@@ -496,10 +502,9 @@ class MyCar(MecanumDriver):
         """
         flag = 1 if state else 0
         angle = self.servo_1_angle_list[flag]
-        # 业务层只允许 LEFT/RIGHT（不允许任意 angle），角度写死在这里。
-        # 如果后续 mc602 真的把 165°（协议值 255）当成非法值再回弹 / 不动，
-        # 改这一行（换成 90° 等）即可，**不要改 servo_1_angle_list** —— 改了
-        # 物理位置就和官方对不上。
+        # raw 直传模式下 LEFT/RIGHT 角度常量就是 raw 协议值(servo_1_angle_list)。
+        # RIGHT=165 在 signed byte 上越界,会 wrap 成负值 —— 业务层若需要 165 协议值必须改用 set_storage_angle。
+        # ⚠️ 跑比赛前现场重新标定舵机物理位置:用 set_storage_angle 试探,把新角度写回 servo_1_angle_list。
         self.servo_1.set_angle(angle)
         self.servo_1_flag = flag
         return {
@@ -525,6 +530,19 @@ class MyCar(MecanumDriver):
         return bool(value)
 
     def set_storage_angle(self, angle, speed=100):
+        """
+        直传存储仓舵机 raw 协议值（2026-07-17 起,+90 偏移已去掉）。
+
+        ⚠️ raw 直传 + signed byte 协议：
+          - angle 直接写入 mc602 servo_pwm 协议字段,**不再 +90**
+          - 合法区间 [-128, 127]（signed byte），超出 struct.error
+          - 与 set_storage 的 LEFT/RIGHT 自动路径不同,**调用方完全控制舵机**
+        物理位置由 main 层用本接口现场标定。
+
+        参数:
+            angle: raw 协议值（int）,目标舵机内部位置;不再代表"业务角度"。
+            speed: 舵机速度,默认 100。
+        """
         self.servo_1_flag = None
         self.servo_1.set_angle(angle, speed)
         return angle

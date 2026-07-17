@@ -282,15 +282,15 @@ class ArmClient:
     #
     # 经验规则（来自现场测试 + 比赛策略，2026-07-16）：
     #   - y ∈ [0, -30]   ：保护区，禁止动舵机/臂（除 init 位置 hand UP=-90 / arm MID=0）
-    #   - y ∈ [-80, -100]：放开一般舵机动作；set_storage 仍需 y < -100
-    #   - y ∈ [-100, -200]：允许 set_storage(LEFT/RIGHT)
+    #   - y ∈ [-80, -200]：放开一般舵机动作
     #   - 物理依据：y 离触底越近（接近 0），舵机摆动就越容易撞到地面或邻物
     # 注：reset_x 已删除，不再涉及 x 撞墙。
+    # 注：set_storage / set_storage_angle **无软限制**（用户原话："这个存储仓舵机不要任何软限制"），
+    #     直传 car.set_storage / car.set_storage_angle，撞车风险由 caller 承担。
     #
     # 实现：每次关键操作前查 y，超阈就 raise ValueError。**不静默吞**。
 
     _Y_PROTECTED_THRESHOLD_MM = -30.0     # 2026-07-16: 收紧保护区 [0, -30]（之前 [0, -80] 太宽松）
-    _Y_STORAGE_SAFE_THRESHOLD_MM = -100.0   # y 必须 < 这个值才能 set_storage
 
     def _check_y_protected(
         self, action: str, *,
@@ -321,24 +321,6 @@ class ArmClient:
                 f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。\n"
                 f"  例外: set_hand('UP'/-90) / set_arm_angle('MID'/0) 初始化姿态允许。"
             )
-
-    def _check_y_safe_for_storage(self, action: str) -> float:
-        """检查当前 y 是否允许做「会动存储仓舵机」的动作。
-
-        action: "set_storage"
-        返回：当前 y_mm（mm），供 caller 日志
-        raise：ValueError 当 y >= _Y_STORAGE_SAFE_THRESHOLD_MM
-        """
-        st = self.get_state()
-        y_mm = float(st.y_mm)
-        if y_mm > self._Y_STORAGE_SAFE_THRESHOLD_MM:
-            raise ValueError(
-                f"[{action}] 安全门拦截: 当前 y={y_mm:.1f}mm > {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm。\n"
-                f"  规则: y < {self._Y_STORAGE_SAFE_THRESHOLD_MM:.0f}mm 才能切存储仓\n"
-                f"  (y ∈ [0, -100] 接近触底,舵机摆动会撞车)\n"
-                f"  解决: 先 ArmClient.move_y(-150) 或更低,再试。"
-            )
-        return y_mm
 
     # ---- 大臂角度限位（业务层硬保护，2026-07-16 联调加） ----
     #
@@ -473,9 +455,8 @@ class ArmClient:
           - "LEFT"  → STORAGE_DEFAULT_LEFT_ANGLE  = -42°（与初始化复位角度一致）
           - "RIGHT" → STORAGE_DEFAULT_RIGHT_ANGLE = 90°（车端 car_wrap_2026.servo_1_angle_list）
 
-        ⚠️ 安全门：y 必须 < -100mm 才能调。在 y ∈ [0, -100] 接近触底的位置舵机摆动
-        会撞底盘结构。底层走 car.set_storage(bool)（不在 arm action 表里），所以这里
-        显式 safety check。
+        ⚠️ **无软限制**（2026-07-17 用户原话："这个存储仓舵机不要任何软限制"）。
+        任意 y 位置都会直传车端舵机，撞车风险由 caller 自负。
 
         底层走 car.set_storage(bool)，它在 car_wrap_2026.sensor_init 阶段已构造。
         之所以走 car（而不是 arm）是因为这块舵机不属于机械臂（arm），属于车体外设。
@@ -493,8 +474,6 @@ class ArmClient:
         side = _normalize_storage_side(side)
         if side is None:
             raise ValueError(f"set_storage 必须给 {STORAGE_SIDES}")
-        # 硬件安全门：y 必须 < -100mm（防止 y ∈ [0,-100] 时舵机摆动撞车）
-        self._check_y_safe_for_storage("set_storage")
         # 注意：car.set_storage(True) → 取 servo_1_angle_list[1] = 165°（RIGHT 档），
         # False → servo_1_angle_list[0] = -42°（LEFT 档）。
         open_flag = side == "RIGHT"
@@ -553,8 +532,9 @@ class ArmClient:
         （即 angle ∈ [-90, 90]），超出由舵机自然回弹——这是已知物理 trade-off，
         与 set_storage 的 RIGHT=165° 同理，runtime/底层都不 clamp。
 
-        ⚠️ 安全门与 set_storage 相同：y 必须 < -100mm 才能动舵机
-        （y ∈ [0, -100] 接近触底，舵机摆动会撞车）。
+        ⚠️ **无软限制**（2026-07-17 用户原话："这个存储仓舵机不要任何软限制"）。
+        任意 y 位置、任意 angle 都会直传车端舵机，撞车风险 / 协议值超界由 caller 自负。
+        角度语义与底层 ServoPwm(mode=180) 一致：协议值 = angle + 90，超 [0,180] 由舵机自然回弹。
 
         底层走车端 car action "set_storage_angle"（runtime 已暴露，接受任意 angle）。
 
@@ -566,8 +546,7 @@ class ArmClient:
         返回:
             {"ok": bool, "angle": float, "raw_job": dict}
         """
-        self._check_y_safe_for_storage("set_storage_angle")
-        job = self._call_car(
+        self._call_car(
             "set_storage_angle", timeout=timeout,
             angle=angle, speed=speed, sync=True,
         )

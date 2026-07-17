@@ -64,8 +64,8 @@ from main.arm import (
 | `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [0, -150]° + y 保护区**） | float（**必填**） | `arm.set_arm_angle` | angle > 0 / < -150 报 ValueError；0° (MID) 是 init 位置（保护区允许） |
 | `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
-| `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | 实际角度走 `ServoPwm` wrapper，参见 §6 |
-| `set_storage_angle(angle, speed=100, timeout=10)` | 存储仓**任意角度**（绕开两档写死，调试/标定用） | float（**必填**） | **`car.set_storage_angle`（注意是 car）** | 同 set_storage 的 y 安全门；合法区间 `angle ∈ [-90, 90]`；调完 `get_storage()` 回 "UNKNOWN"，参见 §6 |
+| `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；实际角度走 `ServoPwm` wrapper，参见 §6 |
+| `set_storage_angle(angle, speed=100, timeout=10)` | 存储仓**任意角度**（绕开两档写死，调试/标定用） | float（**必填**） | **`car.set_storage_angle`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；合法区间 `angle ∈ [-90, 90]`；调完 `get_storage()` 回 "UNKNOWN"，参见 §6 |
 | `get_storage()` | 读当前档位（客户端缓存，**不下发舵机**） | — | — | 重建 client 后回 "UNKNOWN" |
 | `reset_y(timeout=30)` | **仅**归 y（磁感触底） | — | `arm.reset_y` | 不动 x，详见 §7 |
 | `reset_origin(x_wall="left", timeout=60)` | 仅 y 触底定原点 + 写 `arm_origin.yaml` | `"left"`/`"right"` | `arm.reset_position` | `x_origin_m` 固定 0（x 无撞墙校准） |
@@ -471,41 +471,34 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 ### 6.1 `set_storage(side)` —— 两档写死（竞赛流程用）
 
-LEFT/RIGHT 角度写死：
+LEFT/RIGHT 角度常量（**2026-07-17 起不再是 +90 后的协议值,而是 raw 协议值本身**）：
 
-- `STORAGE_DEFAULT_LEFT_ANGLE = -42°`
-- `STORAGE_DEFAULT_RIGHT_ANGLE = 90°`
+- `STORAGE_DEFAULT_LEFT_ANGLE = -42` （signed byte 合法）
+- `STORAGE_DEFAULT_RIGHT_ANGLE = 165` （**signed byte 越界**，wrap 成负值）
 
-下发时 `ServoPwm` wrapper 把 `angle` 转成 `int(angle/180*180 + 90)` = `angle + 90`：
+⚠️ **协议层 raw 直传**（2026-07-17）：
+- `ServoPwm(1, 180, raw=True)` 构造 → 跳过 wrapper 的 `+90` 公式
+- mc602 servo_pwm format 由 `"bbBB"` 改为 `"bbBb"`（angle 字节切到 signed byte）
+- angle 直传 mc602 协议字段，**合法区间 `[-128, 127]`**
+- RIGHT=165 **业务层禁用**：要走"开仓更开"用 §6.2 直传
 
-- LEFT → 协议值 `48`
-- RIGHT → 协议值 `180`（临界）
+物理碰撞由 caller 自负（main 层 y 安全门已取消）。
 
-协议层说明：
+### 6.2 `set_storage_angle(angle, speed=100)` —— raw 直传（调试/标定用）
 
-- `mc601` 自动 clamp 到 0~180，安全
-- `mc602` **不 clamp**，超出 0~180 会触发舵机瞬间回中 / 回弹
-- 历史事故：`RIGHT=165° → 协议值 255`，舵机"摆一下就回弹"
-
-> **改角度常量时务必保证 `angle + 90 ∈ [0, 180]`**。否则 `car.set_storage` 直接抛 `ValueError`（在 `car_wrap_2026.set_storage:480`）。
-
-### 6.2 `set_storage_angle(angle, speed=100)` —— 任意角度（调试/标定用）
-
-绕开两档写死，让 main 层自由变换角度。底层走车端已有的 `car.set_storage_angle`
+绕开两档写死，让 main 层自由控制舵机 raw 协议值。底层走车端已有的 `car.set_storage_angle`
 （`CAR_ACTIONS` 里有），runtime/底层都**不 clamp**。
 
 ```python
-arm.move_y(-150)             # ① 先降到安全区（y < -100mm），否则安全门拦截
-arm.set_storage_angle(30)    # ② 任意角度（°）
-arm.set_storage_angle(-42)   # 也能手动回到原 LEFT 角
+arm.set_storage_angle(-42)   # 直传 raw 协议值,signed byte 合法
+arm.set_storage_angle(30)    # 调开角（具体协议值物理含义由 caller 现场标定）
 ```
 
-- **合法区间 `angle ∈ [-90, 90]`**（协议值 = `angle + 90` 落 `[0, 180]`）。超出会
-  被舵机自然回弹——与 `set_storage` 的 RIGHT=165° 同样的已知 trade-off。
-- **安全门**与 `set_storage` 相同：`y` 必须 `< -100mm` 才能动舵机（`y ∈ [0, -100]`
-  接近触底，舵机摆动会撞车），否则抛 `ValueError`。
+- **合法区间 `angle ∈ [-128, 127]`**（mc602 servo_pwm angle 字节为 signed byte）。超出抛 `struct.error`。
+- **2026-07-17 取消 y 安全门**：任意 y 位置都直传，撞车 / 协议值超界由 caller 自负。
 - 任意角度不属于 LEFT/RIGHT 两档，调完 `get_storage()` 返回 `"UNKNOWN"`。
 - 返回 `{"ok": bool, "angle": float, "raw_job": dict}`。
+- ⚠️ 跑比赛前**必须现场标定**：用本接口扫协议值,找到"开仓最大开角"的 raw 协议值后写业务脚本;**不要假设** 旧角度常量还有效。
 
 ---
 

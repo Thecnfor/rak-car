@@ -447,14 +447,31 @@ class WheelWrap():
         return self.motors.reset()
     
 class ServoPwm():
-    def __init__(self, port_id=None, mode=180) -> None:
+    def __init__(self, port_id=None, mode=180, raw: bool = False) -> None:
+        """PWM 舵机 wrapper。
+
+        Args:
+            port_id: 物理端口号。
+            mode: 默认 180。raw=False 时生效,公式:protocol = int(angle/mode*180+90)。
+            raw: True 时**绕过 +90 公式**,angle 直传 mc602 协议字段;
+                同时把 mc602 的 angle 字节切到 signed(servo_pwm format: "bbBb"),
+                支持负协议值(范围 [-128, 127])。**仅供 storage servo 这类需要
+                真正直传舵机内部协议值的场景使用**,不要给 hand_servo 等仍走
+                业务角度语义的下游用。
+        """
         self.mode = mode
+        self.raw = raw
         self.servo_1 = ServoPwm_1(port_id)
         self.servo_2 = ServoPwm_2(port_id)
+        if raw:
+            # 切到 signed byte: dev_id(b) + mode(b) + port_id(B) + speed(B) + angle(b)
+            # 原 "bbBB" 第四字节 unsigned → 改 "bbBb" 第四字节 signed
+            self.servo_2.data_struct.set_format("bbBb")
 
     def set_angle(self, angle, speed=100):
         funcs = [self.servo_1.set_angle, self.servo_2.set_angle]
-        angle = int(angle / self.mode * 180 + 90)
+        if not self.raw:
+            angle = int(angle / self.mode * 180 + 90)
         return funcs[ctl_id](angle, speed)
 
 class ServoBus():
