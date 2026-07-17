@@ -12,30 +12,6 @@ Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (sma
 - **`develop/ros2-sidecar`** — a ROS2 experiment with a different top level (`ros2_ws/`, `urdf/`, `config_sensors.yml`). The Python-monolith docs do **not** apply there.
 - **`feat/chassis-p0-mecanum-8.10`** / **`legacy/main`** / **`local-snapshot-0712`** — work-in-progress and historical branches; do not target unless the user says so.
 
-## ✋ Edit scope (hard rule, 2026-07-17)
-
-**Only `main/` is editable.** Everything else is **frozen**.
-
-| Tier | What | Status |
-| --- | --- | --- |
-| ✅ writable | `main/` (arm/, chassis/, misc/, test/) | Only place Claude edits |
-| ❌ frozen | `runtime/` (services, api, core, server.py) | FastAPI daemon — do not touch |
-| ❌ frozen | `smartcar/` (whalesbot SDK, paddlebaidu infer) | Hardware + inference — do not touch |
-| ❌ frozen | Root: `config_car.yml`, `ecosystem.config.js` | Calibration + PM2 manifest |
-| ❌ frozen | `smartcar/whalesbot/vehicle/arm/arm_cfg.yaml` | Arm calibration |
-
-**Why:** the runtime already exposes the chassis, arm, vision, OCR, cameras, estop, init — every business action — over HTTP/WebSocket. All new functionality belongs in `main/` against `RuntimeApiClient` / `RuntimeWsClient`. There is no reason to fork the daemon or vendor-patch the SDK.
-
-**If a request seems to need runtime/smartcar edits:**
-1. **Stop.** Don't open the file.
-2. Re-read `runtime/core/actions.py` and `runtime/api/routes.py` — the endpoint you need almost certainly already exists.
-3. If you genuinely can't find it, surface the gap to the user before touching anything outside `main/`.
-
-**Source-of-truth pointers** (from session memory, survive across conversations):
-- Arm action surface → `memory/arm-api-source-of-truth.md`
-- Vision endpoints + `task_state` shape → `memory/rak-car-vision-endpoints.md`
-- This rule → `memory/rak-car-edit-scope.md`
-
 ## Three entry points
 
 The codebase has **three independent entry surfaces**. Pick the one that matches what you're doing:
