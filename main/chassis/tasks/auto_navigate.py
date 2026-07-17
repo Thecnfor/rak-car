@@ -29,10 +29,8 @@ from . import track_target
 
 logger = logging.getLogger(__name__)
 
-# task_feed 检测结果字段顺序（与 smartcar/paddlebaidu 推理输出对齐）
-# 格式: [cls_id, obj_id, label, score, x_c, y_c, w, h]
-_DET_LABEL_INDEX = 2
-_DET_SCORE_INDEX = 3
+# task_feed 检测结果字段（runtime 输出是 dict 不是 list/元组）
+# 格式: {cls_id, det_id, label, score, bbox_norm: {x_center, y_center, width, height}}
 _DEFAULT_CONFIDENCE = 0.5
 
 
@@ -49,17 +47,22 @@ class AutoNavConfig:
 
 
 def _select_target(detections, label: Optional[str], conf_threshold: float):
-    """从 task_feed 检测结果中选一个最匹配的目标。返回 (index, det) 或 (None, None)。"""
+    """从 task_feed 检测结果中选一个最匹配的目标。返回 (index, det) 或 (None, None)。
+
+    detections 是 list[dict]: {cls_id, det_id, label, score, bbox_norm}。
+    旧版曾按 list/元组索引 det[2]/det[3]，runtime 现在是 dict，会 KeyError 崩溃。
+    """
     if not detections:
         return None, None
     candidates = []
     for idx, det in enumerate(detections):
-        if label is not None and det[_DET_LABEL_INDEX] != label:
+        det_label = det.get("label")
+        det_score = float(det.get("score", 0.0))
+        if label is not None and det_label != label:
             continue
-        score = det[_DET_SCORE_INDEX]
-        if score < conf_threshold:
+        if det_score < conf_threshold:
             continue
-        candidates.append((idx, det, score))
+        candidates.append((idx, det, det_score))
     if not candidates:
         return None, None
     # 选置信度最高的
@@ -77,9 +80,14 @@ def _safe_sense(api: ChassisClient) -> LaneState:
 
 
 def _fetch_task_detections(api: ChassisClient, timeout: float = 0.05):
-    """从 task_feed HTTP 拉一次侧摄目标检测（轻量、不抢锁）。"""
+    """从 task_feed HTTP 拉一次侧摄目标检测（轻量、不抢锁）。
+
+    端点 /v1/realtime/vision/task 返回 {"ok":true, "task_state": {...}}
+    这里拆 detections 出来；端点不是 /v1/vision/task/state（已废止 404）。
+    """
     try:
-        return api.http.get(f"{api.http.api_prefix}/vision/task/state", timeout=timeout)
+        payload = api.http.get(f"{api.http.api_prefix}/realtime/vision/task", timeout=timeout)
+        return (payload or {}).get("task_state") or {}
     except Exception:
         return None
 
@@ -142,15 +150,15 @@ def run(
                     "final_state": state,
                 }
             # 2. 拉 task 检测（侧摄）
-            det_payload = _fetch_task_detections(api)
-            dets = (det_payload or {}).get("detections") or []
+            task_state = _fetch_task_detections(api)
+            dets = (task_state or {}).get("detections") or []
             if dets:
                 idx, det = _select_target(dets, cfg.target_label, cfg.confidence_threshold)
                 if det is not None:
                     # 3. 检测到目标 → 让位 track_target
                     logger.info(
                         "auto_navigate: target hit idx=%d label=%s score=%.2f",
-                        idx, det[_DET_LABEL_INDEX], det[_DET_SCORE_INDEX],
+                        idx, det.get("label"), det.get("score"),
                     )
                     api.stop_wheel_speeds()
                     job = track_target.track_target(
