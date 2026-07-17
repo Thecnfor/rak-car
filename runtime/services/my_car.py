@@ -14,7 +14,6 @@ import numpy as np
 from smartcar.whalesbot.vehicle import (
     ArmController,
     ScreenShow,
-    Key4Btn,
     Infrared,
     LedLight,
     MecanumDriver,
@@ -41,8 +40,6 @@ import re
 
 from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
 
-# 添加上本地目录
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
 from smartcar import logger
 
 
@@ -338,8 +335,9 @@ class MyCar(MecanumDriver):
         self.streamer = streamer
         self.arm = ArmController()
 
-        # 获取自己文件所在的目录路径
-        self.path_dir = os.path.abspath(os.path.dirname(__file__))
+        # 获取 rak-car 根目录（runtime/services 的上两级）
+        # car_wrap_2026.py 原在根目录，现在搬到 runtime/services/，config_car.yml 仍在根目录
+        self.path_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
         self.yaml_path = os.path.join(self.path_dir, "config_car.yml")
         # 获取配置
         cfg = get_yaml(self.yaml_path)
@@ -362,11 +360,8 @@ class MyCar(MecanumDriver):
         # 与 _stop_flag 一起构成"协作式取消"，可被 runtime 无锁抢占。
         self._estop_event = threading.Event()
         self.arm._estop = self._estop_event
-        # 按键线程结束标志
+        # 物理按键板 2026 年未启用（仅 arm jog 用，不再触发 _stop_flag）。
         self._end_flag = False
-        self.thread_key = threading.Thread(target=self.key_thread_func)
-        self.thread_key.daemon = True
-        self.thread_key.start()
 
         # lane 误差缓存守护线程：客户端外环用，车端不动轮速
         self._lane_feed_thread = None
@@ -444,7 +439,6 @@ class MyCar(MecanumDriver):
         """
         cfg_sensor = cfg["io"]
         # print(cfg_sensor)
-        self.key = Key4Btn(cfg_sensor["key"])
         self.light = LedLight(cfg_sensor["light"])
         self.left_sensor = Infrared(cfg_sensor["left_sensor"])
         self.right_sensor = Infrared(cfg_sensor["right_sensor"])
@@ -627,12 +621,6 @@ class MyCar(MecanumDriver):
         """读第二路模拟量（mc602 走 AnalogInput，dev_id=0x07 mode=0）。"""
         ai = self._get_realtime_instance("analog", port)
         return float(ai.read())
-
-    def get_key_event(self):
-        return self.key.get_key()
-
-    def get_key_state(self):
-        return self.key.read()
 
     def get_bluetooth_pad(self):
         return self.blue_pad.read()
@@ -852,52 +840,7 @@ class MyCar(MecanumDriver):
             if time.time() - start_time > time_hold:
                 break
 
-    # 按键检测线程
-    def key_thread_func(self):
-        """
-        按键检测线程
-
-        持续检测按键状态，当检测到按键3时设置停止标志。
-        """
-        while True:
-            if self._end_flag:
-                return
-            if self._stop_flag:
-                time.sleep(0.05)
-                continue
-            try:
-                key_val = self.key.get_key()
-            except Exception as exc:
-                if self._end_flag:
-                    return
-                logger.warning("按键线程退出，原因: {}".format(exc))
-                return
-            # print(key_val)
-            if key_val == 3:
-                self._stop_flag = True
-            # === 按键手动 jog：1=y↑ 3=y↓ 2=x← 4=x→ 松开都停 ===
-            try:
-                if key_val == 1:
-                    self.arm.y_speed(0.1)
-                    self.arm.x_speed(0)
-                elif key_val == 3:
-                    self.arm.y_speed(-0.1)
-                    self.arm.x_speed(0)
-                elif key_val == 2:
-                    self.arm.x_speed(-0.1)
-                    self.arm.y_speed(0)
-                elif key_val == 4:
-                    self.arm.x_speed(0.1)
-                    self.arm.y_speed(0)
-                else:
-                    # 无按键：停
-                    self.arm.x_speed(0)
-                    self.arm.y_speed(0)
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-    # 根据某个值获取列表中匹配的结果
+    # 按键检测线程已移除（2026年）：硬件按键仅做 arm jog,不再触发 _stop_flag。
     @staticmethod
     def get_list_by_val(list, index, val):
         """
@@ -1286,7 +1229,7 @@ class MyCar(MecanumDriver):
                 distance=self.get_distance(),
             )
 
-    def start_lane_feed(self, hz: float = 20.0):
+    def start_lane_feed(self, hz: float = 50.0):
         """
         启动 lane 误差缓存守护线程（只刷 lane_state，不下发轮速）。
 
@@ -1475,14 +1418,21 @@ class MyCar(MecanumDriver):
         return {"stopped": True}
 
     # === 侧摄目标检测推送守护线程（实时 task 检测结果,给 WS subscribe_task_detection 订阅） ===
-    def start_task_feed(self, hz: float = 10.0):
+    def start_task_feed(self, hz: float = 30.0):
         """启动侧摄目标检测守护线程,持续刷新 streamer.task_state。
 
         与 start_lane_feed / start_arm_feed 模式一致:
           - 不抢 car_lock(读摄像头 + ZMQ 推理是独立 IO)
-          - 默认 10Hz（task 检测比 lane 慢,~50-100ms/次,hz 太高没意义且浪费 ZMQ）
+          - 默认 30Hz（task 模型 ~30-50ms/次,30Hz 是上限,适合机械臂动态捕捉目标）
           - 不会下发任何控制指令,只刷新 task_state 缓存
           - 订阅一次即可一直 push,disconnect / unsubscribe 时 cancel
+
+        2026-07-16 改造:
+          - 数据源改走 streamer.get_frame("cam2") (与 lane_feed 同模式),避免直接读摄像头
+            与 camera_stream_service._capture_loop 抢 GIL + frame_lock
+          - 默认 hz 10→30,适配机械臂实时动态捕捉目标场景
+          - 增加 fallback: 如果 streamer 取不到帧(摄像头掉线),fallback 到 cap_side.read()
+            (Camera.read 是同步阻塞等 camera.update 线程写 self.frame)
 
         业务场景:"边走边看"侧摄目标 — 不必每帧调 sync /v1/vision/task（5-15s 阻塞）,
         直接读 /v1/realtime/vision/task 缓存或订阅 WS subscribe_task_detection。
@@ -1501,17 +1451,23 @@ class MyCar(MecanumDriver):
             def _task_feed_loop():
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_task_state", None) if streamer else None
-                # 复用 self.cap_side + self.task_det,不重新初始化
-                get_frame = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
+                # 2026-07-16: 优先走 streamer.get_frame (camera_stream_service 维护的 cache),
+                # fallback 到 cap_side.read() (Camera.read 同步阻塞等 update 线程写 self.frame)
+                get_stream_frame = getattr(streamer, "get_frame", None) if streamer else None
+                get_fallback = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
                 consecutive_err = 0
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
                     try:
-                        if get_frame is None:
-                            stop_event.wait(period)
-                            continue
-                        img = get_frame()
+                        img = None
+                        if get_stream_frame is not None:
+                            try:
+                                img = get_stream_frame("cam2")
+                            except Exception:
+                                img = None
+                        if img is None and get_fallback is not None:
+                            img = get_fallback()
                         if img is None:
                             stop_event.wait(period)
                             continue
@@ -2029,8 +1985,10 @@ class MyCar(MecanumDriver):
         det_task.sort(
             key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
         )  # 按照距离由近及远排序
+        # 2026-07-16: 不再污染 cam2 主帧流 (跟 lane_feed 同样的回归修复)。
+        # 调试期想看 overlay 走 /v1/vision/task/preview.jpg (待实现,对照 /vision/lane/preview.jpg)。
         image = self.draw_detection_results(image, det_task)
-        self.streamer.update_frame(image, "cam2")
+        # self.streamer.update_frame(image, "cam2")  # ← 删:污染前端 /stream/frame/cam2.jpg
         # print(det_task)
         return det_task
 
@@ -2160,7 +2118,32 @@ class MyCar(MecanumDriver):
                 self.arm.x_speed(0)
                 return -1, "None"
 
-            dets = self.get_detection_results(sort_pos=sort_pos)
+            # 2026-07-16 改造:读 task_state cache 替代同步 ZMQ
+            # 原版每 50ms 调 get_detection_results -> cap_side.read() + self.task_det() (2s 超时),
+            # 与 task_feed 30Hz 守护线程共用 self.task_det REQ socket 串行排队,卡 arm 闭环
+            # 现读 streamer.task_state (task_feed 写,meta_lock 微秒级),detections 已经是
+            # task_feed 过滤过的最新结果;limit_x/limit_y 默认 1 不做过滤,sort_pos 按
+            # 中心距离排序保留。
+            state = self.streamer.get_task_state() if hasattr(self, "streamer") and self.streamer else None
+            raw_dets = (state or {}).get("detections", []) if state else []
+            # 转换 dict 格式 -> 旧 tuple 格式,保持后续 PID 逻辑不变
+            dets = []
+            for d in raw_dets:
+                bbox = d.get("bbox_norm", {}) or {}
+                dets.append((
+                    d.get("cls_id"),
+                    d.get("det_id"),
+                    d.get("label"),
+                    d.get("score"),
+                    bbox.get("x_center", 0.0),
+                    bbox.get("y_center", 0.0),
+                    bbox.get("width", 0.0),
+                    bbox.get("height", 0.0),
+                ))
+            # 按 sort_pos 距离排序 (中心 -> 远)
+            dets.sort(
+                key=lambda x: (x[4] - sort_pos[0]) ** 2 + (x[5] - sort_pos[1]) ** 2
+            )
 
             if label is not None:
                 dets = [item for item in dets if item[2] == label]
@@ -2322,8 +2305,7 @@ class MyCar(MecanumDriver):
             self.stop_lane_feed()
         except Exception:
             pass
-        if self.thread_key.is_alive():
-            self.thread_key.join(timeout=1.0)
+        # 按键线程已移除
         try:
             super(MyCar, self).close()
         except Exception:
@@ -2334,131 +2316,6 @@ class MyCar(MecanumDriver):
         if self._owns_streamer and self.streamer is not None:
             self.streamer.stop()
         # self.grap_cam.close()
-
-    def manage(self, programs_list: list, order_index=0):
-        """
-        程序管理方法
-
-        管理和执行程序列表，通过按键选择要执行的程序。
-
-        参数:
-            programs_list: 程序列表，包含要执行的函数
-            order_index: 初始选中的程序索引，默认为0
-        """
-
-        def all_task():
-            time.sleep(4)
-            for func in programs_list:
-                func()
-
-        def lane_test():
-            self.lane_dis_offset(0.3, 30)
-
-        programs_suffix = [all_task, lane_test, self.debug]
-        programs = programs_list.copy()
-        programs.extend(programs_suffix)
-        # print(programs)
-        # 选中的python脚本序号
-        # 当前选中的序号
-        win_num = 5
-        win_order = 0
-        # 把programs的函数名转字符串
-        logger.info(order_index)
-        programs_str = [str(i.__name__) for i in programs]
-        logger.info(programs_str)
-        dis_str = sellect_program(programs_str, order_index, win_order)
-        self.display.show(dis_str)
-
-        self.stop()
-        run_flag = False
-        stop_flag = False
-        stop_count = 0
-        while True:
-            # self.button_all.event()
-            btn = self.key.get_key()
-            # 短按1=1,2=2,3=3,4=4
-            # 长按1=5,2=6,3=7,4=8
-            # logger.info(btn)
-            # button_num = car.button_all.clicked()
-
-            if btn != 0:
-                # logger.info(btn)
-                # 长按1按键，退出
-                if btn == 5:
-                    # run_flag = True
-                    self._stop_flag = True
-                    self._end_flag = True
-                    break
-                else:
-                    if btn == 4:
-                        # 序号减1
-                        self.beep()
-                        if order_index == 0:
-                            order_index = len(programs) - 1
-                            win_order = win_num - 1
-                        else:
-                            order_index -= 1
-                            if win_order > 0:
-                                win_order -= 1
-                        # res = sllect_program(programs, num)
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.display.show(dis_str)
-
-                    elif btn == 2:
-                        self.beep()
-                        # 序号加1
-                        if order_index == len(programs) - 1:
-                            order_index = 0
-                            win_order = 0
-                        else:
-                            order_index += 1
-                            if len(programs) < win_num:
-                                win_num = len(programs)
-                            if win_order != win_num - 1:
-                                win_order += 1
-                        # res = sllect_program(programs, num)
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.display.show(dis_str)
-
-                    elif btn == 3:
-                        # 确定执行
-                        # 调用别的程序
-                        dis_str = "\n{} running......\n".format(
-                            str(programs_str[order_index])
-                        )
-                        self.display.show(dis_str)
-                        self.beep()
-                        self._stop_flag = False
-                        programs[order_index]()
-                        self._stop_flag = True
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.stop()
-                        self.beep()
-
-                        # 自动跳转下一条
-                        # if order_index == len(programs)-1:
-                        #     order_index = 0
-                        #     win_order = 0
-                        # else:
-                        #     order_index += 1
-                        #     if len(programs) < win_num:
-                        #         win_num = len(programs)
-                        #     if win_order != win_num-1:
-                        #         win_order += 1
-                        # res = sllect_program(programs, num)
-                        dis_str = sellect_program(programs_str, order_index, win_order)
-                        self.display.show(dis_str)
-                    logger.info(programs_str[order_index])
-            else:
-                self.delay(0.02)
-
-            time.sleep(0.02)
-
-        for i in range(2):
-            self.beep()
-            time.sleep(0.4)
-        time.sleep(0.1)
-        self.close()
 
 
 def test_for_animal():
@@ -2529,7 +2386,6 @@ if __name__ == "__main__":
 
     # my_car.debug()
     # programs = [func1, func2, func3, func4, func5, func6]
-    # my_car.manage(programs)
     # import sys
     # test_ord = 0
     # if len(sys.argv) >= 2:

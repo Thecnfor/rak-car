@@ -100,9 +100,9 @@ class RuntimeApiClient:
           - 适合：链式编排（`move_xy → grasp → release`），业务层要等结果才能下一步。
 
         用 `execute_arm_action` / `execute_car_action` / `call` 的旧调用方，arm 长动作
-        （reset_y / reset_x / reset_origin / move_xy / move_x / move_y / set_side /
+        （reset_y / reset_origin / move_xy / move_x / move_y / set_side /
         set_hand / set_storage / grasp）已显式加 sync=True（见 main/arm/api.py），行为
-        不变。
+        不变。注：reset_x 已删除（2026-07-16）。
         """
         payload = {
             "target": target,
@@ -302,7 +302,7 @@ class RuntimeApiClient:
         """外环最常用：读 lane_feed 守护线程缓存的 lane_state。
 
         不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
-        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 20Hz）的
+        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 50Hz，2026-07-16 上调）的
         更新频率解耦，所以轮询再快也只会读到同一份最新缓存。
 
         返回 `{"lane_state": {"error_y": ..., "error_angle": ..., "active": ..., ...}}`。

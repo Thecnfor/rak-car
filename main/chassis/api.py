@@ -38,7 +38,7 @@ class ChassisClient:
 
     # ---- 业务动作 ----
 
-    def start_lane_feed(self, hz: float = 20.0, timeout: float = 10.0):
+    def start_lane_feed(self, hz: float = 50.0, timeout: float = 10.0):
         """车端：开一个守护线程只刷 lane_state 缓存，不下发轮速。"""
         return self.http.call("car", "start_lane_feed", hz=hz, timeout=timeout)
 

@@ -137,6 +137,16 @@ class SerialWrap(serial.Serial):
         self.last_error = None
         logger.info("port is {}, controller is {}, mode {}".format(self.port, self.dev.name, self.dev.connect_mode))
         _notify_runtime_session("note_io_success")
+        # 兜底:MCU 闲置 2s 内核会 autosuspend ttyUSB → 下次串口操作返 device not ready
+        # → 触发 note_io_failure → 误判 controller 掉线 → 写 RUNCODE 重启下位机。
+        # 写 power/control=on,power/autosuspend=-1 永久禁用;失败不抛(udev 才是正经路子)。
+        # 2026-07-16: 配合 controller_session 调阈值,根治 PM2 反复 rebuild 循环。
+        try:
+            from ...tools.camera import disable_usb_autosuspend_for_tty
+            if self.port:
+                disable_usb_autosuspend_for_tty(self.port)
+        except Exception as exc:
+            logger.debug("disable_usb_autosuspend_for_tty({}) 兜底失败: {}".format(self.port, exc))
         return ctl_dev
 
     def sync_with_probe(self, probe_result=None):

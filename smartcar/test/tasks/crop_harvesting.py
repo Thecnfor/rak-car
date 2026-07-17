@@ -4,9 +4,11 @@
 
 对应 car_task_function.py 中的 crop_harvesting()
 机械臂动作：
-- move_y_position / reset_x / set_arm_pose
+- move_y_position / set_arm_pose
 - move_x_position / set_arm_pose(arm=-115, hand=10)
 - grasp(True/False) / adjust_arm_position
+
+注（2026-07-16）：reset_x 已删除，x 位置由视觉闭环控制。
 """
 
 import time
@@ -15,7 +17,6 @@ from car_wrap_2026 import MyCar, kill_other_python
 
 def crop_harvesting():
     my_car.arm.move_y_position(0.2)
-    my_car.arm.reset_x()
     my_car.arm.set_arm_pose(arm="LEFT", hand="DOWN")
 
     my_car.set_storage(True)

@@ -108,6 +108,78 @@ def read_usb_power_state(video_dev_node):
     return state["control"], state["autosuspend"]
 
 
+def _find_tty_usb_sysfs_path(tty_node):
+    """
+    给一个 /dev/ttyUSB* 或 /dev/ttyACM* 节点，反推它对应的 USB 设备 sysfs 目录
+    （含 power/control）。
+
+    链路：
+      /sys/class/tty/ttyUSB0/device -> USB 接口
+      .../1-2.2:1.0/tty/ttyUSB0    (interface)
+      .../1-2.2/power/control       (USB device 才有 power/control)
+    """
+    if not tty_node:
+        return None
+    try:
+        basename = os.path.basename(os.path.realpath(tty_node))
+        tty_path = "/sys/class/tty/" + basename
+        if not os.path.islink(tty_path):
+            return None
+        iface_link = os.path.join(tty_path, "device")
+        start = os.path.realpath(iface_link)
+        path = start
+        for _ in range(12):
+            if os.path.isdir(os.path.join(path, "power")) and os.path.exists(
+                os.path.join(path, "power", "control")
+            ):
+                return path
+            parent = os.path.dirname(path)
+            if parent == path:
+                return None
+            path = parent
+        return None
+    except Exception:
+        return None
+
+
+def disable_usb_autosuspend_for_tty(tty_node):
+    """
+    跟 disable_usb_autosuspend_for 一样，但走 /sys/class/tty/ 路径。
+    用于 serial_wrap._finish_connect_locked 给 ttyUSB 设备（CH340 MCU）写 power/control=on。
+    解决"MCU 闲置 2s 内核 autosuspend → 下次串口操作返 device not ready → runtime 误判 controller 掉线"。
+    """
+    usb_device = _find_tty_usb_sysfs_path(tty_node)
+    if usb_device is None:
+        logger.debug("找不到 {} 对应的 USB sysfs 设备,跳过 autosuspend 禁用".format(tty_node))
+        return False
+    control_path = os.path.join(usb_device, "power", "control")
+    autosuspend_path = os.path.join(usb_device, "power", "autosuspend")
+    wrote_control = _try_write_sysfs(control_path, _POWER_CONTROL_ON)
+    _try_write_sysfs(autosuspend_path, _AUTOSUSPEND_NEVER)
+    if wrote_control:
+        logger.info(
+            "已禁用 {} (USB 设备 {}) autosuspend".format(tty_node, usb_device)
+        )
+    return wrote_control
+
+
+def read_tty_usb_power_state(tty_node):
+    """读 /dev/ttyUSB* 的 power/control 和 autosuspend。失败返 (None, None)。"""
+    usb_device = _find_tty_usb_sysfs_path(tty_node)
+    if usb_device is None:
+        return None, None
+    state = {"control": None, "autosuspend": None}
+    for key, filename in (("control", "control"), ("autosuspend", "autosuspend")):
+        path = os.path.join(usb_device, "power", filename)
+        try:
+            with open(path, "r") as f:
+                value = f.read().strip()
+                state[key] = value or None
+        except Exception:
+            state[key] = None
+    return state["control"], state["autosuspend"]
+
+
 class Camera:
     def __init__(self, index=1, width=640, height=480):
         # if src ==0:

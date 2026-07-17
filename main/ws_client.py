@@ -213,7 +213,7 @@ class RuntimeWsClient:
         """外环最常用：读 lane_feed 守护线程缓存的 lane_state。
 
         不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
-        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 20Hz）的
+        50Hz+ 外环轮询安全；和数据源（lane_feed，runtime 默认 50Hz，2026-07-16 上调）的
         更新频率解耦，所以轮询再快也只会读到同一份最新缓存。
 
         返回 `{"lane_state": {"error_y": ..., "error_angle": ..., "active": ..., ...}}`。
@@ -229,7 +229,7 @@ class RuntimeWsClient:
         行为：
           - 内部**独立开一条** WebSocket 连接（不复用主连接），避免推送帧
             和主连接的请求/响应相互干扰。
-          - 服务端按 `lane_feed` 的更新节奏（默认 20Hz）推送 `lane_state` dict。
+          - 服务端按 `lane_feed` 的更新节奏（默认 50Hz，2026-07-16 上调）推送 `lane_state` dict。
           - 调用 `on_state(lane_state_dict)`；on_state 抛异常不会中断订阅。
 
         参数：

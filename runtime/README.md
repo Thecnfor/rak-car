@@ -183,7 +183,14 @@ runtime 把「动作执行」与「init / 引用替换」分到两把锁，让�
 
 | 队列 | 接收的 target | 特点 |
 | --- | --- | --- |
-| `arm_queue` | `target="arm"`（15 个 arm action） | 长动作专用，arm worker 卡 1-3s 不影响 car 队列 |
+| `arm_queue` | `target="arm"`（16 个 arm action） | 长动作专用，arm worker 卡 1-3s 不影响 car 队列 |
+
+ARM_ACTIONS 列表：`go_for` / `goto_position` / `grasp` / `move_x_position` / `move_y_position` / `reset_all` / `reset_position` / `reset_x` / `reset_y` / `set_arm_angle` / `set_arm_pose` / `set_hand_angle` / `x_get_position` / `x_speed` / `y_get_position` / `y_speed`。
+
+其中 `reset_x` / `reset_all` 是 2026-07-16 新加的 opt-in 撞墙复位：
+- `reset_x`：单档极慢撞墙定 x 原点，**不**进 auto-init
+- `reset_all`：复合复位（大臂+手爪+x 并行 → y 串行），默认 init 流程调这个
+- 详见 [main/arm/ARM_API.md §9](../main/arm/ARM_API.md#9-reset_x--reset_all--opt-in-撞墙复位2026-07-16-恢复)
 | `car_queue` | `target="car" / "task" / "system"` | 短动作专用，短动作不被 arm 长动作排在同一个 worker 后 |
 
 底层字节流仍由 SDK 串口锁串行——两个 worker 在 Python 层是并行的，**字节流在硬件层是串行的**（物理约束，不可消除）。
@@ -238,10 +245,14 @@ curl -X POST "http://localhost:5050/v1/jobs/$JOB/stop"
 curl -X POST http://localhost:5050/v1/control/reset-stop   # 清 _stop_flag
 curl -X POST http://localhost:5050/v1/execute \
   -H 'Content-Type: application/json' \
-  -d '{"target":"car","name":"start_lane_feed","kwargs":{"hz":20}}'   # 重启 lane_feed
+  -d '{"target":"car","name":"start_lane_feed","kwargs":{"hz":50}}'   # 重启 lane_feed (2026-07-16 上调 50Hz)
 ```
 
 arm_feed 通常由 runtime init 自动启，业务层无需手动控制。
+
+runtime 默认 init 流程（`_create_car_locked(reset_arm=False)`）调 `reset_all`：
+**大臂+手爪+x 并行 → y 串行**（2026-07-16 起）。耗时约 15-25s。
+`reset_arm=True` 走旧路径（仅 `reset_y`，不含 x 撞墙）。
 
 字段：`y_m` / `x_m`（SDK 原始，米）+ `y_mm` / `x_mm`（业务坐标，毫米）+ `ref_encoder`（最近一次 `reset_y` 后的编码器零点）+ `active` / `mode` / `updated_at`。
 

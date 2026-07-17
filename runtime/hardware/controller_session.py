@@ -32,12 +32,15 @@ class ControllerSessionManager:
     def __init__(self):
         self._lock = threading.RLock()
         self._recover_lock = threading.Lock()
-        self._heartbeat_interval = 0.5
+        # 2026-07-16 调宽:autosuspend 唤醒 + 偶发 USB 噪声允许容忍更多次失败
+        # 配合 udev 规则 99-disable-usb-autosuspend.rules 永久禁用 ttyUSB autosuspend
+        # 后,failure_threshold 仍是兜底。原先 2 次失败即触发 RUNCODE 太敏感。
+        self._heartbeat_interval = 1.0      # 原 0.5 — 减少串口 IO 频率
         self._usb_presence_poll_interval = 1.5
         self._not_ready_reconcile_interval = 0.8
         self._ready_ttl = 0.8
-        self._failure_threshold = 2
-        self._transition_window = 1.2
+        self._failure_threshold = 4          # 原 2 — 连续 4 次失败才进 RUNTIME_LOST
+        self._transition_window = 3.0        # 原 1.2 — RUNCODE 节流阀,1.2 太短,改 3s
         self._state = STATE_UNKNOWN
         self._mode = "unknown"
         self._detail = "控制器状态未知"

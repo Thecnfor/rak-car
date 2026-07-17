@@ -243,8 +243,6 @@
 | `car.get_battery_voltage` | 读取电池电压    | 无                   | `float/int`                                           |
 | `car.get_ir_distance`     | 读取单侧 IR   | `side="left/right"` | 单侧距离值                                                 |
 | `car.get_all_ir_distance` | 同时读取左右 IR | 无                   | `{"left","right"}`                                    |
-| `car.get_key_event`       | 读取按键事件    | 无                   | 按键事件值                                                 |
-| `car.get_key_state`       | 读取按键状态    | 无                   | 按键状态值                                                 |
 | `car.get_bluetooth_pad`   | 读取蓝牙手柄状态  | 无                   | 手柄状态数组                                                |
 | `car.get_arm_state`       | 读取机械臂状态   | 无                   | `{"x","y","side","arm_angle","hand_angle","y_limit"}` |
 
@@ -255,7 +253,7 @@
 | 接口名                   | 用途                  | 关键参数                           | 关键返回    |
 | --------------------- | ------------------- | ------------------------------ | ------- |
 | `arm.reset_position`  | 机械臂整体复位             | 无                              | 动作完成    |
-| `arm.reset_x`         | 只复位 X 轴             | 无                              | 动作完成    |
+| ~~`arm.reset_x`~~     | ❌ 已删除（2026-07-16）    | —                                | —          |
 | `arm.set_arm_pose`    | 一次设置 `x/y/arm/hand` | `x?` `y?` `arm?` `hand?`       | 动作完成    |
 | `arm.set_hand_angle`  | 设置手爪角度              | `angle` `speed?`               | 动作完成    |
 | `arm.set_arm_angle`   | 设置大臂角度              | `angle` `speed?`               | 动作完成    |

@@ -3,11 +3,12 @@
 机械臂复位调试脚本
 
 对应 ArmController 方法：
-- reset_position()
+- reset_position()（仅 y 触底定原点，x 无软件复位）
 - reset_y()
-- reset_x()
 - switch_side(side)
 - set_position_start(y_position)
+
+注（2026-07-16）：reset_x 已删除，x 位置由视觉闭环控制。
 """
 
 import time
@@ -15,7 +16,7 @@ from smartcar.whalesbot.vehicle.arm.arm_base import ArmController
 
 
 def test_reset_position(arm: ArmController):
-    """整体复位（Y/X 同时归零 + 手爪向上 + 手臂向右）"""
+    """整体复位（仅 Y 触底 + 手爪向上 + 手臂向右；x 无软件复位）"""
     print("[RESET] reset_position()")
     arm.reset_position()
     print("[RESET] 完成")
@@ -26,13 +27,6 @@ def test_reset_y(arm: ArmController):
     print("[RESET] reset_y()")
     arm.reset_y()
     print("[RESET] Y 轴已归零")
-
-
-def test_reset_x(arm: ArmController):
-    """仅复位 X 轴"""
-    print("[RESET] reset_x()")
-    arm.reset_x()
-    print("[RESET] X 轴已归零")
 
 
 def test_switch_side(arm: ArmController, side="LEFT"):

@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """04_grasp_template.py
 完整 pick-and-place 模板：
-  1) set_side(LEFT)
+  1) set_arm_angle(-90)   [业务硬限 [0, -150]°，LEFT=+93 已禁]
   2) move_xy 到抓取点
   3) grasp(True)
   4) set_hand(DOWN)
@@ -11,7 +11,7 @@
 
 用法：
     python3 main/arm/examples/04_grasp_template.py
-    python3 main/arm/examples/04_grasp_template.py LEFT  120 40   0 30
+    python3 main/arm/examples/04_grasp_template.py -90  120 -40   0 30
 """
 from __future__ import annotations
 
@@ -22,11 +22,11 @@ import json
 
 def main():
     args = sys.argv[1:]
-    side = "LEFT"
-    pick_x, pick_y = 120.0, 40.0
-    drop_x, drop_y = 0.0, 30.0
+    arm_angle = -90.0
+    pick_x, pick_y = 120.0, -40.0
+    drop_x, drop_y = 0.0, -30.0
     if len(args) >= 1:
-        side = args[0].upper()
+        arm_angle = float(args[0])
     if len(args) >= 3:
         pick_x = float(args[1])
         pick_y = float(args[2])
@@ -47,8 +47,8 @@ def main():
         sys.exit(1)
 
     runner = ArmRunner(client)
-    print(f"[1] set_side({side})")
-    print(json.dumps(runner.set_side(side), ensure_ascii=False, indent=2))
+    print(f"[1] set_arm_angle({arm_angle})")
+    print(json.dumps(runner.set_arm_angle(arm_angle), ensure_ascii=False, indent=2))
 
     print(f"[2] move_xy -> ({pick_x}, {pick_y})")
     print(json.dumps(runner.move_xy(pick_x, pick_y), ensure_ascii=False, indent=2))
@@ -56,8 +56,9 @@ def main():
     print("[3] grasp(True)")
     print(json.dumps(runner.grasp(True), ensure_ascii=False, indent=2))
 
-    print("[4] set_hand(DOWN)")
-    print(json.dumps(runner.set_hand("DOWN"), ensure_ascii=False, indent=2))
+    print("[4] set_hand_angle(DOWN=0)")
+    print(json.dumps(runner.client.set_hand_angle(0.0, speed=80, timeout=10.0),
+                     ensure_ascii=False, indent=2))
 
     print(f"[5] move_xy -> ({drop_x}, {drop_y})")
     print(json.dumps(runner.move_xy(drop_x, drop_y), ensure_ascii=False, indent=2))

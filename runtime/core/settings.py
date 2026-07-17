@@ -26,7 +26,10 @@ LEGACY_API_PREFIX = "/api"
 # 下位机掉电恢复后也能自动重建整车对象。需要时可通过
 # 环境变量 RAK_CAR_AUTO_INIT=0 关闭。
 AUTO_INIT_ON_START = True
-RESET_ARM_ON_AUTO_INIT = False
+# 2026-07-16：默认 True 让 init 调 reset_position（hand=UP + arm=MID + y 触底）。
+# 旧版 False 只跑 reset_y，hand/arm 不归 init 位置 → 比赛阶段舵机位置不可控。
+# 设为 False（环境变量 RAK_CAR_RESET_ARM=0）跳过 reset_position。
+RESET_ARM_ON_AUTO_INIT = True
 RESET_POSITION_ON_INIT = True
 STOP_AFTER_ACTION_DEFAULT = False
 AUTO_INIT_RETRY_INTERVAL = 3.0

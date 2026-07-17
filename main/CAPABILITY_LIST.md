@@ -80,7 +80,7 @@
 
 - `arm.reset_position`
   - 机械臂整体回零
-- `arm.reset_x`
+- ~~`arm.reset_x`~~ ❌ 已删除（2026-07-16）
   - 机械臂横轴回零
 - `arm.move_x_position`
   - 横轴移动到指定位置
@@ -195,10 +195,6 @@
   - 同时读取左右 IR
 - `car.get_bluetooth_pad`
   - 读取蓝牙手柄
-- `car.get_key_event`
-  - 读取物理按键事件
-- `car.get_key_state`
-  - 读取物理按键当前状态
 - `car.get_battery_voltage`
   - 读取电池电压
 - `car.set_light_color`

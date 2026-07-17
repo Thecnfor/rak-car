@@ -207,10 +207,14 @@ def _build_runtime_snapshot(service):
 
 
 def _create_job_from_payload(service, payload):
-    target = payload.get("target", "task")
+    # 2026-07-16: target 允许 "car" / "arm" / "system"（system 用于 reset_stop_flag 等系统动作）
+    target = payload.get("target")
+    if target not in ("car", "arm", "system"):
+        raise HTTPException(status_code=400, detail="target 必须是 'car' / 'arm' / 'system'")
     name = payload.get("name")
     args = payload.get("args", [])
-    kwargs = payload.get("kwargs", {})
+    kwargs = dict(payload.get("kwargs", {}) or {})
+    kwargs.pop("timeout", None)
     if not name:
         raise HTTPException(status_code=400, detail="缺少 name")
     try:
@@ -221,10 +225,15 @@ def _create_job_from_payload(service, payload):
 
 
 def _execute_from_payload(service, payload):
-    target = payload.get("target", "task")
+    # 2026-07-16: target 允许 "car" / "arm" / "system"
+    target = payload.get("target")
+    if target not in ("car", "arm", "system"):
+        raise HTTPException(status_code=400, detail="target 必须是 'car' / 'arm' / 'system'")
     name = payload.get("name")
     args = payload.get("args", [])
-    kwargs = payload.get("kwargs", {})
+    kwargs = dict(payload.get("kwargs", {}) or {})
+    # 2026-07-16：timeout 由 runtime 自己用（submit_job_and_wait），不让它透传给 SDK action
+    kwargs.pop("timeout", None)
     timeout = payload.get("timeout")
     # D 改造：默认异步（立即返回 job_id，状态查 /v1/jobs/{id}）。
     # 旧同步调用方传 sync=True 拿原语义（submit_job_and_wait，阻塞到完成）。
@@ -487,7 +496,7 @@ def _ws_op_realtime_analog2(service, payload):
 def _ws_op_realtime_lane_state(service, _payload):
     """外环最常用：读 streamer 缓存的 lane_state。
 
-    数据来源是 lane_feed 守护线程（runtime 启动后默认 20Hz）通过
+    数据来源是 lane_feed 守护线程（runtime 启动后默认 50Hz，2026-07-16 上调）通过
     `car.streamer.set_lane_state(...)` 持续刷新的内存缓存。
     不走 job_queue、不打 ZMQ、不抢 car_lock——只取 meta_lock（极快），
     50Hz+ 外环轮询安全，不会和 lane_feed 守护线程或 MJPEG 推流抢锁。
@@ -1164,7 +1173,7 @@ def create_runtime_router(service, camera_stream_service):
         # 订阅存在则后台 task 一直在跑；disconnect / unsubscribe 时 cancel。
         lane_push_task = None
         lane_subscribed = False
-        lane_push_hz = 20.0  # 默认 20Hz 轮询 lane_state，更新才推
+        lane_push_hz = 50.0  # 默认 50Hz 轮询 lane_state（2026-07-16 上调），更新才推
         # ---- arm_state push 后台任务(同 lane 模式)----
         arm_push_task = None
         arm_subscribed = False

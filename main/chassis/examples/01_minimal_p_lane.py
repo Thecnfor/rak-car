@@ -9,7 +9,7 @@ from main.chassis import ChassisClient, DoubleLoopRunner, POuterLoop
 
 def main(max_seconds: float = 15.0, vx: float = 0.3) -> None:
     api = ChassisClient.connect()
-    api.start_lane_feed(hz=20.0)
+    api.start_lane_feed(hz=50.0)
     runner = DoubleLoopRunner(api=api, outer=POuterLoop(vx=vx), hz=50.0)
     runner.run(max_seconds=max_seconds)
     api.stop_lane_feed()
