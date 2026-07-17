@@ -6,7 +6,7 @@ import math
 from typing import List
 
 from ..state import LaneState
-from .base import OuterLoop, mecanum_inverse
+from .base import OuterLoop
 
 
 class StanleyOuterLoop(OuterLoop):
@@ -21,8 +21,14 @@ class StanleyOuterLoop(OuterLoop):
         if not state.has_error:
             return self._safe_zero()
         vy = -float(state.error_y)  # 视觉误差直接当横向修正（米）
-        # Stanley 转向：δ = ea + atan(k·ey/vx)；麦轮上把 δ 当 omega、vy 当横移
+        # Stanley 转向
         v = max(self.vx, 0.05)
         delta = float(state.error_angle) + math.atan(self.k * float(state.error_y) / v)
         omega = -delta
-        return mecanum_inverse(self.vx, vy, omega, self.r_eff)
+        # Stanley 是单舵机思路；麦轮上把 delta 视作 omega、vy 视作横移
+        return [
+            self.vx - vy + self.r_eff * omega,
+            -self.vx + vy + self.r_eff * omega,
+            -self.vx - vy + self.r_eff * omega,
+            self.vx + vy + self.r_eff * omega,
+        ]

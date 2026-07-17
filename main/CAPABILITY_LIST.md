@@ -195,6 +195,10 @@
   - 同时读取左右 IR
 - `car.get_bluetooth_pad`
   - 读取蓝牙手柄
+- `car.get_key_event`
+  - 读取物理按键事件
+- `car.get_key_state`
+  - 读取物理按键当前状态
 - `car.get_battery_voltage`
   - 读取电池电压
 - `car.set_light_color`
