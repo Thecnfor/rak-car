@@ -20,10 +20,13 @@ horiz_cfg:
     output_limits:
     - -0.4
     - 0.4
+  slow_band_m: 0.05
+  slow_velocity: 0.02
+  fast_velocity: 0.1
 pos_cfg:
   pose_enable: true
   pose_horiz: 0.0
-  pose_vert: 0.00018500000000000027
+  pose_vert: -0.15011000000000002
   side: MID
 vert_cfg:
   motor:

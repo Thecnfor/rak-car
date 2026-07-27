@@ -3,8 +3,6 @@
 import os
 from dataclasses import dataclass
 
-# 默认指向 Jetson 公网 IP,跟 CLAUDE.md "Default URLs" 一致;
-# 本地/异机调试仍可设 RAK_CAR_SERVER_ORIGIN 覆盖。
 DEFAULT_SERVER_ORIGIN = "http://192.168.6.231"
 DEFAULT_API_PORT = 5050
 DEFAULT_STREAM_PORT = DEFAULT_API_PORT

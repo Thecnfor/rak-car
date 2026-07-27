@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 """04_grasp_template.py
 完整 pick-and-place 模板：
-  1) set_arm_angle(-90)   [业务硬限 [0, -150]°，LEFT=+93 已禁]
+  1) set_arm_angle(-90)   [业务硬限 [+90, -150]°（2026-07-27 重定义），+90 是复位位，-150 是结构极限]
   2) move_xy 到抓取点
   3) grasp(True)
   4) set_hand(DOWN)

@@ -234,6 +234,8 @@ print(client.call("car", "get_odometry", timeout=20)["result"])
 | `car.get_battery_voltage` | 读取电池电压 | 无 | `float/int` |
 | `car.get_ir_distance` | 读取单侧 IR | `side="left/right"` | 单侧距离值 |
 | `car.get_all_ir_distance` | 同时读取左右 IR | 无 | `{"left","right"}` |
+| `car.get_key_event` | 读取按键事件 | 无 | 按键事件值 |
+| `car.get_key_state` | 读取按键状态 | 无 | 按键状态值 |
 | `car.get_bluetooth_pad` | 读取蓝牙手柄状态 | 无 | 手柄状态数组 |
 | `car.get_arm_state` | 读取机械臂状态 | 无 | `{"x","y","side","arm_angle","hand_angle","y_limit"}` |
 

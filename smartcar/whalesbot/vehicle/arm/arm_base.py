@@ -35,6 +35,12 @@ from .. import (
 POSITION_ERROR_THRESHOLD = 4e-4 # 位置误差阈值
 STOP_CHECK_THRESHOLD = 1e-10 # 停止检查阈值
 
+# reset_y 成功触底后,机械臂自动升到的目标位置 (m)。负值 = 向上,远离磁感。
+# 设为 None 表示"触底后停在 0 位不动"(历史默认);设为 -0.15 表示升到磁感上方 150mm。
+# reset_position / reset_all 流程会以这个值作为机械臂的"复位后休息位",避免
+# "reset_y 完还在最低位,业务第一步 move_y 还要再走一次"。
+POST_RESET_TARGET_M = -0.15  # 触底归零后自动走到 -150mm
+
 
 def get_path_relative(*args):
     """
@@ -181,17 +187,22 @@ class ArmController:
     def reset_y(self):
         """
         重置竖直方向位置：朝磁感方向下压找触底，【磁感触发】是唯一成功凭证。
+        触发磁感归零后,自动升到 [arm_base.POST_RESET_TARGET_M](./arm_base.py)
+        (默认 -150mm) 收尾（避免 reset 完机械臂还在最低位,业务第一步 move_y
+        还要再走一次浪费行程）。
 
         方向约定（实测）：setpoint>0/velocity>0 = 向下（朝磁感）。
 
         三段速度曲线，避免 PID 接近时减速被 y_stop_check 误判为堵转：
           1) 远段 (y < -slow_band - top_slow)：SLOW_VELOCITY 0.08 m/s 直驱；
           2) 末段 (y >= -slow_band 且 y < 0)：SLOW_VELOCITY 0.02 m/s 极慢贴底；
-          3) 触底 (y_reset_check() 真触发)：保持 0.05s dwell 确认不是抖动，立即归零。
+          3) 触底 (y_reset_check() 真触发)：保持 0.05s dwell 确认不是抖动，立即归零，
+             然后调 move_y_position(POST_RESET_TARGET_M) 升到 -150mm。
         找底期间 y_speed 的磁感门放行（_y_seeking_bottom=True），允许正速度穿入磁感。
 
         退出条件：
-          - 成功：磁感触发后 dwell 通过 → 编码器 ref 记录 + y_pose_start 重置 + True；
+          - 成功：磁感触发后 dwell 通过 → 编码器 ref 记录 + y_pose_start 重置 +
+                  move_y_position(POST_RESET_TARGET_M) 收尾 → True；
           - 失败：超时（10s）未触发磁感 → 强制停车 + 报警 + False（**绝不**伪归零）；
           - 急停：_estop 置位 → 立即退出 + False。
 
@@ -204,6 +215,8 @@ class ArmController:
         DWELL_TIME = 0.05       # 磁感触发后确认 dwell（秒）
         SEEK_TIMEOUT = 10.0     # 总找底超时
         slow_band = self.y_slow_band_m
+        # 触底归零后收尾目标 (m), None 表示停在 0 位
+        post_target = POST_RESET_TARGET_M
 
         # 入口前先把 _y_seeking_bottom 设 True，让 y_speed 对正速度放行
         self._y_seeking_bottom = True
@@ -236,6 +249,26 @@ class ArmController:
                             % (ref, time.time() - start)
                         )
                         self.y_speed(0)
+                        # 退出 seek 模式后再走收尾位移,避免 move_y_position 期间
+                        # _y_seeking_bottom=True 让 y_speed 磁感门失效误推
+                        self._y_seeking_bottom = False
+                        # 收尾：触底归零后走到 POST_RESET_TARGET_M (默认 -150mm)
+                        if post_target is not None:
+                            try:
+                                self.move_y_position(post_target)
+                                logger.info(
+                                    "reset_y: 收尾完成,y=%.1fmm"
+                                    % (self.y_get_position() * 1000.0)
+                                )
+                                return True
+                            except Exception as exc:
+                                logger.error(
+                                    "reset_y: 收尾走到 %.0fmm 异常: %s, "
+                                    "已归零但未升到 -150mm"
+                                    % (post_target * 1000.0, exc)
+                                )
+                                return False
+                        # post_target=None 兼容老语义:停在 0 位
                         return True
                     # dwell 中,维持贴底慢速
                     self.motor_y.set_velocity(0)
@@ -641,7 +674,7 @@ class ArmController:
         return False
 
 
-    def reset_all(self, arm_angle: float = 0, hand_angle: float = -90,
+    def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
                   reset_x_velocity: float = 0.02,
                   timeout: float = 60.0):
@@ -873,10 +906,17 @@ class ArmController:
         """
         重置机械臂位置（仅 y 触底定原点；x 轴无软件复位，由视觉闭环控制位置）。
 
-        初始化姿态（2026-07-16 联调改）：
-          - 大臂：MID (0°) — 居中，避免 RIGHT=-93 撞车
+        初始化姿态（2026-07-27 联调第三次改）：
+          - 大臂：+90° — 复位位（业务硬限上界 +90°,reset_position 用这个值）
           - 手爪：UP (-90°) — 物理上限位置
-          - y：reset_y 触底定原点
+          - y：reset_y 触底定原点，**并自动升到 POST_RESET_TARGET_M（默认 -150mm）**。
+            reset_y 内部已包含「触发磁感 → 归零 → move_y_position(-150)」完整流程，
+            此函数 **绝不** 再赋 `self.y = 0`，否则会把刚升到 -150mm 的机械臂又拉回
+            触底位（历史 bug,2026-07-27 联调复现）。
+
+        历史版本：
+          - 2026-07-16 初版：set_arm_angle(0) — 0° 是 MID 位置
+          - 2026-07-27 改：set_arm_angle(+90) — +90° 是用户实测的复位位（业务硬限上界）
 
         历史：旧版本并行跑 reset_y + reset_x 双线程，因为 reset_x 撞墙存在
         `MIN_PRE_TRIGGER_DISP` 未定义 NameError、25s 超时、空转/编码器漂移等
@@ -884,11 +924,14 @@ class ArmController:
         subscribe_task_detection 视觉闭环控制，不需要软件复位。
 
         注（2026-07-16）：用数字接口而非 "UP"/"MID" 字符串（yaml angle_list 已删）。
+        注（2026-07-27）：删除 `self.y = 0` 残留行 — reset_y 内部已经走到 -150mm。
+        注（2026-07-27）：大臂 reset 位从 0° (MID) 改为 +90°（业务硬限上界，复位位）。
         """
         self.set_hand_angle(-90)      # 手爪初始 = -90 (UP)
-        self.set_arm_angle(0)         # 大臂初始 = 0 (MID，避撞车)
+        self.set_arm_angle(90)        # 大臂初始 = +90（复位位，业务硬限上界）
+        # reset_y 内部:触发磁感 → y_pose_now=0 → move_y_position(POST_RESET_TARGET_M)
+        # 不要再 self.y = 0!否则会把刚升到 -150mm 的臂又拉回 0。
         self.reset_y()
-        self.y = 0
         self.save_config()
 
     def switch_side(self, side):

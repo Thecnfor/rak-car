@@ -824,6 +824,108 @@ def create_runtime_router(service, camera_stream_service):
             raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
         return Response(content=buf.tobytes(), media_type="image/jpeg")
 
+    @router_v1.get("/vision/task/preview.jpg")
+    def v1_vision_task_preview_jpg(cam_id: str = Query(default="cam2")):
+        """cam2 帧 + 侧摄目标检测 bbox overlay 一次性 JPEG。
+
+        设计目的：task_feed 守护线程在后台持续刷新 streamer.task_state，
+        但默认 /video_feed/cam2 只走干净流。调试 / 比赛时希望叠加 bbox，
+        这个端点：
+          1) 读 streamer.frames[cam_id] 缓存（不读摄像头，不抢 _capture_loop）
+          2) 读 task_state 取最新 detections（bbox_norm = 中心点+宽高，归一化 0~1）
+          3) 把每个检测画矩形框 + 类别/置信度文字
+          4) imencode JPEG 返回
+        端点不抢摄像头、不污染 cam2 主帧流，前端 <img> 默认走
+        /video_feed/cam2 拿干净流；想看叠加就切到本端点。
+        """
+        if not _HAS_CV2:
+            raise HTTPException(status_code=503, detail="cv2 不可用，无法生成 overlay")
+        normalized = camera_stream_service.normalize_cam_id(cam_id)
+        frame = camera_stream_service.get_frame(normalized)
+        if frame is None:
+            raise HTTPException(status_code=409, detail="摄像头当前没有可用的帧")
+        try:
+            drawn = frame.copy()
+        except Exception:
+            drawn = frame
+        state = camera_stream_service.get_task_state() or {}
+        detections = state.get("detections") or []
+        if detections:
+            try:
+                h, w = drawn.shape[:2]
+                for det in detections:
+                    bbox = det.get("bbox_norm") or {}
+                    # backend 通过 YoloeInfer.predict(..., normalize_out=True)
+                    # + DetectResult.tolist_nomoralize 返回相对图中心的归一化坐标:
+                    #   x_c, y_c ∈ [-1, +1], width, height ∈ [0, 2]
+                    # 注意归一化基准是 backend resize 后的 416x416 输入,与 cam2
+                    # MJPEG 帧分辨率不同;此处 img_w/img_h 用当前帧尺寸,等比
+                    # resize 下中心点位置仍正确,只有 bbox 宽高会有拉压。
+                    x_c = float(bbox.get("x_center", 0.0))
+                    y_c = float(bbox.get("y_center", 0.0))
+                    box_w = float(bbox.get("width", 0.0))
+                    box_h = float(bbox.get("height", 0.0))
+                    center_x = (x_c + 1.0) / 2.0 * w
+                    center_y = (y_c + 1.0) / 2.0 * h
+                    bw = box_w * w / 2.0
+                    bh = box_h * h / 2.0
+                    x1 = int(round(center_x - bw / 2.0))
+                    y1 = int(round(center_y - bh / 2.0))
+                    x2 = int(round(center_x + bw / 2.0))
+                    y2 = int(round(center_y + bh / 2.0))
+                    x1 = max(x1, 0)
+                    y1 = max(y1, 0)
+                    x2 = min(x2, w - 1)
+                    y2 = min(y2, h - 1)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    cls_id = det.get("cls_id")
+                    # 按 cls_id 散到固定调色板，避免重复类全黑/全绿
+                    palette = [
+                        (0, 255, 0),    # 绿
+                        (255, 200, 0),  # 橙
+                        (255, 80, 200), # 粉
+                        (0, 200, 255),  # 青
+                        (180, 130, 255),# 紫
+                        (255, 255, 0),  # 黄
+                    ]
+                    try:
+                        color = palette[int(cls_id) % len(palette)] if cls_id is not None else (0, 255, 0)
+                    except Exception:
+                        color = (0, 255, 0)
+                    cv2.rectangle(drawn, (x1, y1), (x2, y2), color, 2)
+                    label = str(det.get("label", ""))
+                    score = float(det.get("score", 0.0))
+                    text = "{} {:.2f}".format(label, score) if label else "{:.2f}".format(score)
+                    # 文字画在框上方；放不下就改画框内左上
+                    ty = y1 - 6
+                    if ty < 14:
+                        ty = y1 + 14
+                    cv2.putText(drawn, text, (x1, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+                    cv2.putText(drawn, text, (x1, ty),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+                # 顶部画个 count 角标，方便一眼看出识别数量
+                count = len(detections)
+                banner = "task detections: {}".format(count)
+                cv2.putText(drawn, banner, (12, 22),
+                            cv2.FONT_HERSHEY_TRIPLEX, 0.7, (255, 255, 255), 3, cv2.LINE_AA)
+                cv2.putText(drawn, banner, (12, 22),
+                            cv2.FONT_HERSHEY_TRIPLEX, 0.7, (0, 255, 0), 1, cv2.LINE_AA)
+            except cv2.error:
+                # 偶发在 copy 后非连续数组上 putText 失败，回退到干净帧
+                drawn = frame
+        try:
+            ret, buf = cv2.imencode(
+                ".jpg", drawn,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 80],
+            )
+        except cv2.error:
+            raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
+        if not ret:
+            raise HTTPException(status_code=500, detail="overlay JPEG 编码失败")
+        return Response(content=buf.tobytes(), media_type="image/jpeg")
+
     @router_v1.post("/vision/task")
     def v1_vision_task(payload: dict = Body(default={})):
         timeout = payload.get("timeout", 20)

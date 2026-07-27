@@ -61,10 +61,11 @@ from main.arm import (
 | `move_x(x_mm, v_max_mms=40, out_time=15.0, timeout=30)` | 单轴 x | mm | `arm.move_x_position` | `v_max_mms` 业务层限速（**2026-07-16 真正生效**：SDK 端临时收紧 PID 主限幅）。`out_time` 避免 PID 脉冲式，撞墙时 `x_stop_check` 自动 calibrate |
 | `reset_x(direction="right", reset_velocity_mms=20.0, timeout=30)` | x 撞墙定原点 | mm/s | `arm.reset_x` | **opt-in**（不进 auto-init）。单档极慢撞墙，编码器 stall 50ms dwell 触发 calibrate；详见 §9 |
 | `reset_all(arm_angle=0, hand_angle=-90, x_direction="right", reset_x_velocity_mms=20.0, timeout=120)` | 复合复位（**大臂+手爪+x 并行 → y 串行**） | — | `arm.reset_all` | ThreadPoolExecutor 并行三个独立动作，as_completed 后串行 `reset_y` 触底 |
-| `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [0, -150]° + y 保护区**） | float（**必填**） | `arm.set_arm_angle` | angle > 0 / < -150 报 ValueError；0° (MID) 是 init 位置（保护区允许） |
+| `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [+90, -150]° + y 保护区，2026-07-27 重定义；+90 是复位位，-150 是结构极限**） | float（**必填**） | `arm.set_arm_angle` | angle > +90 / < -150 报 ValueError；+90° (复位位) / 0° (MID) 是 init 位置（保护区允许） |
 | `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
-| `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | 实际角度走 `ServoPwm` wrapper，参见 §6 |
+| `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；实际角度走 `ServoPwm` wrapper，参见 §6 |
+| `set_storage_angle(angle, speed=100, timeout=10)` | 存储仓**任意角度**（绕开两档写死，调试/标定用） | float（**必填**） | **`car.set_storage_angle`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；合法区间 `angle ∈ [-90, 90]`；调完 `get_storage()` 回 "UNKNOWN"，参见 §6 |
 | `get_storage()` | 读当前档位（客户端缓存，**不下发舵机**） | — | — | 重建 client 后回 "UNKNOWN" |
 | `reset_y(timeout=30)` | **仅**归 y（磁感触底） | — | `arm.reset_y` | 不动 x，详见 §7 |
 | `reset_origin(x_wall="left", timeout=60)` | 仅 y 触底定原点 + 写 `arm_origin.yaml` | `"left"`/`"right"` | `arm.reset_position` | `x_origin_m` 固定 0（x 无撞墙校准） |
@@ -464,27 +465,40 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 ---
 
-## 6. 存储仓 `set_storage` 角度范围
+## 6. 存储仓：`set_storage`（两档）与 `set_storage_angle`（任意角）
 
-存储仓是独立 PWM 舵机（`ServoPwm` wrapper，`port=1`），LEFT/RIGHT 角度写死：
+存储仓是独立 PWM 舵机（`ServoPwm` wrapper，`port=1`）。业务层提供两个入口：
 
-- `STORAGE_DEFAULT_LEFT_ANGLE = -42°`
-- `STORAGE_DEFAULT_RIGHT_ANGLE = 90°`
+### 6.1 `set_storage(side)` —— 两档写死（竞赛流程用）
 
-下发时 `ServoPwm` wrapper 把 `angle` 转成 `int(angle/180*180 + 90)` = `angle + 90`：
+LEFT/RIGHT 角度常量（**2026-07-17 起不再是 +90 后的协议值,而是 raw 协议值本身**）：
 
-- LEFT → 协议值 `48`
-- RIGHT → 协议值 `180`（临界）
+- `STORAGE_DEFAULT_LEFT_ANGLE = -42` （signed byte 合法）
+- `STORAGE_DEFAULT_RIGHT_ANGLE = 165` （**signed byte 越界**，wrap 成负值）
 
-协议层说明：
+⚠️ **协议层 raw 直传**（2026-07-17）：
+- `ServoPwm(1, 180, raw=True)` 构造 → 跳过 wrapper 的 `+90` 公式
+- mc602 servo_pwm format 由 `"bbBB"` 改为 `"bbBb"`（angle 字节切到 signed byte）
+- angle 直传 mc602 协议字段，**合法区间 `[-128, 127]`**
+- RIGHT=165 **业务层禁用**：要走"开仓更开"用 §6.2 直传
 
-- `mc601` 自动 clamp 到 0~180，安全
-- `mc602` **不 clamp**，超出 0~180 会触发舵机瞬间回中 / 回弹
-- 历史事故：`RIGHT=165° → 协议值 255`，舵机"摆一下就回弹"
+物理碰撞由 caller 自负（main 层 y 安全门已取消）。
 
-> **改角度常量时务必保证 `angle + 90 ∈ [0, 180]`**。否则 `car.set_storage` 直接抛 `ValueError`（在 `car_wrap_2026.set_storage:480`）。
+### 6.2 `set_storage_angle(angle, speed=100)` —— raw 直传（调试/标定用）
 
-如果确实要任意角度，调 `car.set_storage_angle(angle, speed=100)`（CAR_ACTIONS 里有 `set_storage_angle`），但**业务层慎用**——它会绕开协议校验。
+绕开两档写死，让 main 层自由控制舵机 raw 协议值。底层走车端已有的 `car.set_storage_angle`
+（`CAR_ACTIONS` 里有），runtime/底层都**不 clamp**。
+
+```python
+arm.set_storage_angle(-42)   # 直传 raw 协议值,signed byte 合法
+arm.set_storage_angle(30)    # 调开角（具体协议值物理含义由 caller 现场标定）
+```
+
+- **合法区间 `angle ∈ [-128, 127]`**（mc602 servo_pwm angle 字节为 signed byte）。超出抛 `struct.error`。
+- **2026-07-17 取消 y 安全门**：任意 y 位置都直传，撞车 / 协议值超界由 caller 自负。
+- 任意角度不属于 LEFT/RIGHT 两档，调完 `get_storage()` 返回 `"UNKNOWN"`。
+- 返回 `{"ok": bool, "angle": float, "raw_job": dict}`。
+- ⚠️ 跑比赛前**必须现场标定**：用本接口扫协议值,找到"开仓最大开角"的 raw 协议值后写业务脚本;**不要假设** 旧角度常量还有效。
 
 ---
 

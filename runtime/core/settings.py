@@ -31,6 +31,12 @@ AUTO_INIT_ON_START = True
 # 设为 False（环境变量 RAK_CAR_RESET_ARM=0）跳过 reset_position。
 RESET_ARM_ON_AUTO_INIT = True
 RESET_POSITION_ON_INIT = True
+# 2026-07-17：复用 init 路径（controller 没重启走这里）补 reset_x 撞墙定原点。
+# 之前只有首次 init（self.car is None → _create_car_locked → reset_all）才撞，
+# 复用路径完全跳过 arm x；arm 跑 5 个来回后漂 0.35mm 没人管。
+# 默认 True（env RAK_CAR_RESET_X_ON_INIT=0 关掉），重建风暴期可临时关。
+# reset_x 内部 try/except 兜底（撞墙失败也不阻塞 init 整体）。
+RESET_X_ON_INIT = True
 STOP_AFTER_ACTION_DEFAULT = False
 AUTO_INIT_RETRY_INTERVAL = 3.0
 ACTION_READY_TIMEOUT = 30.0
@@ -117,6 +123,11 @@ def get_reset_arm_on_auto_init():
 
 def get_reset_position_on_init():
     return _bool_env("RAK_CAR_RESET_POSITION_ON_INIT", RESET_POSITION_ON_INIT)
+
+
+def get_reset_x_on_init():
+    """复用 init 路径是否触发 reset_x 撞墙（env: RAK_CAR_RESET_X_ON_INIT，默认 1）。"""
+    return _bool_env("RAK_CAR_RESET_X_ON_INIT", RESET_X_ON_INIT)
 
 
 def get_stop_after_action_default():
@@ -220,6 +231,7 @@ def get_runtime_settings():
         "auto_init_on_start": get_auto_init_on_start(),
         "reset_arm_on_auto_init": get_reset_arm_on_auto_init(),
         "reset_position_on_init": get_reset_position_on_init(),
+        "reset_x_on_init": get_reset_x_on_init(),
         "stop_after_action_default": get_stop_after_action_default(),
         "auto_init_retry_interval": get_auto_init_retry_interval(),
         "action_ready_timeout": get_action_ready_timeout(),
