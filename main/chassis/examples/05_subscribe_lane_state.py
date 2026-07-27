@@ -42,9 +42,9 @@ from typing import Optional
 from main.chassis import (
     ChassisClient,
     CurvatureAdaptiveOuterLoop,
+    LaneState,
     WheelSmoother,
 )
-from main.chassis.state import LaneState
 
 
 def subscribe_lane_state(
@@ -55,10 +55,10 @@ def subscribe_lane_state(
     v_min: float = 0.08,
     kappa_full: float = 0.6,
     dkappa_full: float = 1.5,
-    kp_y: float = 0.65,
+    kp_y: float = 0.80,
     kp_theta: float = 1.2,
-    omega_gain: float = 0.5,
-    k_curvature: float = 0.4,
+    omega_gain: float = 0.35,
+    k_curvature: float = 0.25,
     omega_cap: float = 1.8,
     ey_release: float = 0.02,
     ea_release: float = 0.05,
@@ -74,10 +74,10 @@ def subscribe_lane_state(
     # 横向 I 项（修复 2026-07-16 直行稳态误差）：
     # 纯 P 控制遇到恒定 bias 永远需要稳态 error_y 维持修正力，看起来就是过偏才矫正。
     # leaky 积分项消除稳态偏差。ki_y=0 退化到纯 P。
-    # 经验：ki_y=0.6（与 kp_y=0.65 同量纲）, ey_int_cap=0.10 m（抗饱和）, ey_int_decay=0.5（半衰期≈1.4s）
-    ki_y: float = 0.6,
+    # 2026-07-28: ki_y 0.60→0.40（降低积分力度），ey_int_decay 0.50→0.80（半衰期~0.87s，加速衰减）
+    ki_y: float = 0.40,
     ey_int_cap: float = 0.10,
-    ey_int_decay: float = 0.5,
+    ey_int_decay: float = 0.80,
     r_eff: float = 0.30,
     wheel_max_abs: float = 0.55,
     wheel_max_accel: float = 0.4,
