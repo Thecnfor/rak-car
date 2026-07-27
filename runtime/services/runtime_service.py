@@ -338,19 +338,29 @@ class CarRuntimeService:
         if reset_arm:
             car.arm.reset_position()
         else:
-            # 默认 init 走 reset_all:
-            #   - 大臂(set_arm_angle) + 手爪(set_hand_angle) + x 撞墙定原点
-            #     三路 ThreadPoolExecutor 并行,最后 reset_y 触底串行。
-            #   - 物理顺序:大臂+手爪+x 三个独立动作并行 → y 触底(必须等前面三个到位)。
-            #   - reset_x 不抛异常(logger.warning 兜底),即使撞墙 calibrate 失败也不会
-            #     触发 _should_probe_controller 的 recover loop(commit fb24b1a 的隐患已规避)。
-            # 显式 reset_arm=True 走 reset_position 兼容老路径(手爪+大臂+y,不含 x 撞墙)。
+            # 2026-07-27 行为变更：默认 init 不再走 reset_all 撞 x。
+            #
+            # 旧行为 (commit fb24b1a 之前): reset_all 并行跑 reset_x 撞墙 + 大臂 +
+            # 手爪 + y 触底。reset_x 每次 init 都撞 → 物理磨损 + "调 set_hand_angle
+            # 时 x 自动复位" 的误判（业务脚本看到 init 阶段的 reset_x 撞墙以为是
+            # 自己触发的）。commit fb24b1a 已通过 try/except 兜底防止 PM2 死循环,
+            # 但 init 默认撞 x 仍然存在。
+            #
+            # 新行为: 默认 init 只跑 reset_position(手爪 UP + 大臂 MID + y 触底
+            # + 升到 POST_RESET_TARGET_M=-150mm),**不**撞 x。reset_arm=True/False
+            # 现在语义统一（都是 reset_position）。
+            #
+            # x 撞墙定原点现在是 opt-in,业务层需要时显式调 reset_x(direction="right")。
+            # 见 ARM_API.md §reset_x / main/arm/api.py:580。
+            #
+            # 若确实需要 init 时撞 x(例如首次部署时 x 编码器无 ref),可用环境变量
+            # RAK_CAR_RESET_X_ON_INIT=1 + RAK_CAR_RESET_X_COOLDOWN_S 防抖。
             try:
-                results = car.arm.reset_all()
-                logger.info("init reset_all: %s" % results)
+                car.arm.reset_position()
+                logger.info("init reset_position 完成 (no x 撞墙)")
             except Exception as exc:
-                self.last_error = "arm reset_all 失败: {}".format(exc)
-                logger.warning("init 时 reset_all 失败: %s" % exc)
+                self.last_error = "arm reset_position 失败: {}".format(exc)
+                logger.warning("init 时 reset_position 失败: %s" % exc)
         if reset_position:
             car.reset_position()
         self.car = car

@@ -20,12 +20,13 @@ horiz_cfg:
     output_limits:
     - -0.4
     - 0.4
+  slow_band_m: 0.05
+  slow_velocity: 0.02
+  fast_velocity: 0.1
 pos_cfg:
   pose_enable: true
-  # 2026-07-17: pose_horiz / pose_vert 互换 —— 之前纵向值误写到 horiz 字段,
-  # 横向值误写到 vert 字段。互换后已与 main/arm/arm_origin.yaml 标定原点对齐。
-  pose_horiz: 0.00047639655351936703
-  pose_vert: 0.0
+  pose_horiz: 0.0
+  pose_vert: -0.15011000000000002
   side: MID
 vert_cfg:
   motor:
