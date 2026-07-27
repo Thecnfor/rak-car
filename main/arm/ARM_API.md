@@ -61,7 +61,7 @@ from main.arm import (
 | `move_x(x_mm, v_max_mms=40, out_time=15.0, timeout=30)` | 单轴 x | mm | `arm.move_x_position` | `v_max_mms` 业务层限速（**2026-07-16 真正生效**：SDK 端临时收紧 PID 主限幅）。`out_time` 避免 PID 脉冲式，撞墙时 `x_stop_check` 自动 calibrate |
 | `reset_x(direction="right", reset_velocity_mms=20.0, timeout=30)` | x 撞墙定原点 | mm/s | `arm.reset_x` | **opt-in**（不进 auto-init）。单档极慢撞墙，编码器 stall 50ms dwell 触发 calibrate；详见 §9 |
 | `reset_all(arm_angle=0, hand_angle=-90, x_direction="right", reset_x_velocity_mms=20.0, timeout=120)` | 复合复位（**大臂+手爪+x 并行 → y 串行**） | — | `arm.reset_all` | ThreadPoolExecutor 并行三个独立动作，as_completed 后串行 `reset_y` 触底 |
-| `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [0, -150]° + y 保护区**） | float（**必填**） | `arm.set_arm_angle` | angle > 0 / < -150 报 ValueError；0° (MID) 是 init 位置（保护区允许） |
+| `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [+90, -150]° + y 保护区，2026-07-27 重定义；+90 是复位位，-150 是结构极限**） | float（**必填**） | `arm.set_arm_angle` | angle > +90 / < -150 报 ValueError；+90° (复位位) / 0° (MID) 是 init 位置（保护区允许） |
 | `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
 | `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；实际角度走 `ServoPwm` wrapper，参见 §6 |

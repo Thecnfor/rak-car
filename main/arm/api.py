@@ -322,27 +322,37 @@ class ArmClient:
                 f"  例外: set_hand('UP'/-90) / set_arm_angle('MID'/0) 初始化姿态允许。"
             )
 
-    # ---- 大臂角度限位（业务层硬保护，2026-07-16 联调加） ----
+    # ---- 大臂角度限位（业务层硬保护，2026-07-27 第三次重定义） ----
     #
-    # 经验规则（来自现场测试）：
-    #   - LEFT = +93° 撞车（机械臂结构挡住）
-    #   - angle < -180 撞车（机械臂结构挡住）
-    #   - 业务层硬限 [0, -150]：0 是最大（>= 0 不让），只能负值；-150 是物理安全下界
+    # 经验规则（来自现场测试，2026-07-27 联调改）：
+    #   - 复位角度 = +90°（展开方向，"初始位"，reset_position 用这个值）
+    #   - 最大角度 = -150°（收回方向极限，结构挡住，不能再往下转）
+    #   - 业务层硬限 [+90, -150]：上界 +90（复位位），下界 -150（结构极限）
+    #   - LEFT=+93° 撞车 / <-150° 撞车 都是经验值，物理安全边界。
+    #
+    # 历史版本：
+    #   - 2026-07-16 初版：硬限 [0, -150]
+    #   - 2026-07-27 v2：放宽到 [0, -200]（实测 -180° 不撞车）
+    #   - 2026-07-27 v3：用户实测后定义 [+90, -150]（+90 是复位位，-150 是结构极限）
     #
     # 实现：set_side("LEFT") 拒绝；set_arm_angle(angle) 校验范围。
     # 注意：这是业务层硬保护，HTTP /v1/execute 直调底层 action 不受此限（保留逃生口）。
 
-    _ARM_ANGLE_MIN = -150.0   # 业务层大臂角度下界（°）
-    _ARM_ANGLE_MAX = 0.0      # 业务层大臂角度上界（°），>= 0 拒绝
+    _ARM_ANGLE_MIN = -150.0   # 业务层大臂角度下界（°），2026-07-27 实测结构极限
+    _ARM_ANGLE_MAX = 90.0     # 业务层大臂角度上界（°），2026-07-27 用户实测：+90 是复位位
 
-    # 2026-07-16: 大臂在 [0, -30]° 区间时，y 保护区仍约束；
-    # 大臂在 [0, -30]° 之外时（即 > 0 或 < -30），大臂可"随便动"，跳过 y 保护区。
-    # 物理意义：大臂收起来（<= -30）时结构安全，可大动作；展开（>= 0）时撞车风险。
+    # 2026-07-16: 大臂在 [-30, +30]° 区间时，y 保护区仍约束；
+    # 大臂在 [-30, +30]° 之外时（<= -30 收起或 >= +30 复位），可"随便动"，跳过 y 保护区。
+    # 物理意义：大臂收起来（<= -30）时结构安全，可大动作；展开（>= +30 即接近复位位）也安全。
     _ARM_SAFE_BAND_MIN = -30.0  # 大臂"安全姿态"下界（<= -30 算"收起来"）
-    _ARM_SAFE_BAND_MAX = 0.0    # 大臂"安全姿态"上界
+    _ARM_SAFE_BAND_MAX = 30.0   # 大臂"安全姿态"上界（>= +30 算"展开到复位附近"）
 
     def _is_arm_safe_position(self) -> bool:
-        """当前大臂角度是否在"安全姿态"（<= -30，即收起来）。"""
+        """当前大臂角度是否在"安全姿态"（<= -30 收起 或 >= +30 复位附近）。
+
+        大臂在 [-30, +30]° 区间时算"展开状态",需要 y 保护区约束;
+        收起来或完全复位都安全,可"随便动"。
+        """
         try:
             st = self.get_state()
         except Exception:
@@ -351,22 +361,22 @@ class ArmClient:
         cur = st.arm_angle
         if cur is None:
             return False
-        # cur <= _ARM_SAFE_BAND_MIN 表示收起来（>= -30 是展开/撞车风险区）
-        return cur <= self._ARM_SAFE_BAND_MIN
+        # cur <= _ARM_SAFE_BAND_MIN 收起 / cur >= _ARM_SAFE_BAND_MAX 复位附近 → 安全
+        return cur <= self._ARM_SAFE_BAND_MIN or cur >= self._ARM_SAFE_BAND_MAX
 
     def set_arm_angle(self, angle: float, speed: int, timeout: float) -> dict:
-        """大臂总线舵机角度控制（业务层，硬限 [0, -150]°）。
+        """大臂总线舵机角度控制（业务层，硬限 [+90, -150]°，2026-07-27 重定义）。
 
         Args:
-            angle: 目标角度（°）。硬限 [0, -150]°（LEFT=+93 撞车已禁；<-180 撞车）。
+            angle: 目标角度（°）。硬限 [+90, -150]°（LEFT=+93 撞车；<-150 撞车）。
             speed: 舵机速度（必填，无默认）。
             timeout: HTTP 同步超时（秒，必填，无默认）。
 
         Raises:
-            ValueError: 当 angle > 0 或 angle < -150 时拒绝下发。
+            ValueError: 当 angle > +90 或 angle < -150 时拒绝下发。
 
-        2026-07-16 y 保护区放宽：大臂在 [0, -30]° 之外（即 <= -30"收起来"）时，
-        即使 y ∈ [0, -30] 保护区也可"随便动"（用户新规则）。
+        2026-07-27：硬限从 [0, -200] 改为 [+90, -150]。+90 是复位角度（reset_position 用),
+        -150 是结构极限。
         """
         try:
             a = float(angle)
@@ -375,17 +385,17 @@ class ArmClient:
         if a > self._ARM_ANGLE_MAX or a < self._ARM_ANGLE_MIN:
             raise ValueError(
                 f"set_arm_angle({a}) 超出业务硬限 [{self._ARM_ANGLE_MIN}, {self._ARM_ANGLE_MAX}]°。\n"
-                f"  规则: 大臂角度 ∈ [0, -150]°（LEFT=+93 撞车，<-180 撞车）\n"
-                f"  解决: 选 -90 (RIGHT 附近) / -120 / -150 等。"
+                f"  规则: 大臂角度 ∈ [+90, -150]°（+90 是复位位，-150 是结构极限）\n"
+                f"  解决: 选 +90 (复位) / 0 (MID) / -90 / -150 等。"
             )
-        # y 保护区放宽：大臂"收起来"（<= -30）时跳过 y 保护区
+        # y 保护区放宽：大臂"收起来"（<= -30）或"复位位"（>= +30）时跳过 y 保护区
         skip_y_protect = self._is_arm_safe_position()
         if skip_y_protect:
-            logger.info("set_arm_angle: 大臂已 <= -30 (收起来)，跳过 y 保护区")
-        # y 保护区：0° (MID) 是 init 位置（允许），其他需先出保护区
+            logger.info("set_arm_angle: 大臂已 <= -30 (收起) 或 >= +30 (复位),跳过 y 保护区")
+        # y 保护区：+90° (复位位) 或 0° (MID) 是 init 位置（允许），其他需先出保护区
         self._check_y_protected(
             "set_arm_angle",
-            allow_init_position=(a == 0.0),
+            allow_init_position=(a == 90.0 or a == 0.0),
             skip=skip_y_protect,
         )
         return self._call_arm("set_arm_angle", timeout=timeout, angle=a, speed=speed)
@@ -602,13 +612,14 @@ class ArmClient:
             reset_velocity=reset_velocity_mms / 1000.0,
         )
 
-    def reset_all(self, arm_angle: float = 0, hand_angle: float = -90,
+    def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
                   reset_x_velocity_mms: float = 20.0,
                   timeout: float = 120.0) -> dict:
         """2026-07-16 新加：复合复位 (x + 大臂 + 手爪 并行 → y 串行)。
 
-        三路并行(x 撞墙 / 大臂回 MID / 手爪回 UP),完成后 reset_y 触底。
+        三路并行(x 撞墙 / 大臂回 +90 复位位 / 手爪回 UP),完成后 reset_y 触底。
+        大臂默认 2026-07-27 改为 +90°(业务硬限上界 + 复位位,旧版是 0° MID)。
         timeout 给够(reset_y + reset_x + 2 servo 总耗时约 30-40s)。
 
         物理前提:机械臂当前不在右墙边(<50mm) — 否则 reset_x 不 calibrate。

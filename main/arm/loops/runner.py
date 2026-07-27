@@ -123,9 +123,9 @@ class ArmRunner:
 
     def set_arm_angle(self, angle: float, speed: int = 80,
                       timeout: Optional[float] = None) -> dict:
-        """大臂角度控制（业务层硬限 [0, -150]°）。
+        """大臂角度控制（业务层硬限 [+90, -150]°，2026-07-27 重定义）。
 
-        LEFT=+93 撞车、<-180 撞车，所以业务只允许 ≤ 0 且 ≥ -150。
+        +90 是复位位（reset_position 用），-150 是结构极限。
         """
         return self.client.set_arm_angle(
             angle, speed=speed,

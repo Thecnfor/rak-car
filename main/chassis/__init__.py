@@ -8,6 +8,7 @@ from .controllers.base import OuterLoop, WheelSmoother
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
 from .controllers.pure_pursuit import PurePursuitOuterLoop
+from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 
 __all__ = [
     "ChassisClient",
@@ -20,4 +21,5 @@ __all__ = [
     "POuterLoop",
     "StanleyOuterLoop",
     "PurePursuitOuterLoop",
+    "CurvatureAdaptiveOuterLoop",
 ]
