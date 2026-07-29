@@ -71,7 +71,7 @@ runner.run(max_seconds=15.0)                    # 3. 跑 15 秒（自动 zero ou
 api.stop_wheel_speeds()                        # 4. 关轮速（必调）
 ```
 
-完整示例：`examples/01_minimal_p_lane.py`。
+完整示例：`examples/05_subscribe_lane_state.py`。
 
 ---
 
@@ -356,22 +356,34 @@ track_target(api, label=None, time_out=3.0)
 
 ## 8. `examples/` 索引
 
+`examples/` 只放核心装配逻辑（连 client → 建 outer → 跑 runner），不写调参默认
+值、不写内层循环、不写每帧打印、不写 `__main__`。这三件事分别落在：
+
+- 调参值 → `config/lane_follow.py`（`LaneFollowProfile`）
+- 每帧 trace → `loops/telemetry.py`（`lane_trace`）
+- CLI 入口 → `cli/run_lane_follow.py`（`python3 -m main.chassis.cli.run_lane_follow`）
+
 | 文件 | 场景 | 频率 | 控制律 |
 | --- | --- | --- | --- |
-| `01_minimal_p_lane.py` | 起步、直线赛道、低速 | 50Hz | `POuterLoop` |
-| `02_stanley_lane.py` | 弯道、中速 | 50Hz | `StanleyOuterLoop` |
-| `03_p2p_with_vision.py` | 巡线 → 视觉终点微调（外环+内环切换） | 50Hz | `StanleyOuterLoop` + `track_target` |
-| `04_curvature_adaptive.py` | 弧度偏差自适应巡线（弯道降速 + 加强转向） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
-| `05_subscribe_lane_state.py` | 04 的 WS 直读变体（realtime WS 通道读 lane_state + 手写内层循环） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
+| `05_subscribe_lane_state.py` | 弧度偏差自适应巡线（WS 直读） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
 
-**用法**：
+**典型用法**：
 
 ```bash
-# 默认参数（vx=0.3, 15/20/5 秒）
-python3 main/chassis/examples/01_minimal_p_lane.py
+# 默认 profile（v_max=0.30, max_seconds=85, 实车）
+python3 -m main.chassis.cli.run_lane_follow
 
-# 自定义
-python3 -c "from main.chassis.examples import 01_minimal_p_lane; 01_minimal_p_lane.main(max_seconds=30, vx=0.4)"
+# 离线 dry-run 看数（不连接车也行，只是 state 全空）
+python3 -m main.chassis.cli.run_lane_follow --dry-run --max-seconds 5
+
+# 慢速 + 关 trace（实车短测）
+python3 -m main.chassis.cli.run_lane_follow --profile slow --no-trace --max-seconds 10
+
+# 临时覆盖调参（不改源代码）
+python3 -m main.chassis.cli.run_lane_follow --tune v_max=0.2 --tune ki_y=0.0
+
+# 程序化装配
+python3 -c "from main.chassis.config import LANE_FOLLOW; from main.chassis.examples import subscribe_lane_state; subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.2))"
 ```
 
 ---
@@ -481,15 +493,19 @@ main/chassis/
 │   ├── stanley.py            ← StanleyOuterLoop
 │   ├── pure_pursuit.py       ← PurePursuitOuterLoop（占位骨架）
 │   └── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应）
+├── config/                   ← 调参 profile（所有默认值与工厂方法）
+│   └── lane_follow.py        ← LaneFollowProfile + LANE_FOLLOW / LANE_FOLLOW_SLOW
+├── loops/                    ← 兜底 + 循环 + 每帧 trace
+│   ├── closed_loop.py        ← DoubleLoopRunner
+│   ├── safety.py             ← EmergencyWatchdog / LostLineDetector
+│   └── telemetry.py          ← lane_trace（on_tick 工厂）
+├── cli/                      ← 可执行入口（argparse + __main__）
+│   └── run_lane_follow.py
 ├── tasks/                    ← 高层组合（外环 + 内环事件）
 │   ├── follow_lane.py        ← 起 lane feed + 外环跑 N 秒
 │   ├── track_target.py       ← car.move_to_detection_target 包装
 │   └── back_to_line.py       ← 丢线恢复（直走 straight_seconds）
-└── examples/                 ← 5 个起步脚本
-    ├── 01_minimal_p_lane.py
-    ├── 02_stanley_lane.py
-    ├── 03_p2p_with_vision.py
-    ├── 04_curvature_adaptive.py
+└── examples/                 ← 核心装配（无调参值 / 无循环 / 无打印 / 无 __main__）
     └── 05_subscribe_lane_state.py
 ```
 
