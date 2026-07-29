@@ -13,7 +13,7 @@ import argparse
 from dataclasses import fields
 
 from ..config import LANE_FOLLOW, LANE_FOLLOW_SLOW, LaneFollowProfile
-from ..examples import subscribe_lane_state
+from main.chassis import subscribe_lane_state
 
 
 _PROFILES = {
