@@ -29,7 +29,9 @@ class DoubleLoopRunner:
         api: ChassisClient,
         outer: OuterLoop,
         hz: float = 50.0,
-        watchdog_ms: float = 500.0,
+        watchdog_ms: Optional[float] = 500.0,
+        lost_line_ms: Optional[float] = 300.0,
+        dry_run: bool = False,
         on_tick: Optional[Callable[[LaneState, List[float]], None]] = None,
         smoother: Optional[WheelSmoother] = None,
     ) -> None:
@@ -37,8 +39,13 @@ class DoubleLoopRunner:
         self.outer = outer
         self.hz = float(hz)
         self.dt = 1.0 / max(self.hz, 1.0)
-        self.watchdog = EmergencyWatchdog(threshold_ms=watchdog_ms)
-        self.lost_line = LostLineDetector()
+        # 两个兜底各自可关：传 None 就不挂
+        # - watchdog_ms=None：不因 lane_state 过期急停
+        # - lost_line_ms=None：不因误差齐 0 急停（笔直居中的路段本来就会齐 0）
+        self.watchdog = None if watchdog_ms is None else EmergencyWatchdog(threshold_ms=watchdog_ms)
+        self.lost_line = None if lost_line_ms is None else LostLineDetector(stable_ms=lost_line_ms)
+        # dry_run：只跑控制律不下发轮速，用于离线看数
+        self.dry_run = bool(dry_run)
         self.on_tick = on_tick
         # 默认挂一个 smoother；要彻底关掉就显式传一个 max_abs=∞ / max_accel=∞ 的实例
         self.smoother = smoother if smoother is not None else WheelSmoother()
@@ -48,38 +55,45 @@ class DoubleLoopRunner:
         self._stop = True
 
     def _sense(self) -> LaneState:
-        try:
-            payload = self.api.get_lane_state()
-        except Exception:
-            return LaneState()
-        return LaneState.from_lane_state_payload(payload or {})
+        # ChassisClient.read_lane() 内部已 ws 优先 + 异常兜底返回空 LaneState，
+        # 外环不再自己 try/except —— 空 state 的 has_error 为 False，控制律自然输出零速。
+        return self.api.read_lane()
 
     def run(self, max_seconds: float = 30.0) -> None:
         """阻塞：每 ~dt 跑一次外环 + 下发；任何异常路径都会 zero out 退出。
 
         关键流程：
-            raw = outer.step(state, dt)         # 控制律原始输出
-            safe = self.smoother.step(raw)      # 单轮饱和 + slew rate 限幅
-            api.set_wheel_speeds(safe)          # 下发
+            raw  = outer.step(state, dt)         # 控制律原始输出
+            safe = self.smoother.step(raw)       # 单轮饱和 + slew rate 限幅
+            api.set_wheel_speeds(safe)           # dry_run=False 时才下发
         """
         deadline = time.monotonic() + max(0.0, float(max_seconds))
         next_tick = time.monotonic()
         # smoother 用 0 起步（外环起来前车就是停的），避免被首帧目标"撞到"
         self.smoother.reset([0.0, 0.0, 0.0, 0.0])
-        last_wheel = [0.0, 0.0, 0.0, 0.0]
         try:
             while not self._stop:
                 now = time.monotonic()
                 if now > deadline:
                     break
                 state = self._sense()
-                if self.watchdog.should_stop(state) or self.lost_line.should_alert(state):
-                    self.api.emergency_stop()
+                # 兜底项各自可关：传 None = 不挂这个检查
+                if self.watchdog and self.watchdog.should_stop(state):
+                    if not self.dry_run:
+                        self.api.emergency_stop()
+                    break
+                if self.lost_line and self.lost_line.should_alert(state):
+                    if not self.dry_run:
+                        self.api.emergency_stop()
                     break
                 raw = self.outer.step(state, self.dt)
                 safe = self.smoother.step(raw)
-                last_wheel = list(safe)
-                self.api.set_wheel_speeds(safe)
+                if not self.dry_run:
+                    try:
+                        self.api.set_wheel_speeds(safe)
+                    except Exception:
+                        # 下发掉帧不退出循环：下一帧会再发给当前 smoother 软化后的目标
+                        pass
                 if self.on_tick is not None:
                     try:
                         self.on_tick(state, safe)
@@ -95,7 +109,13 @@ class DoubleLoopRunner:
         finally:
             # 退出前先把 smoother 也清回 0，再发零速，保证 no-op 顺序
             self.smoother.reset([0.0, 0.0, 0.0, 0.0])
+            if not self.dry_run:
+                try:
+                    self.api.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+                except Exception:
+                    pass
+            # 收 ws 长连接，让进程能干净退出
             try:
-                self.api.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+                self.api.close()
             except Exception:
                 pass
