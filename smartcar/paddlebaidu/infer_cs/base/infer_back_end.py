@@ -6,7 +6,8 @@ import json
 import cv2
 import yaml
 import numpy as np
-from threading import Thread
+from threading import Thread, Lock
+import threading
 import time
 import os
 import sys
@@ -75,6 +76,12 @@ class InferServer:
             {"configs": [conf.get("name") for conf in configs]},
         )
         
+        # 支持环境变量控制哪些模型常驻加载（节省内存）
+        # RAK_INFER_EAGER_MODELS=eager,lane,task  只加载 eager/lane/task，OCR 按需加载
+        eager_models_env = os.environ.get("RAK_INFER_EAGER_MODELS", "")
+        self._eager_models = set(m.strip() for m in eager_models_env.split(",") if m.strip()) if eager_models_env else None
+        print(f"[InferServer] eager_models config: {self._eager_models}")
+        
         self.flag_infer_initok = False
     
         self.flag_end = False
@@ -119,53 +126,24 @@ class InferServer:
             # "HummanAtrr": HummanAtrr,
             # "MotHuman": MotHuman
         }
-        # 创建推理模型
+        # 创建推理模型（支持按需加载节省内存）
         self.infer_dict = {}
+        self._models_loaded = {}  # name -> True/False
+        self._model_lock = threading.Lock()
 
         for conf in configs:
-            InferType = InferFactory[conf['infer_type']]
-            model_start = time.time()
-            _debug_emit(
-                "B",
-                "infer_back_end.py:InferServer.__init__",
-                "[DEBUG] infer model init start",
-                {
-                    "name": conf.get("name"),
-                    "infer_type": conf.get("infer_type"),
-                    "run_mode": conf.get("run_mode"),
-                },
-            )
-            if InferType == OCRReco :
-                if 'det_model_dir'in conf and 'rec_model_dir'  in conf:
-                    infer = InferType(conf['det_model_dir'], conf['rec_model_dir'],run_mode= conf['run_mode'])
-                else:
-                    raise InferType()
+            model_name = conf['name']
+            # 检查是否需要常驻加载
+            should_load = self._eager_models is None or model_name in self._eager_models
+            
+            self._models_loaded[model_name] = False
+            
+            if should_load:
+                # 立即加载模型
+                self._load_model(conf, model_name, InferFactory)
             else:
-                if 'model_dir' in conf:
-                    infer = InferType(conf['model_dir'], run_mode= conf['run_mode'])
-                else:
-                    infer = InferType(run_mode= conf['run_mode'])
-            self.infer_dict[conf['name']] = infer
-            _debug_emit(
-                "B",
-                "infer_back_end.py:InferServer.__init__",
-                "[DEBUG] infer model init done",
-                {
-                    "name": conf.get("name"),
-                    "cost_s": round(time.time() - model_start, 3),
-                },
-            )
-
-        # 创建推理模型
-        # self.lane_infer = LaneInfer()
-        # self.front_infer = YoloInfer("front_model2") # "trt_fp32")
-        # self.task_infer = YoloInfer("task_model3") # "trt_fp32")
-        # self.ocr_infer = OCRReco()
-        # self.humattr_infer = HummanAtrr()
-        # self.mot_infer = MotHuman()
+                print(f"[InferServer] lazy model: {model_name} (will load on first request)")
         
-        # 新建一个空白图片，用于预先图片推理
-        img = np.zeros((240, 240, 3), np.uint8)
         # 预加载推理几张图片，刚开始推理时速度慢，会有卡顿
         _debug_emit(
             "C",
@@ -173,29 +151,74 @@ class InferServer:
             "[DEBUG] infer warmup start",
             {"rounds": 3, "models": [conf.get("name") for conf in configs]},
         )
-        for i in range(3):
-            for conf in configs:
-                infer_tmp = self.infer_dict[conf['name']]
-                warmup_start = time.time()
-                infer_tmp(img)
-                _debug_emit(
-                    "C",
-                    "infer_back_end.py:InferServer.__init__",
-                    "[DEBUG] infer warmup step done",
-                    {
-                        "round": i + 1,
-                        "name": conf.get("name"),
-                        "cost_s": round(time.time() - warmup_start, 3),
-                    },
-                )
+        warmup_cfgs = [c for c in configs if self._models_loaded.get(c['name'], False)]
+        if warmup_cfgs:
+            # 新建一个空白图片，用于预先图片推理
+            img = np.zeros((240, 240, 3), np.uint8)
+            for i in range(3):
+                for conf in warmup_cfgs:
+                    infer_tmp = self.infer_dict[conf['name']]
+                    warmup_start = time.time()
+                    infer_tmp(img)
+                    _debug_emit(
+                        "C",
+                        "infer_back_end.py:InferServer.__init__",
+                        "[DEBUG] infer warmup step done",
+                        {
+                            "round": i + 1,
+                            "name": conf.get("name"),
+                            "cost_s": round(time.time() - warmup_start, 3),
+                        },
+                    )
         print("infer init ok")
+        self._eager_loaded_count = sum(1 for v in self._models_loaded.values() if v)
 
         self.flag_infer_initok = True
         _debug_emit(
             "C",
             "infer_back_end.py:InferServer.__init__",
             "[DEBUG] infer backend init ready",
-            {"ready": True},
+            {"ready": True, "eager_loaded": self._eager_loaded_count},
+        )
+
+    def _load_model(self, conf, model_name, InferFactory):
+        """同步加载推理模型"""
+        InferType = InferFactory[conf['infer_type']]
+        model_start = time.time()
+        _debug_emit(
+            "B",
+            "infer_back_end.py:InferServer.__init__",
+            "[DEBUG] infer model init start",
+            {
+                "name": model_name,
+                "infer_type": conf.get("infer_type"),
+                "run_mode": conf.get("run_mode"),
+            },
+        )
+        if InferType == OCRReco:
+            if 'det_model_dir' in conf and 'rec_model_dir' in conf:
+                infer = InferType(conf['det_model_dir'], conf['rec_model_dir'], run_mode=conf['run_mode'])
+            else:
+                raise InferType()
+        else:
+            if 'model_dir' in conf:
+                infer = InferType(conf['model_dir'], run_mode=conf['run_mode'])
+            else:
+                infer = InferType(run_mode=conf['run_mode'])
+        
+        with self._model_lock:
+            self.infer_dict[model_name] = infer
+            self._models_loaded[model_name] = True
+        
+        print(f"[InferServer] model loaded: {model_name} ({time.time() - model_start:.2f}s)")
+        _debug_emit(
+            "B",
+            "infer_back_end.py:InferServer.__init__",
+            "[DEBUG] infer model init done",
+            {
+                "name": model_name,
+                "cost_s": round(time.time() - model_start, 3),
+            },
         )
 
 
@@ -209,8 +232,24 @@ class InferServer:
         
         print(time.strftime("%Y-%m-%d %H:%M:%S"), "{} process start".format(name))
         server:zmq.Socket = self.server_dict[name]
+        
         # lambda定义推理函数，含有归一化处理参数为True, 此处定义方便后续调用
-        func = lambda x: self.infer_dict[name](x, True)
+        # 注意：这里闭包捕获的是 self.infer_dict，需要支持懒加载
+        def get_infer_func(model_name):
+            def lazy_infer(x, normalize=True):
+                # 检查模型是否已加载，未加载则先加载
+                if not self._models_loaded.get(model_name, False):
+                    print(f"[InferServer] lazy loading model: {model_name}")
+                    configs = get_yaml('config_car.yml')['infer_cfg']
+                    conf = next((c for c in configs if c['name'] == model_name), None)
+                    if conf:
+                        from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco
+                        InferFactory = {"YoloeInfer": YoloeInfer, "LaneInfer": LaneInfer, "OCRReco": OCRReco}
+                        self._load_model(conf, model_name, InferFactory)
+                return self.infer_dict[model_name](x, normalize)
+            return lazy_infer
+        
+        func = get_infer_func(name)
         _debug_emit(
             "D",
             "infer_back_end.py:process_demo",
