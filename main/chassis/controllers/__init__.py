@@ -1,7 +1,6 @@
 from .base import OuterLoop, WheelSmoother
 from .p_controller import POuterLoop
 from .stanley import StanleyOuterLoop
-from .pure_pursuit import PurePursuitOuterLoop
 from .curvature_adaptive import CurvatureAdaptiveOuterLoop
 
 __all__ = [
@@ -9,6 +8,5 @@ __all__ = [
     "WheelSmoother",
     "POuterLoop",
     "StanleyOuterLoop",
-    "PurePursuitOuterLoop",
     "CurvatureAdaptiveOuterLoop",
 ]

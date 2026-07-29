@@ -16,19 +16,21 @@ HANDS = ("UP", "MID", "DOWN")
 
 # 存储仓（二选一档位）枚举。
 #
-# 角度常量**严格对齐**官方 `baidu_smartcar_2026/car_wrap_2026.py:389`
-#   servo_1_angle_list = [-42, 165]。
-# **不要修改这两个常量** —— 改了就和官方车体物理位置对不上。
+# 2026-07-17 **协议层重写**：用户要求存储仓舵机无任何软限制,走 raw 直传。
+#   - `runtime/services/my_car.py:servo_1` 现以 `ServoPwm(1, 180, raw=True)` 构造
+#   - raw=True 跳过 +90 公式,且把 mc602 servo_pwm format 切到 "bbBb"(angle signed byte)
+#   - 角度常量**已不再是 +90 后的协议值**,而就是 raw 协议值本身(signed byte,范围 [-128, 127])
+#   - RIGHT=165 **超出 signed byte 上限 127 会回绕**,业务层禁止再走 LEFT/RIGHT 自动路径;
+#     标定用 `set_storage_angle(协议值)` 直传
 #
-# 物理细节（仅供参考，不要据此"修正"角度）：
-#   - LEFT  = -42° → ServoPwm 协议值 = -42+90 = 48，0~180 合法
-#   - RIGHT = 165° → ServoPwm 协议值 = 165+90 = 255，**超 0~180**
-#   - mc602 协议层对 0~180 之外的协议值是"不识别"而非"回弹"，
-#     实际舵机行为由 mc602 固件决定（现场观察稳定，官方车这么用就行）。
-#   - mc601 会自动 clamp 到 0~180，所以换 mc601 时也不需要改。
+# 协议值常量(对齐官方 baidu_smartcar_2026/car_wrap_2026.py:389,原 +90 前):
+#   - LEFT  = -42  (signed byte 合法)
+#   - RIGHT = 165  (signed byte 越界,**禁用**)
 #
-# **业务层只允许 LEFT/RIGHT 二选一**（set_storage() 不接受任意 angle）。
-# 想传任意 angle 是反模式，会绕过官方标定 —— 不允许。
+# ⚠️ 跑比赛前必须现场重新标定舵机物理位置:用 `set_storage_angle(协议值)` 试探,
+#     找到"开仓最大开角"的 raw 协议值后写回业务脚本。**不要假设** LEFT=-42 / RIGHT=165 物理位置仍然正确。
+#
+# 业务层 main/arm/api.py: set_storage / set_storage_angle 已取消 y 安全门。
 STORAGE_SIDES = ("LEFT", "RIGHT")
 STORAGE_DEFAULT_LEFT_ANGLE = -42
 STORAGE_DEFAULT_RIGHT_ANGLE = 165

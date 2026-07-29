@@ -74,17 +74,19 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         dkappa_full: float = 1.5,
         # --- P 项（基础横向 + 转向） ---
         # kp_theta 从 1.8 降到 1.2：弯道转向不再"打满舵"，给内环 PID 留修正余地
-        kp_y: float = 0.5,
+        # 2026-07-28: kp_y 从 0.5 提到 0.80 — 直线段 P 响应更快，不再等偏差放大才修。
+        kp_y: float = 0.80,
         kp_theta: float = 1.2,
         # --- I 项（修复 2026-07-16 直行稳态误差）---
         # 纯 P 控制遇到恒定干扰（视觉 bias / 机械零漂 / 地面不平）时永远需要一个
         # 稳态 error_y 才能维持修正力，看起来就是"过偏了才矫正"。
         # 加 leaky 积分项消除稳态偏差：积分累积 - 衰减 → bias 长时间存在时积分增长，
         # 偏差回零后自动衰减，避免曲线段积分饱和把直线段冲飞。
-        # 经验起步：ki_y=0.6 / ey_int_cap=0.10 / ey_int_decay=0.5
-        ki_y: float = 0.6,
+        # 2026-07-28: ki_y 从 0.6 降到 0.40 — 降低积分力度避免急促修正；
+        # ey_int_decay 从 0.5 提到 0.80 — 半衰期从 ~1.4s 缩到 ~0.87s，弯道残留衰减更快。
+        ki_y: float = 0.40,
         ey_int_cap: float = 0.10,
-        ey_int_decay: float = 0.5,
+        ey_int_decay: float = 0.80,
         # --- 弧度变化驱动的额外 omega 增益 ---
         # omega_gain 从 0.6 降到 0.35、kappa 上限从 2.0 收到 1.5：
         # 大弧度差时 boost 最大 ≈ 1.5x（之前 2.2x），单轮阶跃幅度减半

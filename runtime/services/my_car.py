@@ -360,6 +360,10 @@ class MyCar(MecanumDriver):
         # 与 _stop_flag 一起构成"协作式取消"，可被 runtime 无锁抢占。
         self._estop_event = threading.Event()
         self.arm._estop = self._estop_event
+        # 硬件急停标志:emergency_stop() 触发;与 _stop_flag 不同 —— 硬件 loop 必须
+        # 响应(让底盘/arm 停转),但 lane_feed/arm_feed/task_feed 守护线程不受影响,
+        # 上位机视觉/推理持续对外提供数据流。需要 reset_stop 复位。
+        self._hardware_stop = False
         # 物理按键板 2026 年未启用（仅 arm jog 用，不再触发 _stop_flag）。
         self._end_flag = False
 
@@ -383,17 +387,23 @@ class MyCar(MecanumDriver):
 
     def emergency_stop(self):
         """
-        软件急停：立即停三轴 + 置协作停止标志。
+        软件急停：立即停三轴 + 置硬件协作停止标志。
 
         设计要点（配合 runtime 无锁调用）：
           - 底层串口每条指令自带锁并各自成包，即使 worker 线程正在跑长动作，
             这里并发下发停车指令也不会串包，故 runtime 侧无需再抢 car_lock；
-          - 置 _stop_flag / _estop_event 后：底盘巡线循环读到 _stop_flag 退出、
-            机械臂 y_speed/x_speed 被 _estop chokepoint 强制 0，正在跑的
-            reset_y / move_* 循环随即因电机不动而收敛退出，不会又把电机驱起来。
-        返回：True。
+          - 仅置 _hardware_stop / _estop_event：**不**再置 _stop_flag。两个标志分工：
+              · _hardware_stop（仅 emergency_stop 设置）→ 硬件 loop（move_base /
+                lane_base / reset_* 等）响应；feed 守护线程（lane_feed / arm_feed /
+                task_feed）不响应，上位机视觉/推理仍对外提供数据流。
+              · _stop_flag（仅 cancel_job 路径设置）→ feed 守护线程响应。
+            底盘/机械臂 PID 循环读到 _hardware_stop 退出、y_speed/x_speed 被
+            _estop chokepoint 强制 0,正在跑的 reset_y / move_* 循环随即因电
+            机不动而收敛退出,不会又把电机驱起来。
+
+        返回:True。
         """
-        self._stop_flag = True
+        self._hardware_stop = True
         self._estop_event.set()
         errors = []
         for label, fn in (
@@ -413,10 +423,20 @@ class MyCar(MecanumDriver):
         """
         解除软件急停：清除停止标志，允许后续动作重新驱动电机。
         急停后必须显式调用本方法（或 runtime reset_stop）才能恢复运动。
+        同时清 _hardware_stop 与 _stop_flag、_estop_event。
         """
         self._stop_flag = False
+        self._hardware_stop = False
         self._estop_event.clear()
         return True
+
+    def _must_exit(self):
+        """硬件控制循环退出条件：硬件急停或任务取消任一命中都退出。
+
+        Feed 守护线程只看 _stop_flag（emergency_stop 不杀它们），
+        硬件 loop 同时看两个标志，确保 emergency_stop 立即生效。
+        """
+        return self._hardware_stop or self._stop_flag
 
     def beep(self):
         """
@@ -442,14 +462,18 @@ class MyCar(MecanumDriver):
         self.light = LedLight(cfg_sensor["light"])
         self.left_sensor = Infrared(cfg_sensor["left_sensor"])
         self.right_sensor = Infrared(cfg_sensor["right_sensor"])
-        # 存储仓舵机角度（对齐官方 baidu_smartcar_2026/car_wrap_2026.py:389）：
-        #   LEFT  = -42°（ServoPwm 协议值 = -42+90 = 48，合法）
-        #   RIGHT = 165°（ServoPwm 协议值 = 165+90 = 255，**超 0~180**，mc602 不 clamp 会回弹/回中，
-        #             这是已知 trade-off，参见 state.py 的 STORAGE_DEFAULT_RIGHT_ANGLE 注释）
-        # 业务层只暴露 LEFT/RIGHT 二选一，不允许传任意 angle（见 main/arm/api.py: set_storage）。
+        # 存储仓舵机：**raw 直传**(2026-07-17 用户原话"这个存储仓舵机不要任何软限制")。
+        #   raw=True → 绕过 ServoPwm wrapper 的 +90 公式,angle 直传 mc602 协议字段;
+        #   mc602 servo_pwm format 同时切到 "bbBb"(angle signed byte,范围 [-128, 127])。
+        # LEFT/RIGHT 角度常量 → 直接就是协议值,不再是 +90 偏移后的值。
+        #   LEFT  = -42  (原 -42° 业务角 + 90 = 48 协议值,raw 后变 -42 协议值)
+        #   RIGHT = 165  (原 165° 业务角 + 90 = 255 协议值,raw 后变 165 协议值,**超 signed byte 127 上限
+        #                  会回绕 → 业务层禁止再走 RIGHT 走这条路径,需用 set_storage_angle 直接传目标协议值)
+        # ⚠️ raw 模式下 LEFT/RIGHT 历史角度常量**已失效**,舵机物理位置由 caller 重新标定。
+        # 业务层 main/arm/api.py: set_storage / set_storage_angle 已取消 y 安全门。
         self.servo_1_angle_list = [-42, 165]
         self.servo_1_flag = 0
-        self.servo_1 = ServoPwm(1, 180)
+        self.servo_1 = ServoPwm(1, 180, raw=True)
         # 默认不主动写舵机：保留用户上一次 set_storage 留下的物理位置。
         # 需要"每次启动回到 LEFT"再把下面这行 set_angle(...) 注释打开。
         # self.servo_1.set_angle(self.servo_1_angle_list[self.servo_1_flag])
@@ -463,10 +487,12 @@ class MyCar(MecanumDriver):
 
         根据状态参数控制储存仓的开关。
 
-        角度常量来自 self.servo_1_angle_list（对齐官方 baidu_smartcar_2026 写法）：
-          - False → LEFT  = -42°（协议值 48，合法）
-          - True  → RIGHT = 165°（协议值 255，**超 0~180**，mc602 协议层不识别但实际舵机行为稳定）
-        物理碰撞由 ArmClient.set_storage 的 y < -100 安全门挡。
+        ⚠️ 2026-07-17 协议层改成 raw 直传（servo_1 以 `ServoPwm(1, 180, raw=True)` 构造）：
+          - angle 直传 mc602 协议字段,**不再 +90 偏移**
+          - mc602 servo_pwm format 切到 "bbBb",angle 是 signed byte (合法区间 [-128, 127])
+          - RIGHT=165 **超 signed byte 上限,业务层禁止走这条路径**
+            要"开仓更开"用 set_storage_angle(目标协议值) 直接标定。
+        物理碰撞由 ArmClient 取消 y 安全门,撞车风险 caller 自负。
 
         参数:
             state (bool): 储存仓状态。False 表示放下（LEFT），True 表示收起（RIGHT）。默认为 False。
@@ -476,10 +502,9 @@ class MyCar(MecanumDriver):
         """
         flag = 1 if state else 0
         angle = self.servo_1_angle_list[flag]
-        # 业务层只允许 LEFT/RIGHT（不允许任意 angle），角度写死在这里。
-        # 如果后续 mc602 真的把 165°（协议值 255）当成非法值再回弹 / 不动，
-        # 改这一行（换成 90° 等）即可，**不要改 servo_1_angle_list** —— 改了
-        # 物理位置就和官方对不上。
+        # raw 直传模式下 LEFT/RIGHT 角度常量就是 raw 协议值(servo_1_angle_list)。
+        # RIGHT=165 在 signed byte 上越界,会 wrap 成负值 —— 业务层若需要 165 协议值必须改用 set_storage_angle。
+        # ⚠️ 跑比赛前现场重新标定舵机物理位置:用 set_storage_angle 试探,把新角度写回 servo_1_angle_list。
         self.servo_1.set_angle(angle)
         self.servo_1_flag = flag
         return {
@@ -505,6 +530,19 @@ class MyCar(MecanumDriver):
         return bool(value)
 
     def set_storage_angle(self, angle, speed=100):
+        """
+        直传存储仓舵机 raw 协议值（2026-07-17 起,+90 偏移已去掉）。
+
+        ⚠️ raw 直传 + signed byte 协议：
+          - angle 直接写入 mc602 servo_pwm 协议字段,**不再 +90**
+          - 合法区间 [-128, 127]（signed byte），超出 struct.error
+          - 与 set_storage 的 LEFT/RIGHT 自动路径不同,**调用方完全控制舵机**
+        物理位置由 main 层用本接口现场标定。
+
+        参数:
+            angle: raw 协议值（int）,目标舵机内部位置;不再代表"业务角度"。
+            speed: 舵机速度,默认 100。
+        """
         self.servo_1_flag = None
         self.servo_1.set_angle(angle, speed)
         return angle
@@ -816,7 +854,7 @@ class MyCar(MecanumDriver):
         """
         start_time = time.time()
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if time.time() - start_time > time_hold:
                 break
@@ -854,7 +892,7 @@ class MyCar(MecanumDriver):
         stop = self.resolve_stop(stop)
         self.set_velocity(sp[0], sp[1], sp[2])
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if end_fuction():
                 break
@@ -1044,7 +1082,7 @@ class MyCar(MecanumDriver):
         tar_index = 0
         flag_location = False
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if time.time() > end_time:
                 logger.info("time out")
@@ -1170,7 +1208,7 @@ class MyCar(MecanumDriver):
         """
         stop = self.resolve_stop(stop)
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 if hasattr(self.streamer, "set_lane_state"):
                     self.streamer.set_lane_state(
                         active=False,
@@ -1715,7 +1753,7 @@ class MyCar(MecanumDriver):
         text_out = None
         print(det)
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return text_out
             if time.time() > time_stop:
                 return text_out
@@ -1794,7 +1832,7 @@ class MyCar(MecanumDriver):
         text_count = CountRecord(3)
         text_out = None
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
             if time.time() > time_stop:
                 return None
@@ -2094,7 +2132,7 @@ class MyCar(MecanumDriver):
         pid_x = PID(kp_x, ki_x)
         pid_x.setpoint = delta_x
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 self.set_velocity(0, 0, 0)
                 self.arm.x_speed(0)
                 return -1, "None"
@@ -2188,7 +2226,7 @@ class MyCar(MecanumDriver):
         inference_flag = False
         grasp_flag = False
         while True:
-            if self._stop_flag:
+            if self._must_exit():
                 return
 
             keys_val = self.blue_pad.read()

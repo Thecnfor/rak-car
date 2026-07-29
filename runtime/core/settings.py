@@ -31,6 +31,11 @@ AUTO_INIT_ON_START = True
 # 设为 False（环境变量 RAK_CAR_RESET_ARM=0）跳过 reset_position。
 RESET_ARM_ON_AUTO_INIT = True
 RESET_POSITION_ON_INIT = True
+# 2026-07-27：x 自动撞墙归零只放在真正 init（创建新 car 实例）路径。
+# 不再放在 ensure_initialized 的复用路径，避免执行任务 / 健康检查时被自动补 reset_x。
+# 默认 True（env RAK_CAR_RESET_X_ON_INIT=0 关掉）。
+# reset_x 内部 try/except 兜底（撞墙失败也不阻塞 init 整体）。
+RESET_X_ON_INIT = True
 STOP_AFTER_ACTION_DEFAULT = False
 AUTO_INIT_RETRY_INTERVAL = 3.0
 ACTION_READY_TIMEOUT = 30.0
@@ -117,6 +122,11 @@ def get_reset_arm_on_auto_init():
 
 def get_reset_position_on_init():
     return _bool_env("RAK_CAR_RESET_POSITION_ON_INIT", RESET_POSITION_ON_INIT)
+
+
+def get_reset_x_on_init():
+    """真正 init 路径是否触发 reset_x 撞墙（env: RAK_CAR_RESET_X_ON_INIT，默认 1）。"""
+    return _bool_env("RAK_CAR_RESET_X_ON_INIT", RESET_X_ON_INIT)
 
 
 def get_stop_after_action_default():
@@ -220,6 +230,7 @@ def get_runtime_settings():
         "auto_init_on_start": get_auto_init_on_start(),
         "reset_arm_on_auto_init": get_reset_arm_on_auto_init(),
         "reset_position_on_init": get_reset_position_on_init(),
+        "reset_x_on_init": get_reset_x_on_init(),
         "stop_after_action_default": get_stop_after_action_default(),
         "auto_init_retry_interval": get_auto_init_retry_interval(),
         "action_ready_timeout": get_action_ready_timeout(),

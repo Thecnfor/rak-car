@@ -1,7 +1,7 @@
 """main/arm/tasks/pick_right.py
 右侧抓取：set_arm_angle(-93) -> move_xy -> grasp(True)
 
-注（2026-07-16）：LEFT/MID/RIGHT 字符串预设已删。RIGHT 在业务硬限 [-150, 0]° 内。
+注（2026-07-27）：LEFT/MID/RIGHT 字符串预设已删。RIGHT 在业务硬限 [+90, -150]° 内。
 """
 from typing import Optional
 
@@ -9,7 +9,8 @@ from ..api import ArmClient
 from ..loops.runner import ArmRunner
 
 
-# 业务硬限 [0, -150]°，原 RIGHT=-93 在范围内
+# 业务硬限 [+90, -150]°（2026-07-27 重定义）：+90 是复位位，-150 是结构极限,
+# 原 RIGHT=-93 在范围内
 _ARM_ANGLE_FOR_RIGHT_PICK = -93.0
 
 

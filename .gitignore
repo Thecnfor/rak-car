@@ -153,3 +153,4 @@ cython_debug/
 
 **/test/**
 main/arm/arm_origin.yaml
+docs

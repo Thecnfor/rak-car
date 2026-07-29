@@ -10,7 +10,7 @@ from ..api import ArmClient
 from ..loops.runner import ArmRunner
 
 
-# 业务硬限：0 是最大，-150 是物理下界
+# 业务硬限 [+90, -150]°：+90 是复位位，-150 是结构极限（2026-07-27 重定义）
 _ARM_ANGLE_FOR_LEFT_PICK = -90.0   # ≈ 旧 LEFT=93° 的反向
 
 

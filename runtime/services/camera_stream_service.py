@@ -566,6 +566,33 @@ class CameraStreamService:
                     .statusbar .lane-dot.err { background: #ff5252; }
                     .statusbar .err { color: #8892b0; }
                     .statusbar .err b { color: #e6f1ff; font-weight: 500; }
+                    /* task 状态点：与 lane 共用 .lane-dot 调色板，避免重复 CSS */
+                    .statusbar .sep {
+                        color: #444c5e;
+                        margin: 0 -2px;
+                    }
+                    .statusbar .task-count {
+                        display: inline-block;
+                        min-width: 18px;
+                        text-align: center;
+                        font-variant-numeric: tabular-nums;
+                        color: #e6f1ff;
+                        background: rgba(0, 212, 255, 0.12);
+                        border: 1px solid rgba(0, 212, 255, 0.35);
+                        padding: 0 5px;
+                        border-radius: 9px;
+                        margin-left: 4px;
+                    }
+                    .statusbar .task-count.zero { color: #5b6478; background: transparent; border-color: rgba(255,255,255,0.08); }
+                    .statusbar .task-label {
+                        color: #cdd6e3;
+                        font-family: 'SF Mono', Consolas, monospace;
+                        max-width: 220px;
+                        overflow: hidden;
+                        text-overflow: ellipsis;
+                        white-space: nowrap;
+                        vertical-align: middle;
+                    }
                     .statusbar .key {
                         margin-left: auto;
                         color: #ff5252;
@@ -617,6 +644,13 @@ class CameraStreamService:
                         ey=<b id="laneEy">--</b>
                         ea=<b id="laneEa">--</b>
                     </span>
+                    <span class="sep">|</span>
+                    <span>
+                        <span class="lane-dot" id="taskDot"></span>
+                        <span id="taskText">task: --</span>
+                        <span id="taskCount" class="task-count zero">0</span>
+                    </span>
+                    <span id="taskLabel" class="task-label"></span>
                     <span id="lastKey" class="key"></span>
                 </div>
                 <div class="streams">
@@ -632,7 +666,13 @@ class CameraStreamService:
                     </div>
                     <div class="stream-cell">
                         <span class="label">cam2 / side</span>
-                        <img src="/video_feed/cam2" alt="side camera">
+                        <span class="label" style="left:auto; right:8px; background: rgba(120,40,140,0.55);">
+                            <label style="cursor:pointer; user-select:none;">
+                                <input type="checkbox" id="taskOverlay" style="vertical-align:middle; margin-right:3px;">
+                                task overlay
+                            </label>
+                        </span>
+                        <img id="cam2Img" src="/video_feed/cam2" alt="side camera">
                     </div>
                 </div>
                 <script>
@@ -694,6 +734,73 @@ class CameraStreamService:
                         } else {
                             if (overlayTimer) { clearInterval(overlayTimer); overlayTimer = null; }
                             cam1Img.src = '/video_feed/cam1';
+                        }
+                    });
+
+                    // ---- task 状态轮询 ----
+                    // task_feed 默认 30Hz 刷新 streamer.task_state，但前端 1Hz 足够
+                    // （MJPEG 本身已经 20Hz；overlay 时再切到 10Hz 单帧 JPEG）。
+                    const taskDot = document.getElementById('taskDot');
+                    const taskText = document.getElementById('taskText');
+                    const taskCount = document.getElementById('taskCount');
+                    const taskLabel = document.getElementById('taskLabel');
+
+                    function pickTopLabel(state) {
+                        const dets = state.detections || [];
+                        if (!dets.length) return '';
+                        // 按 score 降序选置信度最高的作为顶栏标签
+                        let top = dets[0];
+                        for (let i = 1; i < dets.length; i++) {
+                            if ((dets[i].score || 0) > (top.score || 0)) top = dets[i];
+                        }
+                        const name = top.label || ('cls_' + (top.cls_id ?? '?'));
+                        return name + ' ' + (top.score || 0).toFixed(2);
+                    }
+
+                    async function pollTask() {
+                        try {
+                            // 后端路由:/v1/realtime/vision/task,不是 /realtime/task_state
+                            const r = await fetch('/v1/realtime/vision/task');
+                            const d = await r.json();
+                            const st = d.task_state || {};
+                            const age = st.updated_at ? (Date.now()/1000 - st.updated_at) : 999;
+                            if (!st.updated_at || age > 2) {
+                                taskDot.className = 'lane-dot err';
+                            } else if (st.active) {
+                                taskDot.className = 'lane-dot ok';
+                            } else {
+                                taskDot.className = 'lane-dot warn';
+                            }
+                            taskText.textContent = 'task: ' + (st.active ? (st.mode || 'on') : 'idle');
+                            const n = st.count || 0;
+                            taskCount.textContent = String(n);
+                            taskCount.className = 'task-count' + (n === 0 ? ' zero' : '');
+                            taskLabel.textContent = pickTopLabel(st);
+                            taskLabel.title = taskLabel.textContent;
+                        } catch (e) {
+                            taskDot.className = 'lane-dot err';
+                            taskText.textContent = 'task: err';
+                        }
+                    }
+                    pollTask();
+                    setInterval(pollTask, 1000);
+
+                    // ---- cam2 task overlay 切换 ----
+                    // 同 cam1 lane overlay：默认 /video_feed/cam2 (干净 MJPEG)，
+                    // 勾上后切到 /v1/vision/task/preview.jpg?cam_id=cam2 (单帧 JPEG，10Hz reload)。
+                    const cam2Img = document.getElementById('cam2Img');
+                    const taskOverlay = document.getElementById('taskOverlay');
+                    let taskOverlayTimer = null;
+                    function refreshTaskOverlay() {
+                        cam2Img.src = '/v1/vision/task/preview.jpg?cam_id=cam2&t=' + Date.now();
+                    }
+                    taskOverlay.addEventListener('change', () => {
+                        if (taskOverlay.checked) {
+                            refreshTaskOverlay();
+                            taskOverlayTimer = setInterval(refreshTaskOverlay, 100);  // 10Hz
+                        } else {
+                            if (taskOverlayTimer) { clearInterval(taskOverlayTimer); taskOverlayTimer = null; }
+                            cam2Img.src = '/video_feed/cam2';
                         }
                     });
 

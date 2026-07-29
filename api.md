@@ -31,7 +31,7 @@
 | ~~`reset_x`~~ | — | ❌ 已删除（2026-07-16） | — |
 | `set_arm_pose` | `x=?, y=?, arm=?, hand=?` | 一次设 4 个轴，None 不动 | 越界抛 `ValueError` |
 | `set_hand_angle` | `angle="UP"/"MID"/"DOWN"/int, speed=80` | 手爪 PWM 舵机 | — |
-| `set_arm_angle` | `angle="MID"/"RIGHT"/int(-150~0), speed=80` | 大臂总线舵机 | 业务层 `ArmClient.set_arm_angle` 硬限 [0, -150]°，`LEFT`/`angle>0`/`angle<-150` 报 ValueError |
+| `set_arm_angle` | `angle=int(-150~+90), speed=80` | 大臂总线舵机 | 业务层 `ArmClient.set_arm_angle` 硬限 [+90, -150]°（2026-07-27 重定义，原 [0, -200]°），`LEFT`/`angle>+90`/`angle<-150` 报 ValueError |
 | `move_x_position` | `target=m, out_time=6.0` | x 轴定位（带软限位 + 丢步核对） | target 单位**米** |
 | `move_y_position` | `target=m` | y 轴定位（带软限位 + 丢步核对） | target 单位**米** |
 | `goto_position` | `x=?, y=?, time_run=?, speed=[0.15, 0.04]` | 双轴定位（PID 闭环） | — |

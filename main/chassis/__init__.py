@@ -1,27 +1,87 @@
 # main/chassis 子包：底盘组独占目录
 # 外部 import 只允许指向 main.*，不接触 runtime / smartcar
+from __future__ import annotations
+
+from typing import Callable, Optional
+
 from .api import ChassisClient
 from .state import LaneState
-from .loops.closed_loop import DoubleLoopRunner
-from .loops.safety import EmergencyWatchdog, LostLineDetector
 from .controllers.base import OuterLoop, WheelSmoother
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
-from .controllers.pure_pursuit import PurePursuitOuterLoop
 from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
-from .tasks import auto_navigate  # 2026-07-16: 自动导航任务（外环 + 视觉 + 安全）
+from .loops.closed_loop import DoubleLoopRunner
+from .loops.safety import EmergencyWatchdog, LostLineDetector
+from .loops.telemetry import lane_trace
+from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, LaneFollowProfile
+
+
+def subscribe_lane_state(
+    *,
+    profile: LaneFollowProfile = LANE_FOLLOW,
+    hz: Optional[float] = None,
+    max_seconds: Optional[float] = None,
+    dry_run: bool = False,
+    with_trace: bool = True,
+    on_tick: Optional[Callable[[LaneState, list[float]], None]] = None,
+) -> None:
+    """巡线外环的**一健装配**：profile → outer / smoother → DoubleLoopRunner。
+
+    等价于手动写::
+
+        api = ChassisClient.connect()
+        outer = profile.build_outer()
+        smoother = profile.build_smoother()
+        on_tick = lane_trace(outer) if with_trace else None
+        runner = DoubleLoopRunner(api=api, outer=outer, hz=..., smoother=smoother, on_tick=on_tick)
+        runner.run(max_seconds=...)
+
+    用法::
+
+        from main.chassis import subscribe_lane_state, LANE_FOLLOW
+        subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.2), max_seconds=10.0)
+
+    参数：
+        profile    - 调参 profile，默认 LANE_FOLLOW
+        hz         - 循环频率，默认用 profile.hz
+        max_seconds - 最大运行时间，默认用 profile.max_seconds
+        dry_run    - True 时只跑控制律不下发轮速
+        with_trace - True 时每帧打印 lane 误差 + 轮速
+        on_tick    - 覆盖 with_trace 的自定义回调
+    """
+    api = ChassisClient.connect()
+    outer = profile.build_outer()
+    smoother = profile.build_smoother()
+
+    if on_tick is None and with_trace:
+        on_tick = lane_trace(outer)
+
+    runner = DoubleLoopRunner(
+        api=api,
+        outer=outer,
+        hz=profile.hz if hz is None else hz,
+        watchdog_ms=profile.watchdog_ms,
+        lost_line_ms=profile.lost_line_ms,
+        dry_run=dry_run,
+        smoother=smoother,
+        on_tick=on_tick,
+    )
+    runner.run(max_seconds=profile.max_seconds if max_seconds is None else max_seconds)
 
 __all__ = [
+    "subscribe_lane_state",
     "ChassisClient",
     "LaneState",
-    "DoubleLoopRunner",
-    "EmergencyWatchdog",
-    "LostLineDetector",
     "OuterLoop",
     "WheelSmoother",
     "POuterLoop",
     "StanleyOuterLoop",
-    "PurePursuitOuterLoop",
     "CurvatureAdaptiveOuterLoop",
-    "auto_navigate",
+    "DoubleLoopRunner",
+    "EmergencyWatchdog",
+    "LostLineDetector",
+    "lane_trace",
+    "LaneFollowProfile",
+    "LANE_FOLLOW",
+    "LANE_FOLLOW_SLOW",
 ]
