@@ -89,7 +89,7 @@ class ArmController:
         self.y_params_init(**self.config["vert_cfg"])
         self.x_params_init(**self.config["horiz_cfg"])
         self.hand_params_init(**self.config["hand_cfg"])
-        self.position_params_init(**self.config["pos_cfg"])
+        self.position_params_init()
 
 
     def y_params_init(self, motor, limit_port, pid, threshold,
@@ -788,58 +788,25 @@ class ArmController:
         self.valve.set(value)
 
 
-    def position_params_init(self, pose_enable, pose_horiz, pose_vert, side):
+    def position_params_init(self):
         """
-        初始化位置参数
-
-        Args:
-            pose_enable: 是否启用位置
-            pose_horiz: 水平位置
-            pose_vert: 竖直位置
-            side: 方向
+        初始化位置参数。不再依赖 yaml 持久化，始终以当前编码器值为零点。
         """
-        self.pose_enable = pose_enable
-        self.side = side
+        self.pose_enable = False
+        self.side = "MID"
 
-        # Init 顺序 bug 修复 (2026-07-16):
-        #   原版无条件用 yaml 的 pose_horiz/pose_vert 反推 _pose_start,导致 SDK 重启后
-        #   x_pose_now 显示成上次的值(实际电机可能漂移),reset_x 起跑时 total_disp 闸
-        #   (min_pre_trigger_disp_m=0.05) 不通过 → 卡 2s → no_move_hard_timeout 触发。
-        #   新逻辑:如果 _x_ref_encoder_at_zero 是 None(SDK 全新启动,无 reset_x 历史),
-        #   用电机当前编码器作为零点,x_pose_now=0。让 reset_x 自己撞墙 calibrate 定 ref。
-        #   _x_ref_encoder_at_zero 在 x_params_init (L375) 已 init 为 None,所以 init
-        #   时一定走这个新分支。
-        if getattr(self, "_x_ref_encoder_at_zero", None) is None:
-            self.x_pose_start = self.motor_x.get_dis()
-            self.x_pose_now = 0.0
-        else:
-            self.x_pose_start = self.motor_x.get_dis() - pose_horiz
-            self.x_pose_now = pose_horiz
+        self.x_pose_start = self.motor_x.get_dis()
+        self.x_pose_now = 0.0
 
-        # y 同理:init 时 _y_ref_encoder_at_zero 一定是 None (reset_y 是 init 才跑的动作)。
-        # 修复后 y_pose_now 显示当前电机物理位置对应的偏移,而不是 yaml 上次保存的数值。
-        if getattr(self, "_y_ref_encoder_at_zero", None) is None:
-            self.y_pose_start = self.motor_y.get_dis()
-            self.y_pose_now = 0.0
-        else:
-            self.y_pose_start = self.motor_y.get_dis() - pose_vert
-            self.y_pose_now = pose_vert
+        self.y_pose_start = self.motor_y.get_dis()
+        self.y_pose_now = 0.0
 
     def save_config(self, pose_enable=True):
         """
-        保存配置到YAML文件
-
-        Args:
-            pose_enable: 是否启用位置
+        空操作：不再把机械臂位置写入 yaml。
+        保留此函数签名以兼容旧调用方，不再有任何副作用。
         """
-        self.config["pos_cfg"] = {
-            "pose_enable": pose_enable,
-            "pose_horiz": self.x_pose_now,
-            "pose_vert": self.y_pose_now,
-            "side": self.side
-        }
-        with open(self.yaml_path, 'w') as stream:
-            yaml.dump(self.config, stream, sort_keys=False)
+        pass
 
     def y_speed(self, velocity):
         """
@@ -900,7 +867,6 @@ class ArmController:
         """
         self.y_pose_start = self.y_pose_now
         self.x_pose_start = self.x_pose_now
-        self.save_config()
 
     def reset_position(self):
         """
@@ -932,7 +898,6 @@ class ArmController:
         # reset_y 内部:触发磁感 → y_pose_now=0 → move_y_position(POST_RESET_TARGET_M)
         # 不要再 self.y = 0!否则会把刚升到 -150mm 的臂又拉回 0。
         self.reset_y()
-        self.save_config()
 
     def switch_side(self, side):
         """
@@ -1083,9 +1048,6 @@ class ArmController:
             -speed_x, speed_x
         )
 
-        # 开始移动前, 位置信息定义, 如果中间中断此时位置信息无用
-        self.save_config(pose_enable=False)
-
         while True:
             # 到达结束标志结束
             if y_flag and x_flag:
@@ -1111,17 +1073,11 @@ class ArmController:
                         self.y_speed(0)
                     self.y_pose_start = self.motor_y.get_dis()
                     self.y_pose_now = 0
-                    self.save_config()
 
             if not x_flag:
                 if self.x_pid_moveto(x_pos):
                     self.x_speed(0)
                     x_flag = True
-
-        self.save_config()
-        # logger.debug(
-        #     f"机械臂移动完成，当前位置状态: x: {self.x_pose_now:.4f}, y: {self.y_pose_now:.4f}, hand: {self.side}。 "
-        # )
     def set_arm_pose(self,x=None,y=None,arm = None,hand = None):
         '''
         设置机械臂的位位姿
