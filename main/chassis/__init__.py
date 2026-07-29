@@ -5,7 +5,6 @@ from .state import LaneState
 from .controllers.base import OuterLoop, WheelSmoother
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
-from .controllers.pure_pursuit import PurePursuitOuterLoop
 from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
@@ -19,7 +18,6 @@ __all__ = [
     "WheelSmoother",
     "POuterLoop",
     "StanleyOuterLoop",
-    "PurePursuitOuterLoop",
     "CurvatureAdaptiveOuterLoop",
     "DoubleLoopRunner",
     "EmergencyWatchdog",
