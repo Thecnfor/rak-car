@@ -25,6 +25,15 @@ python main/quick_start.py        # (legacy) sanity check
 
 `car_start_2026.py` calls `init()` then each task in sequence — comment out the others to run a single task. This path constructs `MyCar()` directly in the calling process; inference backends are **auto-spawned** the first time `MyCar()` is constructed.
 
+### 1.5 Mission orchestrator (`run.py`)
+
+```bash
+python run.py                      # full 8-task mission via main.start.orchestrator
+python run.py --lane-hz 30         # slower outer loop for tuning
+```
+
+`run.py` is a thin shell that delegates to `main.start.orchestrator.Orchestrator`. The orchestrator runs a 50Hz lane-following outer loop in a background thread, accumulates wheel odometry in a second background thread, and the main thread advances through a fixed `DEFAULT_WAYPOINTS` list (8 tasks + 1 finish). Each waypoint waits on an IR + distance trigger (default AND), then pauses the outer loop, calls the task module, and resumes. The point list lives in `main/start/orchestrator.py` as a Python constant — there is **no yaml config**. Replace `main/start/whole_no_task.py` (the old nav-only placeholder) with this orchestrator as the canonical mission entry.
+
 ### 2. Runtime API service (production / remote / debug — preferred for daily work)
 
 The car is normally driven over HTTP from a separate machine (or the Jetson itself). The runtime service is a FastAPI app that owns the `MyCar()` singleton and exposes everything as POST endpoints:
