@@ -74,7 +74,7 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission
 | 子包 | 用途 | 自己的 doc |
 | --- | --- | --- |
 | `main/arm/` | 机械臂业务：ArmClient + ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/` 闭环、`tasks/` 流程、`examples/` 模板、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) |
-| `main/chassis/` | 底盘外环：ChassisClient + 50Hz 主循环；`controllers/` (P / Stanley / Pure Pursuit) + `loops/` (closed_loop, safety) + `tasks/` (follow_lane / track_target / back_to_line) + `examples/` (01–03 最小→完整模板) | [README.md](./main/chassis/README.md) |
+| `main/chassis/` | 底盘外环：ChassisClient + 50Hz 主循环；`controllers/` (P / Stanley / curvature_adaptive) + `loops/` (closed_loop, safety, telemetry) + `tasks/` (read_ir) + `cli/` (run_lane_follow, read_ir) + `config/` (lane_follow) | [README.md](./main/chassis/README.md) |
 | `main/misc/` | 单文件 mini 任务（射击、边走边打等），每个脚本可直接 `python3` 跑 | [README.md](./main/misc/README.md) |
 | `main/test/` | 离线硬件冒烟脚本（arm / storage / x / 循迹），**非正式测试**，绕过 runtime 直接打硬件；改动 main/ 任务前先在这里验证 | — |
 

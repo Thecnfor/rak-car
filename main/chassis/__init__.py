@@ -13,6 +13,7 @@ from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
 from .loops.telemetry import lane_trace
+from .tasks.monitor_ir import monitor_ir, IRAlertCallback, IRTickCallback
 from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, LaneFollowProfile
 
 
@@ -84,4 +85,7 @@ __all__ = [
     "LaneFollowProfile",
     "LANE_FOLLOW",
     "LANE_FOLLOW_SLOW",
+    "monitor_ir",
+    "IRAlertCallback",
+    "IRTickCallback",
 ]

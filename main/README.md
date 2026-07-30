@@ -5,31 +5,34 @@
 - 不关心底层源码细节，只通过 HTTP API 做真实业务开发
 - 业务代码只允许放在 `main/`，并且只能通过接口控制
 - 不允许直接依赖 `main/` 以外的任何 Python 源码
+- 完整流程（巡线、导航、机械臂编排等）统一写在 `main/start/` 下
 
 ## 文件分工
 
 - [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)
   - 统一配置入口，优先改这里或对应环境变量
-- [api_client.py](file:///home/jetson/workspace/rak-car/main/api_client.py)
+- [api\_client.py](file:///home/jetson/workspace/rak-car/main/api_client.py)
   - HTTP 同步调用客户端
-- [ws_client.py](file:///home/jetson/workspace/rak-car/main/ws_client.py)
+- [ws\_client.py](file:///home/jetson/workspace/rak-car/main/ws_client.py)
   - WebSocket 长连接客户端
-- [quick_start.py](file:///home/jetson/workspace/rak-car/main/quick_start.py)
+- [quick\_start.py](file:///home/jetson/workspace/rak-car/main/quick_start.py)
   - 开发自检脚本，先看配置，再测连通性
-- [car_start_api.py](file:///home/jetson/workspace/rak-car/main/car_start_api.py)
+- [car\_start\_api.py](file:///home/jetson/workspace/rak-car/main/car_start_api.py)
   - 类似官方 `car_start_2026.py` 的 API 编排模板
-- [BUSINESS_API_GUIDE.md](file:///home/jetson/workspace/rak-car/main/BUSINESS_API_GUIDE.md)
+- [BUSINESS\_API\_GUIDE.md](file:///home/jetson/workspace/rak-car/main/BUSINESS_API_GUIDE.md)
   - 业务层调用手册，只讲怎么控制和怎么闭环读取
-- [CAPABILITY_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)
+- [CAPABILITY\_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)
   - 能力总表
-- [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)
+- [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)
   - 主文档，所有接口总表速查
 - [chassis/README.md](file:///home/jetson/workspace/rak-car/main/chassis/README.md)
-  - 底盘组独享子包（自动寻线 client 端外环 + 底盘专用 API 子集），底盘请直接看这里
+  - 底盘相关能力统一入口：`main.chassis`，底盘请直接看这里
+- [tasks/](file:///home/jetson/workspace/rak-car/main/tasks/)
+  - 具体任务接口（自动播种等编排逻辑），任务请直接看这里
 - [arm/README.md](file:///home/jetson/workspace/rak-car/main/arm/README.md)
   - 机械臂组独享子包（runtime 启动自动定原点 + 漂移手 reset + 双轴同步 S 曲线 + 业务便捷 API），机械臂请直接看这里
   - [arm/QUICKSTART.md](file:///home/jetson/workspace/rak-car/main/arm/QUICKSTART.md) — 10 行起步
-  - [arm/ARM_API.md](file:///home/jetson/workspace/rak-car/main/arm/ARM_API.md) — 机械臂业务 API 速查
+  - [arm/ARM\_API.md](file:///home/jetson/workspace/rak-car/main/arm/ARM_API.md) — 机械臂业务 API 速查
 
 ## 配置
 
@@ -72,7 +75,7 @@ export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
 python3 /home/jetson/workspace/rak-car/main/quick_start.py
 ```
 
-先确认联通和状态，再直接看 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+先确认联通和状态，再直接看 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 
 ## Python 调用
 
@@ -106,7 +109,7 @@ client.call("car", "lane_dis_offset", timeout=80, speed=0.3, dis_hold=0.2)
 client.call("arm", "move_x_position", 0.20, timeout=20)
 ```
 
-接口总表和用途，直接看 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+接口总表和用途，直接看 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 
 ## 现成脚本
 
@@ -137,9 +140,9 @@ curl -sS -X POST http://127.0.0.1:5050/v1/execute \
 
 > **2026-07 改造**：`/v1/execute` 默认改成异步（不阻塞客户端），适合机械臂 / 任务等长动作。客户端要等结果用 `client.execute(..., sync=True)`，运行时内部已把 `arm` / `car` 拆成两个独立 worker，长动作不再挡短动作和实时端点。详见 [runtime/README.md §并发任务模型](../runtime/README.md#并发任务模型)。
 
-所有接口总表，见 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+所有接口总表，见 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
 
-如果你想先看“这台车现在到底会什么”，直接看 [CAPABILITY_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)。
+如果你想先看“这台车现在到底会什么”，直接看 [CAPABILITY\_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)。
 
 ## 你该怎么理解几类移动
 
@@ -152,8 +155,11 @@ curl -sS -X POST http://127.0.0.1:5050/v1/execute \
   - `lane_time`
   - `lane_dis`
   - `lane_dis_offset`
-- 视觉对齐：
-  - `move_to_detection_target`
+
+### 视觉对齐：
+
+### `move_to_detection_target`
+
 - 机械臂控制：
   - `move_x_position`
   - `move_y_position`
@@ -162,4 +168,4 @@ curl -sS -X POST http://127.0.0.1:5050/v1/execute \
   - `set_arm_pose`
   - `grasp`
 
-区别和参数细节都写在 [API_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+区别和参数细节都写在 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。

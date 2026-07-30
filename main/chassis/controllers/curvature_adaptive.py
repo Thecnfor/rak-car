@@ -67,11 +67,11 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self,
         # --- 速度曲线 ---
         v_max: float = 0.30,
-        v_min: float = 0.08,
+        v_min: float = 0.04,
         # --- 弧度偏差 → 速度映射 ---
-        kappa_full: float = 0.6,
+        kappa_full: float = 0.4,
         # --- 弧度变化率 → 速度映射（rad/s 单位） ---
-        dkappa_full: float = 1.5,
+        dkappa_full: float = 1.4,
         # --- P 项（基础横向 + 转向） ---
         # kp_theta 从 1.8 降到 1.2：弯道转向不再"打满舵"，给内环 PID 留修正余地
         # 2026-07-28: kp_y 从 0.5 提到 0.80 — 直线段 P 响应更快，不再等偏差放大才修。
