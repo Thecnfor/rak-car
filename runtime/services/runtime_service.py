@@ -335,32 +335,27 @@ class CarRuntimeService:
         car.STOP_PARAM = self.stop_after_action
         car.beep()
         time.sleep(1)
-        if reset_arm:
+        # init 阶段统一先做 arm.reset_position（大臂/手爪归位 + y 触底）。
+        # 2026-07-27 调整：x 撞墙归零只放在“真正创建新 car 实例”的 init 路径，
+        # 不再放在 ensure_initialized 的复用路径，避免执行任务时被自动补 reset_x。
+        try:
             car.arm.reset_position()
-        else:
-            # 2026-07-27 行为变更：默认 init 不再走 reset_all 撞 x。
-            #
-            # 旧行为 (commit fb24b1a 之前): reset_all 并行跑 reset_x 撞墙 + 大臂 +
-            # 手爪 + y 触底。reset_x 每次 init 都撞 → 物理磨损 + "调 set_hand_angle
-            # 时 x 自动复位" 的误判（业务脚本看到 init 阶段的 reset_x 撞墙以为是
-            # 自己触发的）。commit fb24b1a 已通过 try/except 兜底防止 PM2 死循环,
-            # 但 init 默认撞 x 仍然存在。
-            #
-            # 新行为: 默认 init 只跑 reset_position(手爪 UP + 大臂 MID + y 触底
-            # + 升到 POST_RESET_TARGET_M=-150mm),**不**撞 x。reset_arm=True/False
-            # 现在语义统一（都是 reset_position）。
-            #
-            # x 撞墙定原点现在是 opt-in,业务层需要时显式调 reset_x(direction="right")。
-            # 见 ARM_API.md §reset_x / main/arm/api.py:580。
-            #
-            # 若确实需要 init 时撞 x(例如首次部署时 x 编码器无 ref),可用环境变量
-            # RAK_CAR_RESET_X_ON_INIT=1 + RAK_CAR_RESET_X_COOLDOWN_S 防抖。
+            logger.info("init reset_position 完成")
+        except Exception as exc:
+            self.last_error = "arm reset_position 失败: {}".format(exc)
+            logger.warning("init 时 reset_position 失败: %s" % exc)
+        if settings.get_reset_x_on_init() and car.arm is not None:
             try:
-                car.arm.reset_position()
-                logger.info("init reset_position 完成 (no x 撞墙)")
+                init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.04"))
+                car.arm.reset_x(reset_velocity=init_x_v)
+                self._last_init_reset_x_at = time.time()
+                logger.warning(
+                    "[init reset_x create path]: ok (velocity={}m/s)".format(init_x_v)
+                )
             except Exception as exc:
-                self.last_error = "arm reset_position 失败: {}".format(exc)
-                logger.warning("init 时 reset_position 失败: %s" % exc)
+                logger.warning(
+                    "[init reset_x create path] failed: {}".format(exc)
+                )
         if reset_position:
             car.reset_position()
         self.car = car
@@ -418,49 +413,10 @@ class CarRuntimeService:
                         self.car.arm.reset_position()
                     if reset_position:
                         self.car.reset_position()
-                    # 2026-07-17: 复用 init 路径补 reset_x 撞墙(此前只有首次 init 撞)。
-                    # 默认走(settings.get_reset_x_on_init()=1),重建风暴期可设
-                    # RAK_CAR_RESET_X_ON_INIT=0 临时关掉。reset_x 内部 try/except
-                    # 已兜底撞墙失败(logger.warning),不会阻塞 init 整体。
-                    if settings.get_reset_x_on_init() and self.car.arm is not None:
-                        # 2026-07-17: 防抖 cooldown。controller 状态在 UNKNOWN
-                        # ↔ PROGRAM_READY 之间反复抖动时,auto_init loop 会反复
-                        # 调 ensure_initialized → 复用路径反复撞墙(物理磨损)。
-                        # 撞墙后 N 秒内(默认 60s)不再撞,等到 controller 真正
-                        # 稳定或下次 manual init 再补一次。
-                        cooldown_s = float(os.getenv(
-                            "RAK_CAR_RESET_X_COOLDOWN_S", "60"
-                        ))
-                        now = time.time()
-                        last_at = getattr(self, "_last_init_reset_x_at", 0.0)
-                        if now - last_at < cooldown_s:
-                            logger.warning(
-                                "[init reset_x reuse path] cooldown skip"
-                                " (last={:.1f}s ago, cooldown={:.0f}s)".format(
-                                    now - last_at, cooldown_s
-                                )
-                            )
-                        else:
-                            try:
-                                # 2026-07-17: 用 RAK_CAR_RESET_X_VELOCITY 配的
-                                # 速度(默认 0.04 m/s),不用 reset_x 默认的 0.02
-                                # —— 默认值在赛道场景偏慢,撞墙瞬间电机还没
-                                # 充分建立 stall 判定窗口就会被弹回,造成
-                                # "动了一下子就停" 的假撞墙。
-                                init_x_v = float(os.getenv(
-                                    "RAK_CAR_RESET_X_VELOCITY", "0.04"
-                                ))
-                                self.car.arm.reset_x(reset_velocity=init_x_v)
-                                self._last_init_reset_x_at = now
-                                logger.warning(
-                                    "[init reset_x reuse path]: ok"
-                                    " (velocity={}m/s)".format(init_x_v)
-                                )
-                            except Exception as exc:
-                                logger.warning(
-                                    "[init reset_x reuse path] failed: {}"
-                                    .format(exc)
-                                )
+                    # 2026-07-27：复用现有 car 的 ensure_initialized 路径不再补 reset_x。
+                    # 这样执行任务、健康检查、短暂重入时不会触发 x 自动撞墙归零。
+                    # x 自动复位只保留在 _create_car_locked() 的真正 init 路径；
+                    # 手动复位仍然显式调用 arm.reset_x / arm.reset_all。
                     self.controller_generation = session.get("generation")
                     # 复用现有 car 时也确保 lane_feed 跑着（幂等）
                     try:

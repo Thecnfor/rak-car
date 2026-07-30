@@ -8,6 +8,8 @@
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
+from .state import LaneState
+
 try:
     from main.api_client import RuntimeApiClient
     from main.ws_client import RuntimeWsClient
@@ -57,6 +59,21 @@ class ChassisClient:
     def get_lane_state(self) -> dict:
         return self.http.get(f"{self.http.api_prefix}/vision/lane/state")
 
+    def read_lane(self) -> LaneState:
+        """外环每帧调这个：ws 通就走 ws，不通回退 http，异常返回空 LaneState。
+
+        空 LaneState 的 has_error 为 False，控制律会自然输出零速，
+        所以调用方不需要自己 try/except。
+        """
+        try:
+            if self.ws_ready:
+                payload = self.ws.realtime_lane_state() or {}
+            else:
+                payload = self.get_lane_state() or {}
+        except Exception:
+            return LaneState()
+        return LaneState.from_lane_state_payload(payload)
+
     def get_odometry(self, timeout: float = 5.0) -> Tuple[float, float, float]:
         pos = self.http.call("car", "get_odometry", timeout=timeout)
         # get_odometry 返回 numpy array，走 normalize 后是 list
@@ -94,3 +111,11 @@ class ChassisClient:
             return True
         except Exception:
             return False
+
+    def close(self) -> None:
+        """退出前收 ws 长连接；失败无所谓（进程要退了）。"""
+        try:
+            self.ws.close()
+        except Exception:
+            pass
+        self.ws_ready = False

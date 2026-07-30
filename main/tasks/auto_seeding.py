@@ -182,11 +182,16 @@ def _grasp(client: RuntimeApiClient, on: bool, timeout: float = 10.0) -> None:
 
 
 # Bypass ArmRunner.move_x (no v_max_mms). Use ArmClient.move_x directly with explicit speed.
-def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 60.0, out_time: float = 15.0, timeout: float = 30.0) -> None:
+def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0, out_time: float = 15.0, timeout: float = 30.0) -> None:
+    """move_x_position PID 闭环 + v_max_mms 限速, 不 jerk cam2.
+
+    v_max_mms 收紧 PID output_limits → 避免第一帧全速 jerk.
+    车端编码器反馈 → 准确到位.
+    """
     job = client.execute(
         "arm", "move_x_position",
         args=[x_mm / 1000.0],
-        kwargs={"v_max_mms": v_max_mms, "out_time": out_time, "timeout": timeout},
+        kwargs={"v_max_mms": v_max_mms, "out_time": out_time},
         sync=True, timeout=timeout + 5,
     )
     if job.get("status") != "succeeded" or job.get("error"):
@@ -311,9 +316,11 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     spacing = cfg["spacing_along_row_m"]
     init_y_mm = cfg.get("init_y_mm", -100)
 
-    # ===== -1. ???????? =====
+    # ===== -1. X 编码器校准 (撞右墙定原点) =====
+    logger.info("init: calibrate X encoder (reset_x)")
+    arm_client.reset_x(direction="right", reset_velocity_mms=20.0, timeout=30.0)
     _wait_infer_ready(client, timeout_s=30.0)
-    # ===== 0. ????? =====
+    # ===== 0. Y 直接到 -100 =====
     logger.info("init: lift arm to Y=%s mm", init_y_mm)
     _arm_move_y(client, init_y_mm)
 
@@ -334,7 +341,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # ===== 0. ????? S1 ???? =====
             #   y ?? -100, arm ?? -150, x ?? -60
             #   ????? return ??? y_protect ??, ????????
-            logger.info("reset to S1 detection pose: y=-100 arm=-150 x=-60")
+            logger.info("reset to detection pose: y=%s arm=%s x=%s", init_y_mm, pick["arm_angle_deg"], pick["x_mm"])
             _arm_move_y(client, init_y_mm)
             _set_arm_angle(client, pick["arm_angle_deg"])
             runner.client.set_hand_angle(pick["hand_angle_deg"], speed=80, timeout=10.0)
