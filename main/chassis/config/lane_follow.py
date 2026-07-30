@@ -27,10 +27,8 @@ class LaneFollowProfile:
     watchdog_ms: Optional[float] = 500.0
     lost_line_ms: Optional[float] = None  # 笔直居中路段误差本来就会齐 0，默认不按丢线处理
 
-    # --- 速度曲线 ---
+    # --- 速度曲线（v_min / kappa_full 由 curvature_adaptive.py 默认值接管）---
     v_max: float = 0.24
-    v_min: float = 0.064
-    kappa_full: float = 0.6
     dkappa_full: float = 1.5
 
     # --- P 项 ---
@@ -42,10 +40,9 @@ class LaneFollowProfile:
     ey_int_cap: float = 0.10
     ey_int_decay: float = 0.80
 
-    # --- 弧度变化驱动的 omega 增益 + 软上限 ---
+    # --- 弧度变化驱动的 omega 增益（omega_cap 由 curvature_adaptive.py 默认值接管）---
     omega_gain: float = 0.35
     k_curvature: float = 0.25
-    omega_cap: float = 1.8
 
     # --- 恢复门控 ---
     ey_release: float = 0.02
@@ -60,8 +57,7 @@ class LaneFollowProfile:
     # --- 麦轮几何 ---
     r_eff: float = 0.30
 
-    # --- 下发软化（饱和 + slew rate）---
-    wheel_max_abs: float = 0.55
+    # --- 下发软化（饱和 + slew rate）（max_abs 由 base.py 默认值接管）---
     wheel_max_accel: float = 0.4
     wheel_max_decel: float = 0.6
 
@@ -70,8 +66,6 @@ class LaneFollowProfile:
 
         return CurvatureAdaptiveOuterLoop(
             v_max=self.v_max,
-            v_min=self.v_min,
-            kappa_full=self.kappa_full,
             dkappa_full=self.dkappa_full,
             kp_y=self.kp_y,
             kp_theta=self.kp_theta,
@@ -80,7 +74,6 @@ class LaneFollowProfile:
             ey_int_decay=self.ey_int_decay,
             omega_gain=self.omega_gain,
             k_curvature=self.k_curvature,
-            omega_cap=self.omega_cap,
             ey_release=self.ey_release,
             ea_release=self.ea_release,
             hold_ms=self.hold_ms,
@@ -94,7 +87,6 @@ class LaneFollowProfile:
         from ..controllers.base import WheelSmoother
 
         return WheelSmoother(
-            max_abs=self.wheel_max_abs,
             max_accel=self.wheel_max_accel,
             max_decel=self.wheel_max_decel,
         )
@@ -108,4 +100,4 @@ class LaneFollowProfile:
 LANE_FOLLOW = LaneFollowProfile()
 
 # dry-run 看数用：不下发也降速，避免误按到实车时冲出去
-LANE_FOLLOW_SLOW = LANE_FOLLOW.tuned(v_max=0.18, v_min=0.06)
+LANE_FOLLOW_SLOW = LANE_FOLLOW.tuned(v_max=0.18)

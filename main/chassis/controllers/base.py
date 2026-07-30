@@ -47,7 +47,7 @@ class WheelSmoother:
 
     def __init__(
         self,
-        max_abs: float = 0.55,
+        max_abs: float = 0.70,
         max_accel: float = 0.4,
         max_decel: float = 0.6,
     ) -> None:

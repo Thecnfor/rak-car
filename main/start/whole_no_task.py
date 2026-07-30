@@ -124,16 +124,16 @@ def _lane_loop(
 
 
 def run(
-    ir_threshold_m: float = 0.45,
+    ir_threshold_m: float = 0.5,
     ir_interval_s: float = 0.1,
     lane_hz: float = 50.0,
-    pause_duration_s: float = 1.0,
+    pause_duration_s: float = 5.0,
 ) -> None:
     """主入口：巡线 + IR 检测 → 暂停 → 恢复（不执行任务）。
 
     Args:
         ir_threshold_m: 右侧 IR 触发阈值（m）。
-        ir_interval_s: IR 采样间隔（s），默认 0.1s（10Hz）。
+        ir_interval_s: IR 采样间隔（s）。
         lane_hz: 巡线外环频率，默认 50Hz。
         pause_duration_s: 触发后暂停时长（s），默认 1.0s。
     """
@@ -179,53 +179,71 @@ def run(
     last_left: float | None = None
     last_right: float | None = None
     err_msg = ""
+    state = "LANE"  # 状态机：LANE → 巡线中检测 IR，DONE → 已触发不再检测
 
     try:
         while True:
             t0 = time.monotonic()
 
-            # ---- 3. 读左右 IR ----
-            try:
-                ir_data = read_ir(api, timeout=2.0)
-                left = float(ir_data.get("left", 0.0))
-                right = float(ir_data.get("right", 0.0))
-                last_left = left
-                last_right = right
-                err_msg = ""
-            except Exception as e:
-                left = last_left
-                right = last_right
-                err_msg = str(e)
-
-            # ---- 4. TUI 刷新 ----
-            _tui_print("巡线中", ir_threshold_m, left, right, _dis_buf[0], err_msg)
-
-            # ---- 5. 检测触发 ----
-            if right is not None and right < ir_threshold_m:
-                logger.info(
-                    "IR triggered: right=%.3f m < %.3f m → pausing",
-                    right,
-                    ir_threshold_m,
-                )
-
-                # TUI 刷新为"暂停中"
-                _tui_print("暂停中", ir_threshold_m, left, right, _dis_buf[0], err_msg)
-
-                # ---- 6. 暂停巡线 ----
-                running.clear()
-                time.sleep(5)  # 等巡线线程停到 wait()
+            if state == "LANE":
+                # ---- 3. 读左右 IR ----
                 try:
-                    api.stop_wheel_speeds()
-                except Exception:
-                    pass
-                logger.info("lane paused (%.1f s)", pause_duration_s)
+                    ir_data = read_ir(api, timeout=2.0)
+                    left = float(ir_data.get("left", 0.0))
+                    right = float(ir_data.get("right", 0.0))
+                    last_left = left
+                    last_right = right
+                    err_msg = ""
+                except Exception as e:
+                    left = last_left
+                    right = last_right
+                    err_msg = str(e)
 
-                # ---- 7. 等待后恢复 ----
-                time.sleep(pause_duration_s)
+                # ---- 4. TUI 刷新 ----
+                _tui_print("巡线中", ir_threshold_m, left, right, _dis_buf[0], err_msg)
 
-                logger.info("resuming lane")
-                running.set()
-                err_msg = ""
+                # ---- 5. 检测触发 ----
+                if right is not None and right < ir_threshold_m:
+                    logger.info(
+                        "IR triggered: right=%.3f m < %.3f m → pausing",
+                        right,
+                        ir_threshold_m,
+                    )
+
+                    # TUI 刷新为"暂停中"
+                    _tui_print("暂停中", ir_threshold_m, left, right, _dis_buf[0], err_msg)
+
+                    # ---- 6. 暂停巡线 ----
+                    running.clear()
+                    # 立即发零速，否则车端下位机会保持最后一帧轮速继续跑
+                    try:
+                        api.stop_wheel_speeds()
+                    except Exception:
+                        pass
+                    time.sleep(0.1)  # 等一帧让下位机响应零速
+                    logger.info("lane paused (%.1f s)", pause_duration_s)
+
+                    # ---- 7. 等待后恢复 ----
+                    time.sleep(pause_duration_s)
+
+                    logger.info("resuming lane → DONE (不再检测 IR)")
+                    running.set()
+                    state = "DONE"
+                    err_msg = ""
+            else:
+                # ---- DONE 状态：保持巡线，继续读 IR 但不触发 ----
+                try:
+                    ir_data = read_ir(api, timeout=2.0)
+                    left = float(ir_data.get("left", 0.0))
+                    right = float(ir_data.get("right", 0.0))
+                    last_left = left
+                    last_right = right
+                    err_msg = ""
+                except Exception as e:
+                    left = last_left
+                    right = last_right
+                    err_msg = str(e)
+                _tui_print("已完成任务一", ir_threshold_m, left, right, _dis_buf[0], err_msg)
 
             # 光标回到 TUI 第一行覆盖刷新
             print(f"\033[{_TUI_LINES}A", end="", flush=True)
