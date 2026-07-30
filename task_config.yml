@@ -91,8 +91,8 @@ task_cfg:
 
     source_position_order: [1, 2]
 
-    tower_spacing_m: 0.60
-    group_forward_m: 0.30
+    tower_spacing_m: 0.65
+    group_forward_m: 0.32
 
     init_pose:
       y_mm: -150
@@ -106,18 +106,18 @@ task_cfg:
       hand_angle_deg: -60
       y_mm: -20
 
-    first_cube_x_mm: -140
-    second_cube_x_mm: -260
+    first_cube_x_mm: -155
+    second_cube_x_mm: -265
 
     pick_pose:
       y_transition_mm: -120
       y_descend_mm: -75
-      y_lift_mm: -105
-      arm_angle_deg: 90
+      y_lift_mm: -150
+      arm_angle_deg: 95
       hand_angle_deg: 0
 
     carry_pose:
-      x_mm: -120
+      x_mm: -105
       arm_angle_deg: -95
       hand_angle_deg: -90
 
