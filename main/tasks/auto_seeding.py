@@ -181,29 +181,21 @@ def _grasp(client: RuntimeApiClient, on: bool, timeout: float = 10.0) -> None:
         raise RuntimeError(f"grasp({on}) failed: status={job.get('status')} error={job.get('error')}")
 
 
-def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 60.0, timeout: float = 30.0) -> None:
-    """X-axis move via move_x_position (PID position control).
+# Bypass ArmRunner.move_x (no v_max_mms). Use ArmClient.move_x directly with explicit speed.
+def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0, out_time: float = 15.0, timeout: float = 30.0) -> None:
+    """move_x_position PID 闭环 + v_max_mms 限速, 不 jerk cam2.
 
-    Uses PID closed-loop to guarantee the target is reached. The v_max_mms
-    parameter limits speed to avoid current spikes that can brown out the
-    USB camera. Default 60 mm/s is a safe balance between speed and stability.
+    v_max_mms 收紧 PID output_limits → 避免第一帧全速 jerk.
+    车端编码器反馈 → 准确到位.
     """
     job = client.execute(
         "arm", "move_x_position",
         args=[x_mm / 1000.0],
-        kwargs={"v_max_mms": v_max_mms, "out_time": timeout},
+        kwargs={"v_max_mms": v_max_mms, "out_time": out_time},
         sync=True, timeout=timeout + 5,
     )
     if job.get("status") != "succeeded" or job.get("error"):
         raise RuntimeError(f"arm move_x({x_mm}) failed: status={job.get('status')} error={job.get('error')}")
-    # verify
-    try:
-        resp = client.get("/v1/realtime/arm/state", timeout=3)
-        final_x = (resp.get("arm_state") or {}).get("x_mm", None)
-        if final_x is not None:
-            logger.info("_arm_move_x(%.0f): final x=%.0f mm", x_mm, final_x)
-    except Exception:
-        pass
 
 
 def _arm_move_y(client: RuntimeApiClient, y_mm: float, timeout: float = 25.0) -> None:
@@ -275,7 +267,7 @@ def _transport_to_slot(
     source_to_pos = {1: 0.0, 2: +spacing, 3: +2 * spacing}
     current = source_to_pos[source_idx]
     # T_slot ????
-    slot_to_pos = {1: 0.0, 2: +spacing, 3: +2 * spacing}
+    slot_to_pos = {1: -spacing, 2: 0.0, 3: +spacing}
     target = slot_to_pos[slot]
     move_m = target - current
     if abs(move_m) > 1e-3:
@@ -324,8 +316,13 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     spacing = cfg["spacing_along_row_m"]
     init_y_mm = cfg.get("init_y_mm", -100)
 
-    # ===== -1. wait for inference backend =====
+    # ===== -1. X 编码器校准 (撞右墙定原点) =====
+    logger.info("init: calibrate X encoder (reset_x)")
+    arm_client.reset_x(direction="right", reset_velocity_mms=20.0, timeout=30.0)
     _wait_infer_ready(client, timeout_s=30.0)
+    # ===== 0. Y 直接到 -100 =====
+    logger.info("init: lift arm to Y=%s mm", init_y_mm)
+    _arm_move_y(client, init_y_mm)
 
     pick = cfg["arm_pick_pose"]
     carry = cfg["arm_carry_pose"]
@@ -333,75 +330,70 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     ret = cfg["arm_return_S1_pose"]
     valid_labels = list(cfg["target_slot_map"].keys())
 
-    # ===== 0. init: Y -150→-100, then set full pick pose =====
-    # Runtime reset_position already left Y at -150. Go directly to detection
-    # height (-100) in one step — no reset_y round-trip.
-    logger.info("init: Y -150 → %s mm", init_y_mm)
-    _arm_move_y(client, init_y_mm)
-
-    # Set pick pose at detection height: arm=-90°, X=-100, hand=0°.
-    # Gentle speeds (arm=40, X=40mm/s) keep serial bus free and avoid USB
-    # current spikes that crash cam2.
-    logger.info("init: pick pose (arm=%.0f°, x=%.0f mm, hand=%.0f°)",
-                pick["arm_angle_deg"], pick["x_mm"], pick["hand_angle_deg"])
-    _set_arm_angle(client, pick["arm_angle_deg"], speed=40)
-    _arm_move_x(client, pick["x_mm"], v_max_mms=40.0)
+    # 0.1 ? S1 ????: X=-60, ??=-150, ??=-10, Y ??? -100
+    _set_arm_angle(client, pick["arm_angle_deg"])
     runner.client.set_hand_angle(pick["hand_angle_deg"], speed=80, timeout=10.0)
-    time.sleep(0.5)  # stabilization for cam2 after all movements
+    _arm_move_x(client, pick["x_mm"], v_max_mms=60.0)
 
     try:
         for i, source_idx in enumerate(cfg["source_position_order"]):
-            logger.info("=== S%d (iteration %d) ===", source_idx, i + 1)
+            logger.info("=== processing S%d (iteration %d) ===", source_idx, i + 1)
+            # ===== 0. ????? S1 ???? =====
+            #   y ?? -100, arm ?? -150, x ?? -60
+            #   ????? return ??? y_protect ??, ????????
+            logger.info("reset to detection pose: y=%s arm=%s x=%s", init_y_mm, pick["arm_angle_deg"], pick["x_mm"])
+            _arm_move_y(client, init_y_mm)
+            _set_arm_angle(client, pick["arm_angle_deg"])
+            runner.client.set_hand_angle(pick["hand_angle_deg"], speed=80, timeout=10.0)
+            _arm_move_x(client, pick["x_mm"], v_max_mms=60.0)
 
-            # ===== 1. detect via cam2 =====
-            # Y is already at detection height (-100): from init on first
-            # iteration, or from the place→lift→return sequence on subsequent
-            # iterations. Arm/hand/X are at pick pose. No extra Y move needed.
+            # ===== 1. ????(? -100 mm ???) =====
             label = _scan_labels(client, valid_labels)
             if label is None:
-                raise RuntimeError(f"cam2 at S{source_idx} detected none of {valid_labels}")
+                raise RuntimeError(f"cam2 ? S{source_idx} ???? {valid_labels}")
             slot = cfg["target_slot_map"][label]
             logger.info("S%d detect %s -> T%d", source_idx, label, slot)
 
-            # ===== 2. pick: Y -100→-30, grasp, Y -30→-150 =====
+            # ===== 2. ?: Y ? -100 ??? -25, grasp on, 0.5s, ?? -150 =====
             _arm_move_y(client, pick["y_mm"])
             _grasp(client, True)
             time.sleep(cfg["vacuum_settle_s"])
             _arm_move_y(client, carry["y_mm"])
 
-            # ===== 3. transport: chassis(source→slot) + X→-270 + arm→+90 =====
+            # ===== 3. ??? T_slot =====
             _transport_to_slot(runner, client, cfg, slot, source_idx)
 
-            # ===== 4. place: Y -150→-30, release, Y -30→-100 =====
-            # Lift to -100 (not -150) after placing — this is the detection
-            # height, so the next iteration can detect immediately.
+            # ===== 4. ?: Y ? -150 ??? -25, grasp off, ?? -150 =====
             _arm_move_y(client, place["y_mm"])
             _grasp(client, False)
-            _arm_move_y(client, ret["y_mm"])
+            _arm_move_y(client, carry["y_mm"])
 
-            # ===== 5. return to pick pose: arm +90→-90, X -270→-100 =====
-            # Y is already at -100 (detection height) from step 4.
-            # Arm swings first, then X slides back.
+            # ===== 5. ? S1 ????(??????) =====
+            # ??: ? X ?? -60 (arm ?? 0?), ?? arm -150
+            # ??: arm 0? ?? -150 ?, ??????????
+            #   ???? arm, ????? -260; ?? X ????
+            #   ?? X ??, ?? arm, ?????? S1 ???
+            _arm_move_x(client, ret["x_mm"], v_max_mms=60.0)
             _set_arm_angle(client, ret["arm_angle_deg"])
-            _arm_move_x(client, ret["x_mm"])
-            logger.info("pick pose restored (arm=%.0f°, x=%.0f mm, y=%.0f mm)",
-                        ret["arm_angle_deg"], ret["x_mm"], ret["y_mm"])
-
-            # ===== 6. chassis: move to next source position =====
-            # Coordinate frame: S1/T1=0.0, S2/T2=+spacing, S3/T3=+2*spacing.
-            # Source and slot positions are in the same frame; no longitudinal
-            # compensation needed.
-            source_to_chassis = {1: 0.0, 2: +spacing, 3: +2 * spacing}
-            slot_to_chassis = {1: 0.0, 2: +spacing, 3: +2 * spacing}
+            logger.info("S1 pose ready (x=-60, arm=-150), proceeding to chassis offset")
+            # ??(?? S1 ??,?? m):
+            #   T1 = -spacing, T2 = 0, T3 = +spacing
+            #   S1 = 0, S2 = +spacing, S3 = +2*spacing
+            slot_to_chassis = {1: -spacing, 2: 0.0, 3: +spacing}
+            current_chassis = slot_to_chassis[slot]
             if i + 1 < len(cfg["source_position_order"]):
                 next_source_idx = cfg["source_position_order"][i + 1]
-                next_source_pos = source_to_chassis[next_source_idx]
-                current_slot_pos = slot_to_chassis[slot]
-                next_offset_m = next_source_pos - current_slot_pos
+                source_to_chassis = {1: 0.0, 2: +spacing, 3: +2 * spacing}
+                next_chassis = source_to_chassis[next_source_idx]
+                next_offset_m = next_chassis - current_chassis
                 if abs(next_offset_m) > 1e-3:
-                    logger.info("chassis: from T%d (%.2f m) to S%d (%.2f m), dx=%.3f m",
-                                slot, current_slot_pos, next_source_idx, next_source_pos, next_offset_m)
+                    logger.info("chassis: from slot=%d (pos=%.2f) to next source S%d (pos=%.2f), dx=%.3f m", slot, current_chassis, next_source_idx, next_chassis, next_offset_m)
                     _chassis_move_for(client, dx_m=next_offset_m, timeout=cfg["chassis_move_timeout_s"])
+            else:
+                # ????,??? T1/T2/T3 ???;???? T1/T3,??? S1
+                if abs(current_chassis) > 1e-3:
+                    logger.info("chassis: end of task, return to S1 from pos=%.2f", current_chassis)
+                    _chassis_move_for(client, dx_m=-current_chassis, timeout=cfg["chassis_move_timeout_s"])
             completed.append(label)
     except Exception as exc:
         logger.exception("auto_seeding failed: %s", exc)

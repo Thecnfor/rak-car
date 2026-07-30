@@ -1,26 +1,28 @@
-﻿# 任务一配置文件
-# 坐标系:
-#   X: 0=右，负=左，范围 [0, 340]
-#   Y: 0=底，负=上，范围 [-soft_y_max, 0]
-#   大臂: 90 deg = MID(init)，-90 deg = 抓取侧(原 -180)
-#   末端: -90 deg = UP(init)，0 deg = DOWN，范围 [-90, 0]
-#   车: +x_m = 右，+y_m = 前
+# ?????? -- ????????????
+# ?????????? + config_car.yml ?????,???????
 #
-# 放置规则 (新版):
-#   - S1/S2/S3 = 入口/前进15cm/再前进15cm
-#   - 标签 -> 目标槽位: cylinder_3 -> T1, cylinder_2 -> T2, cylinder_1 -> T3
-#   - 大臂能转到 -90, S/T 一一对应, 不需要纵向补偿
-#   - T1/T2/T3 全部由底盘横向平移决定
-#   - 安全高度 Y=-150mm, X=-60mm -> -270mm 速度 60mm/s
-#   - 下放高度 Y=-25mm, 抓取末端=0, 放置末端=-10
+# ??????:
+#   ??? x_mm: ?????=0(??),??=??,?????? [0, 340]
+#   ??? y_mm: ??=0,y<0 ??,y>0 ??,?????? [-soft_y_max, 0]
+#   ????:   0 deg = MID(init),-150 deg = ??,???? [0, -150]
+#   ????:   -90 deg = UP(init),0 deg = DOWN,???? [-90, 0]
+#   ??:       ??????? = +x_m,?? = +y_m
+#
+# ???????:
+#   - ?????????????(S1=????, S2=15cm ?, S3=? 15cm)
+#   - ?? label ??????????(cylinder_3->T1, cylinder_2->T2, cylinder_1->T3)
+#   - T2 = ?? 0 deg + X=-270mm; T1 = ???? 15cm; T3 = ???? 15cm
+#   - ??? Y=-150mm,?? X=-60mm->-270mm ?? 60mm/s
+#   - ??? Y=-40mm,???? -10 deg (??)
 
 task_cfg:
 
   auto_seeding:
     _doc: |
-      任务一: 现场(右侧)的 3 个圆柱识别标签后
-              拆到左侧对应目标槽位
-              共有 4 轴: 横向 X / 竖向 Y / 大臂 / 末端, 无 Z 轴
+      ???: ??(????)??? 3 ????????????,
+              ?? label ?????????????
+              ??? 4 ??: ?? X / ?? Y / ???? / ????,? Z ??,
+              ????????,???????
 
     source_position_order: [1, 2, 3]
 
@@ -66,12 +68,12 @@ task_cfg:
     arm_return_S1_pose:
       x_mm: -100
       arm_angle_deg: -90
-      y_mm: -100           # 放置后抬到检测高度，直接可下一轮检测
+      y_mm: -100           # 放置后抬到检测高度
       hand_angle_deg: -10
 
     init_y_mm: -100        # 初始化抬升高度(进入任务时)
 
-    v_max_arm_lateral_mms: 60
+    v_max_arm_lateral_mms: 80
 
     vacuum_settle_s: 0.5
     no_pressure_feedback: true
@@ -89,8 +91,8 @@ task_cfg:
 
     source_position_order: [1, 2]
 
-    tower_spacing_m: 0.60
-    group_forward_m: 0.30
+    tower_spacing_m: 0.65
+    group_forward_m: 0.32
 
     init_pose:
       y_mm: -150
@@ -100,25 +102,23 @@ task_cfg:
 
     detection_pose:
       x_mm: -240
-      arm_angle_deg: -90
+      arm_angle_deg: -95
       hand_angle_deg: -60
       y_mm: -20
 
-    first_cube_x_mm: -240
-    second_cube_x_mm: -270
+    first_cube_x_mm: -155
+    second_cube_x_mm: -265
 
     pick_pose:
       y_transition_mm: -120
-      y_descend_mm: -90
+      y_descend_mm: -75
       y_lift_mm: -150
-      arm_angle_deg: -90
+      arm_angle_deg: 95
       hand_angle_deg: 0
-      pre_pick_arm_angle_deg: 90
-      pre_pick_hand_angle_deg: 0
 
     carry_pose:
-      x_mm: -50
-      arm_angle_deg: -90
+      x_mm: -105
+      arm_angle_deg: -95
       hand_angle_deg: -90
 
     v_max_arm_x_mms: 80
