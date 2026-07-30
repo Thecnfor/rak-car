@@ -3,7 +3,7 @@
 import os
 from dataclasses import dataclass
 
-DEFAULT_SERVER_ORIGIN = "http://192.168.3.6"
+DEFAULT_SERVER_ORIGIN = "http://192.168.5.230"
 DEFAULT_API_PORT = 5050
 DEFAULT_STREAM_PORT = DEFAULT_API_PORT
 DEFAULT_STREAM_PATH = "/stream/"

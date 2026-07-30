@@ -9,11 +9,13 @@ from .state import LaneState
 from .controllers.base import OuterLoop, WheelSmoother
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
-from .controllers.pure_pursuit import PurePursuitOuterLoop
 from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
 from .loops.telemetry import lane_trace
+from .tasks.monitor_ir import monitor_ir, IRAlertCallback, IRTickCallback
+from .tasks.read_dis import read_dis, DisTickCallback
+from .tasks.read_ir import read_ir
 from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, LaneFollowProfile
 
 
@@ -51,6 +53,13 @@ def subscribe_lane_state(
         on_tick    - 覆盖 with_trace 的自定义回调
     """
     api = ChassisClient.connect()
+    effective_hz = profile.hz if hz is None else hz
+
+    try:
+        api.start_lane_feed(hz=effective_hz)
+    except Exception:
+        pass
+
     outer = profile.build_outer()
     smoother = profile.build_smoother()
 
@@ -60,14 +69,20 @@ def subscribe_lane_state(
     runner = DoubleLoopRunner(
         api=api,
         outer=outer,
-        hz=profile.hz if hz is None else hz,
+        hz=effective_hz,
         watchdog_ms=profile.watchdog_ms,
         lost_line_ms=profile.lost_line_ms,
         dry_run=dry_run,
         smoother=smoother,
         on_tick=on_tick,
     )
-    runner.run(max_seconds=profile.max_seconds if max_seconds is None else max_seconds)
+    try:
+        runner.run(max_seconds=profile.max_seconds if max_seconds is None else max_seconds)
+    finally:
+        try:
+            api.stop_lane_feed()
+        except Exception:
+            pass
 
 __all__ = [
     "subscribe_lane_state",
@@ -77,7 +92,6 @@ __all__ = [
     "WheelSmoother",
     "POuterLoop",
     "StanleyOuterLoop",
-    "PurePursuitOuterLoop",
     "CurvatureAdaptiveOuterLoop",
     "DoubleLoopRunner",
     "EmergencyWatchdog",
@@ -86,4 +100,10 @@ __all__ = [
     "LaneFollowProfile",
     "LANE_FOLLOW",
     "LANE_FOLLOW_SLOW",
+    "monitor_ir",
+    "IRAlertCallback",
+    "IRTickCallback",
+    "read_dis",
+    "DisTickCallback",
+    "read_ir",
 ]
