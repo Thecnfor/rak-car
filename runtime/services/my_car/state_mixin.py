@@ -6,7 +6,6 @@
 close 收尾。依赖 MyCar 在 __init__ 里设置 `self.arm` / `self.streamer` /
 `self._estop_event` 等属性。
 """
-import threading
 import time
 
 from smartcar import logger

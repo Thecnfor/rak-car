@@ -16,8 +16,6 @@ except ModuleNotFoundError as exc:  # pragma: no cover
         "/home/jetson/workspace/rak-car/runtime/requirements.txt"
     ) from exc
 
-from runtime.core import settings
-
 from .routers import jobs, keypress, legacy, realtime, stream, system, vision, ws
 from .routers._helpers import get_public_links
 

@@ -10,18 +10,11 @@ import difflib
 import re
 import threading
 import time
-from typing import List, Union
+from typing import List
 
 import cv2
 
-from smartcar import logger
-from smartcar.paddlebaidu.ernie_bot import (
-    ActionPrompt,
-    ErnieBotWrap,
-    HumAttrPrompt,
-    ImagePrompt,
-    OrderPrompt,
-)
+from smartcar.paddlebaidu.ernie_bot import ErnieBotWrap, OrderPrompt
 from smartcar.paddlebaidu.infer_cs import ClintInterface
 from smartcar.whalesbot.tools import CountRecord
 

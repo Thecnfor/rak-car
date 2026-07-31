@@ -11,12 +11,9 @@ from smartcar.whalesbot.vehicle import (
     BluetoothPad,
     Infrared,
     LedLight,
-    ScreenShow,
     ServoPwm,
 )
 from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
-
-from smartcar import logger
 
 
 class SensorsMixin:

@@ -15,10 +15,8 @@
 零改动。
 """
 import logging
-import os
 import queue
 import threading
-import time
 
 from runtime.core import settings
 from runtime.core.actions import ARM_ACTIONS, CAR_ACTIONS

@@ -138,7 +138,6 @@ class LoopsMixin:
             elif feed_name == "odom" and hasattr(car, "restart_odom_feed"):
                 car.restart_odom_feed(hz=float(hz))
             # 95% 高水位降 encoder quality/scale
-            pressure_mb = settings.get_car_memory_pressure_mb()
             hard_mb = settings.get_car_rss_limit_mb()
             rss_mb = self._read_self_rss_mb()
             if (
