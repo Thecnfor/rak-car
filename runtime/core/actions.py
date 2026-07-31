@@ -63,6 +63,11 @@ ARM_ACTIONS = {
     "composite_pick": lambda arm_obj, *args, **kwargs: arm_obj.composite_pick(**kwargs),
     "composite_release": lambda arm_obj, *args, **kwargs: arm_obj.composite_release(**kwargs),
     "composite_go_home": lambda arm_obj, *args, **kwargs: arm_obj.composite_go_home(**kwargs),
+    # 2026-07-31: 四电机通用并行驱动器 (任意 1-4 路可省，None 跳过)。
+    # reset_position 已经内部实现 arm+hand 并行 + y 串行收尾（init 入口），
+    # 但业务层在运行时也想并发多个电机就用这个。
+    "composite_run": lambda arm_obj, *args, **kwargs: arm_obj.composite_run(**kwargs),
+    "composite_run_reset": lambda arm_obj, *args, **kwargs: arm_obj.composite_run_reset(**kwargs),
     "set_arm_pose": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_pose(*args, **kwargs),
     "set_hand_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_hand_angle(*args, **kwargs),
     "set_arm_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_angle(*args, **kwargs),
