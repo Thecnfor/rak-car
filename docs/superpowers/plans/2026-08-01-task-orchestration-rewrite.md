@@ -313,7 +313,7 @@ from main.task._config import load_waypoints  # noqa: E402
 def test_load_waypoints_returns_list_of_dicts():
     wp = load_waypoints()
     assert isinstance(wp, list)
-    assert len(wp) >= 9  # 8 tasks + 1 finish
+    assert len(wp) >= 8  # 7 tasks + 1 finish
     for w in wp:
         assert isinstance(w, dict)
         assert "name" in w
