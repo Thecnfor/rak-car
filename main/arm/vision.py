@@ -5,12 +5,16 @@ Layer 2 的核心：Detection / TargetSelector / ArmVisionClient。
 """
 from __future__ import annotations
 
+import logging
 import time
+import dataclasses
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .labels import Label, LabelInfo, LABELS, LABEL_GROUPS  # noqa: F401
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -174,3 +178,202 @@ class TargetSelector:
             return max(candidates, key=lambda d: d.bbox_norm.y_center)
         # LOCK_FIRST_SEEN 由 find_target 循环内处理（首帧锁定 track_id）
         return candidates[0]
+
+
+# ===== 视觉伺服循环 =====
+
+
+@dataclass(frozen=True)
+class ServoTrace:
+    t_s: float
+    iteration: int
+    dx_norm: float
+    dy_norm: float
+    x_mm: float
+    y_mm: float
+    score: float
+    selected_track_id: Optional[int]
+
+
+@dataclass(frozen=True)
+class ServoResult:
+    converged: bool
+    selector: TargetSelector
+    x_mm: float
+    y_mm: float
+    confidence: float
+    iterations: int
+    elapsed_s: float
+    final_detection: Optional[Detection]
+    trace: Tuple[ServoTrace, ...]
+
+
+class ArmVisionClient:
+    """末端摄像头（side cam）视觉伺服客户端。
+
+    主路径走 task_feed 30Hz 缓存（GET /v1/realtime/vision/task）；
+    一次快照走 POST /v1/vision/task（含 bbox_pixels）。
+
+    不动 runtime 一行代码 —— 所有硬件动作由 ArmClient 通过 move_fn 注入。
+    """
+
+    def __init__(self, http, *, default_timeout_s: float = 10.0):
+        self.http = http
+        self.default_timeout_s = default_timeout_s
+
+    @staticmethod
+    def labels() -> Tuple[LabelInfo, ...]:
+        return LABELS
+
+    @staticmethod
+    def group(name: str) -> Tuple[Label, ...]:
+        return LABEL_GROUPS[name]
+
+    def get_state(self) -> List[Detection]:
+        return _parse_cache(self.http.get_vision_task_cache())
+
+    def get_state_filtered(self, selector: TargetSelector) -> List[Detection]:
+        return [d for d in self.get_state() if selector.matches(d)]
+
+    def snap(self, *, sort_pos=(0.0, 0.0), limit_x: float = 1.0,
+             limit_y: float = 1.0, timeout: float = 20.0) -> List[Detection]:
+        return _parse_sync(self.http.request_vision_task(
+            sort_pos=sort_pos, limit_x=limit_x, limit_y=limit_y, timeout=timeout))
+
+    def find_target(self, selector: TargetSelector, *,
+                    x_mm: float, y_mm: float,
+                    mm_per_norm: float = 30.0,
+                    settle_tol_norm: float = 0.05,
+                    min_step_mm: float = 1.0,
+                    max_iter: int = 500,
+                    timeout: float = 10.0,
+                    on_missing_track: str = "abort",
+                    move_fn: Optional[Callable[[float, float], dict]] = None) -> ServoResult:
+        """视觉伺服主路径。
+
+        循环：读缓存 → 应用 selector（label/group/track_id）→ 收敛判断 → dead-band
+        → 通过 move_fn 下发 x/y 位移（默认走 http.execute_arm_action('goto_position')）。
+
+        Args:
+            selector: 多目标选择器（见 TargetSelector）
+            x_mm, y_mm: 起始位姿
+            mm_per_norm: bbox 归一化坐标 → mm 的转换系数
+            settle_tol_norm: 收敛阈值（|dx|<tol AND |dy|<tol）
+            min_step_mm: dead-band，避免抖动
+            max_iter: 最大迭代次数（兜底）
+            timeout: 总超时（秒）
+            on_missing_track: 目标丢失行为（"abort"=5 帧无检测就 raise；"wait"=继续等）
+            move_fn: 自定义 move 函数；默认走 arm.goto_position
+
+        Returns:
+            ServoResult(converged, x_mm, y_mm, confidence, iterations, elapsed_s, ...)
+
+        Raises:
+            RuntimeError: 连续 5 帧未检测到（on_missing_track="abort"）
+            ValueError: y_mm 越界（move_fn 内部 raise）
+        """
+        t0 = time.time()
+        trace: List[ServoTrace] = []
+        locked_track_id: Optional[int] = None
+        consecutive_misses = 0
+        last_x_mm, last_y_mm = x_mm, y_mm
+        last_detection: Optional[Detection] = None
+        current_selector = selector
+
+        for i in range(max_iter):
+            if time.time() - t0 > timeout:
+                break
+
+            candidates = self.get_state_filtered(current_selector)
+
+            if current_selector.strategy == SelectionStrategy.LOCK_FIRST_SEEN.value:
+                if locked_track_id is None:
+                    pick = current_selector.apply_strategy(candidates)
+                    if pick is None:
+                        consecutive_misses += 1
+                        if consecutive_misses >= 5 and on_missing_track == "abort":
+                            raise RuntimeError(
+                                f"find_target: 首帧未检测到 {current_selector}"
+                            )
+                        continue
+                    locked_track_id = pick.track_id
+                    current_selector = dataclasses.replace(
+                        current_selector, track_id=locked_track_id
+                    )
+                candidates = [d for d in candidates if d.track_id == locked_track_id]
+            elif current_selector.track_id is not None:
+                candidates = [d for d in candidates if d.track_id == current_selector.track_id]
+
+            pick = current_selector.apply_strategy(candidates) if candidates else None
+            if pick is None:
+                consecutive_misses += 1
+                if on_missing_track == "abort" and consecutive_misses >= 5:
+                    raise RuntimeError(
+                        f"find_target: 连续 {consecutive_misses} 帧未检测到 {current_selector}"
+                    )
+                continue
+            consecutive_misses = 0
+            last_detection = pick
+
+            dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
+            if pick.bbox_norm.is_centered_at(settle_tol_norm):
+                trace.append(ServoTrace(
+                    t_s=time.time() - t0, iteration=i,
+                    dx_norm=dx_norm, dy_norm=dy_norm,
+                    x_mm=last_x_mm, y_mm=last_y_mm,
+                    score=pick.score, selected_track_id=pick.track_id))
+                return ServoResult(
+                    converged=True, selector=current_selector,
+                    x_mm=last_x_mm, y_mm=last_y_mm,
+                    confidence=pick.score, iterations=i + 1,
+                    elapsed_s=time.time() - t0,
+                    final_detection=pick, trace=tuple(trace))
+
+            dx_mm = -dx_norm * mm_per_norm
+            dy_mm = -dy_norm * mm_per_norm
+            if abs(dx_mm) < min_step_mm:
+                dx_mm = 0.0
+            if abs(dy_mm) < min_step_mm:
+                dy_mm = 0.0
+
+            new_x_mm = last_x_mm + dx_mm
+            new_y_mm = last_y_mm + dy_mm
+            trace.append(ServoTrace(
+                t_s=time.time() - t0, iteration=i,
+                dx_norm=dx_norm, dy_norm=dy_norm,
+                x_mm=new_x_mm, y_mm=new_y_mm,
+                score=pick.score, selected_track_id=pick.track_id))
+
+            if move_fn is not None:
+                move_fn(new_x_mm, new_y_mm)
+            else:
+                self.http.execute_arm_action(
+                    "goto_position",
+                    x=new_x_mm / 1000.0, y=new_y_mm / 1000.0,
+                    timeout=5.0, sync=True,
+                )
+            last_x_mm, last_y_mm = new_x_mm, new_y_mm
+
+        return ServoResult(
+            converged=False, selector=current_selector,
+            x_mm=last_x_mm, y_mm=last_y_mm,
+            confidence=last_detection.score if last_detection else 0.0,
+            iterations=max_iter, elapsed_s=time.time() - t0,
+            final_detection=last_detection, trace=tuple(trace))
+
+    def find_targets_sequence(self, selectors: List[TargetSelector], *,
+                              x_mm: float, y_mm: float, **kwargs) -> List[ServoResult]:
+        """按顺序对每个 selector 调 find_target；返回 list of ServoResult"""
+        return [self.find_target(sel, x_mm=x_mm, y_mm=y_mm, **kwargs) for sel in selectors]
+
+    def pick_one(self, selectors: List[TargetSelector], *,
+                 x_mm: float, y_mm: float, **kwargs) -> Optional[ServoResult]:
+        """按优先级找第一个能匹配的目标并伺服；返回首个成功的 ServoResult 或 None"""
+        for sel in selectors:
+            try:
+                result = self.find_target(sel, x_mm=x_mm, y_mm=y_mm, **kwargs)
+                if result.converged:
+                    return result
+            except RuntimeError:
+                continue
+        return None
