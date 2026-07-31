@@ -42,11 +42,17 @@
 │                                       │            │  │   ┌──────────────┐    │
 │   odometer_thread ─► odometry / encoders ◄────────┼──┼───┤ set_wheel_sp │    │
 │                                                    │  │   └──────────────┘    │
+│  ▲                                                  │  │                       │
+│  │ 2026-07-31 fast-path feed 守护线程（runtime init │  │  ┌──────────────┐    │
+│  │ 默认 50Hz,与 lane_feed 同档）:                   │  │  │ get_ir_state │    │
+│  │   ir_feed  ─► ir_state  (左右红外距离) ◄─────────┼──┼──┤              │    │
+│  │   odom_feed ─► odom_state (底盘里程计) ◄─────────┼──┼──┤get_odom_state│    │
+│  │                                                  │  │  └──────────────┘    │
 └────────────────────────────────────────────────────┘  └───────────────────────┘
-
 外环：客户端，20-50Hz，控制律只读 lane_state，写 4 轮速
 内环：车端，PID（已存在），吃 4 轮速直接驱动
-车端 lane_feed：单独线程，只刷 lane_state 不下发轮速（不抢 runtime 锁）
+车端 lane_feed / ir_feed / odom_feed：单独线程，只刷 streamer cache 不下发轮速（不抢 runtime 锁）
+        业务层 <2ms 直接读 cache,与外环主循环完全解耦
 ```
 
 **核心原则**：外环和内环 **不能同时跑**。`start_lane_feed` 是"只刷 state"的旁路线程，跟外环下发轮速不冲突；但如果你又开了 `car.lane_*`（车端内环 PID），就会撞 runtime 锁，外环被串行化延迟。
@@ -97,8 +103,11 @@ runner.run(max_seconds=15.0)
 | `close()` | 内部自动发 `[0,0,0,0]` + 关 ws | — | — | 退出必调（`DoubleLoopRunner.run()` finally 已自动调） |
 | `emergency_stop()` | `POST /v1/control/emergency-stop` | `{stopped}` | — | 兜底 |
 | `get_lane_state()` | `GET /v1/vision/lane/state` | dict | — | ≤50Hz |
-| `get_odometry()` | `car.get_odometry` | `(x, y, theta)` float3 | m, m, rad | ≤50Hz |
+| `get_odometry()` | **fast-path** `GET /v1/realtime/odom/state`（odom_feed 50Hz 缓存）<br/>fallback `car.get_odometry`（job_queue 同步） | `(x, y, theta)` float3 | m, m, rad | ≤50Hz |
+| `get_odometry_state()` | **fast-path** `GET /v1/realtime/odom/state`（odom_feed 50Hz 缓存）<br/>失败 → `OdometryState` 全 None 字段,不抛异常 | `OdometryState` dataclass | m, m, rad, m, —, ms | ≤50Hz |
 | `get_wheel_encoders()` | `GET /v1/realtime/wheels/encoders` | list[float] (4) | rad 累计 | ≤50Hz |
+| `get_ir_state()` | **fast-path** `GET /v1/realtime/ir/state`（ir_feed 50Hz 缓存）<br/>失败 → `IrState` 全 None 字段 | `IrState` dataclass | m, m, —, ms | ≤50Hz |
+| `get_ir(side=None)` | **fast-path** 同 `get_ir_state` (ir_feed 缓存,双侧 / 单侧一次 HTTP)<br/>fallback `car.get_all_ir_distance` / `car.get_ir_distance`(_realtime_gate 同步直读) | side=None → dict `{right, left}`(m)<br/>side=`left`/`right` → float(m) | m | ≤50Hz |
 | `set_wheel_speeds([v1,v2,v3,v4])` | ws `realtime/wheel_speeds` | `{speeds}` | m/s | ≤50Hz |
 | `set_single_motor(port, speed, reverse=1)` | ws `realtime/motor_speed` | `{port, speed, reverse}` | — | ≤50Hz |
 | `ping()` | `GET /v1/health` | bool | — | 1Hz |
@@ -161,7 +170,67 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 
 ### `OdometryState` / `WheelsState`
 
-只读 dataclass，给上层任务（点到点、航位推算）用，目前 `ChassisClient` 还没暴露它们的 dataclass 形式，按需扩展。
+升级到完整 dataclass 见 [state.py](state.py) —— 2026-07-31 之前是骨架，目前已经全部对齐
+runtime `/v1/realtime/odom/state` / `/v1/realtime/wheels/state` 缓存。
+
+#### `OdometryState`（fast-path,2026-07-31）
+
+数据源：odom_feed 守护线程 50Hz 喂 streamer.odom_state。读缓存延迟 <2ms。
+
+```python
+@dataclass
+class OdometryState:
+    x: Optional[float]            # m
+    y: Optional[float]            # m
+    theta: Optional[float]        # rad
+    distance: Optional[float]     # m,本轮累积行驶距离
+    mode: Optional[str]           # odom_feed / idle / stopped
+    age_ms: Optional[float]       # 距离上次更新的毫秒数
+
+# 来源
+OdometryState.from_odom_state_payload(payload)
+# payload 接受 {"odom_state": {...}} 或裸 {...} 或 None,后两者 → 全 None 字段
+```
+
+属性：`active`（mode == "odom_feed"）、`is_fresh`（age_ms < 500ms）。
+
+构造入口：`ChassisClient.get_odometry_state()`。
+
+#### `WheelsState`（fast-path,2026-07-31）
+
+底盘 4 路电机 RPM 缓存视图：
+
+```python
+@dataclass
+class WheelsState:
+    fl_rpm: Optional[float]       # 前左 rpm
+    fr_rpm: Optional[float]       # 前右 rpm
+    rl_rpm: Optional[float]       # 后左 rpm
+    rr_rpm: Optional[float]       # 后右 rpm
+    mode: Optional[str]
+    age_ms: Optional[float]
+```
+
+> 目前 lane_feed / arm_feed / task_feed 都是单独缓存,wheels_state 由 SDK
+> 自带 update_odometry_thread 20Hz 提供；后续若需要单独提高频率,会通过新的
+> wheels_feed 守护线程实现。
+
+#### `IrState`（fast-path,2026-07-31）
+
+左右红外距离缓存视图：
+
+```python
+@dataclass
+class IrState:
+    left: Optional[float]         # m（用户视角左,与 main/chassis/tasks/read_ir 语义一致）
+    right: Optional[float]        # m（用户视角右）
+    mode: Optional[str]           # ir_feed / idle / stopped
+    age_ms: Optional[float]
+```
+
+属性：`active`（mode == "ir_feed"）、`is_fresh`（age_ms < 500ms）。
+
+构造入口：`ChassisClient.get_ir_state()`，双侧/单侧数值快速路径走 `ChassisClient.get_ir(side=None|str)`。
 
 ---
 
@@ -338,9 +407,9 @@ def should_alert(self, state):
 
 | 任务 | 用途 | 走哪个环 |
 | --- | --- | --- |
-| `read_ir(api, side=None)` | 一次性读红外 | — |
-| `read_dis(api, hz, on_tick)` | 持续读累计距离（自带 TUI） | — |
-| `monitor_ir(api, threshold_m, on_alert)` | 持续读红外 + 阈值命中回调 | — |
+| `read_ir(api, side=None)` | **fast-path**（2026-07-31）：先读 ir_feed 缓存（<2ms）；失败回退 `car.get_all_ir_distance` / `car.get_ir_distance` 同步直读（runtime `_realtime_gate`，不造 job）。 | — |
+| `read_dis(api, hz, on_tick)` | **fast-path**（2026-07-31）：内部 `_read_distance` 先读 odom_feed 缓存（<2ms）；失败回退 `car.get_distance` 同步。 | — |
+| `monitor_ir(api, threshold_m, on_alert)` | **fast-path**（沿用 2026-07-31 升级）：走 ir_feed 缓存，每帧差量回调。 | — |
 
 > **TODO**：未来要加的高层组合（`follow_lane` / `track_target` / `back_to_line`）
 > 还在 README 占位阶段。当前业务侧都用 `subscribe_lane_state()` 直接装配
@@ -471,6 +540,19 @@ finally:
     # 不要 api.stop_lane_feed() —— 它一直跑
 ```
 
+### 🔴 4. （2026-07-31）**不要**用 `POST /v1/execute car get_all_ir_distance / get_odometry / get_distance / get_ir_distance`
+
+- **症状**：50Hz 走 job_queue 排队变成 5Hz；IR 还会撞 MC602 字节往返（每次 10-30ms），整链路 50-200ms
+- **正确**：
+  - 红外：`api.get_ir(side=None)` 或 `api.get_ir_state()`（内部走 `/v1/realtime/ir/state` 缓存，<2ms）
+  - 里程计：`api.get_odometry()` 或 `api.get_odometry_state()`（内部走 `/v1/realtime/odom/state` 缓存，<2ms）
+  - 距离：`read_dis._read_distance(api)`（内部走 `/v1/realtime/odom/state.distance`，<2ms）
+- **代码层强制**：`ChassisClient.get_odometry / get_ir_state / get_odometry_state` 已经默认走 fast-path，业务层直接调用就行；
+   如果非 runtime 升级版本（没起 ir_feed / odom_feed）则自动 fallback 到 `POST /v1/execute`，不需要单独处理
+- **原理**：ir_feed / odom_feed 是 runtime init 启动的守护线程（默认 50Hz），
+  持续把读到的左右 IR / 里程计写入 streamer cache(meta_lock 微秒级)。业务层
+  HTTP `GET /v1/realtime/ir/state` 等只取 meta_lock，几乎零延迟
+
 ---
 
 ## 11. 性能基准
@@ -483,6 +565,12 @@ finally:
 | 单轮端到端 RTT（HTTP） | ~10ms | 仍能跑 50Hz，但留余量小 |
 | WebSocket push 5s | ~250 次 | `subscribe_lane` 实测 50Hz×5s（受 lane_feed 频率上限约束） |
 | 实车端到端 5s | 50Hz × 5s 下发无丢帧 | `subscribe_lane_state` 实测（profile.hz=50） |
+| **`ir_feed` 推送频率**（2026-07-31） | 守护线程 `hz=50`（env `RAK_CAR_IR_FEED_HZ` 可覆盖） | 读两侧红外 ~10-30ms（MC602 字节往返 ×2）→ 实际写入频率受字节往返限制 ≈25-30Hz；50Hz 下业务层读 cache 不会撞 spam，arm_long_action 不会挡 IR |
+| **`odom_feed` 推送频率**（2026-07-31） | 守护线程 `hz=50`（env `RAK_CAR_ODOM_FEED_HZ` 可覆盖） | 内存读（get_odometry + get_distance），廉价。**50Hz 跑得满**，无 20Hz 模型上限 |
+| **`get_ir_state()` RTT**（2026-07-31, HTTP） | **<2ms** | 实测 50Hz+ 轮询安全，含 HTTP RTT；与 lane_feed 完全解耦 |
+| **`get_odometry()` RTT**（2026-07-31, HTTP） | **<2ms** | 实测 50Hz+ 轮询安全；与 arm 长动作并发 |
+| **`read_dis` TUI tick 延迟**（2026-07-31） | **<2ms 读 + 1s 周期**，50Hz 后台喂 | TUI UI 仍按 `--hz` 渲染 |
+| **业务层 fast-path 前后对比**（2026-07-31） | 旧 `read_ir(api)` 双侧 40-150ms+；新 `<2ms`。<br/>旧 `get_odometry()` 30-150ms+；新 `<2ms`。 | 见 §10 红线 4 |
 
 ---
 
@@ -525,7 +613,6 @@ main/chassis/
 ## 在哪查 API
 
 - 底盘专用接口子集：本文档
-- 全部接口速查：[main/API_REFERENCE.md](../API_REFERENCE.md)
-- 完整能力清单：[main/CAPABILITY_LIST.md](../CAPABILITY_LIST.md)
+- 全部接口速查：[main/API_INDEX.md](../API_INDEX.md)
 - Runtime 服务端 lane_state / WS push：[runtime/VISION_API.md](../../runtime/VISION_API.md)
 - 出问题了看：[debug-controller-download-stuck.md](../../debug-controller-download-stuck.md)、[debug-runtime-init-queue.md](../../debug-runtime-init-queue.md)

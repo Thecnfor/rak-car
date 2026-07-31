@@ -1,5 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+import threading
 import zmq
 import cv2
 import numpy as np
@@ -8,7 +9,7 @@ import yaml
 
 import time, os, sys
 # 添加上两层目录
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..","..", ".."))) 
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..","..", "..")))
 from smartcar.whalesbot.tools.log_wrap import logger
 # from smartcar.whalesbot.tools.tools_class import get_yaml
 
@@ -149,28 +150,31 @@ class ClintInterface:
         return socket
 
     def reset_client(self):
-        try:
-            self.client.close()
-        except Exception:
-            pass
-        self.client = self.get_zmp_client(self.port)
+        with self._socket_lock:
+            try:
+                self.client.close()
+            except Exception:
+                pass
+            self.client = self.get_zmp_client(self.port)
 
     def __call__(self, *args, **kwds):
         return self.get_infer(*args, **kwds)
 
     def get_state(self):
         data = bytes('ATATA', encoding='utf-8')
-        try:
-            self.client.send(data)
-            response = self.client.recv()
-        except zmq.Again:
-            logger.warning("{}服务器状态探测超时".format(self.name))
-            self.reset_client()
-            return None
-        except zmq.ZMQError as exc:
-            logger.warning("{}服务器状态探测失败: {}".format(self.name, exc))
-            self.reset_client()
-            return None
+        with self._socket_lock:
+            try:
+                self.client.send(data)
+                response = self.client.recv()
+            except zmq.Again:
+                logger.warning("{}服务器状态探测超时".format(self.name))
+                # 锁内重建 socket,避免 reset_client 持有锁时别处又抢 socket
+                self._reset_client_locked()
+                return None
+            except zmq.ZMQError as exc:
+                logger.warning("{}服务器状态探测失败: {}".format(self.name, exc))
+                self._reset_client_locked()
+                return None
         response = json.loads(response)
         return response
 
@@ -179,14 +183,24 @@ class ClintInterface:
             img = cv2.resize(img, self.img_size)
         img = cv2.imencode('.jpg', img)[1].tobytes()
         data = bytes('image', encoding='utf-8') + img
-        try:
-            self.client.send(data)
-            response = self.client.recv()
-        except (zmq.Again, zmq.ZMQError) as exc:
-            self.reset_client()
-            raise RuntimeError("{}推理请求失败: {}".format(self.name, exc))
+        with self._socket_lock:
+            try:
+                self.client.send(data)
+                response = self.client.recv()
+            except (zmq.Again, zmq.ZMQError) as exc:
+                # 锁内重建,避免把"半连接"socket 留给下一调用方
+                self._reset_client_locked()
+                raise RuntimeError("{}推理请求失败: {}".format(self.name, exc))
         response = json.loads(response)
         return response
+
+    def _reset_client_locked(self):
+        """必须在 self._socket_lock 已持有的前提下调用,避免 race。"""
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = self.get_zmp_client(self.port)
 
 def main_client():
     from camera import Camera

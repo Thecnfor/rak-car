@@ -1,171 +1,84 @@
-# main 最小业务层
+# main/ —— 业务客户端（依赖 runtime HTTP / WS）
 
-`main/` 现在只保留最小可用集，目标就是一件事：
+> **`main/` 永远不会 import `runtime/services/my_car.py`**，所有调用走 HTTP / WS。
+> 这条边界是为了让**业务层**和**车端 runtime** 可以独立部署、独立热更、独立调试。
 
-- 不关心底层源码细节，只通过 HTTP API 做真实业务开发
-- 业务代码只允许放在 `main/`，并且只能通过接口控制
-- 不允许直接依赖 `main/` 以外的任何 Python 源码
-- 完整流程（巡线、导航、机械臂编排等）统一写在 `main/start/` 下
+---
 
-## 文件分工
+## 0. 你应当从哪开始
 
-- [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)
-  - 统一配置入口，优先改这里或对应环境变量
-- [api\_client.py](file:///home/jetson/workspace/rak-car/main/api_client.py)
-  - HTTP 同步调用客户端
-- [ws\_client.py](file:///home/jetson/workspace/rak-car/main/ws_client.py)
-  - WebSocket 长连接客户端
-- [quick\_start.py](file:///home/jetson/workspace/rak-car/main/quick_start.py)
-  - 开发自检脚本，先看配置，再测连通性
-- [car\_start\_api.py](file:///home/jetson/workspace/rak-car/main/car_start_api.py)
-  - 类似官方 `car_start_2026.py` 的 API 编排模板
-- [BUSINESS\_API\_GUIDE.md](file:///home/jetson/workspace/rak-car/main/BUSINESS_API_GUIDE.md)
-  - 业务层调用手册，只讲怎么控制和怎么闭环读取
-- [CAPABILITY\_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)
-  - 能力总表
-- [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)
-  - 主文档，所有接口总表速查
-- [chassis/README.md](file:///home/jetson/workspace/rak-car/main/chassis/README.md)
-  - 底盘相关能力统一入口：`main.chassis`，底盘请直接看这里
-- [tasks/](file:///home/jetson/workspace/rak-car/main/tasks/)
-  - 具体任务接口（自动播种等编排逻辑），任务请直接看这里
-- [arm/README.md](file:///home/jetson/workspace/rak-car/main/arm/README.md)
-  - 机械臂组独享子包（runtime 启动自动定原点 + 漂移手 reset + 双轴同步 S 曲线 + 业务便捷 API），机械臂请直接看这里
-  - [arm/QUICKSTART.md](file:///home/jetson/workspace/rak-car/main/arm/QUICKSTART.md) — 10 行起步
-  - [arm/ARM\_API.md](file:///home/jetson/workspace/rak-car/main/arm/ARM_API.md) — 机械臂业务 API 速查
+| 你想做的事 | 看这里 |
+| --- | --- |
+| **5 分钟跑通"客户端 → runtime"通信** | [QUICKSTART.md](./QUICKSTART.md) |
+| **查 HTTP / WS / 客户端方法的权威清单** | [API_INDEX.md](./API_INDEX.md) |
+| **写机械臂业务** | [arm/README.md](./arm/README.md) + [arm/QUICKSTART.md](./arm/QUICKSTART.md) |
+| **写底盘外环 / 巡线 / 触发判定** | [chassis/README.md](./chassis/README.md) |
+| **写单文件 mini 任务（射击、边走边打…）** | [misc/README.md](./misc/README.md) |
+| **查车端动作注册表（`runtime/core/actions.py`）** | [API_INDEX.md §6](./API_INDEX.md#6-actions-runtimecoreactionspy-全部注册) |
+| **查车端 action 内部行为** | [`runtime/services/my_car.py`](../runtime/services/my_car.py) |
 
-## 配置
+---
 
-默认配置在 [settings.py](file:///home/jetson/workspace/rak-car/main/settings.py)：
+## 1. 子包分层
 
-- `RAK_CAR_SERVER_ORIGIN` 默认 `http://127.0.0.1`
-- `RAK_CAR_API_PORT` 默认 `5050`
-- `RAK_CAR_STREAM_PORT` 默认复用 `5050`
-- `RAK_CAR_STREAM_PATH` 默认 `/stream/`
-- `RAK_CAR_API_PREFIX` 默认 `/v1`
-- `RAK_CAR_REQUEST_TIMEOUT` 默认 `10`
-- `RAK_CAR_WAIT_TIMEOUT` 默认 `300`
-- `RAK_CAR_POLL_INTERVAL` 默认 `0.5`
-- `RAK_CAR_API_BASE`
-  - 兼容旧写法，会覆盖自动拼出来的 API 地址
-- `RAK_CAR_STREAMER_URL`
-  - 兼容旧写法，会覆盖自动拼出来的推流地址
-
-最常用的只改一个：
-
-```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
+```
+main/
+├── README.md           ← 你正在看
+├── QUICKSTART.md       ← 5 分钟起步
+├── API_INDEX.md        ← 全部 HTTP / WS / 客户端方法速查
+├── api_client.py       ← RuntimeApiClient：HTTP + job 异步/同步
+├── ws_client.py        ← RuntimeWsClient：WS 单点 + 推送订阅
+├── settings.py         ← env 解析（RAK_CAR_*）
+├── arm/                ← 机械臂业务子包（client/runner/state/origin/trajectory/tasks/examples）
+├── chassis/            ← 底盘外环子包（client + controllers + loops + tasks + cli + config）
+└── misc/               ← 单文件 mini 任务 + 调研笔记
 ```
 
-这样会同时影响：
+| 子包 | 定位 | 一句话入口 |
+| --- | --- | --- |
+| `main/arm/` | 机械臂业务（client + runner + 软限位 + 复合动作 + S 曲线） | `from main.arm import ArmClient, ArmRunner` |
+| `main/chassis/` | 底盘外环（client + 50Hz 主循环 + 控制器 + IR 触发判定） | `from main.chassis import ChassisClient, run_lane_follow` |
+| `main/misc/` | 单文件 mini 任务（射击、边走边打、单发、连发）+ 笔记 | `python3 main/misc/single_shot.py` |
 
-- API: `http://192.168.6.231:5050`
-- Streamer: `http://192.168.6.231:5050/stream/`
+---
 
-安装依赖：
+## 2. 三条红线
 
-```bash
-python3 -m pip install -r /home/jetson/workspace/rak-car/main/requirements.txt
-```
+1. **业务层不直连车端硬件**——所有调用走 `RuntimeApiClient` 或 `RuntimeWsClient`，连 `my_car.py` 的方法都不 import。
+2. **`/v1/execute` 默认异步**——立即返回 `job_id`，链式调用必须显式 `sync=True`（arm 业务 API 内部已加）。轮询请用 `wait_job(job_id, timeout)`。
+3. **清 `_stop_flag` 必须调 `/v1/control/reset-stop`**——`lane_feed` / `arm_feed` / `task_feed` / `ir_feed` / `odom_feed` 守护线程在 stop 状态下 break 退出，急停恢复后必须重置才能继续。
 
-## 建议开发顺序
+---
 
-```bash
-export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
-python3 /home/jetson/workspace/rak-car/main/quick_start.py
-```
+## 3. runtime 默认守护线程（init 后自动启动）
 
-先确认联通和状态，再直接看 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+| 守护线程 | 频率 | 缓存字段 | 客户端读法 |
+| --- | --- | --- | --- |
+| `lane_feed` | 50Hz | `lane_state` | `client.realtime_lane_state()` / WS `subscribe_lane` |
+| `arm_feed` | 20Hz | `arm_state` | `client.get_arm_state()` / WS `subscribe_arm_state` |
+| `task_feed` | 10Hz | `task_state` | `client.get_task_state()` / WS `subscribe_task_detection` |
+| `ir_feed` | 50Hz | `ir_state` | `client.get_ir_state()` / WS `subscribe_ir` |
+| `odom_feed` | 50Hz | `odom_state` | `client.get_odom_state()` / WS `subscribe_odom` |
 
-## Python 调用
+- 全部是**守护线程 + meta_lock**，外环 50Hz+ 轮询安全，不进 job_queue、不打 ZMQ、不抢车锁。
+- 共享 `ClintInterface` 内部 `threading.Lock()`（2026-07-31 修复 EFSM 后）。
 
-推荐只记一个类：[RuntimeApiClient](file:///home/jetson/workspace/rak-car/main/api_client.py)
+---
 
-最简单：
+## 4. 比赛流程 8 任务
 
-```python
-from main.api_client import RuntimeApiClient
+固定顺序：**seed → scout pests → water → shoot pests → harvest → sort → read order via OCR → deliver**。
 
-client = RuntimeApiClient()
-result = client.call("car", "beep", timeout=40)
-print(result)
-```
+| 任务 | 关键依赖 | 入口 |
+| --- | --- | --- |
+| seed（自动播种） | `car.move_to_detection_target` + `arm.move_xy` | `main/start/orchestrator.py` |
+| scout pests | `task_feed` 边走边看 + 视觉判定 | 同上 |
+| water | `car.set_storage` + 距离触发 | 同上 |
+| shoot pests | `car.shooting` × N（每次 500ms 间隔 ≥5s） | [`main/misc/shooting_logic.md`](./misc/shooting_logic.md) |
+| harvest | `arm.composite_pick` | [arm/tasks/](./arm/tasks/) |
+| sort | `arm.composite_release` | 同上 |
+| read order | `POST /v1/vision/ocr` label=`order` / `name` | [API_INDEX.md §2](./API_INDEX.md#2-visioncam1-车道--cam2-侧摄) |
+| deliver | `car.move_to_position` + 终点对齐 | 同 seed |
 
-前进 5cm：
-
-```python
-client.call("car", "move_for", [0.05, 0.0, 0.0], timeout=60)
-```
-
-巡线前进 20cm：
-
-```python
-client.call("car", "lane_dis_offset", timeout=80, speed=0.3, dis_hold=0.2)
-```
-
-机械臂横向移动：
-
-```python
-client.call("arm", "move_x_position", 0.20, timeout=20)
-```
-
-接口总表和用途，直接看 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
-
-## 现成脚本
-
-官方流程风格的 API 模板：
-
-```bash
-python3 /home/jetson/workspace/rak-car/main/car_start_api.py
-```
-
-这个脚本默认不直接动小车，只保留和 `car_start_2026.py` 一样的任务顺序模板。
-你只要把需要的那几行取消注释，就能开始业务编排。
-
-## curl 调用
-
-最常用的就是 `POST /v1/execute`：
-
-```bash
-# 默认异步：立即返回 job_id，状态查 GET /v1/jobs/{id}
-curl -sS -X POST http://127.0.0.1:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{"target":"car","name":"beep","timeout":40}'
-
-# 同步阻塞：传 "sync": true 拿到 result
-curl -sS -X POST http://127.0.0.1:5050/v1/execute \
-  -H 'Content-Type: application/json' \
-  -d '{"target":"car","name":"beep","timeout":40,"sync":true}'
-```
-
-> **2026-07 改造**：`/v1/execute` 默认改成异步（不阻塞客户端），适合机械臂 / 任务等长动作。客户端要等结果用 `client.execute(..., sync=True)`，运行时内部已把 `arm` / `car` 拆成两个独立 worker，长动作不再挡短动作和实时端点。详见 [runtime/README.md §并发任务模型](../runtime/README.md#并发任务模型)。
-
-所有接口总表，见 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
-
-如果你想先看“这台车现在到底会什么”，直接看 [CAPABILITY\_LIST.md](file:///home/jetson/workspace/rak-car/main/CAPABILITY_LIST.md)。
-
-## 你该怎么理解几类移动
-
-- 纯底盘直控：
-  - `move_for`
-  - `move_to_position`
-  - `move_time`
-  - `move_distance`
-- 智能巡线导航：
-  - `lane_time`
-  - `lane_dis`
-  - `lane_dis_offset`
-
-### 视觉对齐：
-
-### `move_to_detection_target`
-
-- 机械臂控制：
-  - `move_x_position`
-  - `move_y_position`
-  - `set_arm_angle`
-  - `set_hand_angle`
-  - `set_arm_pose`
-  - `grasp`
-
-区别和参数细节都写在 [API\_REFERENCE.md](file:///home/jetson/workspace/rak-car/main/API_REFERENCE.md)。
+编排入口：[main/start/orchestrator.py](./start/orchestrator.py)（50Hz lane_follow + waypoint 列表）。
+模板：`run.py` → `main.start.orchestrator.Orchestrator`。

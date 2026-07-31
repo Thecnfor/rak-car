@@ -328,6 +328,30 @@ class RuntimeApiClient:
         """
         return self._request("GET", f"{self.api_prefix}/realtime/vision/task")
 
+    # === 2026-07-31：左右 IR / 底盘里程计 fast-path（与 get_lane_state / get_arm_state 同构）===
+    def get_ir_state(self):
+        """读 ir_feed 守护线程缓存的左右 IR 距离（runtime 默认 50Hz 刷新）。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
+        这是 main/chassis/tasks/read_ir.py 的 fast-path:业务层不再每次
+        触发 /v1/execute → car_queue → MC602 字节往返。
+
+        返回 `{"ir_state": {"active": ..., "mode": ..., "left": m, "right": m, "updated_at": ...}}`。
+        left/right 为 None 时说明 ir_feed 未运行或刚启动。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/ir/state")
+
+    def get_odom_state(self):
+        """读 odom_feed 守护线程缓存的底盘里程计（runtime 默认 50Hz 刷新）。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
+        这是 main/chassis/api.py.get_odometry 的 fast-path:业务层不再每次
+        触发 /v1/execute → car_queue → car_lock。
+
+        返回 `{"odom_state": {"active": ..., "mode": ..., "x": m, "y": m, "theta": rad, "distance": m, "updated_at": ...}}`。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/odom/state")
+
     def run_task(self, name, *args, **kwargs):
         return self.create_job("task", name, args=list(args), kwargs=kwargs)
 

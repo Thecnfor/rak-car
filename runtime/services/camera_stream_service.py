@@ -81,6 +81,14 @@ class CameraStreamService:
         # 侧摄目标检测缓存：与 arm_state 同模式，由 car.start_task_feed 守护线程
         # 持续刷新,subscribe_task_detection WS op 推送。
         self.task_state = self._default_task_state()
+        # 2026-07-31：左右 IR 距离缓存（meta_lock 保护），
+        # 由 car.start_ir_feed 守护线程持续刷新（默认 50Hz，与 lane_feed 同档）。
+        # main/chassis/tasks/read_ir.py 不再每次走 job_queue + MC602 字节往返。
+        self.ir_state = self._default_ir_state()
+        # 2026-07-31：底盘里程计缓存（meta_lock 保护），
+        # 由 car.start_odom_feed 守护线程持续刷新（默认 50Hz，与 lane_feed 同档）。
+        # main/chassis/api.py.get_odometry 不再每次抢 _ref_lock + job_queue。
+        self.odom_state = self._default_odom_state()
 
     def start(self):
         if self.running:
@@ -103,6 +111,10 @@ class CameraStreamService:
             self._jpeg_cache.clear()
         with self.meta_lock:
             self.lane_state = self._default_lane_state()
+            self.arm_state = self._default_arm_state()
+            self.task_state = self._default_task_state()
+            self.ir_state = self._default_ir_state()
+            self.odom_state = self._default_odom_state()
 
     def get_key(self, clear=True):
         with self.key_lock:
@@ -987,3 +999,64 @@ class CameraStreamService:
             "ref_encoder": None, # 丢步核对 ref
             "updated_at": None,
         }
+
+    # === 左右 IR 距离缓存（供 /v1/realtime/ir/state 与 WS subscribe_ir 推送） ===
+    def _default_ir_state(self):
+        return {
+            "active": False,
+            "mode": "idle",      # ir_feed | idle | stopped
+            "left": None,        # m（用户视角左）
+            "right": None,       # m（用户视角右）
+            "updated_at": None,
+        }
+
+    def set_ir_state(self, **updates):
+        """ir_feed 守护线程持续刷新的左右 IR 距离缓存（meta_lock 路径，不抢 car_lock）。
+
+        left/right: 用户视角（与 main/chassis/tasks/read_ir.py 语义一致：
+                    底层 left_sensor/right_sensor 已对应物理端口，业务层
+                    若发现方向反了由调用方调换，本缓存按底层取到的值原样记录）。
+        """
+        with self.meta_lock:
+            state = dict(self.ir_state)
+            for key, value in updates.items():
+                state[key] = value
+            state["updated_at"] = time.time()
+            self.ir_state = state
+            return dict(state)
+
+    def get_ir_state(self):
+        with self.meta_lock:
+            state = dict(self.ir_state)
+        return state
+
+    # === 底盘里程计缓存（供 /v1/realtime/odom/state 与 WS subscribe_odom 推送） ===
+    def _default_odom_state(self):
+        return {
+            "active": False,
+            "mode": "idle",      # odom_feed | idle | stopped
+            "x": None,           # m
+            "y": None,           # m
+            "theta": None,       # rad
+            "distance": None,    # m,本轮累积行驶距离
+            "updated_at": None,
+        }
+
+    def set_odom_state(self, **updates):
+        """odom_feed 守护线程持续刷新的底盘里程计缓存（meta_lock 路径，不抢 car_lock）。
+
+        数据源：MyCar.get_odometry() + get_distance() —— 锁内是 numpy.copy()
+        与 float 取数，比 IR 廉价很多。50Hz 持续刷新主路径延迟接近 0。
+        """
+        with self.meta_lock:
+            state = dict(self.odom_state)
+            for key, value in updates.items():
+                state[key] = value
+            state["updated_at"] = time.time()
+            self.odom_state = state
+            return dict(state)
+
+    def get_odom_state(self):
+        with self.meta_lock:
+            state = dict(self.odom_state)
+        return state

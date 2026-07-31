@@ -28,7 +28,21 @@ __all__ = ["read_dis", "DisTickCallback"]
 
 
 def _read_distance(api: ChassisClient, *, timeout: float = 5.0) -> float:
-    """单次读取车端累计行驶距离（m），失败返回 0.0。"""
+    """单次读取车端累计行驶距离（m），失败返回 0.0。
+
+    fast-path（2026-07-31）：runtime odom_feed 守护线程 50Hz 喂 streamer.odom_state，
+    通过 /v1/realtime/odom/state 拉（不进 job_queue、不打 MC602、不抢 car_lock）。
+    fallback：原 car.get_distance() 同步 execute(主要在 runtime 升级前/feed 异常时)。
+    """
+    try:
+        payload = api.http.get_odom_state()
+    except Exception:
+        payload = None
+    if isinstance(payload, dict):
+        odom = payload.get("odom_state") or {}
+        if odom.get("active") and odom.get("distance") is not None:
+            return float(odom["distance"])
+    # fallback：原 job_queue + car_lock 路径
     try:
         dist = api.http.execute("car", "get_distance", timeout=timeout, sync=True)
         if isinstance(dist, dict) and "result" in dist:

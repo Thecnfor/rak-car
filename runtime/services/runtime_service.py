@@ -403,6 +403,23 @@ class CarRuntimeService:
             car.start_task_feed(hz=30.0)
         except Exception as exc:
             logger.warning("task_feed auto-start failed: {}".format(exc))
+        # 2026-07-31 默认启 ir_feed 守护线程(50Hz,与 lane_feed 同档):
+        # 供 main/chassis/tasks/read_ir.py 与 orchestrator._wait_until_triggered
+        # 走缓存读,避免每次进 job_queue。hz 由 env RAK_CAR_IR_FEED_HZ 覆盖。
+        try:
+            car.start_ir_feed(
+                hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
+            )
+        except Exception as exc:
+            logger.warning("ir_feed auto-start failed: {}".format(exc))
+        # 2026-07-31 默认启 odom_feed 守护线程(50Hz):同上模式,
+        # 喂底盘里程计缓存,给 main/chassis/api.py.get_odometry 走 fast-path。hz 由 env 覆盖。
+        try:
+            car.start_odom_feed(
+                hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
+            )
+        except Exception as exc:
+            logger.warning("odom_feed auto-start failed: {}".format(exc))
         return car
 
     def _ensure_infer_ready(self):
@@ -455,6 +472,19 @@ class CarRuntimeService:
                         self.car.start_task_feed(hz=30.0)
                     except Exception as exc:
                         logger.warning("task_feed auto-start (reused) failed: {}".format(exc))
+                    # 2026-07-31：ir_feed / odom_feed 同理（复用现有 car 时也确保在跑）
+                    try:
+                        self.car.start_ir_feed(
+                            hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
+                        )
+                    except Exception as exc:
+                        logger.warning("ir_feed auto-start (reused) failed: {}".format(exc))
+                    try:
+                        self.car.start_odom_feed(
+                            hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
+                        )
+                    except Exception as exc:
+                        logger.warning("odom_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()
@@ -641,6 +671,111 @@ class CarRuntimeService:
             raise RuntimeError("stream_service 未注入（runtime 启动异常）")
         return self.stream_service.get_task_state()
 
+    def get_ir_state(self):
+        """外环/触发判定专用：读 streamer 缓存的 ir_state（左右 IR 距离）。
+
+        数据来源：`ir_feed` 守护线程（runtime 启动后默认 50Hz）通过
+        `car.streamer.set_ir_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        50Hz+ 轮询安全，与 lane_feed / arm_feed / task_feed 同构。
+
+        返回字段：
+          - active: bool (ir_feed 是否在跑)
+          - mode: str ("ir_feed" / "idle" / "stopped")
+          - left: float | None (m,用户视角左)
+          - right: float | None (m,用户视角右)
+          - updated_at: float (unix time)
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_ir_state()
+
+    def get_odom_state(self):
+        """外环/触发判定专用：读 streamer 缓存的 odom_state（底盘里程计）。
+
+        数据来源：`odom_feed` 守护线程（runtime 启动后默认 50Hz）通过
+        `car.streamer.set_odom_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        50Hz+ 轮询安全，与 lane_feed / ir_feed 同构。
+
+        返回字段：
+          - active: bool (odom_feed 是否在跑)
+          - mode: str ("odom_feed" / "idle" / "stopped")
+          - x, y, theta: float | None (m, m, rad)
+          - distance: float | None (m,本轮累积行驶距离)
+          - updated_at: float (unix time)
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_odom_state()
+
+    # === 2026-07-31：IR / odometer 同步直读（_realtime_gate 路径,绕过 job_queue） ===
+    #
+    # 用于 main 业务层在没有 feed 缓存可用时（feed 未启动 / 异常退出）的 fallback。
+    # 也用于 arm 长动作期间需要再拉一次"最新未缓存值"的场景。
+    def get_ir_distance_sync(self, side="left"):
+        """step B：单次读 IR,走 _realtime_gate,不进 job_queue。
+
+        实测延迟:HTTP RTT + (1-2 次 MC602 字节往返 ~10-30ms)。
+        """
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_ir_distance(side=side)
+
+    def get_all_ir_distance_sync(self):
+        """step B：单次读两侧 IR,走 _realtime_gate,不进 job_queue。"""
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_all_ir_distance()
+
+    def get_odometry_sync(self, show_info=False):
+        """step B：单次读里程计,走 _realtime_gate,不进 job_queue。
+
+        实测延迟:几乎只有 HTTP RTT（get_odometry 内部 _lock 微秒级），
+        比走 job_queue 快一个数量级。
+        """
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_odometry(show_info=show_info)
+
+    def get_distance_sync(self):
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_distance()
+
+    def get_feed_status(self):
+        """2026-07-31: 给 /v1/health 用的 feed summary（一次性扫所有 cache）。
+
+        返回:{lane_state, arm_state, task_state, ir_state, odom_state} 各自的 active / mode / updated_at。
+        调试用,不抢任何锁,只读 streamer meta_lock 5 次。
+        """
+        if self.stream_service is None:
+            return {"ir_state": {}, "odom_state": {}, "lane_state": {}, "arm_state": {}, "task_state": {}}
+        out = {}
+        for name, fn in (
+            ("lane_state", self.stream_service.get_lane_state),
+            ("arm_state", self.stream_service.get_arm_state),
+            ("task_state", self.stream_service.get_task_state),
+            ("ir_state", self.stream_service.get_ir_state),
+            ("odom_state", self.stream_service.get_odom_state),
+        ):
+            try:
+                st = fn()
+                out[name] = {
+                    "active": st.get("active"),
+                    "mode": st.get("mode"),
+                    "updated_at": st.get("updated_at"),
+                }
+            except Exception:
+                out[name] = {"active": False, "mode": "idle", "updated_at": None}
+        return out
+
     def set_single_motor(self, port, speed, reverse=1):
         with self._realtime_gate:
             self._realtime_check_locked()
@@ -714,6 +849,9 @@ class CarRuntimeService:
             "controller_session": controller_snapshot,
             "infer_service": infer_snapshot,
             "camera_stream": camera_snapshot,
+            # 2026-07-31：feed 守护线程状态（lane / arm / task / ir / odom）。
+            # 给 /v1/health 调试用，一眼看清 feed 是否卡住 / 卡了哪个。
+            "feeds": self.get_feed_status(),
             "components": {
                 "controller": {
                     "ready": controller_snapshot.get("state") == "PROGRAM_READY",

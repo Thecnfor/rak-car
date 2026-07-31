@@ -1,8 +1,8 @@
 # main/arm —— 机械臂组独享子包
 
 > 这份文档只回答一件事：**业务层调机械臂需要知道哪些 API、怎么搭起来**。
-> 完整 API 总表见 `main/API.md` 和本目录下 [ARM_API.md](./ARM_API.md)，本文件不再重复。
-> 10 行起步见 [QUICKSTART.md](./QUICKSTART.md)。
+> 完整 API 总表见 [main/API_INDEX.md](../API_INDEX.md) 和本目录下 [ARM_API.md](./ARM_API.md)，本文件不再重复。
+> 10 行起步见 [main/QUICKSTART.md §4](../QUICKSTART.md#4-跑一个机械臂动作业务层-10-行) + [arm/QUICKSTART.md](./QUICKSTART.md)。
 
 ## 一句话定位
 
@@ -195,6 +195,6 @@ main/arm/
 - 机械臂专用接口子集：本文档（上面那张表）
 - 业务侧便捷 API：[ARM_API.md](./ARM_API.md)
 - 10 行起步：[QUICKSTART.md](./QUICKSTART.md)
-- 全部接口速查：[main/API.md](../API.md)
+- 全部接口速查：[main/API_INDEX.md](../API_INDEX.md)
 - 底层细节：[smartcar/whalesbot/vehicle/arm/arm_base.py](../../smartcar/whalesbot/vehicle/arm/arm_base.py)
-- **软件急停 / `reset_y` 找底方向 / 急停 HTTP 端点：[SOFTWARE_ESTOP.md](./SOFTWARE_ESTOP.md)**
+- 急停 / 复位：`/v1/control/reset-stop`（[API_INDEX.md §4](../API_INDEX.md#4-control系统控制)）

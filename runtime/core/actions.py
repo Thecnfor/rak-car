@@ -22,6 +22,12 @@ CAR_ACTIONS = {
     "lane_dis_offset": lambda car, *args, **kwargs: car.lane_dis_offset(*args, **kwargs),
     "start_lane_feed": lambda car, *args, **kwargs: car.start_lane_feed(*args, **kwargs),
     "stop_lane_feed": lambda car, *args, **kwargs: car.stop_lane_feed(**kwargs) if kwargs else car.stop_lane_feed(),
+    # 2026-07-31: 左右 IR / 底盘里程计守护线程开关（默认 50Hz auto-start）。
+    # 与 start_lane_feed / start_arm_feed / start_task_feed 同构。
+    "start_ir_feed": lambda car, *args, **kwargs: car.start_ir_feed(*args, **kwargs),
+    "stop_ir_feed": lambda car, *args, **kwargs: car.stop_ir_feed(**kwargs) if kwargs else car.stop_ir_feed(),
+    "start_odom_feed": lambda car, *args, **kwargs: car.start_odom_feed(*args, **kwargs),
+    "stop_odom_feed": lambda car, *args, **kwargs: car.stop_odom_feed(**kwargs) if kwargs else car.stop_odom_feed(),
     "move_to_detection_target": lambda car, *args, **kwargs: car.move_to_detection_target(*args, **kwargs),
     "adjust_arm_position": lambda car, *args, **kwargs: car.adjust_arm_position(*args, **kwargs),
     "get_detection_results": lambda car, *args, **kwargs: car.get_detection_results(*args, **kwargs),

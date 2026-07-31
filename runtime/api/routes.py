@@ -69,6 +69,9 @@ def get_public_links():
         "realtime_analog": f"{api_base}{v1}/realtime/analog",
         "realtime_analog2": f"{api_base}{v1}/realtime/analog2",
         "realtime_lane_state": f"{api_base}{v1}/realtime/lane/state",
+        # 2026-07-31: 新增 ir / odom realtime cache 端点。
+        "realtime_ir_state": f"{api_base}{v1}/realtime/ir/state",
+        "realtime_odom_state": f"{api_base}{v1}/realtime/odom/state",
     }
     _PUBLIC_LINKS_CACHE = cached
     return cached
@@ -537,6 +540,24 @@ def _ws_op_realtime_task_state(service, _payload):
     return {"ok": True, "op": "realtime/task_state", "data": {"task_state": task_state}}
 
 
+def _ws_op_realtime_ir_state(service, _payload):
+    """WS op=realtime/ir_state: 读 streamer 缓存的 ir_state 一次（左右 IR 距离）。"""
+    try:
+        ir_state = service.get_ir_state()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/ir_state", "data": {"ir_state": ir_state}}
+
+
+def _ws_op_realtime_odom_state(service, _payload):
+    """WS op=realtime/odom_state: 读 streamer 缓存的 odom_state 一次（底盘里程计）。"""
+    try:
+        odom_state = service.get_odom_state()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "op": "realtime/odom_state", "data": {"odom_state": odom_state}}
+
+
 # op string → handler。统一 `(service, payload) -> dict`。
 _WS_OP_DISPATCH = {
     "ping": _ws_op_ping,
@@ -566,6 +587,8 @@ _WS_OP_DISPATCH = {
     "realtime/lane_state": _ws_op_realtime_lane_state,
     "realtime/arm_state": _ws_op_realtime_arm_state,
     "realtime/task_state": _ws_op_realtime_task_state,
+    "realtime/ir_state": _ws_op_realtime_ir_state,
+    "realtime/odom_state": _ws_op_realtime_odom_state,
 }
 
 
@@ -1125,6 +1148,36 @@ def create_runtime_router(service, camera_stream_service):
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
+    @router_v1.get("/realtime/ir/state")
+    def v1_realtime_ir_state():
+        """外环/触发判定专用：读 ir_feed 守护线程缓存的左右 IR 距离。
+
+        与 /v1/realtime/lane/state 完全同构：不走 job_queue、不打 ZMQ、不抢 car_lock，
+        只取 meta_lock（极快）。ir_feed 默认 50Hz 刷新。
+
+        返回字段见 `camera_stream_service.get_ir_state`：
+          `{active, mode, left, right, updated_at}`。
+        """
+        try:
+            return {"ok": True, "ir_state": service.get_ir_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    @router_v1.get("/realtime/odom/state")
+    def v1_realtime_odom_state():
+        """外环/触发判定专用：读 odom_feed 守护线程缓存的底盘里程计。
+
+        与 /v1/realtime/lane/state 完全同构：不走 job_queue、不打 ZMQ、不抢 car_lock，
+        只取 meta_lock（极快）。odom_feed 默认 50Hz 刷新。
+
+        返回字段见 `camera_stream_service.get_odom_state`：
+          `{active, mode, x, y, theta, distance, updated_at}`。
+        """
+        try:
+            return {"ok": True, "odom_state": service.get_odom_state()}
+        except RuntimeError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+
     @router_v1.get("/realtime/vision/task")
     def v1_realtime_task_state():
         """边走边看侧摄目标:读 task_feed 守护线程缓存的最新一次目标检测结果。
@@ -1264,6 +1317,10 @@ def create_runtime_router(service, camera_stream_service):
                     "unsubscribe_arm_state": {"op": "unsubscribe_arm_state"},
                     "subscribe_task_detection": {"op": "subscribe_task_detection", "note": "持续 push 侧摄 task_state (边走边看)"},
                     "unsubscribe_task_detection": {"op": "unsubscribe_task_detection"},
+                    "subscribe_ir": {"op": "subscribe_ir", "note": "持续 push 左右 IR 距离 (50Hz)"},
+                    "unsubscribe_ir": {"op": "unsubscribe_ir"},
+                    "subscribe_odom": {"op": "subscribe_odom", "note": "持续 push 底盘里程计 (50Hz)"},
+                    "unsubscribe_odom": {"op": "unsubscribe_odom"},
                     "realtime_chassis_velocity": {"op": "realtime/chassis_velocity", "vx": 0.0, "vy": 0.0, "wz": 0.0},
                     "realtime_wheel_speeds": {"op": "realtime/wheel_speeds", "speeds": [0,0,0,0]},
                 },
@@ -1402,6 +1459,92 @@ def create_runtime_router(service, camera_stream_service):
                     pass
             task_push_task = None
 
+        # ---- 2026-07-31：ir_state push loop（外环/触发判定专用）----
+        ir_push_task = None
+        ir_subscribed = False
+        ir_push_hz = 50.0  # 与 ir_feed 默认刷新频率同档
+
+        async def _ir_push_loop():
+            last_updated_at = None
+            interval = 1.0 / max(float(ir_push_hz), 1.0)
+            while True:
+                try:
+                    state = service.get_ir_state()
+                except Exception:
+                    state = None
+                updated_at = state.get("updated_at") if state else None
+                if state and updated_at is not None and updated_at != last_updated_at:
+                    last_updated_at = updated_at
+                    try:
+                        await websocket.send_json(
+                            {"ok": True, "op": "ir_state", "data": state}
+                        )
+                    except Exception:
+                        return
+                await _asyncio.sleep(interval)
+
+        async def _start_ir_push():
+            nonlocal ir_push_task, ir_subscribed
+            if ir_subscribed and ir_push_task is not None and not ir_push_task.done():
+                return False
+            ir_subscribed = True
+            ir_push_task = _asyncio.create_task(_ir_push_loop())
+            return True
+
+        async def _stop_ir_push():
+            nonlocal ir_push_task, ir_subscribed
+            ir_subscribed = False
+            if ir_push_task is not None and not ir_push_task.done():
+                ir_push_task.cancel()
+                try:
+                    await ir_push_task
+                except (_asyncio.CancelledError, Exception):
+                    pass
+            ir_push_task = None
+
+        # ---- 2026-07-31：odom_state push loop ----
+        odom_push_task = None
+        odom_subscribed = False
+        odom_push_hz = 50.0
+
+        async def _odom_push_loop():
+            last_updated_at = None
+            interval = 1.0 / max(float(odom_push_hz), 1.0)
+            while True:
+                try:
+                    state = service.get_odom_state()
+                except Exception:
+                    state = None
+                updated_at = state.get("updated_at") if state else None
+                if state and updated_at is not None and updated_at != last_updated_at:
+                    last_updated_at = updated_at
+                    try:
+                        await websocket.send_json(
+                            {"ok": True, "op": "odom_state", "data": state}
+                        )
+                    except Exception:
+                        return
+                await _asyncio.sleep(interval)
+
+        async def _start_odom_push():
+            nonlocal odom_push_task, odom_subscribed
+            if odom_subscribed and odom_push_task is not None and not odom_push_task.done():
+                return False
+            odom_subscribed = True
+            odom_push_task = _asyncio.create_task(_odom_push_loop())
+            return True
+
+        async def _stop_odom_push():
+            nonlocal odom_push_task, odom_subscribed
+            odom_subscribed = False
+            if odom_push_task is not None and not odom_push_task.done():
+                odom_push_task.cancel()
+                try:
+                    await odom_push_task
+                except (_asyncio.CancelledError, Exception):
+                    pass
+            odom_push_task = None
+
         while True:
             try:
                 payload = await websocket.receive_json()
@@ -1467,6 +1610,41 @@ def create_runtime_router(service, camera_stream_service):
                     {"ok": True, "op": "unsubscribe_task_detection", "subscribed": False}
                 )
                 continue
+            # 2026-07-31：IR / odom 订阅控制（同 task_detection 模式）
+            if op == "subscribe_ir":
+                started = await _start_ir_push()
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "op": "subscribe_ir",
+                        "subscribed": started,
+                        "hz": ir_push_hz,
+                    }
+                )
+                continue
+            if op == "unsubscribe_ir":
+                await _stop_ir_push()
+                await websocket.send_json(
+                    {"ok": True, "op": "unsubscribe_ir", "subscribed": False}
+                )
+                continue
+            if op == "subscribe_odom":
+                started = await _start_odom_push()
+                await websocket.send_json(
+                    {
+                        "ok": True,
+                        "op": "subscribe_odom",
+                        "subscribed": started,
+                        "hz": odom_push_hz,
+                    }
+                )
+                continue
+            if op == "unsubscribe_odom":
+                await _stop_odom_push()
+                await websocket.send_json(
+                    {"ok": True, "op": "unsubscribe_odom", "subscribed": False}
+                )
+                continue
 
             request_id = payload.get("request_id")
             try:
@@ -1483,6 +1661,8 @@ def create_runtime_router(service, camera_stream_service):
         await _stop_lane_push()
         await _stop_arm_push()
         await _stop_task_push()
+        await _stop_ir_push()
+        await _stop_odom_push()
 
     router.include_router(router_v1)
     return router
