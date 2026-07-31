@@ -66,8 +66,8 @@ class Waypoint:
 # 默认 8 任务点位 + 1 终点。换场地改这里。
 DEFAULT_WAYPOINTS: List[Waypoint] = [
     Waypoint("seed",        task_module="main.tasks.auto_seeding",
-             ir_threshold_m=0.7, ir_side="right",
-             dis_at_least_m=1.20, trigger_op="AND"),
+             ir_threshold_m=0.6, ir_side="right",
+             dis_at_least_m=1.00, trigger_op="AND"),
     Waypoint("scout_pests", task_module="main.tasks.scout_pests",
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=3.50, trigger_op="AND"),
@@ -115,6 +115,18 @@ class Orchestrator:
             api.start_lane_feed(hz=self.lane_hz)
         except Exception as exc:
             logger.warning("start_lane_feed failed: %s", exc)
+
+        # 确保 ir_feed 就绪（#seed-overshoot）：首次 read_ir 走 fast-path，
+        # 避免 fallback 到 sync execute(timeout=2s) 导致 0.6m 盲区。
+        _ir_deadline = time.time() + 5.0
+        while time.time() < _ir_deadline:
+            ir_state = api.get_ir_state()
+            if ir_state.active:
+                logger.info("ir_feed active (age_ms=%s)", ir_state.age_ms)
+                break
+            time.sleep(0.2)
+        else:
+            logger.warning("ir_feed not active after 5s, IR reads may use slow fallback")
 
         # 用 LANE_FOLLOW profile 装配 DoubleLoopRunner（#1）
         # —— 不再自己 new CurvatureAdaptiveOuterLoop + WheelSmoother。
@@ -251,7 +263,7 @@ class Orchestrator:
         while True:
             ir: dict = {}
             try:
-                ir = read_ir(api, timeout=2.0)
+                ir = read_ir(api, timeout=0.5)  # fast-path 不受影响；fallback 盲区从 0.6m→0.15m
             except Exception:
                 pass
             right = ir.get("right") if isinstance(ir, dict) else None
