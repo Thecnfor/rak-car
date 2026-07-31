@@ -144,10 +144,13 @@ class ArmRunner:
         return self.client.grasp(on, timeout=timeout or self.default_timeout_s)
 
     def go_home(self) -> dict:
-        """回到 y=0, x=0，hand=UP（-90），arm=MID（0）。"""
-        self.client.set_hand_angle(-90.0, speed=80, timeout=10.0)
-        self.client.set_arm_angle(0.0, speed=80, timeout=10.0)
-        return self.move_xy(0.0, 0.0)
+        """回到 y=0, x=0，hand=UP（-90），arm=MID（0）。
+
+        2026-07-31 PR#13：改走 composite_go_home,内部 arm + xy 并行,hand 串行在末尾。
+        """
+        return self.client.composite_go_home(
+            hand=-90.0, arm=0.0, speed=80, timeout=self.default_timeout_s,
+        )
 
     # ---- 复位 ----
 
@@ -162,13 +165,30 @@ class ArmRunner:
     # ---- 业务组合 ----
 
     def pick(self, arm_angle: float, x_mm: float, y_mm: float) -> dict:
-        """set_arm_angle -> move_xy -> grasp(True)。"""
-        self.set_arm_angle(arm_angle)
-        self.move_xy(x_mm=x_mm, y_mm=y_mm)
-        return self.grasp(True)
+        """复合抓取 (2026-07-31 PR#13)：底层并行 set_arm_angle + goto_position,再串行 hand + grasp。
+
+        业务前置（必须满足，违反会抛 ValueError）：
+          - 当前 y 必须 < -30mm(出保护区)。
+            大臂舵机在 y ∈ [0, -30] 摆动会撞车,client wrapper 会拒绝。
+          - 大臂角度 arm_angle ∈ [+90, -150]°。
+          - 手爪角度 hand ∈ [-90, 0]°。
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool, "grasp": bool}}
+            ok=False 时 caller 决定是否 raise 或继续。
+        """
+        return self.client.composite_pick(
+            arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
+            hand=0.0, speed=80, timeout=self.default_timeout_s,
+        )
 
     def release(self, drop_x_mm: float = 0.0, drop_y_mm: float = 30.0) -> dict:
-        """set_hand_angle(DOWN=0) -> move_xy -> grasp(False)。"""
-        self.client.set_hand_angle(0.0, speed=80, timeout=10.0)
-        self.move_xy(x_mm=drop_x_mm, y_mm=drop_y_mm)
-        return self.grasp(False)
+        """复合释放 (2026-07-31 PR#13)：保守序列 hand → goto_position → grasp(False)。
+
+        业务前置：当前 y 必须 < -30mm(出保护区)。
+        Returns: {"ok": bool, "steps": {"hand": bool, "position": bool, "grasp": bool}}
+        """
+        return self.client.composite_release(
+            drop_x_mm=drop_x_mm, drop_y_mm=drop_y_mm,
+            hand=0.0, speed=80, timeout=self.default_timeout_s,
+        )

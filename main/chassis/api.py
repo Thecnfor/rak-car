@@ -41,14 +41,22 @@ class ChassisClient:
     # ---- 业务动作 ----
 
     def start_lane_feed(self, hz: float = 50.0, timeout: float = 10.0):
-        """车端：开一个守护线程只刷 lane_state 缓存，不下发轮速。"""
+        """车端：开一个守护线程只刷 lane_state 缓存，不下发轮速。
+
+        注意：runtime init 默认已经启 lane_feed（50Hz），业务侧一般不需要调。
+        timeout 留给未来同步语义扩展；当前服务端是瞬时返回。
+        """
         return self.http.call("car", "start_lane_feed", hz=hz, timeout=timeout)
 
     def stop_lane_feed(self, timeout: float = 5.0):
         return self.http.call("car", "stop_lane_feed", timeout=timeout)
 
     def stop_wheel_speeds(self):
-        """零速：客户端外环退出前必须发。"""
+        """手动零速（兜底/异常路径用）。正常退出请调 ``close()``。
+
+        ``close()`` 会自动发零速 + 收 ws —— 调用方在 finally 里只调 close()
+        就够了，不要既调 stop_wheel_speeds 又调 close（重复发零速无副作用但不必要）。
+        """
         return self.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
 
     def emergency_stop(self):
@@ -113,7 +121,17 @@ class ChassisClient:
             return False
 
     def close(self) -> None:
-        """退出前收 ws 长连接；失败无所谓（进程要退了）。"""
+        """退出收尾（#5）：自动发零速 + 关 ws 长连接。
+
+        流程：先发 [0,0,0,0]（即使 ws 断了也走 HTTP 兜底）→ 再关 ws。
+        失败无所谓（进程要退了）。
+        """
+        # 自动发零速（#5）：以前 DoubleLoopRunner finally 与 stop_wheel_speeds 双重发，
+        # 现在收敛到 close()。多次调用 close() 也安全（smoother 已清零，不会乱跳）。
+        try:
+            self.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+        except Exception:
+            pass
         try:
             self.ws.close()
         except Exception:

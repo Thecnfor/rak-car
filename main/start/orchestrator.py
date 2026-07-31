@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """main/start/orchestrator.py
 
-run.py 的实现后端：
-  - 后台 A：50Hz 巡线外环 (受 running Event 控制)
+run.py 的实现后端（#1 重构）：
+  - 后台 A：DoubleLoopRunner 50Hz 巡线外环（pause/resume 控制）
   - 后台 B：20Hz 里程计累计
   - 主线程：顺序遍历 DEFAULT_WAYPOINTS，等待「IR + 里程计」双触发 → 暂停巡线
     → 调 task.run() → 恢复巡线 → 终点处 break。
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import math
 import sys
 import threading
 import time
@@ -27,10 +28,9 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from main.api_client import RuntimeApiClient
+from main.chassis import LANE_FOLLOW
 from main.chassis.api import ChassisClient
-from main.chassis.controllers.base import WheelSmoother
-from main.chassis.controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
-from main.chassis.loops.safety import EmergencyWatchdog
+from main.chassis.loops.closed_loop import DoubleLoopRunner
 from main.chassis.tasks.read_dis import read_dis
 from main.chassis.tasks.read_ir import read_ir
 
@@ -116,12 +116,26 @@ class Orchestrator:
         except Exception as exc:
             logger.warning("start_lane_feed failed: %s", exc)
 
-        # 后台 A：巡线外环（受 running Event 控制）
-        running = threading.Event()
-        running.set()
-        threading.Thread(target=self._lane_loop,
-                         args=(api, running),
-                         daemon=True, name="lane").start()
+        # 用 LANE_FOLLOW profile 装配 DoubleLoopRunner（#1）
+        # —— 不再自己 new CurvatureAdaptiveOuterLoop + WheelSmoother。
+        profile = LANE_FOLLOW
+        runner = DoubleLoopRunner(
+            api=api,
+            outer=profile.build_outer(),
+            hz=self.lane_hz,
+            watchdog_ms=profile.watchdog_ms,
+            lost_line_ms=profile.lost_line_ms,
+            smoother=profile.build_smoother(),
+        )
+
+        # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）
+        # max_seconds=inf：常驻，由 runner.stop() 终止
+        runner_thread = threading.Thread(
+            target=runner.run,
+            kwargs={"max_seconds": math.inf},
+            daemon=True, name="lane",
+        )
+        runner_thread.start()
 
         # 后台 B：里程计（全程累计，写共享 buffer）
         dis_buf = [0.0]
@@ -153,7 +167,7 @@ class Orchestrator:
                                   "state": "done"}
                     completed.append(wp.name)
                     break
-                self._pause_lane(api, running)
+                self._pause_lane(runner, api)
                 time.sleep(wp.pause_before_s)
                 if wp.task_module:
                     tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
@@ -163,25 +177,29 @@ class Orchestrator:
                     if not ok:
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
                 time.sleep(wp.pause_after_s)
-                self._resume_lane(running)
+                self._resume_lane(runner)
                 completed.append(wp.name)
         except KeyboardInterrupt:
             logger.info("interrupted by user")
         finally:
-            running.clear()
+            # 终止 runner（#1）：stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
+            # join 等其 finally 块跑完（smoother 归零 + api.close()）。
+            # 同时关掉 TUI 后台线程.
             tui_running.clear()
             try:
                 api.stop_wheel_speeds()
             except Exception:
                 pass
+            runner.stop()
+            runner_thread.join(timeout=2.0)
             try:
                 api.stop_lane_feed()
             except Exception:
                 pass
-            api.close()
+            # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
             logger.info("mission completed: %s", completed)
 
-    # ── 后台线程 ────────────────────────────────────────────
+# ── 后台线程 ────────────────────────────────────────────
 
     @staticmethod
     def _tui_loop(tui_buf: List[Dict[str, Any]],
@@ -204,49 +222,21 @@ class Orchestrator:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    def _lane_loop(self, api: ChassisClient, running: threading.Event) -> None:
-        """50Hz 巡线：读 lane → 控制律 → smoother → 下发。running.clear() 暂停。"""
-        outer = CurvatureAdaptiveOuterLoop()
-        smoother = WheelSmoother()
-        watchdog = EmergencyWatchdog(threshold_ms=500.0)
-        dt = 1.0 / max(self.lane_hz, 1.0)
-        while True:
-            running.wait()
-            smoother.reset([0.0, 0.0, 0.0, 0.0])
-            t0 = time.monotonic()
-            state = api.read_lane()
-            if watchdog.should_stop(state):
-                try:
-                    api.emergency_stop()
-                except Exception:
-                    pass
-                time.sleep(dt)
-                continue
-            raw = outer.step(state, dt)
-            safe = smoother.step(raw)
-            try:
-                api.set_wheel_speeds(safe)
-            except Exception:
-                pass
-            sleep_s = dt - (time.monotonic() - t0)
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-
     # ── 主线程辅助 ──────────────────────────────────────────
 
     @staticmethod
-    def _pause_lane(api: ChassisClient, running: threading.Event) -> None:
-        """暂停外环：clear Event + 主动发零速 + 等一帧让车端消化。"""
-        running.clear()
+    def _pause_lane(runner: DoubleLoopRunner, api: ChassisClient) -> None:
+        """暂停外环（#1）：runner.pause() 阻塞下一帧 + 主动发零速兜底。"""
+        runner.pause()
         try:
             api.stop_wheel_speeds()
         except Exception:
             pass
-        time.sleep(0.1)
 
     @staticmethod
-    def _resume_lane(running: threading.Event) -> None:
-        running.set()
+    def _resume_lane(runner: DoubleLoopRunner) -> None:
+        """恢复外环（#1）：resume() 唤醒 + 清 smoother 记忆，从静止起步。"""
+        runner.resume()
 
     @staticmethod
     def _wait_until_triggered(wp: Waypoint, api: ChassisClient,

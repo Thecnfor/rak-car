@@ -2,6 +2,7 @@
 外环兜底：lane_state 太久没刷（车端 lane feed 卡死或推理慢）就急停。
 """
 from ..state import LaneState
+from ..config.lane_follow import LOST_LINE_ZERO_EPS
 
 
 class EmergencyWatchdog:
@@ -19,7 +20,7 @@ class EmergencyWatchdog:
 class LostLineDetector:
     """误差值齐 0 持续 N 帧 → 报警（视作丢线）。"""
 
-    def __init__(self, stable_ms: float = 300.0, zero_eps: float = 1e-3) -> None:
+    def __init__(self, stable_ms: float = 300.0, zero_eps: float = LOST_LINE_ZERO_EPS) -> None:
         self.stable_ms = float(stable_ms)
         self.zero_eps = float(zero_eps)
         self._zero_since: float = 0.0

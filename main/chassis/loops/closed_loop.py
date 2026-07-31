@@ -5,6 +5,7 @@
 下发前会经过 ``WheelSmoother`` 做单轮 |v| 饱和 + 单帧 slew rate 限幅，
 避免弯道瞬间单轮目标跨度过大把下位机电源拉爆。
 """
+import threading
 import time
 from typing import Callable, List, Optional
 
@@ -17,11 +18,21 @@ from ..controllers.base import OuterLoop, WheelSmoother
 class DoubleLoopRunner:
     """双环 runner：外环在客户端、内环在车端（这里只负责发事件）。
 
-    用法：
+    用法 1（一次性跑 N 秒）：
         api = ChassisClient.connect()
-        api.start_lane_feed(hz=20.0)
         runner = DoubleLoopRunner(api=api, outer=StanleyOuterLoop())
         runner.run(max_seconds=20.0)
+
+    用法 2（#1：run 在后台线程，主线程 pause/resume）：
+        runner = DoubleLoopRunner(...)
+        threading.Thread(target=runner.run, kwargs={"max_seconds": math.inf},
+                         daemon=True).start()
+        ...
+        runner.pause()      # 停外环（断触发保护：smoother 保持最后值）
+        do_task()
+        runner.resume()     # 续外环（smoother 重置为 0，避免 stale 数据跳变）
+        ...
+        runner.stop()
     """
 
     def __init__(
@@ -50,9 +61,34 @@ class DoubleLoopRunner:
         # 默认挂一个 smoother；要彻底关掉就显式传一个 max_abs=∞ / max_accel=∞ 的实例
         self.smoother = smoother if smoother is not None else WheelSmoother()
         self._stop = False
+        # pause/resume 控制（#1）：pause 后外环在 _pause.wait() 处阻塞；
+        # smoother 保持最后值，不会"忘记"已下发速度（避免发零后恢复时跳变）。
+        self._pause = threading.Event()
+        self._pause.set()  # 初始为"运行"状态
 
     def stop(self) -> None:
+        """请求 run() 退出（finally 会兜底 zero out + api.close）。"""
         self._stop = True
+        # 唤醒 _pause.wait()，让 run() 立刻看到 _stop
+        self._pause.set()
+
+    def pause(self) -> None:
+        """暂停外环：当前帧跑完后阻塞在 _pause.wait()。smoother 保留最后值。
+
+        安全：调用方通常紧跟着 ``api.stop_wheel_speeds()`` 主动发零速，
+        然后跑任务逻辑（车端内环 PID 接管）。这样 resume() 时车已静止，
+        smoother 重置到 0 是连续的。
+        """
+        self._pause.clear()
+
+    def resume(self) -> None:
+        """恢复外环：smoother 重置为 0，下一帧从静止起步（避免 stale 跳变）。"""
+        # 先清 smoother 的"上一帧"记忆，再唤醒外环
+        self.smoother.reset([0.0, 0.0, 0.0, 0.0])
+        self._pause.set()
+
+    def is_paused(self) -> bool:
+        return not self._pause.is_set()
 
     def _sense(self) -> LaneState:
         # ChassisClient.read_lane() 内部已 ws 优先 + 异常兜底返回空 LaneState，
@@ -66,6 +102,9 @@ class DoubleLoopRunner:
             raw  = outer.step(state, dt)         # 控制律原始输出
             safe = self.smoother.step(raw)       # 单轮饱和 + slew rate 限幅
             api.set_wheel_speeds(safe)           # dry_run=False 时才下发
+
+        pause/resume（#1）：pause 时循环阻塞在 ``_pause.wait()``，
+        唤醒后从阻塞处继续；resume() 同时清 smoother 记忆。
         """
         deadline = time.monotonic() + max(0.0, float(max_seconds))
         next_tick = time.monotonic()
@@ -73,6 +112,10 @@ class DoubleLoopRunner:
         self.smoother.reset([0.0, 0.0, 0.0, 0.0])
         try:
             while not self._stop:
+                # pause 点（#1）：pause() 后阻塞；resume() / stop() 唤醒。
+                self._pause.wait()
+                if self._stop:
+                    break
                 now = time.monotonic()
                 if now > deadline:
                     break
@@ -107,14 +150,9 @@ class DoubleLoopRunner:
                     # 调度已经落后了，放弃补偿避免 catching up
                     next_tick = time.monotonic()
         finally:
-            # 退出前先把 smoother 也清回 0，再发零速，保证 no-op 顺序
+            # 退出收尾（#5）：smoother 归零 + api.close()（close 内部自动发零速）。
+            # 不要再单独发 [0,0,0,0] —— close 已经做了。
             self.smoother.reset([0.0, 0.0, 0.0, 0.0])
-            if not self.dry_run:
-                try:
-                    self.api.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
-                except Exception:
-                    pass
-            # 收 ws 长连接，让进程能干净退出
             try:
                 self.api.close()
             except Exception:
