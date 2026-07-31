@@ -21,6 +21,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         dkappa_full: float = 1.4,
         kp_y: float = 0.80,
         kp_theta: float = 1.2,
+        kp_theta_straight: float = 0.85,
         ki_y: float = 0.40,
         ey_int_cap: float = 0.10,
         ey_int_decay: float = 0.80,
@@ -45,6 +46,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self.dkappa_full = max(float(dkappa_full), 1e-3)
         self.kp_y = float(kp_y)
         self.kp_theta = float(kp_theta)
+        self.kp_theta_straight = float(kp_theta_straight)
         self.ki_y = float(ki_y)
         self.ey_int_cap = max(float(ey_int_cap), 0.0)
         self.ey_int_decay = max(float(ey_int_decay), 0.0)
@@ -179,8 +181,12 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         ea_now = float(state.error_angle)
         if ea_now != 0.0:
             self._prev_sign = math.copysign(1.0, ea_now)
+
+        # 直道 kp_theta 用更小的 straight 值，弯道不变
+        self._axis_mix = self._axis_mix_from_kappa(kappa)
+        kp_theta_eff = self.kp_theta_straight + (self.kp_theta - self.kp_theta_straight) * self._axis_mix
         omega_raw = (
-            +self.kp_theta * ea_now * boost
+            +kp_theta_eff * ea_now * boost
             + self.k_curvature * self._dkappa_ema * self._prev_sign
             + self.ki_theta * self._ea_integral * boost
         )
@@ -189,7 +195,6 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         elif omega_raw < -self.omega_cap:
             omega_raw = -self.omega_cap
 
-        self._axis_mix = self._axis_mix_from_kappa(kappa)
         vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
         vy_decided = vy_keep * vy_raw
         omega_decided = self._axis_mix * omega_raw
