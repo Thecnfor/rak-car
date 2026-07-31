@@ -69,7 +69,10 @@ def _parse_cache(raw: Dict[str, Any]) -> List[Detection]:
       - det_id（cache 字段） / track_id（sync 字段） 都视作 track_id
       - cls_id / class_id 都视作 class_id
     """
-    state = raw.get("task_state") or raw.get("data") or {}
+    state = raw.get("task_state") or raw.get("data") or raw
+    # 第三种情况：state 直接发（无 wrapper）—— 用 "detections" 字段识别
+    if "detections" not in state:
+        state = raw
     dets = state.get("detections") or []
     now = float(state.get("updated_at") or time.time())
     out: List[Detection] = []
