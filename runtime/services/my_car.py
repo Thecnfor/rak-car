@@ -1616,6 +1616,15 @@ class MyCar(MecanumDriver):
                 )
                 return {"started": False, "reason": "already_running", "hz": hz}
             # 否则无论 alive 与否，都走"清旧建新"——也覆盖了"join 失败但活进程失去响应"边界
+            logger.info(
+                "ir_feed reset path: thread_alive=%s thread_is_None=%s hz_current=%s hz_request=%s"
+                % (
+                    self._ir_feed_thread.is_alive() if self._ir_feed_thread is not None else None,
+                    self._ir_feed_thread is None,
+                    self._ir_feed_hz,
+                    hz,
+                )
+            )
             if self._ir_feed_thread is not None:
                 if self._ir_feed_stop is not None:
                     self._ir_feed_stop.set()
