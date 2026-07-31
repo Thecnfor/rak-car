@@ -41,12 +41,15 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from main.api_client import RuntimeApiClient
-from main.tasks.auto_seeding_safe import (
+from main.tasks._helpers import (
     _ensure_runtime,
     _wait_infer_ready,
-    _chassis_move_for,
-    _grasp,
+    _move_x,
+    _move_y,
     _set_arm_angle,
+    _set_hand_angle as _helpers_set_hand_angle,
+    _grasp,
+    _chassis_move_for,
 )
 from main.tasks._config import load_task_config
 
@@ -55,39 +58,9 @@ logger = logging.getLogger("task.water_tower")
 WATER_TOWER_LABELS = ("water_l1", "water_l2", "water_l3")
 
 
-def _move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0,
-            out_time: float = 15.0, timeout: float = 30.0) -> None:
-    """move_x_position PID 闭环 — 对齐 Task 1 auto_seeding.py L185-193."""
-    job = client.execute(
-        "arm", "move_x_position",
-        args=[x_mm / 1000.0],
-        kwargs={"v_max_mms": v_max_mms, "out_time": out_time},
-        sync=True, timeout=timeout + 5,
-    )
-    if job.get("status") != "succeeded" or job.get("error"):
-        raise RuntimeError(
-            "arm move_x({:.0f}) failed: status={} error={}".format(
-                x_mm, job.get("status"), job.get("error")
-            )
-        )
-
-
-def _move_y(client: RuntimeApiClient, y_mm: float, timeout: float = 25.0) -> None:
-    """move_y_position PID 闭环 — 对齐 Task 1 auto_seeding.py L196-207."""
-    job = client.execute(
-        "arm", "move_y_position",
-        args=[y_mm / 1000.0],
-        sync=True, timeout=timeout,
-    )
-    if job.get("status") != "succeeded" or job.get("error"):
-        raise RuntimeError(
-            "arm move_y({:.0f}) failed: status={} error={}".format(
-                y_mm, job.get("status"), job.get("error")
-            )
-        )
-
-
-# ── 安全区间 ──────────────────────────────────────────────
+# ============================================================
+# 大臂旋转前置约束 (Rule A / Rule B) + Rule C 角度到位校验
+# ============================================================
 
 # Rule A: 大臂旋转前 X 必须在 [-300, -150], Y 必须在 [-180, -100]
 ARM_SAFE_X_MIN = -300.0
@@ -211,25 +184,10 @@ def _ensure_x_for_y_lift(client: RuntimeApiClient) -> None:
     _move_x(client, -180.0, v_max_mms=80.0)
 
 
-def _set_hand_angle(client: RuntimeApiClient, angle_deg: float, speed: int = 80, timeout: float = 10.0) -> None:
-    """Wrapper for set_hand_angle (same retry pattern as _set_arm_angle)."""
-    import time as _t
-    last = None
-    for attempt in range(1, 3):
-        try:
-            job = client.execute(
-                "arm", "set_hand_angle",
-                args=[angle_deg, speed],
-                sync=True, timeout=timeout + 5,
-            )
-            if job.get("status") == "succeeded" and not job.get("error"):
-                return
-            last = "status={} error={}".format(job.get("status"), job.get("error"))
-        except Exception as exc:
-            last = "{}: {}".format(type(exc).__name__, exc)[:200]
-        logger.warning("set_hand_angle(%.0f) attempt %d failed: %s", angle_deg, attempt, last)
-        _t.sleep(1.0)
-    raise RuntimeError("set_hand_angle({}) failed: {}".format(angle_deg, last))
+def _set_hand_angle(client: RuntimeApiClient, angle_deg: float, speed: int = 80,
+                   timeout: float = 10.0) -> None:
+    # 委托到 main.tasks._helpers._set_hand_angle (含 retry)
+    return _helpers_set_hand_angle(client, angle_deg, speed=speed, timeout=timeout)
 
 
 def _pick_cube(

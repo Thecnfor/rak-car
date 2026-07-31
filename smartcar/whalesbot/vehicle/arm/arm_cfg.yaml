@@ -30,9 +30,9 @@ vert_cfg:
     perimeter: 0.008
   limit_port: 5
   pid:
-    Kp: 4
-    Ki: 0.1
-    Kd: 0.1
+    Kp: 6
+    Ki: 0
+    Kd: 0
     setpoint: 0
     output_limits:
     - -0.1

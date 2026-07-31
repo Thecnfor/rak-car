@@ -371,6 +371,18 @@ class MyCar(MecanumDriver):
         self._lane_feed_thread = None
         self._lane_feed_stop = None
         self._lane_feed_lock = threading.Lock()
+        # 2026-07-31：左右 IR 距离缓存守护线程（与 _lane_feed_* 同构）。
+        # 数据源 MyCar.get_all_ir_distance() —— 内部是 MC602 字节往返。
+        # 后台跑后 main 业务层 /v1/realtime/ir/state 几乎是 0 队列延迟 + 0 car_lock。
+        self._ir_feed_thread = None
+        self._ir_feed_stop = None
+        self._ir_feed_lock = threading.Lock()
+        # 2026-07-31：底盘里程计缓存守护线程（与 _lane_feed_* 同构）。
+        # 数据源 MyCar.get_odometry() + get_distance() —— 内存读，廉价但同步路径
+        # 抢 _ref_lock + job_queue，慢；后台喂 50Hz 后业务层读 0 延迟。
+        self._odom_feed_thread = None
+        self._odom_feed_stop = None
+        self._odom_feed_lock = threading.Lock()
 
         self.beep()
 
@@ -791,14 +803,55 @@ class MyCar(MecanumDriver):
 
     def ernie_bot_init(self):
         """
-        初始化文心一言分析
-
-        初始化、图像分析和订单分析的文心一言接口。
+        2026-08-01：ERNIE 改为 lazy 属性，避免 MyCar init 时立刻发起 HTTPS 连接
+        （原版两个 ErnieBotWrap() 各开一次 access_token 刷新/鉴权握手，比赛长时间运行
+        会因 race + 关闭抖动累积连接数）。访问 `self.image_analysis` / `self.order_analysis`
+        时才真正构造。
         """
-        self.image_analysis = ErnieBotWrap()
+        self._ernie_image = None
+        self._ernie_order = None
+        self._ernie_image_lock = threading.Lock()
+        self._ernie_order_lock = threading.Lock()
+        self.order_analysis_prompt = str(OrderPrompt())  # 字符串缓存，纯文本
+        self._action_bot = None
+        self._hum_analysis = None
+        self._action_bot_lock = threading.Lock()
+        self._hum_analysis_lock = threading.Lock()
 
-        self.order_analysis = ErnieBotWrap()
-        self.order_analysis.set_promt(str(OrderPrompt()))
+    @property
+    def image_analysis(self):
+        if self._ernie_image is None:
+            with self._ernie_image_lock:
+                if self._ernie_image is None:
+                    self._ernie_image = ErnieBotWrap()
+        return self._ernie_image
+
+    @property
+    def order_analysis(self):
+        if self._ernie_order is None:
+            with self._ernie_order_lock:
+                if self._ernie_order is None:
+                    inst = ErnieBotWrap()
+                    inst.set_promt(self.order_analysis_prompt)
+                    self._ernie_order = inst
+        return self._ernie_order
+
+    @property
+    def hum_analysis(self):
+        # 兼容旧 yiyan_get_humattr 调用，懒构造。
+        if self._hum_analysis is None:
+            with self._hum_analysis_lock:
+                if self._hum_analysis is None:
+                    self._hum_analysis = ErnieBotWrap()
+        return self._hum_analysis
+
+    @property
+    def action_bot(self):
+        if self._action_bot is None:
+            with self._action_bot_lock:
+                if self._action_bot is None:
+                    self._action_bot = ErnieBotWrap()
+        return self._action_bot
 
     def animal_image_analysis(self):
         dets = self.get_detection_results()
@@ -1301,7 +1354,16 @@ class MyCar(MecanumDriver):
                     if (streamer is not None and hasattr(streamer, "normalize_cam_id"))
                     else "cam1"
                 )
-                consecutive_err = 0
+                # 2026-07-31 lane 推理断连修复:
+                # 旧逻辑连续 5 次异常就 break, 守护线程永久退出, lane_state 永远停在
+                # idle, 外环拿不到误差信号 -> 车在路上突然失明。
+                # 新逻辑:
+                #   - 连续异常不退出, 只递增 backoff(period*2^n, 封顶 1s)
+                #   - 每收到一次正常 result, 计数清零并恢复原 period
+                #   - 仍然走 stop_event / _stop_flag 优雅退出
+                # backoff 状态
+                backoff = 1
+                max_backoff = 20  # 20 * period = 1s @ period=50ms
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
@@ -1321,7 +1383,7 @@ class MyCar(MecanumDriver):
                             continue
                         error_y = float(result[0])
                         error_angle = float(result[1])
-                        consecutive_err = 0
+                        backoff = 1  # 恢复正常, 退避复位
                         if set_state is not None:
                             set_state(
                                 active=True,
@@ -1334,18 +1396,18 @@ class MyCar(MecanumDriver):
                                 distance=self.get_distance(),
                             )
                     except Exception as exc:
-                        consecutive_err += 1
-                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出，
-                        # 否则外环会丢一份新鲜的 lane_state。
+                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出。
+                        # 旧版本累计 5 次直接 break, 导致 lane_feed 永久死掉,
+                        # 必须手动重启 lane_feed, 这是 issue "前置推理突然断掉"
+                        # 的根因。改为连续异常也不退出, 用 backoff 拉长间隔,
+                        # 一旦 ZMQ 恢复立刻复位 backoff=1 续跑。
+                        wait_s = min(period * backoff, period * max_backoff)
                         logger.warning(
-                            "lane feed transient err ({}): {}".format(
-                                consecutive_err, exc
-                            )
+                            "lane feed transient err (backoff=%d, wait=%.2fs): %s",
+                            backoff, wait_s, exc,
                         )
-                        if consecutive_err >= 5:
-                            logger.warning("lane feed loop exit after {} errs".format(consecutive_err))
-                            break
-                        stop_event.wait(period)
+                        backoff = min(backoff * 2, max_backoff)
+                        stop_event.wait(wait_s)
                         continue
                     stop_event.wait(period)
                 if set_state is not None:
@@ -1381,6 +1443,11 @@ class MyCar(MecanumDriver):
             self._lane_feed_thread = None
             self._lane_feed_stop = None
         return {"stopped": True}
+
+    def restart_lane_feed(self, hz: float = 50.0):
+        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
+        self.stop_lane_feed()
+        return self.start_lane_feed(hz=hz)
 
     # === arm 位置推送守护线程（实时 y/x,给 WS subscribe_arm_state 订阅） ===
     def start_arm_feed(self, hz: float = 20.0):
@@ -1455,6 +1522,11 @@ class MyCar(MecanumDriver):
             self._arm_feed_stop = None
         return {"stopped": True}
 
+    def restart_arm_feed(self, hz: float = 20.0):
+        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
+        self.stop_arm_feed()
+        return self.start_arm_feed(hz=hz)
+
     # === 侧摄目标检测推送守护线程（实时 task 检测结果,给 WS subscribe_task_detection 订阅） ===
     def start_task_feed(self, hz: float = 30.0):
         """启动侧摄目标检测守护线程,持续刷新 streamer.task_state。
@@ -1493,7 +1565,12 @@ class MyCar(MecanumDriver):
                 # fallback 到 cap_side.read() (Camera.read 同步阻塞等 update 线程写 self.frame)
                 get_stream_frame = getattr(streamer, "get_frame", None) if streamer else None
                 get_fallback = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
-                consecutive_err = 0
+                # 2026-07-31: 与 lane_feed / arm_feed / ir_feed 同模式 —— 连续异常
+                # 不退出, backoff 封顶 1s, 收到一次正常 result 立刻复位。旧版本
+                # 累计 5 次异常就 break 退出, task_state 永久 idle, /v1/vision/task
+                # 失败 + 业务层"边走边看"失明, 必须手动 restart_task_feed 才能恢复。
+                backoff = 1
+                max_backoff = 20  # 20 * period = 1s @ period=50ms
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
@@ -1514,6 +1591,7 @@ class MyCar(MecanumDriver):
                         raw = self.task_det(img) if hasattr(self, "task_det") else []
                         # raw 形如 [[cls_id, det_id, label, score, x_c, y_c, w, h], ...]
                         # 缓存到 streamer.task_state 供上层轮询/订阅
+                        backoff = 1  # 正常一次,退避复位
                         if set_state is not None:
                             set_state(
                                 active=True,
@@ -1535,16 +1613,17 @@ class MyCar(MecanumDriver):
                                 ],
                                 count=len(raw or []),
                             )
-                        consecutive_err = 0
                     except Exception as exc:
-                        consecutive_err += 1
+                        # ZMQ 暂时超时 / cv2 resize 临时失败 / EFSM:
+                        # 退避但不退出。clintInterface 内部已带锁, 这里的 EFSM
+                        # 通常来自 socket 已死等更底层故障, 让它有机会恢复。
+                        wait_s = min(period * backoff, period * max_backoff)
                         logger.warning(
-                            "task feed transient err ({}): {}".format(consecutive_err, exc)
+                            "task feed transient err (backoff=%d, wait=%.2fs): %s",
+                            backoff, wait_s, exc,
                         )
-                        if consecutive_err >= 5:
-                            logger.warning("task feed loop exit after {} errs".format(consecutive_err))
-                            break
-                        stop_event.wait(period)
+                        backoff = min(backoff * 2, max_backoff)
+                        stop_event.wait(wait_s)
                         continue
                     stop_event.wait(period)
                 if set_state is not None:
@@ -1573,6 +1652,257 @@ class MyCar(MecanumDriver):
             self._task_feed_thread = None
             self._task_feed_stop = None
         return {"stopped": True}
+
+    def restart_task_feed(self, hz: float = 30.0):
+        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
+        self.stop_task_feed()
+        return self.start_task_feed(hz=hz)
+
+    # === 2026-07-31：左右 IR 距离缓存守护线程（实时 IR,给 /realtime/ir/state 轮询 / WS 订阅） ===
+    def start_ir_feed(self, hz: float = 50.0):
+        """启动左右 IR 距离守护线程,持续刷新 streamer.ir_state。
+
+        与 start_lane_feed / start_arm_feed / start_task_feed 模式完全一致:
+          - 默认 50Hz（与 lane_feed 同档,env RAK_CAR_IR_FEED_HZ 可覆盖）
+          - 不抢 car_lock：读 IR 是 MC602 字节往返(内部 SDK 锁),
+            与 move_y / move_x 不互斥,但慢(~10-30ms/次),适合后台串行喂缓存
+          - 不会下发任何控制指令,只刷新 ir_state 缓存
+          - 订阅一次即可一直 push,disconnect / unsubscribe 时 cancel
+
+        业务场景: main/chassis/tasks/read_ir.py、orchestrator._wait_until_triggered
+        不再每次都进 job_queue + car_lock + MC602 字节往返,直接读缓存。
+        """
+        # 2026-07-31 修：init 后被 force-init 重建过 car 引用的 race —— car 实例对象
+        # 是新的,_ir_feed_hz 属性可能不存在,用 getattr 防御
+        cur_hz = getattr(self, "_ir_feed_hz", None)
+        cur_thread = getattr(self, "_ir_feed_thread", None)
+        cur_lock = getattr(self, "_ir_feed_lock", None)
+        cur_stop = getattr(self, "_ir_feed_stop", None)
+        if cur_lock is None:
+            self._ir_feed_lock = threading.Lock()
+            self._ir_feed_thread = None
+            self._ir_feed_stop = None
+            self._ir_feed_hz = None
+        else:
+            self._ir_feed_lock = cur_lock
+            self._ir_feed_thread = cur_thread
+            self._ir_feed_stop = cur_stop
+            self._ir_feed_hz = cur_hz
+        with self._ir_feed_lock:
+            # 同一 hz 已经在跑，直接 fast-path（即使别的并发 caller 刚 restart 完）。
+            cur_thread = self._ir_feed_thread
+            cur_hz = self._ir_feed_hz
+            if (
+                cur_thread is not None
+                and cur_thread.is_alive()
+                and cur_hz is not None
+                and float(cur_hz) == float(hz)
+            ):
+                return {"started": False, "reason": "already_running", "hz": hz}
+            # 否则无论 alive 与否，都走"清旧建新"——也覆盖了"join 失败但活进程失去响应"边界
+            if self._ir_feed_thread is not None:
+                if self._ir_feed_stop is not None:
+                    self._ir_feed_stop.set()
+                if self._ir_feed_thread.is_alive():
+                    self._ir_feed_thread.join(timeout=2.0)
+            self._ir_feed_thread = None
+            self._ir_feed_stop = None
+            self._ir_feed_stop = threading.Event()
+            stop_event = self._ir_feed_stop
+            self._ir_feed_hz = float(hz)
+            period = 1.0 / max(float(hz), 1.0)
+
+            def _ir_feed_loop():
+                streamer = getattr(self, "streamer", None)
+                set_state = getattr(streamer, "set_ir_state", None) if streamer else None
+                # 与 lane_feed / arm_feed 同模式：连续异常不退出,
+                # backoff 封顶 1s,正常一次立刻复位 period
+                backoff = 1
+                max_backoff = 20  # 20 * period = 1s @ period=50ms
+                while not stop_event.is_set():
+                    if self._stop_flag:
+                        break
+                    try:
+                        # 一次读两侧（底层 Infrared.read 串行字节往返两次）,
+                        # 比 main 业务层两次 execute 节省一次 HTTP + 一次 job_queue
+                        irs = self.get_all_ir_distance() if hasattr(self, "get_all_ir_distance") else {}
+                        left = irs.get("left") if isinstance(irs, dict) else None
+                        right = irs.get("right") if isinstance(irs, dict) else None
+                        backoff = 1
+                        if set_state is not None:
+                            set_state(
+                                active=True,
+                                mode="ir_feed",
+                                left=float(left) if left is not None else None,
+                                right=float(right) if right is not None else None,
+                            )
+                    except Exception as exc:
+                        wait_s = min(period * backoff, period * max_backoff)
+                        logger.warning(
+                            "ir feed transient err (backoff=%d, wait=%.2fs): %s",
+                            backoff, wait_s, exc,
+                        )
+                        backoff = min(backoff * 2, max_backoff)
+                        stop_event.wait(wait_s)
+                        continue
+                    stop_event.wait(period)
+                # 退出时 active=False,业务层能感知"feed 已停"
+                if set_state is not None:
+                    try:
+                        set_state(active=False, mode="idle", left=None, right=None)
+                    except Exception:
+                        pass
+
+            self._ir_feed_thread = threading.Thread(target=_ir_feed_loop, name="ir-feed")
+            self._ir_feed_thread.daemon = True
+            self._ir_feed_thread.start()
+            return {"started": True, "hz": hz}
+
+    def stop_ir_feed(self):
+        """停止 ir_feed 守护线程,并把 ir_state 复位成 idle。
+
+        join timeout 拉到 (1.5 * period + 0.5s 缓冲),IR 单次 SDK 字节往返
+        最坏 ~30ms,默认 50Hz 下 period=20ms,1.0s join 完全够；老逻辑 hard-code
+        2.0s 在低 hz（10Hz period=100ms）下也可能擦边,这里直接放宽+封顶。
+        """
+        if not hasattr(self, "_ir_feed_lock"):
+            return {"stopped": True, "reason": "never_started"}
+        with self._ir_feed_lock:
+            stop_event = self._ir_feed_stop
+            thread = self._ir_feed_thread
+        if stop_event is None and thread is None:
+            return {"stopped": True, "reason": "never_started"}
+        # period 是上一次的 period,这里取最大 2.0s,任何 hz 都不会卡死
+        join_timeout = 2.0
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout)
+        with self._ir_feed_lock:
+            # 不论 join 成不成功,引用清掉——start 路径还会再次 stop
+            self._ir_feed_thread = None
+            self._ir_feed_stop = None
+        return {"stopped": True}
+
+    def restart_ir_feed(self, hz: float = 50.0):
+        """2026-07-31：stop 同步等待 + start(hz) 原子操作,给 main 业务层"切档"。"""
+        self.stop_ir_feed()
+        return self.start_ir_feed(hz=hz)
+
+    # === 2026-07-31：底盘里程计缓存守护线程（实时 odom,给 /realtime/odom/state 轮询 / WS 订阅） ===
+    def start_odom_feed(self, hz: float = 50.0):
+        """启动底盘里程计守护线程,持续刷新 streamer.odom_state。
+
+        与 start_ir_feed 同模式:
+          - 默认 50Hz（env RAK_CAR_ODOM_FEED_HZ 可覆盖）
+          - 读 get_odometry / get_distance 都只是内存读（带 _ref_lock 短锁）,
+            比 IR 廉价很多,但走原路径每次要抢 _ref_lock + job_queue 也慢
+          - 不下发任何控制指令,只刷新 odom_state 缓存
+
+        业务场景: main/chassis/api.py.get_odometry、orchestrator 的 distance 轮询,
+        不再每次都进 job_queue,主路径延迟接近 0。
+        """
+        # 2026-07-31 修：init 后被 force-init 重建过 car 引用的 race —— car 实例对象
+        # 是新的,_odom_feed_hz 属性可能不存在,用 getattr 防御
+        cur_hz = getattr(self, "_odom_feed_hz", None)
+        cur_thread = getattr(self, "_odom_feed_thread", None)
+        cur_lock = getattr(self, "_odom_feed_lock", None)
+        cur_stop = getattr(self, "_odom_feed_stop", None)
+        if cur_lock is None:
+            self._odom_feed_lock = threading.Lock()
+            self._odom_feed_thread = None
+            self._odom_feed_stop = None
+            self._odom_feed_hz = None
+        else:
+            self._odom_feed_lock = cur_lock
+            self._odom_feed_thread = cur_thread
+            self._odom_feed_stop = cur_stop
+            self._odom_feed_hz = cur_hz
+        with self._odom_feed_lock:
+            cur_thread = self._odom_feed_thread
+            cur_hz = self._odom_feed_hz
+            if (
+                cur_thread is not None
+                and cur_thread.is_alive()
+                and cur_hz is not None
+                and float(cur_hz) == float(hz)
+            ):
+                return {"started": False, "reason": "already_running", "hz": hz}
+            if self._odom_feed_thread is not None:
+                if self._odom_feed_stop is not None:
+                    self._odom_feed_stop.set()
+                if self._odom_feed_thread.is_alive():
+                    self._odom_feed_thread.join(timeout=2.0)
+            self._odom_feed_thread = None
+            self._odom_feed_stop = None
+            self._odom_feed_stop = threading.Event()
+            stop_event = self._odom_feed_stop
+            self._odom_feed_hz = float(hz)
+            period = 1.0 / max(float(hz), 1.0)
+
+            def _odom_feed_loop():
+                streamer = getattr(self, "streamer", None)
+                set_state = getattr(streamer, "set_odom_state", None) if streamer else None
+                while not stop_event.is_set():
+                    if self._stop_flag:
+                        break
+                    try:
+                        pos = self.get_odometry() if hasattr(self, "get_odometry") else None
+                        x = float(pos[0]) if pos is not None and len(pos) > 0 else None
+                        y = float(pos[1]) if pos is not None and len(pos) > 1 else None
+                        theta = float(pos[2]) if pos is not None and len(pos) > 2 else None
+                        distance = (
+                            float(self.get_distance()) if hasattr(self, "get_distance") else None
+                        )
+                        if set_state is not None:
+                            set_state(
+                                active=True,
+                                mode="odom_feed",
+                                x=x, y=y, theta=theta, distance=distance,
+                            )
+                    except Exception as exc:
+                        logger.warning("odom feed transient err: {}".format(exc))
+                        stop_event.wait(period)
+                        continue
+                    stop_event.wait(period)
+                if set_state is not None:
+                    try:
+                        set_state(active=False, mode="idle",
+                                  x=None, y=None, theta=None, distance=None)
+                    except Exception:
+                        pass
+
+            self._odom_feed_thread = threading.Thread(target=_odom_feed_loop, name="odom-feed")
+            self._odom_feed_thread.daemon = True
+            self._odom_feed_thread.start()
+            return {"started": True, "hz": hz}
+
+    def stop_odom_feed(self):
+        """停止 odom_feed 守护线程,并把 odom_state 复位成 idle。
+
+        join timeout 沿用 2.0s 封顶(odom 循环比 IR 更便宜,几十毫秒就退出)。
+        """
+        if not hasattr(self, "_odom_feed_lock"):
+            return {"stopped": True, "reason": "never_started"}
+        with self._odom_feed_lock:
+            stop_event = self._odom_feed_stop
+            thread = self._odom_feed_thread
+        if stop_event is None and thread is None:
+            return {"stopped": True, "reason": "never_started"}
+        join_timeout = 2.0
+        if stop_event is not None:
+            stop_event.set()
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=join_timeout)
+        with self._odom_feed_lock:
+            self._odom_feed_thread = None
+            self._odom_feed_stop = None
+        return {"stopped": True}
+
+    def restart_odom_feed(self, hz: float = 50.0):
+        """2026-07-31：stop 同步等待 + start(hz) 原子操作。"""
+        self.stop_odom_feed()
+        return self.start_odom_feed(hz=hz)
 
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):
     #     """

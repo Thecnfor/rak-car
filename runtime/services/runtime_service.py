@@ -138,6 +138,27 @@ class CarRuntimeService:
         self.auto_init_supervisor.start()
         self.camera_supervisor = None
         self.camera_supervisor_started = False
+        # 2026-08-01：内存压力降档（详见 .trae/specs/system-arch-optimization/spec.md）。
+        # ResourceProbeThread 每 30s 读 psutil RSS，超过阈值按既定顺序降档；恢复条件
+        # 满足后反向恢复。feeds.degraded 字段记入 /v1/health。
+        self._resource_lock = threading.Lock()
+        self._feeds_degraded = []  # 公开字段（degraded list，按降档顺序追加）
+        self._feed_default_hz = {
+            "lane": 50.0,
+            "arm": 20.0,
+            "task": 30.0,
+            "ir": 50.0,
+            "odom": 50.0,
+        }
+        self._feed_current_hz = dict(self._feed_default_hz)
+        # 降档顺序：ir → odom → arm → task → lane（lane 永不降档，但留 slot 兼容未来）
+        self._degrade_order = ["ir", "odom", "arm", "task", "lane"]
+        self._resource_probe_thread = threading.Thread(
+            target=self._resource_probe_loop,
+            name="rak-car-resource-probe",
+            daemon=True,
+        )
+        self._resource_probe_thread.start()
 
     @property
     def car_lock(self):
@@ -158,6 +179,154 @@ class CarRuntimeService:
 
     def set_stream_service(self, stream_service):
         self.stream_service = stream_service
+
+    # 2026-08-01：内存压力降档 + feeds.degraded 上报。
+    def _resource_probe_loop(self):
+        """后台守护线程：每 30s 读 psutil RSS，触发降档/恢复。
+
+        不动业务；只调用各 feed 的 restart_*（已存在的幂等接口），把 hz 砍半；
+        feeds.degraded 列表按降档顺序累计。恢复条件：RSS 持续 60s 低于阈值。
+        """
+        # 启动后给 60s 让 init 路径完成（按 spec 建议）
+        time.sleep(60.0)
+        pressure_mb = settings.get_car_memory_pressure_mb()
+        hard_mb = settings.get_car_rss_limit_mb()
+        last_below = None  # time.time() of first RSS <= (pressure-200)
+        last_high_warn = 0.0
+        while True:
+            try:
+                rss_mb = self._read_self_rss_mb()
+                if rss_mb is None:
+                    time.sleep(30.0)
+                    continue
+                # 1) 软限 warn（不动业务，只 log + 上报到 /v1/health）
+                if rss_mb > hard_mb and (time.time() - last_high_warn) > 60.0:
+                    print(
+                        "[CarRuntimeService] RSS high: {:.0f}MB > hard limit {}MB".format(
+                            rss_mb, hard_mb
+                        )
+                    )
+                    last_high_warn = time.time()
+                # 2) 高水位触发降档
+                if rss_mb > pressure_mb:
+                    self._degrade_one_step()
+                    last_below = None
+                # 3) 恢复
+                elif rss_mb < pressure_mb - 200:
+                    if last_below is None:
+                        last_below = time.time()
+                    elif (time.time() - last_below) >= 60.0:
+                        self._restore_one_step()
+                        last_below = time.time()  # 重置计数；下次再等 60s
+                else:
+                    last_below = None
+            except Exception as exc:
+                # 探测线程本身崩了不影响业务
+                print("[CarRuntimeService] resource_probe err: {}".format(exc))
+            time.sleep(30.0)
+
+    def _read_self_rss_mb(self):
+        try:
+            import psutil as _psutil
+            rss = _psutil.Process(os.getpid()).memory_info().rss
+            return rss / (1024.0 * 1024.0)
+        except Exception:
+            return None
+
+    def _degrade_one_step(self):
+        """按 _degrade_order 顺序找第一个还没降档的 feed，把 hz 砍半。"""
+        with self._resource_lock:
+            for feed_name in self._degrade_order:
+                if feed_name == "lane":
+                    continue  # 永不降档
+                cur = self._feed_current_hz.get(feed_name, 0.0)
+                default = self._feed_default_hz.get(feed_name, cur)
+                if cur >= default:
+                    # 当前还在 default，下一次降到 default/2
+                    new_hz = max(default / 2.0, 5.0)  # 最低 5Hz
+                    self._feed_current_hz[feed_name] = new_hz
+                    self._apply_feed_hz(feed_name, new_hz)
+                    if feed_name not in self._feeds_degraded:
+                        self._feeds_degraded.append(feed_name)
+                    return feed_name
+                # 已降过档，看看下一档空间
+                if cur > 5.0:
+                    new_hz = max(cur / 2.0, 5.0)
+                    self._feed_current_hz[feed_name] = new_hz
+                    self._apply_feed_hz(feed_name, new_hz)
+                    return feed_name
+        return None
+
+    def _restore_one_step(self):
+        """按 _degrade_order 反向找最后一个降过档的 feed，hz 翻倍。"""
+        with self._resource_lock:
+            for feed_name in reversed(self._degrade_order):
+                if feed_name == "lane":
+                    continue
+                cur = self._feed_current_hz.get(feed_name, 0.0)
+                default = self._feed_default_hz.get(feed_name, cur)
+                if cur >= default:
+                    if feed_name in self._feeds_degraded:
+                        self._feeds_degraded.remove(feed_name)
+                    continue
+                new_hz = min(cur * 2.0, default)
+                if new_hz >= default - 0.01:
+                    new_hz = default
+                    if feed_name in self._feeds_degraded:
+                        self._feeds_degraded.remove(feed_name)
+                self._feed_current_hz[feed_name] = new_hz
+                self._apply_feed_hz(feed_name, new_hz)
+                return feed_name
+        return None
+
+    def _apply_feed_hz(self, feed_name, hz):
+        """调对应 feed 的 restart_*（已存在的幂等接口）。"""
+        try:
+            car = self.car
+        except Exception:
+            car = None
+        if car is None:
+            return
+        try:
+            if feed_name == "lane" and hasattr(car, "restart_lane_feed"):
+                car.restart_lane_feed(hz=float(hz))
+            elif feed_name == "arm" and hasattr(car, "restart_arm_feed"):
+                car.restart_arm_feed(hz=float(hz))
+            elif feed_name == "task" and hasattr(car, "restart_task_feed"):
+                car.restart_task_feed(hz=float(hz))
+            elif feed_name == "ir" and hasattr(car, "restart_ir_feed"):
+                car.restart_ir_feed(hz=float(hz))
+            elif feed_name == "odom" and hasattr(car, "restart_odom_feed"):
+                car.restart_odom_feed(hz=float(hz))
+            # 95% 高水位降 encoder quality/scale
+            pressure_mb = settings.get_car_memory_pressure_mb()
+            hard_mb = settings.get_car_rss_limit_mb()
+            rss_mb = self._read_self_rss_mb()
+            if (
+                rss_mb is not None
+                and rss_mb > hard_mb * 0.95
+                and self.stream_service is not None
+                and hasattr(self.stream_service, "set_encode_quality")
+            ):
+                self.stream_service.set_encode_quality(quality=60, scale=0.5)
+        except Exception as exc:
+            print("[CarRuntimeService] apply_feed_hz({}) err: {}".format(feed_name, exc))
+
+    def set_memory_pressure_for_test(self, rss_mb):
+        """测试入口：手动假装 RSS 是 rss_mb，触发一次降档/恢复判定。
+
+        debug 用，真实环境由 ResourceProbeThread 接管。
+        """
+        pressure_mb = settings.get_car_memory_pressure_mb()
+        if rss_mb > pressure_mb:
+            return self._degrade_one_step()
+        elif rss_mb < pressure_mb - 200:
+            return self._restore_one_step()
+        return None
+
+    def get_feeds_degraded(self):
+        with self._resource_lock:
+            return list(self._feeds_degraded)
 
     def start_background_services(self):
         self.infer_service.start_background()
@@ -335,29 +504,49 @@ class CarRuntimeService:
         car.STOP_PARAM = self.stop_after_action
         car.beep()
         time.sleep(1)
-        # init 阶段统一先做 arm.reset_position（大臂/手爪归位 + y 触底）。
-        # 2026-07-27 调整：x 撞墙归零只放在“真正创建新 car 实例”的 init 路径，
-        # 不再放在 ensure_initialized 的复用路径，避免执行任务时被自动补 reset_x。
+        # init 阶段统一做一次 arm.reset_all():
+        #   x 撞墙 + 大臂 +90° + 手爪 UP —— 三路并行（物理独立，串口字节 FIFO 串行化）
+        #   reset_y 触底串行收尾在最后（触底磁感是绝对零点，不进并行池）
+        # 2026-07-31 调整：复用 ensure_initialized 的复用路径在 reset_arm=True 时也走 reset_all,
+        # 但**不**单独补 reset_x —— 复用路径下 x 由视觉闭环控制，避免 auto-init 反复撞墙
+        # (commit fb24b1a 描述的 PM2 死循环)。
         try:
-            car.arm.reset_position()
-            logger.info("init reset_position 完成")
+            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.02"))
+            reset_res = car.arm.reset_all(
+                arm_angle=90,        # 复位位 +90°
+                hand_angle=-90,      # UP
+                x_direction="right", # 默认撞右墙
+                reset_x_velocity=init_x_v,
+                timeout=60.0,
+            )
+            logger.info("init reset_all 完成: %s", reset_res)
         except Exception as exc:
-            self.last_error = "arm reset_position 失败: {}".format(exc)
-            logger.warning("init 时 reset_position 失败: %s" % exc)
-        if settings.get_reset_x_on_init() and car.arm is not None:
+            self.last_error = "arm reset_all 失败: {}".format(exc)
+            logger.warning("init 时 reset_all 失败: %s" % exc)
+        if reset_position:
+            # 机械臂归位 + 里程计清零 打包在 car.init_car_position() 里,
+            # 一个调用同时完成两件事, 避免分开调时一个异常导致另一个遗漏。
+            # reset_arm=True (默认): 包含 arm.reset_position(); 复用 car 路径
+            # 仍会单独走 ensure_initialized 的 reset_arm 分支, 不重复归位 arm。
             try:
-                init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.04"))
-                car.arm.reset_x(reset_velocity=init_x_v)
-                self._last_init_reset_x_at = time.time()
-                logger.warning(
-                    "[init reset_x create path]: ok (velocity={}m/s)".format(init_x_v)
+                init_res = car.init_car_position(reset_arm=False)
+                logger.info(
+                    "init_car_position 完成 (arm_reset=%s, odometry_reset=%s)",
+                    init_res.get("arm_reset"), init_res.get("odometry_reset"),
                 )
             except Exception as exc:
-                logger.warning(
-                    "[init reset_x create path] failed: {}".format(exc)
-                )
-        if reset_position:
-            car.reset_position()
+                self.last_error = "init_car_position 失败: {}".format(exc)
+                logger.warning("init_car_position 失败: %s" % exc)
+        # 2026-07-30 init 时把存储仓舵机转到 close 物理位（98°），与 reset 同步。
+        # 参照 test/test_storage_close.py：先抬 y 到 -150mm 离开保护区，再发舵机。
+        # 走下层同步方法（car.arm.move_y_position / car.set_storage_angle），
+        # 不绕 HTTP / ArmClient 业务 wrapper，失败仅 log warn，不阻断 init。
+        try:
+            car.arm.move_y_position(-0.150)
+            car.set_storage_angle(98, speed=5)
+            logger.info("init storage close (98°) 完成")
+        except Exception as exc:  # pragma: no cover - 不让 init 失败
+            logger.warning("init storage close 失败: %s" % exc)
         self.car = car
         self.controller_generation = session.get("generation")
         self.last_init_at = time.time()
@@ -381,6 +570,23 @@ class CarRuntimeService:
             car.start_task_feed(hz=30.0)
         except Exception as exc:
             logger.warning("task_feed auto-start failed: {}".format(exc))
+        # 2026-07-31 默认启 ir_feed 守护线程(50Hz,与 lane_feed 同档):
+        # 供 main/chassis/tasks/read_ir.py 与 orchestrator._wait_until_triggered
+        # 走缓存读,避免每次进 job_queue。hz 由 env RAK_CAR_IR_FEED_HZ 覆盖。
+        try:
+            car.start_ir_feed(
+                hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
+            )
+        except Exception as exc:
+            logger.warning("ir_feed auto-start failed: {}".format(exc))
+        # 2026-07-31 默认启 odom_feed 守护线程(50Hz):同上模式,
+        # 喂底盘里程计缓存,给 main/chassis/api.py.get_odometry 走 fast-path。hz 由 env 覆盖。
+        try:
+            car.start_odom_feed(
+                hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
+            )
+        except Exception as exc:
+            logger.warning("odom_feed auto-start failed: {}".format(exc))
         return car
 
     def _ensure_infer_ready(self):
@@ -410,7 +616,24 @@ class CarRuntimeService:
                         )
                     self.car.STOP_PARAM = self.stop_after_action
                     if reset_arm:
-                        self.car.arm.reset_position()
+                        # 复用现有 car 的"完整复位"路径：arm + hand 并行 → y 串行收尾。
+                        # 与 _create_car_locked 走同一入口 (reset_all),保证两条 init 路径语义一致。
+                        # 注：复用路径显式传 reset_x=False 跳过撞墙,防止 auto_init 自愈循环
+                        # 反复撞墙触发 commit fb24b1a 描述的 PM2 死循环;只有真正创建新 car 的
+                        # _create_car_locked 才默认 reset_x=True 撞墙定原点。
+                        try:
+                            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.02"))
+                            reset_res = self.car.arm.reset_all(
+                                arm_angle=90,
+                                hand_angle=-90,
+                                x_direction="right",
+                                reset_x_velocity=init_x_v,
+                                timeout=60.0,
+                                reset_x=False,  # 复用路径:跳过撞墙
+                            )
+                            logger.info("ensure_initialized reset_all 完成: %s", reset_res)
+                        except Exception as exc:
+                            logger.warning("ensure_initialized reset_all 失败: %s" % exc)
                     if reset_position:
                         self.car.reset_position()
                     # 2026-07-27：复用现有 car 的 ensure_initialized 路径不再补 reset_x。
@@ -433,6 +656,19 @@ class CarRuntimeService:
                         self.car.start_task_feed(hz=30.0)
                     except Exception as exc:
                         logger.warning("task_feed auto-start (reused) failed: {}".format(exc))
+                    # 2026-07-31：ir_feed / odom_feed 同理（复用现有 car 时也确保在跑）
+                    try:
+                        self.car.start_ir_feed(
+                            hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
+                        )
+                    except Exception as exc:
+                        logger.warning("ir_feed auto-start (reused) failed: {}".format(exc))
+                    try:
+                        self.car.start_odom_feed(
+                            hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
+                        )
+                    except Exception as exc:
+                        logger.warning("odom_feed auto-start (reused) failed: {}".format(exc))
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()
@@ -619,6 +855,111 @@ class CarRuntimeService:
             raise RuntimeError("stream_service 未注入（runtime 启动异常）")
         return self.stream_service.get_task_state()
 
+    def get_ir_state(self):
+        """外环/触发判定专用：读 streamer 缓存的 ir_state（左右 IR 距离）。
+
+        数据来源：`ir_feed` 守护线程（runtime 启动后默认 50Hz）通过
+        `car.streamer.set_ir_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        50Hz+ 轮询安全，与 lane_feed / arm_feed / task_feed 同构。
+
+        返回字段：
+          - active: bool (ir_feed 是否在跑)
+          - mode: str ("ir_feed" / "idle" / "stopped")
+          - left: float | None (m,用户视角左)
+          - right: float | None (m,用户视角右)
+          - updated_at: float (unix time)
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_ir_state()
+
+    def get_odom_state(self):
+        """外环/触发判定专用：读 streamer 缓存的 odom_state（底盘里程计）。
+
+        数据来源：`odom_feed` 守护线程（runtime 启动后默认 50Hz）通过
+        `car.streamer.set_odom_state(...)` 持续刷新的内存缓存。
+
+        不进 job_queue、不打 ZMQ、不抢任何 runtime 锁——只取 `meta_lock`（极快）。
+        50Hz+ 轮询安全，与 lane_feed / ir_feed 同构。
+
+        返回字段：
+          - active: bool (odom_feed 是否在跑)
+          - mode: str ("odom_feed" / "idle" / "stopped")
+          - x, y, theta: float | None (m, m, rad)
+          - distance: float | None (m,本轮累积行驶距离)
+          - updated_at: float (unix time)
+        """
+        if self.stream_service is None:
+            raise RuntimeError("stream_service 未注入（runtime 启动异常）")
+        return self.stream_service.get_odom_state()
+
+    # === 2026-07-31：IR / odometer 同步直读（_realtime_gate 路径,绕过 job_queue） ===
+    #
+    # 用于 main 业务层在没有 feed 缓存可用时（feed 未启动 / 异常退出）的 fallback。
+    # 也用于 arm 长动作期间需要再拉一次"最新未缓存值"的场景。
+    def get_ir_distance_sync(self, side="left"):
+        """step B：单次读 IR,走 _realtime_gate,不进 job_queue。
+
+        实测延迟:HTTP RTT + (1-2 次 MC602 字节往返 ~10-30ms)。
+        """
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_ir_distance(side=side)
+
+    def get_all_ir_distance_sync(self):
+        """step B：单次读两侧 IR,走 _realtime_gate,不进 job_queue。"""
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_all_ir_distance()
+
+    def get_odometry_sync(self, show_info=False):
+        """step B：单次读里程计,走 _realtime_gate,不进 job_queue。
+
+        实测延迟:几乎只有 HTTP RTT（get_odometry 内部 _lock 微秒级），
+        比走 job_queue 快一个数量级。
+        """
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_odometry(show_info=show_info)
+
+    def get_distance_sync(self):
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        return car.get_distance()
+
+    def get_feed_status(self):
+        """2026-07-31: 给 /v1/health 用的 feed summary（一次性扫所有 cache）。
+
+        返回:{lane_state, arm_state, task_state, ir_state, odom_state} 各自的 active / mode / updated_at。
+        调试用,不抢任何锁,只读 streamer meta_lock 5 次。
+        """
+        if self.stream_service is None:
+            return {"ir_state": {}, "odom_state": {}, "lane_state": {}, "arm_state": {}, "task_state": {}}
+        out = {}
+        for name, fn in (
+            ("lane_state", self.stream_service.get_lane_state),
+            ("arm_state", self.stream_service.get_arm_state),
+            ("task_state", self.stream_service.get_task_state),
+            ("ir_state", self.stream_service.get_ir_state),
+            ("odom_state", self.stream_service.get_odom_state),
+        ):
+            try:
+                st = fn()
+                out[name] = {
+                    "active": st.get("active"),
+                    "mode": st.get("mode"),
+                    "updated_at": st.get("updated_at"),
+                }
+            except Exception:
+                out[name] = {"active": False, "mode": "idle", "updated_at": None}
+        return out
+
     def set_single_motor(self, port, speed, reverse=1):
         with self._realtime_gate:
             self._realtime_check_locked()
@@ -692,6 +1033,20 @@ class CarRuntimeService:
             "controller_session": controller_snapshot,
             "infer_service": infer_snapshot,
             "camera_stream": camera_snapshot,
+            # 2026-07-31：feed 守护线程状态（lane / arm / task / ir / odom）。
+            # 给 /v1/health 调试用，一眼看清 feed 是否卡住 / 卡了哪个。
+            "feeds": {
+                **self.get_feed_status(),
+                # 2026-08-01：当前被 ResourceProbeThread 降档的 feed 列表，
+                # 顺序即降档触发顺序（ir → odom → arm → task）。
+                "degraded": self.get_feeds_degraded(),
+            },
+            # 2026-08-01：runtime 进程内存画像（psutil RSS），给 /v1/health 用。
+            "resource": {
+                "rss_mb": self._read_self_rss_mb(),
+                "pressure_mb": settings.get_car_memory_pressure_mb(),
+                "hard_limit_mb": settings.get_car_rss_limit_mb(),
+            },
             "components": {
                 "controller": {
                     "ready": controller_snapshot.get("state") == "PROGRAM_READY",
@@ -748,6 +1103,17 @@ class CarRuntimeService:
 
     def get_infer_state(self):
         return self.infer_service.get_state()
+
+    def infer_drop_oldest(self, timeout_s=None):
+        """2026-08-01：让推理后端按 LRU 卸载非 eager 模型（详见 system-arch-optimization spec）。
+
+        通过每个后端端口发 DROPX! 命令实现；前端 /v1/infer/drop-oldest 入口。
+        """
+        try:
+            results = self.infer_service.drop_oldest(timeout_s=timeout_s)
+        except Exception as exc:  # pragma: no cover
+            return {"ok": False, "error": str(exc), "results": []}
+        return {"ok": True, "results": results}
 
     def submit_job(self, target, name, args=None, kwargs=None):
         args = args or []

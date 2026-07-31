@@ -20,6 +20,9 @@ import yaml
 import os
 import time
 import sys
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class _Offset:
@@ -408,6 +411,42 @@ class MecanumDriver:
         """
         with self._lock:
             self.chassis.odometry.reset(x, y, z,distance)
+
+    def init_car_position(self, x=0, y=0, z=0.0, distance=0,
+                          reset_arm: bool = True):
+        """
+        Init 阶段的"一次性归位": 机械臂归位 + 里程计清零打包在一起。
+
+        init 路径 (runtime _create_car_locked) 之前是分别调:
+          1) self.arm.reset_position()      -> 机械臂大臂/手爪归位 + y 触底
+          2) self.reset_position()          -> 底盘里程计清零
+        两步分开调容易在其中一个异常时遗漏另一个, 把它们绑在一起:
+          - reset_arm=True  (默认): 调 arm.reset_position() 做机械臂归位,
+            异常只 warn, 不阻断里程计清零(里程计一定要清零, 否则车还认为在原点跑)
+          - 然后调 self.reset_position() 清零里程计
+
+        Args:
+            x, y, z, distance: 同 reset_position(), 传给 odometry.reset
+            reset_arm: 是否做机械臂归位。False = 仅清里程计(例如复用 car 时跳过 arm)
+
+        Returns:
+            dict: {"arm_reset": bool, "odometry_reset": bool}
+        """
+        result = {"arm_reset": False, "odometry_reset": False}
+        if reset_arm and getattr(self, "arm", None) is not None:
+            try:
+                self.arm.reset_position()
+                result["arm_reset"] = True
+            except Exception as exc:
+                logger.warning("init_car_position: arm.reset_position 失败: %s" % exc)
+        # 里程计清零是关键, 必须跑到
+        try:
+            self.reset_position(x=x, y=y, z=z, distance=distance)
+            result["odometry_reset"] = True
+        except Exception as exc:
+            logger.warning("init_car_position: odometry reset 失败: %s" % exc)
+            raise
+        return result
 
     def world_to_car_velocity(self, vel_world, angle_car):
         """

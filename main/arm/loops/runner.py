@@ -171,10 +171,13 @@ class ArmRunner:
         return self.client.grasp(on, timeout=timeout or self.default_timeout_s)
 
     def go_home(self) -> dict:
-        """回到 y=0, x=0，hand=UP（-90），arm=MID（0）。"""
-        self.client.set_hand_angle(-90.0, speed=80, timeout=10.0)
-        self.client.set_arm_angle(0.0, speed=80, timeout=10.0)
-        return self.move_xy(0.0, 0.0)
+        """回到 y=0, x=0，hand=UP（-90），arm=MID（0）。
+
+        2026-07-31 PR#13：改走 composite_go_home,内部 arm + xy 并行,hand 串行在末尾。
+        """
+        return self.client.composite_go_home(
+            hand=-90.0, arm=0.0, speed=80, timeout=self.default_timeout_s,
+        )
 
     # ---- 复位 ----
 
@@ -189,13 +192,142 @@ class ArmRunner:
     # ---- 业务组合 ----
 
     def pick(self, arm_angle: float, x_mm: float, y_mm: float) -> dict:
-        """set_arm_angle -> move_xy -> grasp(True)。"""
-        self.set_arm_angle(arm_angle)
-        self.move_xy(x_mm=x_mm, y_mm=y_mm)
-        return self.grasp(True)
+        """复合抓取 (2026-07-31 PR#13)：底层并行 set_arm_angle + goto_position,再串行 hand + grasp。
+
+        业务前置（必须满足，违反会抛 ValueError）：
+          - 当前 y 必须 < -30mm(出保护区)。
+            大臂舵机在 y ∈ [0, -30] 摆动会撞车,client wrapper 会拒绝。
+          - 大臂角度 arm_angle ∈ [+90, -150]°。
+          - 手爪角度 hand ∈ [-90, 0]°。
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool, "grasp": bool}}
+            ok=False 时 caller 决定是否 raise 或继续。
+        """
+        return self.client.composite_pick(
+            arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
+            hand=0.0, speed=80, timeout=self.default_timeout_s,
+        )
 
     def release(self, drop_x_mm: float = 0.0, drop_y_mm: float = 30.0) -> dict:
-        """set_hand_angle(DOWN=0) -> move_xy -> grasp(False)。"""
-        self.client.set_hand_angle(0.0, speed=80, timeout=10.0)
-        self.move_xy(x_mm=drop_x_mm, y_mm=drop_y_mm)
-        return self.grasp(False)
+        """复合释放 (2026-07-31 PR#13)：保守序列 hand → goto_position → grasp(False)。
+
+        业务前置：当前 y 必须 < -30mm(出保护区)。
+        Returns: {"ok": bool, "steps": {"hand": bool, "position": bool, "grasp": bool}}
+        """
+        return self.client.composite_release(
+            drop_x_mm=drop_x_mm, drop_y_mm=drop_y_mm,
+            hand=0.0, speed=80, timeout=self.default_timeout_s,
+        )
+
+    # ---- 2026-07-31: 视觉伺服高层组合 ----
+
+    def move_to_vision_target(self, selector, *,
+                              x_mm: float, y_mm: float,
+                              arm_angle: float = 0.0, hand: float = -90.0,
+                              mm_per_norm: float = 30.0,
+                              settle_tol_norm: float = 0.05,
+                              timeout: float = 10.0):
+        """高层组合：composite_run 粗定位 → 视觉伺服精调。
+
+        业务前置：必须在 y < -30mm 保护区外（composite_run 入口会校验）。
+
+        Args:
+            selector: TargetSelector（label/group/strategy）
+            x_mm, y_mm: 目标位姿（业务单位 mm）
+            arm_angle: 大臂目标角度（°）
+            hand: 手爪角度（°），默认 -90 = UP（防撞）
+            mm_per_norm: bbox 归一化坐标 → mm 转换系数（现场可调）
+            settle_tol_norm: 收敛阈值
+            timeout: 视觉伺服超时（秒）
+
+        Returns:
+            ServoResult（详见 VISION_SERVO_DESIGN.md）
+        """
+        self.client.composite_run(
+            arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
+        )
+        return self.client._make_vision_with_move().find_target(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            mm_per_norm=mm_per_norm, settle_tol_norm=settle_tol_norm,
+            timeout=timeout,
+        )
+
+    def pick_by_vision(self, selector, *,
+                       x_mm: float, y_mm: float, arm_angle: float = -90.0,
+                       settle_tol_norm: float = 0.05,
+                       timeout: float = 10.0) -> dict:
+        """最高层：粗定位 → 视觉伺服 → composite_pick → grasp。
+
+        业务前置：必须在 y < -30mm 保护区外。
+        """
+        self.move_to_vision_target(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            arm_angle=arm_angle, hand=-90.0,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+        )
+        return self.client.composite_pick(
+            arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
+            hand=0.0, speed=80, timeout=30.0,
+        )
+
+    # ---- 2026-07-31: 实时（WS push）版本 ----
+
+    def move_to_vision_target_realtime(self, selector, *,
+                                        x_mm: float, y_mm: float,
+                                        arm_angle: float = 0.0, hand: float = -90.0,
+                                        hz: float = 30.0,
+                                        mm_per_norm: float = 30.0,
+                                        settle_tol_norm: float = 0.05,
+                                        timeout: float = 10.0):
+        """高层组合：composite_run 粗定位 → 视觉伺服（WS 实时推流）。
+
+        业务前置：必须在 y < -30mm 保护区外（composite_run 入口会校验）。
+        """
+        self.client.composite_run(
+            arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
+        )
+        return self.client._make_vision_with_move().find_target_realtime(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            hz=hz, mm_per_norm=mm_per_norm,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+        )
+
+    def pick_by_vision_realtime(self, selector, *,
+                                 x_mm: float, y_mm: float, arm_angle: float = -90.0,
+                                 settle_tol_norm: float = 0.05,
+                                 timeout: float = 10.0) -> dict:
+        """最高层（实时版）：粗定位 → WS 伺服 → composite_pick → grasp。"""
+        self.move_to_vision_target_realtime(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            arm_angle=arm_angle, hand=-90.0,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+        )
+        return self.client.composite_pick(
+            arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
+            hand=0.0, speed=80, timeout=30.0,
+        )
+
+    def track_vision_target(self, selector, *,
+                            x_mm: float, y_mm: float,
+                            arm_angle: float = 90.0, hand: float = -90.0,
+                            hz: float = 30.0,
+                            mm_per_norm: float = 30.0,
+                            timeout: float = 30.0):
+        """持续实时追踪（永不收敛停）：WS 推送驱动，timeout 后返回。
+
+        与 move_to_vision_target_realtime 区别：
+          - realtime 版找到目标居中就停；track 版持续跟（即使居中也保持）
+          - on_missing_track='wait' 默认（短暂丢失不 abort）
+
+        适用：目标会移动的场景（边走边跟、流水线）。
+        """
+        # composite_run 粗定位（保持 arm_angle，不强切）
+        self.client.composite_run(
+            arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
+        )
+        return self.client._make_vision_with_move().find_target_track(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            hz=hz, mm_per_norm=mm_per_norm,
+            timeout=timeout,
+        )

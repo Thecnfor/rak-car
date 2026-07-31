@@ -22,6 +22,14 @@ CAR_ACTIONS = {
     "lane_dis_offset": lambda car, *args, **kwargs: car.lane_dis_offset(*args, **kwargs),
     "start_lane_feed": lambda car, *args, **kwargs: car.start_lane_feed(*args, **kwargs),
     "stop_lane_feed": lambda car, *args, **kwargs: car.stop_lane_feed(**kwargs) if kwargs else car.stop_lane_feed(),
+    # 2026-07-31: 左右 IR / 底盘里程计守护线程开关（默认 50Hz auto-start）。
+    # 与 start_lane_feed / start_arm_feed / start_task_feed 同构。
+    "start_ir_feed": lambda car, *args, **kwargs: car.start_ir_feed(*args, **kwargs),
+    "stop_ir_feed": lambda car, *args, **kwargs: car.stop_ir_feed(**kwargs) if kwargs else car.stop_ir_feed(),
+    "restart_ir_feed": lambda car, *args, **kwargs: car.restart_ir_feed(*args, **kwargs),
+    "start_odom_feed": lambda car, *args, **kwargs: car.start_odom_feed(*args, **kwargs),
+    "stop_odom_feed": lambda car, *args, **kwargs: car.stop_odom_feed(**kwargs) if kwargs else car.stop_odom_feed(),
+    "restart_odom_feed": lambda car, *args, **kwargs: car.restart_odom_feed(*args, **kwargs),
     "move_to_detection_target": lambda car, *args, **kwargs: car.move_to_detection_target(*args, **kwargs),
     "adjust_arm_position": lambda car, *args, **kwargs: car.adjust_arm_position(*args, **kwargs),
     "get_detection_results": lambda car, *args, **kwargs: car.get_detection_results(*args, **kwargs),
@@ -48,7 +56,18 @@ ARM_ACTIONS = {
     # 2026-07-16 新加：opt-in 撞墙复位 + 复合复位。
     # 不接入 _create_car_locked / ensure_initialized / _auto_init_kwargs，避免 fb24b1a 描述的 pm2 循环。
     "reset_x": lambda arm_obj, *args, **kwargs: arm_obj.reset_x(**kwargs),
-    "reset_all": lambda arm_obj, *args, **kwargs: arm_obj.reset_all(**kwargs),
+    "reset_all": lambda arm_obj, *args, **kwargs: arm_obj.reset_all(*args, **kwargs),
+    # 2026-07-31 PR#13: 复合动作 (arm_base.composite_*)。业务层用 composite_* 替换
+    # 原 pick/release/go_home 的三步串行,实现 2-3 路电机真并发。
+    # 与 reset_all 同样的设计:JOB 内 ThreadPoolExecutor,JOB 间 arm_queue 仍串行。
+    "composite_pick": lambda arm_obj, *args, **kwargs: arm_obj.composite_pick(**kwargs),
+    "composite_release": lambda arm_obj, *args, **kwargs: arm_obj.composite_release(**kwargs),
+    "composite_go_home": lambda arm_obj, *args, **kwargs: arm_obj.composite_go_home(**kwargs),
+    # 2026-07-31: 四电机通用并行驱动器 (任意 1-4 路可省，None 跳过)。
+    # reset_position 已经内部实现 arm+hand 并行 + y 串行收尾（init 入口），
+    # 但业务层在运行时也想并发多个电机就用这个。
+    "composite_run": lambda arm_obj, *args, **kwargs: arm_obj.composite_run(**kwargs),
+    "composite_run_reset": lambda arm_obj, *args, **kwargs: arm_obj.composite_run_reset(**kwargs),
     "set_arm_pose": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_pose(*args, **kwargs),
     "set_hand_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_hand_angle(*args, **kwargs),
     "set_arm_angle": lambda arm_obj, *args, **kwargs: arm_obj.set_arm_angle(*args, **kwargs),

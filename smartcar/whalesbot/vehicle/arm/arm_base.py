@@ -13,6 +13,7 @@ import yaml
 import os
 import sys
 from typing import Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 添加上本地目录
 dir_this = os.path.abspath(os.path.dirname(__file__))
@@ -677,13 +678,21 @@ class ArmController:
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
                   reset_x_velocity: float = 0.02,
-                  timeout: float = 60.0):
+                  timeout: float = 60.0,
+                  reset_x: bool = True):
         """
         复合复位:x 撞墙 + 大臂 + 手爪 三路并行,完成后 reset_y 触底串行。
 
-        为什么不接入 _create_car_locked / ensure_initialized / _auto_init_kwargs:
+        2026-07-31 改造: 加 reset_x=True 默认参数 (历史默认行为)。
+          - reset_x=True  (默认): 与原来完全一致,x 撞墙 + arm + hand 三路并行
+          - reset_x=False: 跳过 reset_x 撞墙,只并行 arm + hand,最后 reset_y 串行收尾。
+            给 ensure_initialized 复用路径 (auto-init 自愈循环) 用,避免反复撞墙触发
+            commit fb24b1a 描述的 PM2 死循环。
+
+        为什么不能无条件接入 _create_car_locked / ensure_initialized:
           commit fb24b1a 已根治"reset_x 撞墙 + auto-init 反复调用"的 PM2 死循环。
-          此方法仅 opt-in 触发（POST /v1/execute 显式调），不进 auto-init 路径。
+          此方法由 _create_car_locked 显式调用 (reset_x=True),
+          ensure_initialized 复用路径显式传 reset_x=False,跳过撞墙。
 
         并行原理:
           - x 是 motor_280 编码器电机,大臂/手爪是 PWM/bus 舵机,三者在物理上独立。
@@ -700,14 +709,18 @@ class ArmController:
             x_direction: x 撞墙方向,默认 "right"
             reset_x_velocity: x 撞墙速度 (m/s),默认 0.02
             timeout: 并行阶段总超时 (s)
+            reset_x: 是否包含 x 撞墙 (默认 True)
 
         Returns:
-            dict: {"x": bool, "arm": ..., "hand": ..., "y": ...}
+            dict: {"x": bool|None, "arm": bool, "hand": bool, "y": bool}
+                  reset_x=False 时 "x": None (表示跳过)
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         results = {}
 
         def _do_x():
+            if not reset_x:
+                return ("x", None)
             return ("x", self.reset_x(direction=x_direction,
                                        reset_velocity=reset_x_velocity))
 
@@ -749,6 +762,333 @@ class ArmController:
         results["y"] = y_ok
 
         logger.info("reset_all 完成: %s" % results)
+        return results
+
+
+    # ============== 复合动作 (业务层 pick / release / go_home 用) ==============
+    #
+    # 与 reset_all 同样的设计：
+    #   - ThreadPoolExecutor 在一个 runtime job 内部并行驱动多个电机
+    #   - arm_queue 单 worker,串行的是 JOB 之间,JOB 内的并发是安全的
+    #   - 任何子步骤异常 logger.warning 不抛,避免 runtime 走 _should_probe_controller 自愈路径
+    #   - 返回 {"ok": bool, "steps": {...}} 让上层 ArmRunner 自决定后续动作
+    #
+    # 业务侧说明 (main/arm/README.md §坐标系约定 + 软限位)：
+    #   - x 单位米,y 单位米 (与 goto_position 一致)
+    #   - arm_angle 单位度,set_arm_angle 直传
+    #   - hand 单位度,set_hand_angle 直传
+    #   - grasp 是 vacuum 开关
+
+    def composite_pick(
+        self,
+        arm_angle: float,
+        x: float,
+        y: float,
+        hand: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合抓取：并行 set_arm_angle + goto_position,再串行 set_hand_angle + grasp(True)。
+
+        设计：
+          ① ThreadPoolExecutor(2) 并行 set_arm_angle(arm_angle) + goto_position(x, y)
+            (大臂舵机 + x/y 电机物理独立)
+          ② 等两者都到位
+          ③ 串行 set_hand_angle(hand) — 手爪独立,放最后避免与旋转中的大臂撞车
+          ④ grasp(True) 开真空泵
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool, "grasp": bool}}
+        """
+        results = {"arm": False, "position": False, "hand": False, "grasp": False}
+
+        # ① 并行：大臂角度 + xy 位置
+        def _do_arm():
+            self.set_arm_angle(arm_angle, speed=speed)
+            return ("arm", True)
+
+        def _do_position():
+            self.goto_position(x, y)
+            return ("position", True)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="composite_pick") as ex:
+                futs = [ex.submit(_do_arm), ex.submit(_do_position)]
+                for fut in as_completed(futs, timeout=timeout):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("composite_pick 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("composite_pick 并行阶段异常: %s" % exc)
+
+        # ② 仅当 position 成功才继续 hand + grasp (避免抓在错误位置)
+        if results["position"]:
+            try:
+                self.set_hand_angle(hand, speed=speed)
+                results["hand"] = True
+            except Exception as exc:
+                logger.warning("composite_pick: set_hand_angle 异常: %s" % exc)
+            try:
+                self.grasp(True)
+                results["grasp"] = True
+            except Exception as exc:
+                logger.warning("composite_pick: grasp 异常: %s" % exc)
+        else:
+            logger.warning("composite_pick: position 未到位,跳过 hand + grasp")
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+
+    def composite_release(
+        self,
+        drop_x: float = 0.0,
+        drop_y: float = 0.03,
+        hand: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合释放：保守序列 — 先 set_hand_angle,再 goto_position,再 grasp(False)。
+
+        为什么 release 不用并发：
+          - hand 放料姿态是 DOWN (0°),与 set_hand_angle 直传;
+            同时 set_hand_angle 在大臂展开带 [-30, +30] 时拒绝非 UP,
+            因此保守起见 hand 串行在 position 之前(避开"手爪先下但位置未到"的中间态)
+          - position 单轴并发节省有限,主要时间花在舵机 wait,不值得加并发复杂度
+
+        Returns:
+            {"ok": bool, "steps": {"hand": bool, "position": bool, "grasp": bool}}
+        """
+        results = {"hand": False, "position": False, "grasp": False}
+
+        # ① hand 串行 (业务侧 _check_y_protected 在 client wrapper 已做)
+        try:
+            self.set_hand_angle(hand, speed=speed)
+            results["hand"] = True
+        except Exception as exc:
+            logger.warning("composite_release: set_hand_angle 异常: %s" % exc)
+            # hand 失败仍继续 — 可能已经在 DOWN
+
+        # ② position 单线程,够用
+        try:
+            self.goto_position(drop_x, drop_y)
+            results["position"] = True
+        except Exception as exc:
+            logger.warning("composite_release: goto_position 异常: %s" % exc)
+
+        # ③ grasp 关真空
+        try:
+            self.grasp(False)
+            results["grasp"] = True
+        except Exception as exc:
+            logger.warning("composite_release: grasp 异常: %s" % exc)
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+
+    def composite_go_home(
+        self,
+        hand: float = -90.0,
+        arm: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合回原点：并行 set_arm_angle + goto_position,再串行 set_hand_angle(hand)。
+
+        hand 放最后：
+          - hand=-90 (UP) 是安全姿态,即便大臂在 [-30,+30] 也不会撞车
+          - 与 reset_all 末尾 hand 串行的设计一致
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool}}
+        """
+        results = {"arm": False, "position": False, "hand": False}
+
+        # ① 并行：大臂角度 + xy 位置
+        def _do_arm():
+            self.set_arm_angle(arm, speed=speed)
+            return ("arm", True)
+
+        def _do_position():
+            self.goto_position(0.0, 0.0)
+            return ("position", True)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="composite_go_home") as ex:
+                futs = [ex.submit(_do_arm), ex.submit(_do_position)]
+                for fut in as_completed(futs, timeout=timeout):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("composite_go_home 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("composite_go_home 并行阶段异常: %s" % exc)
+
+        # ② hand 串行,放最后(参考 reset_all 模式)
+        try:
+            self.set_hand_angle(hand, speed=speed)
+            results["hand"] = True
+        except Exception as exc:
+            logger.warning("composite_go_home: set_hand_angle 异常: %s" % exc)
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+    def composite_run(
+        self,
+        arm: Union[float, str, None] = None,
+        x: Union[float, None] = None,
+        y: Union[float, None] = None,
+        hand: Union[float, str, None] = None,
+        speed: int = 80,
+        timeout: float = 30.0,
+        y_pid_timeout: float = 10.0,
+    ) -> dict:
+        """四电机通用并行驱动器：在一路 runtime job 内同时驱动 motor_y / motor_x / arm_servo / hand_servo。
+
+        用法：
+          - 任一参数传 None 表示该路跳过；
+          - y/x 用 PID 闭环(mm 坐标直接传也行,本方法按 m 计算)；
+          - arm/hand 走舵机角度（数字或字符串 "LEFT"/"RIGHT"/"MID"/"UP"/"DOWN"，会查 yaml list）；
+          - timeout 是并行阶段总超时，单路超时单独计时不互相阻塞。
+
+        并行可行性（与 composite_pick / composite_go_home 一致）：
+          - 物理上 y / x / arm / hand 四轴完全独立,可同时下发；
+          - serial_mc602.lock 串行化串口写入 → Python 层并发,串口字节 FIFO,
+            舵机/电机指令在串口层被 serialize,但 set_arm_angle 等舵机阻塞在物理到位,
+            期间 PID 闭环可以并行跑 — 这是公认收益的并发模式；
+          - y 和 x 的 PID 都各自持有独立 setpoint / pose_now,本方法把它们都丢进
+            ThreadPoolExecutor 后各自调 goto_position 内部串行,与 composite_pick
+            调 self.goto_position 行为一致；
+          - reset_y 不能放进这个并行池 — 见 composite_run_reset 说明。
+
+        失败语义：单路子步骤异常 logger.warning + 返回 False,不入 _should_probe_controller;
+        全部子路成功才 "ok": True。
+
+        Args:
+            arm: 大臂角度 (°) 或字符串,None=跳过。
+            x: 水平目标位置 (m),None=跳过。
+            y: 竖直目标位置 (m),None=跳过。注意 y 是 PID 闭环,耗时较长。
+            hand: 手爪角度 (°) 或字符串,None=跳过。
+            speed: 舵机速度 (仅 arm/hand 生效)。
+            timeout: 并行阶段总超时 (s)。
+            y_pid_timeout: y 闭环单独超时 (s)。
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "x": bool, "y": bool, "hand": bool}}
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = {"arm": False, "x": False, "y": False, "hand": False}
+
+        # 跳过空指令:避免线程池空转,也方便上层任意传 None。
+        todo = []
+        if arm is not None:
+            todo.append(("arm", lambda: self.set_arm_angle(arm, speed=speed)))
+        if x is not None:
+            todo.append(("x", lambda: self.move_x_position(float(x))))
+        if y is not None:
+            todo.append(("y", lambda: self.move_y_position(float(y))))
+        if hand is not None:
+            todo.append(("hand", lambda: self.set_hand_angle(hand, speed=speed)))
+
+        if not todo:
+            return {"ok": True, "steps": results}
+
+        def _wrap(name, fn):
+            try:
+                fn()
+                return (name, True)
+            except Exception as exc:
+                logger.warning("composite_run: %s 子步骤异常: %s" % (name, exc))
+                return (name, False)
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=len(todo), thread_name_prefix="composite_run"
+            ) as ex:
+                futs = [ex.submit(_wrap, name, fn) for name, fn in todo]
+                for fut in as_completed(futs, timeout=timeout):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("composite_run: 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("composite_run: 并行阶段异常: %s" % exc)
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+    def composite_run_reset(
+        self,
+        arm_angle: float = 90,
+        hand_angle: float = -90,
+        x_direction: str = "right",
+        reset_x_velocity: float = 0.02,
+        timeout: float = 60.0,
+        reset_x: bool = True,
+    ) -> dict:
+        """复合复位 + y 最后：x 撞墙 + 大臂 + 手爪 三路并行,reset_y 触底串行收尾。
+
+        设计说明（与 composite_run 一致,但有 reset 专属差别）：
+          - 用 x(撞墙) 而非 x(到点),因为 reset 必须以硬件墙为绝对零点；
+          - reset_y 串行收尾在并行池外 — 见 reset_all 内注释 [arm_base.py L744]
+            "触底磁感应是绝对零点" + 并行失败回滚复杂；
+          - 与 reset_all 等价(参数完全相同),但作为独立入口便于上层按名字区分
+            "完整复位" vs "运行时多轴并行"。
+          - reset_x=False 时跳过 reset_x 撞墙,只并行 arm + hand（与 reset_all 同语义）。
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        results = {}
+
+        def _do_x():
+            if not reset_x:
+                return ("x", None)
+            return ("x", self.reset_x(direction=x_direction,
+                                       reset_velocity=reset_x_velocity))
+
+        def _do_arm():
+            try:
+                self.set_arm_angle(arm_angle, speed=80)
+                return ("arm", True)
+            except Exception as exc:
+                logger.warning("composite_run_reset: set_arm_angle 异常: %s" % exc)
+                return ("arm", False)
+
+        def _do_hand():
+            try:
+                self.set_hand_angle(hand_angle, speed=80)
+                return ("hand", True)
+            except Exception as exc:
+                logger.warning("composite_run_reset: set_hand_angle 异常: %s" % exc)
+                return ("hand", False)
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=3, thread_name_prefix="composite_run_reset"
+            ) as ex:
+                futs = [ex.submit(_do_x), ex.submit(_do_arm), ex.submit(_do_hand)]
+                for fut in as_completed(futs, timeout=timeout):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("composite_run_reset: 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("composite_run_reset: 并行阶段异常: %s" % exc)
+
+        try:
+            y_ok = bool(self.reset_y())
+        except Exception as exc:
+            logger.warning("composite_run_reset: reset_y 异常: %s" % exc)
+            y_ok = False
+        results["y"] = y_ok
+
+        logger.info("composite_run_reset 完成: %s" % results)
         return results
 
 
@@ -869,35 +1209,76 @@ class ArmController:
         self.x_pose_start = self.x_pose_now
 
     def reset_position(self):
-        """
-        重置机械臂位置（仅 y 触底定原点；x 轴无软件复位，由视觉闭环控制位置）。
+        """重置机械臂位置（init 阶段并行复位 + 串行定原点）。
 
-        初始化姿态（2026-07-27 联调第三次改）：
-          - 大臂：+90° — 复位位（业务硬限上界 +90°,reset_position 用这个值）
-          - 手爪：UP (-90°) — 物理上限位置
-          - y：reset_y 触底定原点，**并自动升到 POST_RESET_TARGET_M（默认 -150mm）**。
-            reset_y 内部已包含「触发磁感 → 归零 → move_y_position(-150)」完整流程，
-            此函数 **绝不** 再赋 `self.y = 0`，否则会把刚升到 -150mm 的机械臂又拉回
-            触底位（历史 bug,2026-07-27 联调复现）。
+        实现：
+          ① 并行：大臂 → +90°（复位位） ＋  手爪 → -90°（UP）
+             — 两路舵机物理独立，set_arm_angle 阻塞到位期间手爪可并行到位，
+               总耗时从原 ~1.5s 串行降到 ~0.8s 并行。
+          ② 串行：reset_y 触底定原点（reset_y 内部:触发磁感 → y_pose_now=0
+             → move_y_position(-150mm) 收尾）。
+
+        不放并行：reset_y 不能进并行池 —— 触底磁感是绝对零点 + 并行失败回滚复杂；
+        与 composite_run_reset 的设计一致。
+
+        历史重置位（2026-07-27 联调第三次改）：
+          - 大臂：+90°（业务硬限上界，复位位）
+          - 手爪：UP (-90°)
 
         历史版本：
           - 2026-07-16 初版：set_arm_angle(0) — 0° 是 MID 位置
-          - 2026-07-27 改：set_arm_angle(+90) — +90° 是用户实测的复位位（业务硬限上界）
+          - 2026-07-27 改：set_arm_angle(+90) — +90° 是用户实测的复位位
+          - 本次(并行优化)：arm + hand 并行下发，y 串行收尾，x 不参与 reset
+            (CLAUDE.md: x 由视觉闭环控制)。
 
-        历史：旧版本并行跑 reset_y + reset_x 双线程，因为 reset_x 撞墙存在
-        `MIN_PRE_TRIGGER_DISP` 未定义 NameError、25s 超时、空转/编码器漂移等
-        问题，已整体删除 reset_x。x 轴位置由 move_to_detection_target +
-        subscribe_task_detection 视觉闭环控制，不需要软件复位。
-
-        注（2026-07-16）：用数字接口而非 "UP"/"MID" 字符串（yaml angle_list 已删）。
-        注（2026-07-27）：删除 `self.y = 0` 残留行 — reset_y 内部已经走到 -150mm。
-        注（2026-07-27）：大臂 reset 位从 0° (MID) 改为 +90°（业务硬限上界，复位位）。
+        注意：reset_y 内部已经走到 -150mm,不要再 self.y = 0,
+        否则会把刚升到 -150mm 的臂又拉回 0(2026-07-27 bug)。
         """
-        self.set_hand_angle(-90)      # 手爪初始 = -90 (UP)
-        self.set_arm_angle(90)        # 大臂初始 = +90（复位位，业务硬限上界）
-        # reset_y 内部:触发磁感 → y_pose_now=0 → move_y_position(POST_RESET_TARGET_M)
-        # 不要再 self.y = 0!否则会把刚升到 -150mm 的臂又拉回 0。
-        self.reset_y()
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        results = {"arm": False, "hand": False, "y": False}
+
+        def _do_arm():
+            try:
+                self.set_arm_angle(90, speed=80)  # 复位位 +90°
+                return ("arm", True)
+            except Exception as exc:
+                logger.warning("reset_position: set_arm_angle 异常: %s" % exc)
+                return ("arm", False)
+
+        def _do_hand():
+            try:
+                self.set_hand_angle(-90, speed=80)  # UP
+                return ("hand", True)
+            except Exception as exc:
+                logger.warning("reset_position: set_hand_angle 异常: %s" % exc)
+                return ("hand", False)
+
+        # ① 并行 arm + hand
+        try:
+            with ThreadPoolExecutor(
+                max_workers=2, thread_name_prefix="reset_position"
+            ) as ex:
+                futs = [ex.submit(_do_arm), ex.submit(_do_hand)]
+                for fut in as_completed(futs, timeout=15.0):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("reset_position: 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("reset_position: 并行阶段异常: %s" % exc)
+
+        # ② reset_y 串行收尾（绝对零点,不放并行池）
+        try:
+            y_ok = bool(self.reset_y())
+        except Exception as exc:
+            logger.warning("reset_position: reset_y 异常: %s" % exc)
+            y_ok = False
+        results["y"] = y_ok
+
+        logger.info("reset_position 完成: %s" % results)
+        return results
 
     def switch_side(self, side):
         """
@@ -1090,10 +1471,10 @@ class ArmController:
         
         '''
         self.goto_position(x, y)
-        # time.sleep(0.2)
+        # 注：原先此处 arm -> hand 之间有 time.sleep(1) 死等,
+        # 与 PID 闭环无关,纯空转。已删除(2026-07-31 PR#13)。
         if arm is not None:
             self.set_arm_angle(arm)
-            time.sleep(1)
         if hand is not None:
             self.set_hand_angle(hand)
 

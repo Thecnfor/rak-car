@@ -37,14 +37,18 @@ from main.api_client import RuntimeApiClient
 from main.arm.api import ArmClient
 from main.arm.loops.runner import ArmRunner
 
+from main.tasks._helpers import (
+    _ensure_runtime,
+    _wait_infer_ready,
+    _move_x as _helpers_move_x,
+    _move_y as _helpers_move_y,
+    _set_arm_angle,
+    _grasp,
+    _chassis_move_for,
+)
 from main.tasks._config import load_task_config
 
 logger = logging.getLogger("task.auto_seeding")
-
-
-def _ensure_runtime(client: RuntimeApiClient) -> None:
-    if not client.wait_until_ready(timeout=10.0):
-        raise RuntimeError("runtime not ready, check pm2 logs rak-car-api")
 
 
 def _scan_labels(
@@ -112,129 +116,20 @@ def _scan_labels(
     return None
 
 
-def _wait_infer_ready(client: RuntimeApiClient, timeout_s: float = 30.0) -> None:
-    """Probe /v1/health and wait until the task model is ready.
-    If timeout, raise with hint to restart pm2 rak-car-api.
-    """
-    import time as _t
-    deadline = _t.time() + timeout_s
-    last: Any = None
-    while _t.time() < deadline:
-        try:
-            h = client.get_health(snapshot=True)
-        except Exception as exc:
-            last = f"health call failed: {exc}"
-            _t.sleep(1.0)
-            continue
-        last = h
-        # health response shape: {ok, state: {infer_service: {models: [...]}}}
-        state = h.get("state") or {}
-        infer = state.get("infer_service") or {}
-        models = infer.get("models") or []
-        task = next((m for m in models if m.get("name") == "task"), None)
-        if task and task.get("ready") and task.get("response"):
-            logger.info("task inference backend ready (port=%s)", task.get("port"))
-            return
-        _t.sleep(1.0)
-    raise RuntimeError(
-        f"task inference backend not ready within {timeout_s}s; "
-        f"on Jetson run: pm2 restart rak-car-api. last={last}"
-    )
-
-
 # _warmup_cam2 removed: it broke the long-lived ZMQ REQ socket
 
 
-def _apply_pose(
-    runner: ArmRunner,
-    x_mm: float,
-    y_mm: float,
-    arm_angle_deg: float,
-    hand_angle_deg: float,
-    v_max_mms: float = 150.0,
-) -> None:
-    _set_arm_angle(client, arm_angle_deg)
-    runner.client.set_hand_angle(hand_angle_deg, speed=80, timeout=10.0)
-    runner.move_xy(x_mm=x_mm, y_mm=y_mm, v_max_mms=v_max_mms, a_max_mms2=400.0)
-
-
-def _chassis_move_for(client: RuntimeApiClient, dx_m: float, dy_m: float = 0.0, dtheta_rad: float = 0.0, timeout: float = 30.0) -> None:
-    job = client.execute(
-        "car",
-        "move_for",
-        args=[[dx_m, dy_m, dtheta_rad]],
-        timeout=timeout,
-        sync=True,
-    )
-    if job.get("status") != "succeeded" or job.get("error"):
-        raise RuntimeError(f"chassis move_for failed: status={job.get('status')} error={job.get('error')}")
-
-
-# Bypass ArmClient.grasp: it has a positional/keyword collision in _call_arm.
-# Use RuntimeApiClient directly with a fresh action call.
-def _grasp(client: RuntimeApiClient, on: bool, timeout: float = 10.0) -> None:
-    job = client.execute(
-        "arm", "grasp", args=[bool(on)],
-        sync=True, timeout=timeout,
-    )
-    if job.get("status") != "succeeded" or job.get("error"):
-        raise RuntimeError(f"grasp({on}) failed: status={job.get('status')} error={job.get('error')}")
-
-
-# Bypass ArmRunner.move_x (no v_max_mms). Use ArmClient.move_x directly with explicit speed.
-def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0, out_time: float = 15.0, timeout: float = 30.0) -> None:
-    """move_x_position PID 闭环 + v_max_mms 限速, 不 jerk cam2.
-
-    v_max_mms 收紧 PID output_limits → 避免第一帧全速 jerk.
-    车端编码器反馈 → 准确到位.
-    """
-    job = client.execute(
-        "arm", "move_x_position",
-        args=[x_mm / 1000.0],
-        kwargs={"v_max_mms": v_max_mms, "out_time": out_time},
-        sync=True, timeout=timeout + 5,
-    )
-    if job.get("status") != "succeeded" or job.get("error"):
-        raise RuntimeError(f"arm move_x({x_mm}) failed: status={job.get('status')} error={job.get('error')}")
+# Auto_seeding 业务层 alias: 走下层 _helpers._move_x / _move_y, 但允许外部
+# 通过 _arm_move_x / _arm_move_y 调用(保留命名一致性)
+def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0,
+                out_time: float = 15.0, timeout: float = 30.0) -> None:
+    """业务层 alias: 委托 main.tasks._helpers._move_x (含完整错误处理)."""
+    _helpers_move_x(client, x_mm, v_max_mms=v_max_mms, out_time=out_time, timeout=timeout)
 
 
 def _arm_move_y(client: RuntimeApiClient, y_mm: float, timeout: float = 25.0) -> None:
-    """Bypass ArmClient.move_y (which calls get_state sanity check -> y/x_get_position
-    can time out after big arm rotations). Talk to the runtime action directly.
-    move_y_position(target) only takes a single positional target (m), no speed kwargs.
-    """
-    job = client.execute(
-        "arm", "move_y_position",
-        args=[y_mm / 1000.0],
-        sync=True, timeout=timeout,
-    )
-    if job.get("status") != "succeeded" or job.get("error"):
-        raise RuntimeError(f"arm move_y({y_mm}) failed: status={job.get('status')} error={job.get('error')}")
-
-
-def _set_arm_angle(client: RuntimeApiClient, angle_deg: float, speed: int = 80, timeout: float = 20.0, retries: int = 2) -> None:
-    """set_arm_angle with retry. Runtime can occasionally be slow to respond right
-    after busy operations (chassis move, big arm rotations); a transient 8s timeout
-    is recoverable.
-    """
-    import time as _t
-    last = None
-    for attempt in range(1, retries + 1):
-        try:
-            job = client.execute(
-                "arm", "set_arm_angle",
-                args=[angle_deg, speed],
-                sync=True, timeout=timeout + 5,
-            )
-            if job.get("status") == "succeeded" and not job.get("error"):
-                return
-            last = f"status={job.get('status')} error={job.get('error')}"
-        except Exception as exc:
-            last = f"{type(exc).__name__}: {exc}"[:200]
-        logger.warning("set_arm_angle(%.0f) attempt %d/%d failed: %s", angle_deg, attempt, retries, last)
-        if attempt < retries:
-            _t.sleep(1.0)
-    raise RuntimeError(f"set_arm_angle({angle_deg}) failed after {retries} retries: {last}")
+    """业务层 alias: 委托 main.tasks._helpers._move_y."""
+    _helpers_move_y(client, y_mm, timeout=timeout)
 
 
 def _pick_one(runner: ArmRunner, client: RuntimeApiClient, cfg: Dict[str, Any]) -> str:

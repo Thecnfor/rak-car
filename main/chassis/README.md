@@ -42,11 +42,17 @@
 │                                       │            │  │   ┌──────────────┐    │
 │   odometer_thread ─► odometry / encoders ◄────────┼──┼───┤ set_wheel_sp │    │
 │                                                    │  │   └──────────────┘    │
+│  ▲                                                  │  │                       │
+│  │ 2026-07-31 fast-path feed 守护线程（runtime init │  │  ┌──────────────┐    │
+│  │ 默认 50Hz,与 lane_feed 同档）:                   │  │  │ get_ir_state │    │
+│  │   ir_feed  ─► ir_state  (左右红外距离) ◄─────────┼──┼──┤              │    │
+│  │   odom_feed ─► odom_state (底盘里程计) ◄─────────┼──┼──┤get_odom_state│    │
+│  │                                                  │  │  └──────────────┘    │
 └────────────────────────────────────────────────────┘  └───────────────────────┘
-
 外环：客户端，20-50Hz，控制律只读 lane_state，写 4 轮速
 内环：车端，PID（已存在），吃 4 轮速直接驱动
-车端 lane_feed：单独线程，只刷 lane_state 不下发轮速（不抢 runtime 锁）
+车端 lane_feed / ir_feed / odom_feed：单独线程，只刷 streamer cache 不下发轮速（不抢 runtime 锁）
+        业务层 <2ms 直接读 cache,与外环主循环完全解耦
 ```
 
 **核心原则**：外环和内环 **不能同时跑**。`start_lane_feed` 是"只刷 state"的旁路线程，跟外环下发轮速不冲突；但如果你又开了 `car.lane_*`（车端内环 PID），就会撞 runtime 锁，外环被串行化延迟。
@@ -58,20 +64,28 @@
 ## 2. 10 行起步
 
 ```python
-from main.chassis import ChassisClient, DoubleLoopRunner, POuterLoop
+from main.chassis import ChassisClient, subscribe_lane_state, LANE_FOLLOW
 
-api = ChassisClient.connect()                  # 1. 连 HTTP + WS（自动）
+# 一键装配：profile → outer / smoother → DoubleLoopRunner。
 # 注意：lane_feed 守护线程由 runtime init 默认启起来（50Hz，2026-07-16 上调），不用手动 start/stop。
-runner = DoubleLoopRunner(
-    api=api,
-    outer=POuterLoop(vx=0.3),                  # 2. 控制律：P 起步
-    hz=50.0,
+subscribe_lane_state(
+    profile=LANE_FOLLOW.tuned(v_max=0.30, ki_y=0.6),
+    max_seconds=15.0,
 )
-runner.run(max_seconds=15.0)                    # 3. 跑 15 秒（自动 zero out）
-api.stop_wheel_speeds()                        # 4. 关轮速（必调）
+# 退出由 subscribe_lane_state 内部 try/finally 兜底（自动发零速 + 关 ws）
 ```
 
-完整示例：`examples/05_subscribe_lane_state.py`。
+想手写更多控制：
+
+```python
+from main.chassis import ChassisClient, DoubleLoopRunner, CurvatureAdaptiveOuterLoop
+
+api = ChassisClient.connect()
+outer = CurvatureAdaptiveOuterLoop(v_max=0.30, ki_y=0.6)
+runner = DoubleLoopRunner(api=api, outer=outer, hz=50.0)
+runner.run(max_seconds=15.0)
+# runner.run() finally 自动调 api.close()（内部发零速 + 关 ws）
+```
 
 ---
 
@@ -85,11 +99,15 @@ api.stop_wheel_speeds()                        # 4. 关轮速（必调）
 | `connect()` | — | `ChassisClient` | — | 启动一次 |
 | `start_lane_feed(hz=50)` | runtime init 默认启（50Hz，2026-07-16 上调），无需手动调用 | `{started, hz}` | Hz | 自动 |
 | `stop_lane_feed()` | 已禁用 —— lane_feed 由 runtime 一直跑 | `{stopped}` | — | 不调 |
-| `stop_wheel_speeds()` | `realtime/wheel_speeds [0,0,0,0]` | `{speeds: [0,0,0,0]}` | m/s | 退出必调 |
+| `stop_wheel_speeds()` | `realtime/wheel_speeds [0,0,0,0]` | `{speeds: [0,0,0,0]}` | m/s | 兜底/异常路径用。正常退出走 `close()` |
+| `close()` | 内部自动发 `[0,0,0,0]` + 关 ws | — | — | 退出必调（`DoubleLoopRunner.run()` finally 已自动调） |
 | `emergency_stop()` | `POST /v1/control/emergency-stop` | `{stopped}` | — | 兜底 |
 | `get_lane_state()` | `GET /v1/vision/lane/state` | dict | — | ≤50Hz |
-| `get_odometry()` | `car.get_odometry` | `(x, y, theta)` float3 | m, m, rad | ≤50Hz |
+| `get_odometry()` | **fast-path** `GET /v1/realtime/odom/state`（odom_feed 50Hz 缓存）<br/>fallback `car.get_odometry`（job_queue 同步） | `(x, y, theta)` float3 | m, m, rad | ≤50Hz |
+| `get_odometry_state()` | **fast-path** `GET /v1/realtime/odom/state`（odom_feed 50Hz 缓存）<br/>失败 → `OdometryState` 全 None 字段,不抛异常 | `OdometryState` dataclass | m, m, rad, m, —, ms | ≤50Hz |
 | `get_wheel_encoders()` | `GET /v1/realtime/wheels/encoders` | list[float] (4) | rad 累计 | ≤50Hz |
+| `get_ir_state()` | **fast-path** `GET /v1/realtime/ir/state`（ir_feed 50Hz 缓存）<br/>失败 → `IrState` 全 None 字段 | `IrState` dataclass | m, m, —, ms | ≤50Hz |
+| `get_ir(side=None)` | **fast-path** 同 `get_ir_state` (ir_feed 缓存,双侧 / 单侧一次 HTTP)<br/>fallback `car.get_all_ir_distance` / `car.get_ir_distance`(_realtime_gate 同步直读) | side=None → dict `{right, left}`(m)<br/>side=`left`/`right` → float(m) | m | ≤50Hz |
 | `set_wheel_speeds([v1,v2,v3,v4])` | ws `realtime/wheel_speeds` | `{speeds}` | m/s | ≤50Hz |
 | `set_single_motor(port, speed, reverse=1)` | ws `realtime/motor_speed` | `{port, speed, reverse}` | — | ≤50Hz |
 | `ping()` | `GET /v1/health` | bool | — | 1Hz |
@@ -152,20 +170,81 @@ def step(self, state: LaneState, dt: float) -> List[float]:
 
 ### `OdometryState` / `WheelsState`
 
-只读 dataclass，给上层任务（点到点、航位推算）用，目前 `ChassisClient` 还没暴露它们的 dataclass 形式，按需扩展。
+升级到完整 dataclass 见 [state.py](state.py) —— 2026-07-31 之前是骨架，目前已经全部对齐
+runtime `/v1/realtime/odom/state` / `/v1/realtime/wheels/state` 缓存。
+
+#### `OdometryState`（fast-path,2026-07-31）
+
+数据源：odom_feed 守护线程 50Hz 喂 streamer.odom_state。读缓存延迟 <2ms。
+
+```python
+@dataclass
+class OdometryState:
+    x: Optional[float]            # m
+    y: Optional[float]            # m
+    theta: Optional[float]        # rad
+    distance: Optional[float]     # m,本轮累积行驶距离
+    mode: Optional[str]           # odom_feed / idle / stopped
+    age_ms: Optional[float]       # 距离上次更新的毫秒数
+
+# 来源
+OdometryState.from_odom_state_payload(payload)
+# payload 接受 {"odom_state": {...}} 或裸 {...} 或 None,后两者 → 全 None 字段
+```
+
+属性：`active`（mode == "odom_feed"）、`is_fresh`（age_ms < 500ms）。
+
+构造入口：`ChassisClient.get_odometry_state()`。
+
+#### `WheelsState`（fast-path,2026-07-31）
+
+底盘 4 路电机 RPM 缓存视图：
+
+```python
+@dataclass
+class WheelsState:
+    fl_rpm: Optional[float]       # 前左 rpm
+    fr_rpm: Optional[float]       # 前右 rpm
+    rl_rpm: Optional[float]       # 后左 rpm
+    rr_rpm: Optional[float]       # 后右 rpm
+    mode: Optional[str]
+    age_ms: Optional[float]
+```
+
+> 目前 lane_feed / arm_feed / task_feed 都是单独缓存,wheels_state 由 SDK
+> 自带 update_odometry_thread 20Hz 提供；后续若需要单独提高频率,会通过新的
+> wheels_feed 守护线程实现。
+
+#### `IrState`（fast-path,2026-07-31）
+
+左右红外距离缓存视图：
+
+```python
+@dataclass
+class IrState:
+    left: Optional[float]         # m（用户视角左,与 main/chassis/tasks/read_ir 语义一致）
+    right: Optional[float]        # m（用户视角右）
+    mode: Optional[str]           # ir_feed / idle / stopped
+    age_ms: Optional[float]
+```
+
+属性：`active`（mode == "ir_feed"）、`is_fresh`（age_ms < 500ms）。
+
+构造入口：`ChassisClient.get_ir_state()`，双侧/单侧数值快速路径走 `ChassisClient.get_ir(side=None|str)`。
 
 ---
 
 ## 5. `controllers/` 控制律库
 
-### P / Stanley / Pure Pursuit / 弧度自适应 公式与适用场景
+### P / Stanley / 弧度自适应 公式与适用场景
+
+通过 `LaneFollowProfile(controller_type=...)` 或 CLI `--controller` 切换。
 
 | 控律 | 类 | 公式 | 适用场景 | 调参难度 |
 | --- | --- | --- | --- | --- |
 | **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
 | **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
-| **Pure Pursuit** | `PurePursuitOuterLoop` | 视觉误差当假想目标点 → 几何曲率 → omega | 占位骨架（需替换为目标轨迹） | ⭐⭐⭐ |
-| **弧度自适应** | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_raw = -kp_y*ey - ki_y*Σey*dt*decay`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥 + 横向 I 项（消除稳态偏差）。直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力 | ⭐⭐⭐ |
+| **弧度自适应**（主力） | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_raw = -kp_y*ey - ki_y*Σey*dt*decay`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥 + 横向 I 项（消除稳态偏差）。直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力 | ⭐⭐⭐ |
 
 **实测典型取值**（调参从这开始）：
 
@@ -324,48 +403,45 @@ def should_alert(self, state):
 
 ## 7. `tasks/` 高层任务组合
 
+`tasks/` 放高层"组合"——把 ChassisClient + 控制律 + runner 拼成一个流程。
+
 | 任务 | 用途 | 走哪个环 |
 | --- | --- | --- |
-| `follow_lane(api, outer, dis_hold=1.5, timeout_s=30)` | 起 lane feed + 外环跑 N 秒 | **外环** |
-| `track_target(api, label=None, delta_x=0, delta_y=None, time_out=3)` | 让位给车端 `car.move_to_detection_target` 微调终点 | **内环** |
-| `back_to_line(api, straight_seconds=0.6, vx=0.2)` | 丢线时直行恢复（占位骨架） | **外环** |
+| `read_ir(api, side=None)` | **fast-path**（2026-07-31）：先读 ir_feed 缓存（<2ms）；失败回退 `car.get_all_ir_distance` / `car.get_ir_distance` 同步直读（runtime `_realtime_gate`，不造 job）。 | — |
+| `read_dis(api, hz, on_tick)` | **fast-path**（2026-07-31）：内部 `_read_distance` 先读 odom_feed 缓存（<2ms）；失败回退 `car.get_distance` 同步。 | — |
+| `monitor_ir(api, threshold_m, on_alert)` | **fast-path**（沿用 2026-07-31 升级）：走 ir_feed 缓存，每帧差量回调。 | — |
+
+> **TODO**：未来要加的高层组合（`follow_lane` / `track_target` / `back_to_line`）
+> 还在 README 占位阶段。当前业务侧都用 `subscribe_lane_state()` 直接装配
+> + 自己写任务循环（参考 `main/start/orchestrator.py`）。
 
 ### 任务编排模板
 
 ```python
-from main.chassis import ChassisClient, DoubleLoopRunner, StanleyOuterLoop
-from main.chassis.tasks import follow_lane, track_target
+from main.chassis import ChassisClient, subscribe_lane_state, LANE_FOLLOW
+from main.chassis.tasks import read_dis
 
 api = ChassisClient.connect()
 
-# Phase 1：外环巡线（沿主车道走）
-follow_lane(api, outer=StanleyOuterLoop(vx=0.3), timeout_s=10.0)
+# Phase 1：外环巡线 N 秒（替代手动拼 DoubleLoopRunner）
+subscribe_lane_state(profile=LANE_FOLLOW.tuned(max_seconds=10.0))
 
-# Phase 2：让位给内环（车端 PID 做视觉终点微调）
-api.stop_wheel_speeds()
-track_target(api, label=None, time_out=3.0)
-# 注意：不需要 api.stop_lane_feed() —— lane_feed 由 runtime 一直跑
+# Phase 2：让位给内环（车端 PID 做视觉终点微调 —— 走 car.move_to_detection_target）
+# 不在本模块范围内，直接调 my_car / runtime 即可
 ```
-
-### `back_to_line` 注意事项
-
-- 当前是直行兜底，**底盘组按真实"丢线恢复"策略替换**（比如倒车、转 90° 找线）
-- 默认 `straight_seconds=0.6s`，按麦轮 0.2m/s 估算走过 12cm，按场地调
 
 ---
 
-## 8. `examples/` 索引
+## 8. `__init__.py` 公开入口
 
-`examples/` 只放核心装配逻辑（连 client → 建 outer → 跑 runner），不写调参默认
-值、不写内层循环、不写每帧打印、不写 `__main__`。这三件事分别落在：
+`main/chassis/` 的对外 API 都在 `__init__.py` 的 `__all__` 里，调参值在
+`config/lane_follow.py`，每帧 trace 在 `loops/telemetry.py`，CLI 在
+`cli/run_lane_follow.py`：
 
-- 调参值 → `config/lane_follow.py`（`LaneFollowProfile`）
-- 每帧 trace → `loops/telemetry.py`（`lane_trace`）
-- CLI 入口 → `cli/run_lane_follow.py`（`python3 -m main.chassis.cli.run_lane_follow`）
-
-| 文件 | 场景 | 频率 | 控制律 |
-| --- | --- | --- | --- |
-| `05_subscribe_lane_state.py` | 弧度偏差自适应巡线（WS 直读） | 50Hz | `CurvatureAdaptiveOuterLoop` + `WheelSmoother` |
+```python
+from main.chassis import subscribe_lane_state, LANE_FOLLOW
+subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.30, ki_y=0.6))
+```
 
 **典型用法**：
 
@@ -374,16 +450,19 @@ track_target(api, label=None, time_out=3.0)
 python3 -m main.chassis.cli.run_lane_follow
 
 # 离线 dry-run 看数（不连接车也行，只是 state 全空）
-python3 -m main.chassis.cli.run_lane_follow --dry-run --max-seconds 5
+python3 -m main.chassis.cli.run_lane_follow --dry-run
 
 # 慢速 + 关 trace（实车短测）
-python3 -m main.chassis.cli.run_lane_follow --profile slow --no-trace --max-seconds 10
+python3 -m main.chassis.cli.run_lane_follow --profile slow --no-trace
 
-# 临时覆盖调参（不改源代码）
+# 切换控制律（curvature_adaptive / stanley / p）
+python3 -m main.chassis.cli.run_lane_follow --controller stanley
+
+# 临时覆盖调参（不改源代码；任意 profile 字段都能覆盖）
 python3 -m main.chassis.cli.run_lane_follow --tune v_max=0.2 --tune ki_y=0.0
 
 # 程序化装配
-python3 -c "from main.chassis.config import LANE_FOLLOW; from main.chassis.examples import subscribe_lane_state; subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.2))"
+python3 -c "from main.chassis import subscribe_lane_state, LANE_FOLLOW; subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.2))"
 ```
 
 ---
@@ -445,10 +524,10 @@ DoubleLoopRunner(
   - HTTP：`POST /v1/realtime/wheels/speeds` 或 `POST /v1/realtime/chassis-velocity`
 - **代码层强制**：`ChassisClient.set_wheel_speeds` 内部已经只走这两个入口，业务层不会误用
 
-### 🔴 3. **任何脚本入口都要 `try/finally: api.stop_wheel_speeds()`**
+### 🔴 3. **任何脚本入口都要 `try/finally: api.close()`**
 
 - **症状**：Ctrl-C 后车一直以最后那个轮速冲出去
-- **`DoubleLoopRunner.run` 已经做了**，手写循环请照抄：
+- **`api.close()` 内部会自动发零速 + 关 ws**，手写循环请照抄：
 
 ```python
 # 注意：lane_feed 由 runtime init 默认启起来，不需要 start。
@@ -457,9 +536,22 @@ try:
     while True:
         ...
 finally:
-    api.stop_wheel_speeds()    # ← 必加
+    api.close()    # ← 必加（自动发 [0,0,0,0] + 关 ws）
     # 不要 api.stop_lane_feed() —— 它一直跑
 ```
+
+### 🔴 4. （2026-07-31）**不要**用 `POST /v1/execute car get_all_ir_distance / get_odometry / get_distance / get_ir_distance`
+
+- **症状**：50Hz 走 job_queue 排队变成 5Hz；IR 还会撞 MC602 字节往返（每次 10-30ms），整链路 50-200ms
+- **正确**：
+  - 红外：`api.get_ir(side=None)` 或 `api.get_ir_state()`（内部走 `/v1/realtime/ir/state` 缓存，<2ms）
+  - 里程计：`api.get_odometry()` 或 `api.get_odometry_state()`（内部走 `/v1/realtime/odom/state` 缓存，<2ms）
+  - 距离：`read_dis._read_distance(api)`（内部走 `/v1/realtime/odom/state.distance`，<2ms）
+- **代码层强制**：`ChassisClient.get_odometry / get_ir_state / get_odometry_state` 已经默认走 fast-path，业务层直接调用就行；
+   如果非 runtime 升级版本（没起 ir_feed / odom_feed）则自动 fallback 到 `POST /v1/execute`，不需要单独处理
+- **原理**：ir_feed / odom_feed 是 runtime init 启动的守护线程（默认 50Hz），
+  持续把读到的左右 IR / 里程计写入 streamer cache(meta_lock 微秒级)。业务层
+  HTTP `GET /v1/realtime/ir/state` 等只取 meta_lock，几乎零延迟
 
 ---
 
@@ -472,7 +564,13 @@ finally:
 | 单轮端到端 RTT（WS） | ~5ms | ws 路径比 http 快 ~3-5ms |
 | 单轮端到端 RTT（HTTP） | ~10ms | 仍能跑 50Hz，但留余量小 |
 | WebSocket push 5s | ~250 次 | `subscribe_lane` 实测 50Hz×5s（受 lane_feed 频率上限约束） |
-| lane_outer_loop.py 3.3s | 51 push + 51 下发 | 15.5 Hz 端到端 |
+| 实车端到端 5s | 50Hz × 5s 下发无丢帧 | `subscribe_lane_state` 实测（profile.hz=50） |
+| **`ir_feed` 推送频率**（2026-07-31） | 守护线程 `hz=50`（env `RAK_CAR_IR_FEED_HZ` 可覆盖） | 读两侧红外 ~10-30ms（MC602 字节往返 ×2）→ 实际写入频率受字节往返限制 ≈25-30Hz；50Hz 下业务层读 cache 不会撞 spam，arm_long_action 不会挡 IR |
+| **`odom_feed` 推送频率**（2026-07-31） | 守护线程 `hz=50`（env `RAK_CAR_ODOM_FEED_HZ` 可覆盖） | 内存读（get_odometry + get_distance），廉价。**50Hz 跑得满**，无 20Hz 模型上限 |
+| **`get_ir_state()` RTT**（2026-07-31, HTTP） | **<2ms** | 实测 50Hz+ 轮询安全，含 HTTP RTT；与 lane_feed 完全解耦 |
+| **`get_odometry()` RTT**（2026-07-31, HTTP） | **<2ms** | 实测 50Hz+ 轮询安全；与 arm 长动作并发 |
+| **`read_dis` TUI tick 延迟**（2026-07-31） | **<2ms 读 + 1s 周期**，50Hz 后台喂 | TUI UI 仍按 `--hz` 渲染 |
+| **业务层 fast-path 前后对比**（2026-07-31） | 旧 `read_ir(api)` 双侧 40-150ms+；新 `<2ms`。<br/>旧 `get_odometry()` 30-150ms+；新 `<2ms`。 | 见 §10 红线 4 |
 
 ---
 
@@ -485,36 +583,36 @@ main/chassis/
 ├── api.py                    ← ChassisClient：薄封装 RuntimeApiClient/WS
 ├── state.py                  ← LaneState / OdometryState / WheelsState
 ├── loops/
-│   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环
+│   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环（支持 pause/resume）
 │   └── safety.py             ← EmergencyWatchdog / LostLineDetector
 ├── controllers/
 │   ├── base.py               ← OuterLoop ABC + WheelSmoother + mecanum_inverse helper
 │   ├── p_controller.py       ← POuterLoop
 │   ├── stanley.py            ← StanleyOuterLoop
-│   ├── pure_pursuit.py       ← PurePursuitOuterLoop（占位骨架）
-│   └── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应）
-├── config/                   ← 调参 profile（所有默认值与工厂方法）
-│   └── lane_follow.py        ← LaneFollowProfile + LANE_FOLLOW / LANE_FOLLOW_SLOW
+│   └── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应，主力）
+├── config/                   ← 调参 profile（所有默认值与工厂方法）+ magic-number 集中点
+│   └── lane_follow.py        ← LaneFollowProfile + LANE_FOLLOW / LANE_FOLLOW_SLOW + ControllerType
 ├── loops/                    ← 兜底 + 循环 + 每帧 trace
 │   ├── closed_loop.py        ← DoubleLoopRunner
 │   ├── safety.py             ← EmergencyWatchdog / LostLineDetector
 │   └── telemetry.py          ← lane_trace（on_tick 工厂）
 ├── cli/                      ← 可执行入口（argparse + __main__）
 │   └── run_lane_follow.py
-├── tasks/                    ← 高层组合（外环 + 内环事件）
-│   ├── follow_lane.py        ← 起 lane feed + 外环跑 N 秒
-│   ├── track_target.py       ← car.move_to_detection_target 包装
-│   └── back_to_line.py       ← 丢线恢复（直走 straight_seconds）
-└── examples/                 ← 核心装配（无调参值 / 无循环 / 无打印 / 无 __main__）
-    └── 05_subscribe_lane_state.py
+└── tasks/                    ← 一次性/低层数据读取
+    ├── read_ir.py            ← 一次性读红外
+    ├── read_dis.py           ← 持续读累计距离（自带 TUI __main__）
+    └── monitor_ir.py         ← 持续读红外 + 阈值命中回调
 ```
+
+> `main/chassis/tasks/follow_lane.py` / `track_target.py` / `back_to_line.py`
+> 是 README 早期承诺的"高层任务组合"，目前业务侧用 `subscribe_lane_state()`
+> 直接装配 + 在 `main/start/orchestrator.py` 写任务循环。需要时再补。
 
 ---
 
 ## 在哪查 API
 
 - 底盘专用接口子集：本文档
-- 全部接口速查：[main/API_REFERENCE.md](../API_REFERENCE.md)
-- 完整能力清单：[main/CAPABILITY_LIST.md](../CAPABILITY_LIST.md)
+- 全部接口速查：[main/API_INDEX.md](../API_INDEX.md)
 - Runtime 服务端 lane_state / WS push：[runtime/VISION_API.md](../../runtime/VISION_API.md)
 - 出问题了看：[debug-controller-download-stuck.md](../../debug-controller-download-stuck.md)、[debug-runtime-init-queue.md](../../debug-runtime-init-queue.md)

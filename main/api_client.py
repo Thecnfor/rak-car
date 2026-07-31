@@ -49,6 +49,37 @@ class RuntimeApiClient:
     def get(self, path, timeout=None):
         return self._request("GET", path, timeout=timeout)
 
+    # 2026-07-31: 视觉伺服封装需要的 vision 调用方法（VISION_SERVO_DESIGN.md §3）。
+    # - request_vision_task: 单次同步推理（带 bbox_pixels + filter）
+    # - get_vision_task_cache: 读 task_feed 30Hz 缓存（视觉伺服主路径）
+    def request_vision_task(
+        self,
+        *,
+        sort_pos=(0.0, 0.0),
+        limit_x: float = 1.0,
+        limit_y: float = 1.0,
+        timeout: float = 20.0,
+    ):
+        """POST /v1/vision/task — 同步单次推理（含 bbox_pixels）。
+
+        返回 runtime JSON 原样 dict，由 vision.py 层负责解析。
+        """
+        return self._request(
+            "POST",
+            f"{self.api_prefix}/vision/task",
+            payload={
+                "sort_pos": [float(sort_pos[0]), float(sort_pos[1])],
+                "limit_x": float(limit_x),
+                "limit_y": float(limit_y),
+                "timeout": float(timeout),
+            },
+            timeout=timeout + 5.0,
+        )
+
+    def get_vision_task_cache(self):
+        """GET /v1/realtime/vision/task — 读 task_feed 30Hz 缓存。"""
+        return self._request("GET", f"{self.api_prefix}/realtime/vision/task")
+
     def post(self, path, payload=None, timeout=None):
         return self._request("POST", path, payload=payload, timeout=timeout)
 
@@ -332,6 +363,30 @@ class RuntimeApiClient:
         字段为 None 时说明 task_feed 未运行或刚启动。
         """
         return self._request("GET", f"{self.api_prefix}/realtime/vision/task")
+
+    # === 2026-07-31：左右 IR / 底盘里程计 fast-path（与 get_lane_state / get_arm_state 同构）===
+    def get_ir_state(self):
+        """读 ir_feed 守护线程缓存的左右 IR 距离（runtime 默认 50Hz 刷新）。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
+        这是 main/chassis/tasks/read_ir.py 的 fast-path:业务层不再每次
+        触发 /v1/execute → car_queue → MC602 字节往返。
+
+        返回 `{"ir_state": {"active": ..., "mode": ..., "left": m, "right": m, "updated_at": ...}}`。
+        left/right 为 None 时说明 ir_feed 未运行或刚启动。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/ir/state")
+
+    def get_odom_state(self):
+        """读 odom_feed 守护线程缓存的底盘里程计（runtime 默认 50Hz 刷新）。
+
+        不进 job_queue、不打 ZMQ、不抢 car_lock——只取 streamer 的 meta_lock。
+        这是 main/chassis/api.py.get_odometry 的 fast-path:业务层不再每次
+        触发 /v1/execute → car_queue → car_lock。
+
+        返回 `{"odom_state": {"active": ..., "mode": ..., "x": m, "y": m, "theta": rad, "distance": m, "updated_at": ...}}`。
+        """
+        return self._request("GET", f"{self.api_prefix}/realtime/odom/state")
 
     def run_task(self, name, *args, **kwargs):
         return self.create_job("task", name, args=list(args), kwargs=kwargs)

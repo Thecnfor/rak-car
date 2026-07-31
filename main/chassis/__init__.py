@@ -16,7 +16,7 @@ from .loops.telemetry import lane_trace
 from .tasks.monitor_ir import monitor_ir, IRAlertCallback, IRTickCallback
 from .tasks.read_dis import read_dis, DisTickCallback
 from .tasks.read_ir import read_ir
-from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, LaneFollowProfile
+from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, ControllerType, LaneFollowProfile
 
 
 def subscribe_lane_state(
@@ -98,6 +98,7 @@ __all__ = [
     "LostLineDetector",
     "lane_trace",
     "LaneFollowProfile",
+    "ControllerType",
     "LANE_FOLLOW",
     "LANE_FOLLOW_SLOW",
     "monitor_ir",

@@ -180,6 +180,44 @@ class InferBackendService:
             socket.close(0)
             context.term()
 
+    def drop_oldest(self, timeout_s=None):
+        """2026-08-01：让后端按 LRU 卸载非 eager 模型（不杀进程）。
+
+        每个后端端口发 `DROPX!` 命令，单端口无响应不阻塞；返回汇总结果。
+        """
+        if timeout_s is None:
+            timeout_s = settings.get_infer_health_timeout()
+        configs = self._load_configs()
+        results = []
+        for conf in configs:
+            port = conf.get("port")
+            name = conf.get("name")
+            if not port or not name:
+                continue
+            context = zmq.Context()
+            socket = context.socket(zmq.REQ)
+            socket.setsockopt(zmq.LINGER, 0)
+            socket.setsockopt(zmq.RCVTIMEO, int(timeout_s * 1000))
+            socket.setsockopt(zmq.SNDTIMEO, int(timeout_s * 1000))
+            try:
+                socket.connect(f"tcp://127.0.0.1:{int(port)}")
+                socket.send(b"DROPX!")
+                response = socket.recv()
+                payload = json.loads(response)
+                results.append({"name": name, "port": port, "ok": True, "payload": payload})
+            except Exception as exc:
+                results.append({"name": name, "port": port, "ok": False, "error": str(exc)})
+            finally:
+                try:
+                    socket.close(0)
+                except Exception:
+                    pass
+                try:
+                    context.term()
+                except Exception:
+                    pass
+        return results
+
     def probe(self):
         configs = self._load_configs()
         timeout_s = settings.get_infer_health_timeout()
@@ -195,7 +233,18 @@ class InferBackendService:
                 "ready": result["ok"],
             }
             if result["ok"]:
-                model_state["response"] = result["payload"]
+                payload = result["payload"]
+                # 2026-08-01：把后端 ATATA dict 折叠到 model_state 顶层。
+                # 后端 payload 在改造后是 dict（ready/name/loaded/last_used_at/
+                # mem_estimate_mb/lazy_load_count），但旧后端返回 True/False 时
+                # 仍是 bool，这里做兼容：bool 不展开，dict 才展开。
+                if isinstance(payload, dict):
+                    for k, v in payload.items():
+                        model_state[k] = v
+                else:
+                    # 兼容旧后端：bool payload 只表示 ready
+                    pass
+                model_state["response"] = payload
             else:
                 all_ready = False
                 model_state["error"] = result["error"]
