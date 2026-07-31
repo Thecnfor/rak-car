@@ -16,7 +16,7 @@ from .loops.telemetry import lane_trace
 from .tasks.monitor_ir import monitor_ir, IRAlertCallback, IRTickCallback
 from .tasks.read_dis import read_dis, DisTickCallback
 from .tasks.read_ir import read_ir
-from .config import LANE_FOLLOW, ControllerType, LaneFollowProfile
+from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, ControllerType, LaneFollowProfile
 
 
 def subscribe_lane_state(
@@ -42,7 +42,7 @@ def subscribe_lane_state(
     用法::
 
         from main.chassis import subscribe_lane_state, LANE_FOLLOW
-        subscribe_lane_state(profile=LANE_FOLLOW, max_seconds=10.0)
+        subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.2), max_seconds=10.0)
 
     参数：
         profile    - 调参 profile，默认 LANE_FOLLOW
@@ -100,6 +100,7 @@ __all__ = [
     "LaneFollowProfile",
     "ControllerType",
     "LANE_FOLLOW",
+    "LANE_FOLLOW_SLOW",
     "monitor_ir",
     "IRAlertCallback",
     "IRTickCallback",
