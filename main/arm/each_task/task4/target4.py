@@ -133,6 +133,7 @@ def _identify_and_pick(
     pick_timeout_s: float,
     dry_run: bool,
     pre_recognition_settle_s: float = DEFAULT_PRE_RECOGNITION_SETTLE_S,
+    debug_recognition: bool = False,
 ) -> dict:
     """单轮 "识别 + 抓球" 序列。
 
@@ -147,6 +148,8 @@ def _identify_and_pick(
     Args:
         round_idx: 当前轮次 (用于日志, 0 = 初始轮)
         pre_recognition_settle_s: 识别前静置秒数 (默认 3.0s, 设 0 跳过)
+        debug_recognition: 透传给 fetch_balls, 打印每条 detection 过滤原因
+                           (现场 fetch_balls 返回 0 球时定位用)
         其他: 见 step_target4 docstring
 
     Returns:
@@ -176,6 +179,7 @@ def _identify_and_pick(
         balls = target2.fetch_balls(
             http_client,
             color_filter=None,                # 不按颜色过滤, 选 score 最高时再判
+            debug=debug_recognition,
         )
     except Exception as e:
         print(f"  [{LOG_PREFIX}] ⚠️ fetch_balls 异常: "
@@ -288,6 +292,7 @@ def step_target4(
     do_prep: bool = True,
     dry_run: bool = False,
     pre_recognition_settle_s: float = DEFAULT_PRE_RECOGNITION_SETTLE_S,
+    debug_recognition: bool = False,
 ) -> dict:
     """target1 起手 + 循环 (前移 + 识别 + 抓球)。
 
@@ -305,6 +310,9 @@ def step_target4(
         dry_run: True 只 print 不动硬件。
         pre_recognition_settle_s: 识别前静置秒数 (2026-08-01, 默认 3.0s)。
             设 0 = 跳过静置 (老行为)。识别更准, 总耗时增加 rounds * settle_s。
+        debug_recognition: 透传给 fetch_balls, 打印每条 detection 的过滤原因
+            (raw detections 数 + 每条 score/aspect/area/bbox/color 哪一项没过)。
+            现场 fetch_balls 返回 0 球时定位用 (默认 False 静默, 跟老行为一致)。
 
     Returns:
         dict:
@@ -362,6 +370,7 @@ def step_target4(
             pick_timeout_s=pick_timeout_s,
             dry_run=dry_run,
             pre_recognition_settle_s=pre_recognition_settle_s,
+            debug_recognition=debug_recognition,
         )
         history.append(init_res)
         if init_res["action"] == "picked":
@@ -406,6 +415,7 @@ def step_target4(
                 pick_timeout_s=pick_timeout_s,
                 dry_run=dry_run,
                 pre_recognition_settle_s=pre_recognition_settle_s,
+                debug_recognition=debug_recognition,
             )
             history.append(round_res)
             if round_res["action"] == "picked":
@@ -491,6 +501,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help=f"识别前静置秒数 (默认 {DEFAULT_PRE_RECOGNITION_SETTLE_S}s)。"
                         f" 设 0 = 跳过 (老行为)。每轮增加 rounds × 该值 秒, "
                         f"但 fetch_balls 抓拍准确率显著提升。")
+    p.add_argument("--debug-recognition", dest="debug_recognition",
+                   action="store_true", default=False,
+                   help="fetch_balls 打印每条 detection 过滤原因 (raw 数 + score/aspect/"
+                        "area/bbox/color 哪一项没过)。现场 fetch_balls 返回 0 球时定位用。")
     return p
 
 
@@ -520,6 +534,7 @@ def main(argv=None) -> int:
         do_prep=not args.no_prep,
         dry_run=args.dry_run,
         pre_recognition_settle_s=args.pre_recognition_settle_s,
+        debug_recognition=args.debug_recognition,
     )
 
     print(f"\n[{LOG_PREFIX}] 最终结果: {result}")

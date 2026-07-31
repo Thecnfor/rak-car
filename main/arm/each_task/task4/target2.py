@@ -69,10 +69,13 @@ except ImportError:  # pragma: no cover — 直接 python target2.py 时无包�
 LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target2"
 
 # ---- cls_id → color fallback (部分模型不返回 label 字符串, 用 cls_id 兜底) ----
-# 约定: 0=blue, 1=yellow (跟 task4 训练数据对齐; 以 label 为准, cls_id 仅做 fallback)
+# task4 实测 2026-07-25 PaddleDet 用 cls_id 16=ball_blue / 17=ball_yellow,
+# 早期 0/1 是另一个数据集的约定。两条都列上, 哪个命中算哪个。
 CLS_ID_TO_COLOR: dict[int, str] = {
-    0: COLOR_BLUE,
+    0: COLOR_BLUE,    # 旧数据集 (以 label 为准)
     1: COLOR_YELLOW,
+    16: COLOR_BLUE,   # task4 实测 2026-07-25 PaddleDet 输出
+    17: COLOR_YELLOW,
 }
 
 
@@ -173,6 +176,7 @@ def fetch_balls(
     aspect_tol: Optional[float] = None,
     area_min: Optional[float] = None,
     area_max: Optional[float] = None,
+    debug: bool = False,
 ) -> list[dict]:
     """调 task_feed 拿当前帧的球类识别结果 + 按阈值过滤 + 颜色映射。
 
@@ -181,6 +185,8 @@ def fetch_balls(
         score_min: score 阈值 (None → 用 constants.TARGET_SCORE_MIN)
         color_filter: "blue" / "yellow" / None (None=不按颜色过滤)
         aspect_tol / area_min / area_max: 几何阈值 (None → 用 constants)
+        debug: True 时打印每条 detection 的过滤原因 (score/aspect/area/bbox 字段缺失
+               / color unknown); 默认 False 静默 (与旧行为一致)。
 
     Returns:
         list[dict]: 每球一个 dict, 字段见模块 docstring。
@@ -201,32 +207,75 @@ def fetch_balls(
     task_state = (resp or {}).get("task_state") or {}
     if not task_state.get("active"):
         # task_feed 未启 / 刚启动
+        if debug:
+            print(f"  [{LOG_PREFIX}] [DEBUG] task_state.active=False "
+                  f"(task_feed 未启 / 刚启动), keys={list(task_state.keys())}")
         return []
     detections = task_state.get("detections") or []
     if not isinstance(detections, list):
         return []
+    if debug:
+        print(f"  [{LOG_PREFIX}] [DEBUG] raw detections={len(detections)}, "
+              f"filters: score>={score_min}, |aspect-1|<={aspect_tol}, "
+              f"{area_min}<=area<={area_max}")
 
     out: list[dict] = []
-    for det in detections:
+    for i, det in enumerate(detections):
         if not isinstance(det, dict):
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 (不是 dict)")
             continue
+        # score 字段缺失/None/非数字 都静默跳过 (原来就是这逻辑, debug 打原因)
+        score_raw = det.get("score", None)
         try:
-            score = float(det.get("score", 0.0))
+            score = float(score_raw) if score_raw is not None else 0.0
         except (TypeError, ValueError):
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(score={score_raw!r} 不是数字)")
             continue
         if score < score_min:
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(score={score:.3f} < {score_min})")
             continue
         bbox_norm = det.get("bbox_norm") or {}
-        if not _is_ball_like(bbox_norm, score, aspect_tol, area_min, area_max):
-            continue
+        # 解析 bbox 拿到 w/h/area 后面 debug 要用
         try:
             cx, cy, w, h = _norm_xy(bbox_norm)
-        except (ValueError, TypeError):
+            bbox_ok = True
+        except (ValueError, TypeError) as e:
+            bbox_ok = False
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(bbox_norm 解析失败: {e})")
+            continue
+        if w <= 0 or h <= 0:
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(w={w} h={h} 非正)")
+            continue
+        # 宽高比 (球 ≈ 1)
+        aspect = w / h
+        if abs(aspect - 1.0) > aspect_tol:
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(aspect={aspect:.3f} |aspect-1|={abs(aspect-1):.3f} > {aspect_tol})")
+            continue
+        area = w * h
+        if not (area_min <= area <= area_max):
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(area={area:.3f} 不在 [{area_min}, {area_max}])")
             continue
         label = det.get("label")
         cls_id = det.get("cls_id")
         color = _label_to_color(label, cls_id)
         if color_filter and color != color_filter:
+            if debug:
+                print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 "
+                      f"(color={color!r} != filter={color_filter!r}, "
+                      f"label={label!r} cls_id={cls_id!r})")
             continue
         ball = {
             "color": color,
@@ -241,6 +290,9 @@ def fetch_balls(
         }
         out.append(ball)
 
+    if debug:
+        print(f"  [{LOG_PREFIX}] [DEBUG] 通过过滤: {len(out)}/{len(detections)} "
+              f"(raw={len(detections)})")
     return out
 
 
@@ -300,8 +352,11 @@ def step_target2_once(
     """单次识别 + (可选) 写盘。
 
     Args:
-        debug: True 时打印 raw detections 全部字段 (前 3 条) + active/count/updated_at;
-               用于现场诊断 task_feed 输出结构跟 fetch_balls 假设不一致的问题。
+        debug: True 时打印:
+               - raw task_state 全部 keys + active + count + updated_at
+               - raw detections 前 3 条完整字段
+               - **fetch_balls 内部每条 detection 的过滤原因** (score/aspect/area/bbox/
+                 color unknown/active=False), 立刻定位为什么返回 0 球。
 
     Returns:
         {"ok": bool, "balls": list[dict], "raw_task_state": dict|None, "saved_path": str|None}
@@ -329,6 +384,7 @@ def step_target2_once(
         http_client,
         score_min=score_min,
         color_filter=color_filter,
+        debug=debug,
     )
     saved_path = save_latest(balls) if save else None
     _print_balls(balls, raw=raw_task_state if show_raw else None)
