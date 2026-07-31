@@ -1610,6 +1610,10 @@ class MyCar(MecanumDriver):
                 and self._ir_feed_hz is not None
                 and float(self._ir_feed_hz) == float(hz)
             ):
+                logger.info(
+                    "ir_feed fast-path (alive hz=%s requested hz=%s)"
+                    % (self._ir_feed_hz, hz)
+                )
                 return {"started": False, "reason": "already_running", "hz": hz}
             # 否则无论 alive 与否，都走"清旧建新"——也覆盖了"join 失败但活进程失去响应"边界
             if self._ir_feed_thread is not None:
