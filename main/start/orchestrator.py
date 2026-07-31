@@ -12,7 +12,6 @@ run.py 的实现后端（#1 重构）：
 """
 from __future__ import annotations
 
-import importlib
 import logging
 import math
 import sys
@@ -39,20 +38,22 @@ logger = logging.getLogger("main.start.orchestrator")
 
 @dataclass
 class Waypoint:
-    """一个任务点位。
+    """一个任务点位.
 
     Attributes:
-        name:           人类可读名字，会出现在日志。
-        task_module:    任务模块路径（"main.tasks.auto_seeding"）；None 表示纯导航段。
-        ir_threshold_m: IR 接近阈值（None 表示不参与 IR 判断）。
-        ir_side:        IR 哪一侧触发："left" / "right" / "any"（默认 "right"）。
-        dis_at_least_m: 累计里程计 ≥ 该值才算「到了这个点」（None 表示不参与）。
-        trigger_op:     "AND"（默认，严格防误触）/ "OR"。
-        pause_before_s: 触发后、调 task 前的停顿。
-        pause_after_s:  任务跑完、恢复巡线前的停顿。
-        is_finish:      True = 这是终点（里程计达到即整个流程结束）。
+        name:           人类可读名字,会出现在日志 (位置参数,保持向后兼容).
+        task_id:        任务编号 (1..7), 用于 TASK_RUNNERS[id] 查表. None 表示纯导航/finish.
+        task_module:    (兼容旧字段,实际不再用 —— orchestrator 走 TASK_RUNNERS).
+        ir_threshold_m: IR 接近阈值 (None 表示不参与 IR 判断).
+        ir_side:        IR 哪一侧触发: "left" / "right" / "any" (默认 "right").
+        dis_at_least_m: 累计里程计 ≥ 该值才算"到了这个点" (None 表示不参与).
+        trigger_op:     "AND" (默认,严格防误触) / "OR".
+        pause_before_s: 触发后、调 task 前的停顿.
+        pause_after_s:  任务跑完、恢复巡线前的停顿.
+        is_finish:      True = 这是终点 (里程计达到即整个流程结束).
     """
     name: str
+    task_id: Optional[int] = None
     task_module: Optional[str] = None
     ir_threshold_m: Optional[float] = None
     ir_side: str = "right"
@@ -63,34 +64,32 @@ class Waypoint:
     is_finish: bool = False
 
 
-# 默认 8 任务点位 + 1 终点。换场地改这里。
+# 默认 8 任务点位 + 1 终点. 换场地改 task_config.yml 的 waypoints 段 (业务代码不动).
+# 保留 DEFAULT_WAYPOINTS 作为 fallback —— 启动时优先从 yaml 加载.
 DEFAULT_WAYPOINTS: List[Waypoint] = [
-    Waypoint("seed",        task_module="main.tasks.auto_seeding",
+    Waypoint("task1_seeding",     task_id=1,
              ir_threshold_m=0.6, ir_side="right",
              dis_at_least_m=1.00, trigger_op="AND"),
-    Waypoint("scout_pests", task_module="main.tasks.scout_pests",
-             ir_threshold_m=0.50, ir_side="right",
-             dis_at_least_m=3.50, trigger_op="AND"),
-    Waypoint("water",       task_module="main.tasks.water_tower_task",
+    Waypoint("task2_water_tower", task_id=2,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=5.20, trigger_op="AND"),
-    Waypoint("shoot_pests", task_module="main.tasks.target_shooting",
+    Waypoint("task3_pest_scout",  task_id=3,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=7.00, trigger_op="AND"),
-    Waypoint("harvest",     task_module="main.tasks.crop_harvesting",
+    Waypoint("task4_harvest",     task_id=4,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=9.00, trigger_op="AND"),
-    Waypoint("sort",        task_module="main.tasks.sort_and_store",
+    Waypoint("task5_sort",        task_id=5,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=11.0, trigger_op="AND"),
-    Waypoint("ocr",         task_module="main.tasks.get_order",
+    Waypoint("task6_get_order",   task_id=6,
              ir_threshold_m=0.50, ir_side="left",
              dis_at_least_m=13.0, trigger_op="AND"),
-    Waypoint("deliver",     task_module="main.tasks.order_delivery",
+    Waypoint("task7_deliver",     task_id=7,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=14.5, trigger_op="AND"),
-    # 终点：里程计达到 16.5m → 整个流程结束
-    Waypoint("cruise_done", task_module=None, ir_threshold_m=None,
+    # 终点: 里程计达到 16.5m → 整个流程结束
+    Waypoint("cruise_done",       ir_threshold_m=None,
              dis_at_least_m=16.5, is_finish=True),
 ]
 
@@ -101,10 +100,39 @@ class Orchestrator:
     def __init__(self,
                  waypoints: Optional[List[Waypoint]] = None,
                  lane_hz: float = 50.0,
-                 ir_interval_s: float = 0.1):
-        self.waypoints = waypoints if waypoints is not None else DEFAULT_WAYPOINTS
+                 ir_interval_s: float = 0.1,
+                 config_path: Optional[str] = None):
+        """config_path: 自定义 task_config.yml 路径, None 走默认 (根目录 task_config.yml)."""
+        if waypoints is not None:
+            self.waypoints = waypoints
+        else:
+            # 优先从 yaml 加载; 失败 fallback DEFAULT_WAYPOINTS
+            self.waypoints = self._load_waypoints_from_yaml(config_path) or DEFAULT_WAYPOINTS
         self.lane_hz = lane_hz
         self.ir_interval_s = ir_interval_s
+
+    @staticmethod
+    def _load_waypoints_from_yaml(config_path: Optional[str]) -> Optional[List[Waypoint]]:
+        """从 yaml 加载 waypoints, 失败返 None."""
+        try:
+            from main.task._config import load_waypoints
+            wp_dicts = load_waypoints()
+        except (FileNotFoundError, KeyError, ValueError) as exc:
+            logger.warning("yaml load_waypoints failed, fallback DEFAULT_WAYPOINTS: %s", exc)
+            return None
+        out = []
+        for w in wp_dicts:
+            out.append(Waypoint(
+                name=w.get("name", ""),
+                task_id=w.get("task_id"),
+                task_module=w.get("task_module"),  # 保留旧字段, 不参与 _run_task
+                ir_threshold_m=w.get("ir_threshold_m"),
+                ir_side=w.get("ir_side", "right"),
+                dis_at_least_m=w.get("dis_at_least_m"),
+                trigger_op=w.get("trigger_op", "AND"),
+                is_finish=w.get("is_finish", False),
+            ))
+        return out
 
     def run(self) -> None:
         client = RuntimeApiClient()
@@ -295,22 +323,32 @@ class Orchestrator:
 
     @staticmethod
     def _run_task(client: RuntimeApiClient, wp: Waypoint) -> bool:
-        """按需 import 任务模块，调 run()。返回 True 表示成功，False 表示失败。"""
+        """按 task_id 查 TASK_RUNNERS 字典, 调 run(). 返回 True 表示成功."""
+        if wp.task_id is None:
+            # 纯导航段或 finish, 不应到这里
+            return True
         try:
-            mod = importlib.import_module(wp.task_module)
-        except ImportError:
-            logger.warning("task module %s not implemented, skipping", wp.task_module)
+            from main.task import TASK_RUNNERS
+            runner = TASK_RUNNERS[wp.task_id]
+        except (ImportError, KeyError) as exc:
+            logger.warning("task_id=%d not registered in TASK_RUNNERS: %s",
+                           wp.task_id, exc)
             return False
         try:
-            result = mod.run(client)
+            result = runner(client)
+        except NotImplementedError as exc:
+            # 未实现 task (3/7) 抛 NotImplementedError, warning + 跳过
+            logger.warning("task_id=%d not implemented, skipping: %s",
+                           wp.task_id, exc)
+            return False
         except Exception:
             logger.exception("task %s raised exception", wp.name)
             return False
         if isinstance(result, dict) and not result.get("ok"):
             logger.warning("task %s failed: %s", wp.name,
-                           result.get("error", "unknown error"))
+                           result.get("error", result.get("detail", "?")))
             return False
-        logger.info("task %s succeeded -> %s", wp.name, result)
+        logger.info("task %s (id=%d) succeeded -> %s", wp.name, wp.task_id, result)
         return True
 
 
