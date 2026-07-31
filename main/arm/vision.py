@@ -385,3 +385,155 @@ class ArmVisionClient:
             except RuntimeError:
                 continue
         return None
+
+    # ===== 实时（WS push）路径 =====
+
+    def find_target_realtime(self, selector: TargetSelector, *,
+                             x_mm: float, y_mm: float,
+                             hz: float = 30.0,
+                             mm_per_norm: float = 30.0,
+                             settle_tol_norm: float = 0.05,
+                             min_step_mm: float = 1.0,
+                             max_iter: int = 500,
+                             timeout: float = 10.0,
+                             on_missing_track: str = "abort",
+                             move_fn: Optional[Callable[[float, float], dict]] = None,
+                             ws=None) -> ServoResult:
+        """视觉伺服实时版本：用 WS subscribe_task_detection 推流（替代 HTTP 轮询）。
+
+        与 find_target 行为一致，但检测来源是 WS 推送（task_feed 30Hz），
+        延迟更低、多客户端不重复消费。
+
+        Args:
+            selector: 多目标选择器
+            x_mm, y_mm: 起始位姿
+            hz: WS 推送频率上限（默认 30.0）
+            其他参数同 find_target
+            ws: 注入 ws client（默认新建 RuntimeWsClient）
+
+        Returns:
+            ServoResult
+        """
+        if ws is None:
+            try:
+                from main.ws_client import RuntimeWsClient
+            except ImportError:  # pragma: no cover
+                from ws_client import RuntimeWsClient  # type: ignore
+            ws = RuntimeWsClient()
+
+        state = {
+            "trace": [],
+            "x_mm": x_mm, "y_mm": y_mm,
+            "last_detection": None,
+            "consecutive_misses": 0,
+            "locked_track_id": None,
+            "current_selector": selector,
+            "stop_flag": False,
+            "last_updated_at": None,
+        }
+
+        def _on_push(raw: dict) -> None:
+            """WS 推送回调 —— 单帧处理"""
+            if state["stop_flag"]:
+                return
+            ts = raw.get("task_state") or {}
+            updated_at = ts.get("updated_at")
+            if updated_at is not None and updated_at == state["last_updated_at"]:
+                return    # 同一帧 skip
+            state["last_updated_at"] = updated_at
+
+            try:
+                dets = _parse_cache(raw)
+            except Exception:
+                return
+
+            cur_sel = state["current_selector"]
+            candidates = [d for d in dets if cur_sel.matches(d)]
+
+            if cur_sel.strategy == SelectionStrategy.LOCK_FIRST_SEEN.value:
+                if state["locked_track_id"] is None:
+                    pick = cur_sel.apply_strategy(candidates)
+                    if pick is None:
+                        state["consecutive_misses"] += 1
+                        return
+                    state["locked_track_id"] = pick.track_id
+                    cur_sel = dataclasses.replace(cur_sel, track_id=pick.track_id)
+                    state["current_selector"] = cur_sel
+                candidates = [d for d in candidates if d.track_id == state["locked_track_id"]]
+            elif cur_sel.track_id is not None:
+                candidates = [d for d in candidates if d.track_id == cur_sel.track_id]
+
+            pick = cur_sel.apply_strategy(candidates) if candidates else None
+            if pick is None:
+                state["consecutive_misses"] += 1
+                return
+            state["consecutive_misses"] = 0
+            state["last_detection"] = pick
+
+            dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
+            if pick.bbox_norm.is_centered_at(settle_tol_norm):
+                state["stop_flag"] = True
+                return
+
+            dx_mm = -dx_norm * mm_per_norm
+            dy_mm = -dy_norm * mm_per_norm
+            if abs(dx_mm) < min_step_mm:
+                dx_mm = 0.0
+            if abs(dy_mm) < min_step_mm:
+                dy_mm = 0.0
+
+            new_x = state["x_mm"] + dx_mm
+            new_y = state["y_mm"] + dy_mm
+            if move_fn is not None:
+                move_fn(new_x, new_y)
+            else:
+                self.http.execute_arm_action(
+                    "goto_position",
+                    x=new_x / 1000.0, y=new_y / 1000.0,
+                    timeout=5.0, sync=True,
+                )
+            state["x_mm"], state["y_mm"] = new_x, new_y
+
+        stop = ws.subscribe_task_detection(_on_push, hz=hz)
+
+        t0 = time.time()
+        try:
+            # 阻塞循环：定时检查收敛 / timeout / max_iter
+            # 注：subscribe_task_detection 的 on_state 在 client 内部线程异步调用，
+            # 这里只能轮询 state 标志位，无法精确计算 iterations。
+            # 用 timeout 兜底：到时间或 max_iter 秒就停。
+            while time.time() - t0 < timeout:
+                if state["stop_flag"]:
+                    break
+                time.sleep(0.01)
+            # 收尾：timeout 兜底
+            elapsed = time.time() - t0
+        finally:
+            try:
+                stop.stop()
+            except Exception:
+                pass
+
+        # 构造 ServoResult
+        last = state["last_detection"]
+        # iterations 估算：用 elapsed / 0.033（30Hz）做粗算
+        approx_iter = min(max_iter, max(1, int(elapsed * 30.0)))
+        if state["stop_flag"] and last is not None and last.bbox_norm.is_centered_at(settle_tol_norm):
+            return ServoResult(
+                converged=True, selector=selector,
+                x_mm=state["x_mm"], y_mm=state["y_mm"],
+                confidence=last.score, iterations=approx_iter,
+                elapsed_s=elapsed,
+                final_detection=last, trace=(),
+            )
+        if on_missing_track == "abort" and state["consecutive_misses"] >= 5:
+            raise RuntimeError(
+                f"find_target_realtime: 连续 {state['consecutive_misses']} 帧未检测到 {selector}"
+            )
+        return ServoResult(
+            converged=False, selector=selector,
+            x_mm=state["x_mm"], y_mm=state["y_mm"],
+            confidence=last.score if last else 0.0,
+            iterations=approx_iter, elapsed_s=elapsed,
+            final_detection=last, trace=(),
+        )

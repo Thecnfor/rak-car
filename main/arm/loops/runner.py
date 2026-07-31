@@ -243,3 +243,40 @@ class ArmRunner:
             arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
             hand=0.0, speed=80, timeout=30.0,
         )
+
+    # ---- 2026-07-31: 实时（WS push）版本 ----
+
+    def move_to_vision_target_realtime(self, selector, *,
+                                        x_mm: float, y_mm: float,
+                                        arm_angle: float = 0.0, hand: float = -90.0,
+                                        hz: float = 30.0,
+                                        mm_per_norm: float = 30.0,
+                                        settle_tol_norm: float = 0.05,
+                                        timeout: float = 10.0):
+        """高层组合：composite_run 粗定位 → 视觉伺服（WS 实时推流）。
+
+        业务前置：必须在 y < -30mm 保护区外（composite_run 入口会校验）。
+        """
+        self.client.composite_run(
+            arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
+        )
+        return self.client._make_vision_with_move().find_target_realtime(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            hz=hz, mm_per_norm=mm_per_norm,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+        )
+
+    def pick_by_vision_realtime(self, selector, *,
+                                 x_mm: float, y_mm: float, arm_angle: float = -90.0,
+                                 settle_tol_norm: float = 0.05,
+                                 timeout: float = 10.0) -> dict:
+        """最高层（实时版）：粗定位 → WS 伺服 → composite_pick → grasp。"""
+        self.move_to_vision_target_realtime(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            arm_angle=arm_angle, hand=-90.0,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+        )
+        return self.client.composite_pick(
+            arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
+            hand=0.0, speed=80, timeout=30.0,
+        )
