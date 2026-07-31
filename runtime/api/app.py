@@ -8,7 +8,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover
         "/home/jetson/workspace/rak-car/runtime/requirements.txt"
     ) from exc
 
-from runtime.api.routes import create_legacy_router, create_runtime_router, get_public_links
+from runtime.api.router_registry import create_legacy_router, create_runtime_router, get_public_links
 from runtime.core import settings
 from runtime.services.camera_stream_service import CameraStreamService
 from runtime.services.runtime_service import CarRuntimeService
