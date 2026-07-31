@@ -162,14 +162,30 @@ main/arm/
 ├── __init__.py
 ├── ARM_API.md                 ← 业务层机械臂 API 速查
 ├── QUICKSTART.md              ← 10 行起步
-├── api.py                     ← ArmClient：薄封装 main.api_client / main.ws_client
 ├── state.py                   ← ArmState / ArmOrigin dataclass
 ├── trajectory.py              ← TrajectoryGenerator：双轴同步 S 曲线（纯 Python）
 ├── origin.py                  ← OriginCalibrator：调车端 reset_position 重新定原点
 ├── arm_origin.yaml            ← 业务坐标系软限位 + 标注（gitignore）
+├── api/                       ← ArmClient 8 mixin + 1 聚合 (2026-08-01 重整)
+│   ├── __init__.py            ← ArmClient 聚合, MRO = (Safety, Motion, Setters, Composite, Reset, Storage, StateIO, VisServo)
+│   ├── safety.py              ← SafetyMixin: 软限位 / y 保护区 / 大臂手爪硬限
+│   ├── motion.py              ← MotionMixin: set_pose / move_xy / move_x / move_y
+│   ├── setters.py             ← SettersMixin: set_arm_angle / set_hand_angle
+│   ├── composite.py           ← CompositeMixin: 5 个 composite_*
+│   ├── reset_ops.py           ← ResetOpsMixin: reset_y / reset_x / reset_all / reset_origin
+│   ├── storage.py             ← StorageMixin: 存储仓舵机
+│   ├── state_io.py            ← StateIOMixin: get_state / emergency_stop / ping
+│   └── vis_servo.py           ← VisServoMixin: vision 懒属性 + _make_vision_with_move
+├── vision/                    ← ArmVisionClient 5 模块 + 1 聚合 (2026-08-01 重整)
+│   ├── __init__.py            ← ArmVisionClient 聚合, MRO = (ServoLoop, RealtimeLoop) + compute_depth
+│   ├── types.py               ← BBoxNorm / BBoxPixels / Detection / ServoTrace / ServoResult
+│   ├── parsers.py             ← _parse_cache / _parse_sync
+│   ├── selector.py            ← SelectionStrategy / TargetSelector
+│   ├── servo.py               ← ServoLoop: find_target (PID+depth+4DOF) + find_target_legacy (纯 P)
+│   └── realtime.py            ← RealtimeLoop: find_target_realtime / find_target_track (WS 推送)
 ├── loops/
 │   ├── __init__.py
-│   └── runner.py              ← ArmRunner：业务编排 + dry-run
+│   └── runner.py              ← ArmRunner：业务编排 + dry-run + 视觉伺服高层 (5 个 method 透传 **kwargs)
 ├── tasks/
 │   ├── __init__.py
 │   ├── go_home.py             ← 回到 y=0, x=0, hand=UP, side=MID
@@ -182,6 +198,21 @@ main/arm/
     ├── 02_trajectory_preview.py
     ├── 03_move_xy_basic.py
     └── 04_grasp_template.py
+
+## 内部架构 (2026-08-01 重整)
+
+`main/arm/` 按 mixin 聚合 + 职责切分组织。公共 API (`from main.arm import ...`) 100% 兼容, 业务层零修改。
+
+### 视觉伺服算法 (2026-08-01 升级)
+
+`find_target` / `find_target_realtime` / `find_target_track` 从纯 P 升级为:
+
+1. **PID 控制** (Kp=1.0 / Ki=0.05 / Kd=0.2, 全 optional; 旧调用方不传 → 走 find_target_legacy 纯 P 路径 100% 兼容)
+2. **Depth-aware adaptive gain** (`compute_depth` 从 bbox 高度反推距离, 调 `mm_per_norm_eff`; 当前 task_feed 30Hz cache 不含 bbox_pixels 字段, 真实生产 depth 走 fallback; 深度估计在 snap 调用时生效)
+3. **稳定收敛** (`settle_stable_frames=3` 连续帧满足阈值才 `converged=True + settle_stable=True`; 默认 frames=1 兼容旧单帧收敛)
+4. **4 自由度策略** (大偏移 `|dx_norm|>0.3` 触发 `on_strategic_4dof("arm_rotate", det)` 回调, 业务层 hook 在回调里调 `composite_run(arm=...)` 转大臂)
+
+8 类 label `real_height_m` 已填值 (`cylinder_*=0.10` / `ball_*=0.06` / `h_dou_jiao=0.20` / `h_fan_qie=0.07` / `h_qing_jiao=0.10` / `h_tu_dou=0.08` / `animal=0.30` / `water=0.15`); 其它 label 留 0.0 走 fallback.
 ```
 
 ## 三条红线
