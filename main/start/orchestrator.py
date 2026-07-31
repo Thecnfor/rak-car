@@ -143,7 +143,9 @@ class Orchestrator:
                 self._pause_lane(api, running)
                 time.sleep(wp.pause_before_s)
                 if wp.task_module:
-                    self._run_task(client, wp)
+                    ok = self._run_task(client, wp)
+                    if not ok:
+                        logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
                 time.sleep(wp.pause_after_s)
                 self._resume_lane(running)
                 completed.append(wp.name)
@@ -245,18 +247,24 @@ class Orchestrator:
             time.sleep(interval_s)
 
     @staticmethod
-    def _run_task(client: RuntimeApiClient, wp: Waypoint) -> None:
-        """按需 import 任务模块，调 run()。失败不致命：记日志、继续下一站。"""
+    def _run_task(client: RuntimeApiClient, wp: Waypoint) -> bool:
+        """按需 import 任务模块，调 run()。返回 True 表示成功，False 表示失败。"""
         try:
             mod = importlib.import_module(wp.task_module)
         except ImportError:
             logger.warning("task module %s not implemented, skipping", wp.task_module)
-            return
+            return False
         try:
             result = mod.run(client)
-            logger.info("task %s -> %s", wp.name, result)
         except Exception:
-            logger.exception("task %s failed", wp.name)
+            logger.exception("task %s raised exception", wp.name)
+            return False
+        if isinstance(result, dict) and not result.get("ok"):
+            logger.warning("task %s failed: %s", wp.name,
+                           result.get("error", "unknown error"))
+            return False
+        logger.info("task %s succeeded -> %s", wp.name, result)
+        return True
 
 
 __all__ = ["Waypoint", "Orchestrator", "DEFAULT_WAYPOINTS"]

@@ -22,38 +22,41 @@ Phases:
   Phase 4: pick goods — veggie detect + vacuum pick ×2
   Phase 5: carry pose for Task 7 (stub)
 
-Motion functions imported from Task 1 / Task 2 (identical PID closed-loop):
-  _move_x, _move_y, _set_hand_angle ← water_tower_task
-  _set_arm_angle, _ensure_runtime, _wait_infer_ready ← auto_seeding_safe
+Motion helpers: 统一从 main.tasks._helpers 取 (与 task1/task2 共用)。
 """
-
 from __future__ import annotations
 
 import logging
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from main.api_client import RuntimeApiClient
-from main.tasks.water_tower_task import _move_x, _move_y, _set_hand_angle
-from main.tasks.auto_seeding_safe import (
+from main.tasks._helpers import (
     _ensure_runtime,
     _wait_infer_ready,
+    _move_x,
+    _move_y,
     _set_arm_angle,
+    _set_hand_angle,
     _grasp,
     _chassis_move_for,
+    _move_x_checked,
+    _read_x_mm,
 )
 from main.misc.test_order_read import run as order_read_run
 from main.misc.test_veggie_detect import run as veggie_detect_run
 
 import yaml
 
-_TASK6_CONFIG = Path(__file__).resolve().with_name("task6_config.yml")
+# task6 配置独立保留在 test/task6_config.yml (避免侵入 task_config.yml 其它段)
+_TASK6_CONFIG = Path(_PROJECT_ROOT) / "test" / "task6_config.yml"
 
 
 def _load_task6_config() -> Dict[str, Any]:
@@ -70,52 +73,6 @@ def _load_task6_config() -> Dict[str, Any]:
 logger = logging.getLogger("task.get_order")
 
 
-# ============================================================
-# 带位置校验的 X 移动（防 PID 超调）
-# ============================================================
-
-def _move_x_checked(client, x_mm: float, v_max_mms: float = 40.0,
-                    tolerance_mm: float = 3.0, timeout: float = 30.0):
-    """X 轴移动到目标位置, 完成后读取实际位置校验.
-
-    如果实际位置偏差 > tolerance_mm, 用低速 (30mm/s) 再纠正一次。
-    防止 PID 在方向切换时（扫动向右→复位向左）超调导致撞杆。
-    """
-    _move_x(client, x_mm, v_max_mms=v_max_mms, timeout=timeout)
-
-    # 读回实际位置
-    actual = _read_x_mm(client)
-    if actual is None:
-        logger.warning("  _move_x_checked: cannot read back X position, assume ok")
-        return
-
-    err = actual - x_mm
-    logger.info("  _move_x_checked(%.0f): actual=%.0f err=%.1f mm", x_mm, actual, err)
-
-    if abs(err) > tolerance_mm:
-        logger.warning("  ⚠ X overshoot! actual=%.0f target=%.0f err=%.1f mm — "
-                       "correcting at 30 mm/s", actual, x_mm, err)
-        _move_x(client, x_mm, v_max_mms=30.0, timeout=timeout)
-        time.sleep(0.3)
-        actual2 = _read_x_mm(client)
-        if actual2 is not None:
-            err2 = actual2 - x_mm
-            logger.info("  _move_x_checked retry: actual=%.0f err=%.1f mm", actual2, err2)
-            if abs(err2) > tolerance_mm:
-                raise RuntimeError(
-                    "X position correction failed: target=%.0f actual=%.0f err=%.1f mm"
-                    % (x_mm, actual2, err2)
-                )
-
-
-def _read_x_mm(client) -> float | None:
-    """读取当前 X 轴实际位置 (mm)."""
-    try:
-        resp = client.get("/v1/realtime/arm/state", timeout=3)
-        return (resp.get("arm_state") or {}).get("x_mm", None)
-    except Exception:
-        return None
-
 # ── 货架 X 位置（从上到下 4 行）──
 _SHELF_X_BY_ROW = [-50.0, -100.0, -140.0, -180.0]
 
@@ -126,8 +83,6 @@ def _pos_to_row(pos: str) -> int:
     格式: "右1"=右边第一排第1行, "左3"=左边第二排第3行.
     """
     pos = (pos or "").strip()
-    # 尝试匹配 "右1"~"右4" 或 "左1"~"左4"
-    import re
     m = re.search(r'[左右]\s*(\d)', pos)
     if m:
         n = int(m.group(1))
@@ -320,7 +275,7 @@ def _lift_and_carry(client, cfg):
 # run() entry point
 # ============================================================
 
-def run(client=None):
+def run(client: Optional[RuntimeApiClient] = None):
     """Task 6 main entry. Runs push-bar pose + sweep + reposition.
 
     Returns: {"ok": bool, "completed": [...], "order_list": [], "error": str}
@@ -490,4 +445,3 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     result = run()
     print("get_order result:", result)
-
