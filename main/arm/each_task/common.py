@@ -395,15 +395,61 @@ def move_x_hard_reach(
     )
 
     # ⚠️ 熔断 (2026-07-31): 第一轮 split 实时位置完全没变 → motor 可能死了
-    #   之前会进入 stall 5 轮死循环,业务层看不见 motor 真死; 现在立刻抛错。
+    #   之前会进入 stall 5 轮死循环,业务层看不见 motor 真死; 立刻抛错。
+    # 2026-08-01: FUSE 之前先试 reset_x 一次 (last-ditch), reset_x 成功 + 编码器重置
+    #   后可能让 motor 恢复响应 (硬件过流保护会自恢复; 编码器失同步也能 reset)。
     if res1["segments"] >= 1 and abs(res1["residual_mm"]) >= abs(target_x_mm) * 0.9:
-        # 走了至少 1 轮但还在原位附近(目标 ≥90% 没到)→ motor 完全没响应
-        msg = (f"{log_prefix} motor 完全没响应: split#1 走了 {res1['segments']} 轮,"
-               f"residual={res1['residual_mm']:+.1f}mm,目标={target_x_mm:+.0f}mm。"
-               f"可能 belt-slip 跳齿 / 编码器失同步 / motor 驱动板过流保护。"
-               f"业务层不再静默 stall 循环,立即抛错请查硬件。")
-        print(f"  [FUSE] {msg}")
-        raise RuntimeError(msg)
+        print(f"  [FUSE] {log_prefix} split#1 完全没动 (residual={res1['residual_mm']:+.1f}mm"
+              f", 目标 {target_x_mm:+.0f}mm 的 {abs(res1['residual_mm'])/abs(target_x_mm)*100:.0f}%)"
+              f"; **先试 reset_x 一次** (last-ditch 救 motor)")
+        try:
+            print(f"  {log_prefix} [FUSE-rescue] reset_x 撞墙重置编码器...")
+            reset_job = client._call_arm(
+                "reset_x", timeout=reset_timeout, sync=True,
+                direction=reset_direction,
+                reset_velocity=reset_velocity_mms / 1000.0,
+                probe_time=reset_probe_time,
+            )
+            print(f"  {log_prefix} [FUSE-rescue] reset_x 完成, 再走一次 split...")
+            res_rescue = move_x_with_split(
+                client, runner,
+                target_x_mm=target_x_mm,
+                log_prefix=log_prefix + " [split#2 after FUSE-rescue]",
+                v_max_mms=v_max_mms,
+                tol_mm=tol_mm,
+                max_rounds=max_rounds,
+                stall_mm=stall_mm,
+                max_stall_rounds=max_stall_rounds,
+                kick_sleep_s=kick_sleep_s,
+                wall_mm=wall_mm,
+                wall_tol_mm=wall_tol_mm,
+                overshoot_ratio=overshoot_ratio,
+            )
+            res_rescue["reset_count"] = 1
+            if res_rescue["reached"]:
+                # reset_x 救回来了!
+                print(f"  [FUSE-RESCUED] {log_prefix} reset_x 后 split 成功到位 "
+                      f"({res_rescue['final_x']:+.1f}mm), 标记为 reset_then_success")
+                res_rescue["result"] = "reset_then_success"
+                return res_rescue
+            # reset_x 也没救回来, 抛错 (兜底失败)
+            msg = (f"{log_prefix} motor 完全没响应: split#1 走了 {res1['segments']} 轮,"
+                   f"FUSE-rescue reset_x 后 split#2 仍 residual={res_rescue['residual_mm']:+.1f}mm,"
+                   f"目标={target_x_mm:+.0f}mm。可能 belt-slip 跳齿 / 编码器坏 / "
+                   f"motor 驱动板过流保护。业务层不再静默 stall 循环,立即抛错请查硬件。")
+            print(f"  [FUSE-RAISE] {msg}")
+            raise RuntimeError(msg)
+        except RuntimeError:
+            raise
+        except Exception as rescue_exc:
+            # reset_x 本身挂了 (e.g. 控制器没响应) → 抛原 FUSE 错
+            msg = (f"{log_prefix} motor 完全没响应: split#1 走了 {res1['segments']} 轮,"
+                   f"residual={res1['residual_mm']:+.1f}mm,目标={target_x_mm:+.0f}mm。"
+                   f"FUSE-rescue 救不了 (reset_x 抛 {type(rescue_exc).__name__}: "
+                   f"{str(rescue_exc)[:80]})。可能 belt-slip 跳齿 / 编码器失同步 / "
+                   f"motor 驱动板过流保护 / 控制器挂死。")
+            print(f"  [FUSE-RAISE] {msg}")
+            raise RuntimeError(msg) from rescue_exc
 
     if res1["reached"]:
         res1["reset_count"] = 0
