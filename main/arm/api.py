@@ -10,6 +10,7 @@ ArmClient：薄封装 RuntimeApiClient + RuntimeWsClient，专给机械臂用。
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -23,6 +24,39 @@ except ImportError:  # pragma: no cover
     from api_client import RuntimeApiClient  # type: ignore
     from ws_client import RuntimeWsClient  # type: ignore
 
+# 2026-07-28: 球检测验证基线 + 助手。task4 业务层有 BALL_VERIFIED_*
+# (target1 位姿下球检测期望范围, 蓝黄共用), api.py 这里**再导出 + 暴露
+# verify_ball()** 让一般 arm 客户端代码也能做"球是不是在期望范围"的检查
+# (不直接依赖 task4 常量文件)。`ArmClient.verify_ball()` 方法是常用入口。
+try:
+    from main.arm.each_task.task4.constants import (  # type: ignore
+        BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX,
+        BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX,
+        BALL_VERIFIED_W_MIN, BALL_VERIFIED_W_MAX,
+        BALL_VERIFIED_H_MIN, BALL_VERIFIED_H_MAX,
+        BALL_VERIFIED_AREA_MIN_VERIFY, BALL_VERIFIED_AREA_MAX_VERIFY,
+        BALL_VERIFIED_SCORE_MIN_VERIFY,
+        BALL_VERIFIED_ASPECT_MIN, BALL_VERIFIED_ASPECT_MAX,
+    )
+except ImportError:  # pragma: no cover — 业务层未就绪时给空缺省值, 不阻断 import
+    # 2026-07-30: fallback 同步 constants.py 第 9 次 (新最佳) 加测后的 UNION 区间。
+    # 2026-07-29 第 8 次 (cx=0.120, aspect=0.923) → 2026-07-30 第 9 次 (cx=0.026, aspect=1.057) 加测,
+    # 新球 aspect 跨 1.0 (横宽>纵高), 放宽 H_MIN/ASPECT_MAX。
+    # 业务层导入成功时**不会**用这里, 只在 task4 constants.py 缺失时兜底。
+    BALL_VERIFIED_CX_MIN = 0.02
+    BALL_VERIFIED_CX_MAX = 0.20
+    BALL_VERIFIED_CY_MIN = -0.78
+    BALL_VERIFIED_CY_MAX = -0.55
+    BALL_VERIFIED_W_MIN = 0.35
+    BALL_VERIFIED_W_MAX = 0.56
+    BALL_VERIFIED_H_MIN = 0.48
+    BALL_VERIFIED_H_MAX = 0.65
+    BALL_VERIFIED_AREA_MIN_VERIFY = 0.20
+    BALL_VERIFIED_AREA_MAX_VERIFY = 0.35
+    BALL_VERIFIED_SCORE_MIN_VERIFY = 0.80
+    BALL_VERIFIED_ASPECT_MIN = 0.55
+    BALL_VERIFIED_ASPECT_MAX = 1.10
+
 from .state import (
     ArmState,
     ArmOrigin,
@@ -31,6 +65,16 @@ from .state import (
     STORAGE_DEFAULT_RIGHT_ANGLE,
 )
 from .trajectory import TrajectoryGenerator, TrajectoryPlan
+
+
+class ArmSafetyError(ValueError):
+    """机械臂安全门拦截时抛的异常。
+
+    业务层入口（move_x / move_y / set_arm_angle / set_hand_angle）目前的保护区检查
+    仍统一抛 ``ValueError``；本类作为 ``ValueError`` 的子类提供显式语义，
+    方便未来代码按"是否安全门拦截"细分 ``except``（同时不破坏现有
+    ``except ValueError`` 的捕获路径）。``__init__.py`` 已对外导出。
+    """
 
 
 def _mm_to_m(v_mm: float) -> float:
@@ -51,6 +95,113 @@ def _normalize_storage_side(side: Optional[str]) -> Optional[str]:
     return s
 
 
+def pre_init_close_storage(
+    http: RuntimeApiClient,
+    timeout: float = 10.0,
+    closed_angle_deg: float = 98.0,
+) -> dict:
+    """初始化前预操作：把储存仓舵机打到关闭位（默认 98°）。
+
+    user 2026-07-18 要求：任何 init 入口前都应先关仓，避免开仓状态
+    干扰磁感找底。不动 y 轴（忽略 ``test_storage_close.py`` 里的
+    y=-150 抬升，那是测试脚本的临时 workaround）。
+
+    实现：走 ``/v1/execute target=car name=set_storage_angle`` 直传
+    raw 协议值，``sync=True`` 阻塞轮询到 ``succeeded``；预操作失败
+    由调用方 catch（不阻塞 init 主流程，本函数本身只负责下发）。
+
+    注意：set_storage_angle 是 **CAR action**（不是 ARM action，见
+    ``runtime/core/actions.py:12``），runtime 收到 ``target=arm`` 会 400。
+    跟 ``ArmClient.set_storage_angle`` 走 ``_call_car`` 同款。
+
+    参数:
+        http: ``RuntimeApiClient`` 实例。
+        timeout: job 超时（秒）。
+        closed_angle_deg: 关闭位角度（°），现场标定值，默认 98°。
+
+    返回:
+        ``/v1/execute`` 同步返回的 job dict（含 ``status`` / ``result`` / ``error``）。
+    """
+    return http.execute_car_action(
+        "set_storage_angle",
+        angle=float(closed_angle_deg),
+        timeout=timeout,
+        sync=True,
+    )
+
+
+def verify_ball(
+    ball: dict,
+    *,
+    cx_min: float = BALL_VERIFIED_CX_MIN,
+    cx_max: float = BALL_VERIFIED_CX_MAX,
+    cy_min: float = BALL_VERIFIED_CY_MIN,
+    cy_max: float = BALL_VERIFIED_CY_MAX,
+    w_min: float = BALL_VERIFIED_W_MIN,
+    w_max: float = BALL_VERIFIED_W_MAX,
+    h_min: float = BALL_VERIFIED_H_MIN,
+    h_max: float = BALL_VERIFIED_H_MAX,
+    area_min: float = BALL_VERIFIED_AREA_MIN_VERIFY,
+    area_max: float = BALL_VERIFIED_AREA_MAX_VERIFY,
+    score_min: float = BALL_VERIFIED_SCORE_MIN_VERIFY,
+    aspect_min: float = BALL_VERIFIED_ASPECT_MIN,
+    aspect_max: float = BALL_VERIFIED_ASPECT_MAX,
+) -> bool:
+    """验证 ball dict 是否落在 BALL_VERIFIED_* 期望范围 (target1 位姿下)。
+
+    2026-07-28 加进 api.py: 业务层 (target2 / test_* / step_*) 之外的其他
+    代码也能用 arm 客户端做球验证, 不必 import task4.constants。
+
+    默认值取自 `BALL_VERIFIED_*` (target1.py 位姿下 5 次实测基线, 蓝黄共用)。
+    全部 7 项**同时**通过才返 True; 任一不通过 → False (静默, 不抛)。
+
+    字段缺失 / 类型错 → 不通过。
+
+    验证项:
+      - cx_norm  ∈ [cx_min, cx_max]
+      - cy_norm  ∈ [cy_min, cy_max]
+      - w_norm   ∈ [w_min, w_max]
+      - h_norm   ∈ [h_min, h_max]
+      - area     = w*h ∈ [area_min, area_max]
+      - score    ≥ score_min
+      - aspect   = w/h ∈ [aspect_min, aspect_max]
+
+    Args:
+        ball: dict, 期望含 cx_norm / cy_norm / w_norm / h_norm / score 字段。
+        其他参数: 阈值覆盖, 默认值 = BALL_VERIFIED_*, 调用方可临时调。
+
+    Returns:
+        True = 在范围内 (球检测合理); False = 越界 (噪声框或位姿偏移)。
+    """
+    try:
+        cx = float(ball.get("cx_norm", 0.0))
+        cy = float(ball.get("cy_norm", 0.0))
+        w = float(ball.get("w_norm", 0.0))
+        h = float(ball.get("h_norm", 0.0))
+        score = float(ball.get("score", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if w <= 0 or h <= 0:
+        return False
+    area = w * h
+    aspect = w / h
+    if not (cx_min <= cx <= cx_max):
+        return False
+    if not (cy_min <= cy <= cy_max):
+        return False
+    if not (w_min <= w <= w_max):
+        return False
+    if not (h_min <= h <= h_max):
+        return False
+    if not (area_min <= area <= area_max):
+        return False
+    if score < score_min:
+        return False
+    if not (aspect_min <= aspect <= aspect_max):
+        return False
+    return True
+
+
 @dataclass
 class ArmClient:
     """机械臂专用 client。薄封装 main.api_client / main.ws_client。"""
@@ -69,6 +220,16 @@ class ArmClient:
         self.ws_ready = False
         self.origin = origin or ArmOrigin()
         self.traj = traj or TrajectoryGenerator()
+        # ---- x_speed safety watchdog 状态（per ARM_API §10 + memory [[x-speed-safety-watchdog]]）----
+        # latest-wins: 多次调用 x_speed_with_safety 会取消前一个 watchdog。
+        # 状态必须用 self._x_safety_lock 串行访问。
+        self._x_safety_lock = threading.Lock()
+        self._x_safety_thread: Optional[threading.Thread] = None
+        self._x_safety_stop_event: Optional[threading.Event] = None
+        self._x_safety_start_x_mm: Optional[float] = None
+        self._x_safety_velocity_ms: float = 0.0
+        # ---- realtime 读取失败原因（见 _read_arm_state_realtime / last_realtime_error）----
+        self._last_realtime_error: Optional[str] = None
 
     @classmethod
     def connect(cls, load_origin: bool = True) -> "ArmClient":
@@ -244,13 +405,19 @@ class ArmClient:
 
     def move_x(self, x_mm: float, v_max_mms: float = 40.0, out_time: float = 15.0,
                timeout: float = 30.0) -> dict:
-        """2026-07-16: 启用 x 控制 + 速度减半。out_time 默认 15s（避免 PID 脉冲式）。"""
+        """2026-07-16: 启用 x 控制 + 速度减半。out_time 默认 15s（避免 PID 脉冲式）。
+
+        2026-07-28 修：v_max_mms 之前**接收了但没透传**给 _call_arm，target1/2 传
+        v_max_mms=15 实际跑默认 40。修法：v_max_mms 走 kwarg 转发给底层
+        move_x_position（arm_base.py:456 接受 v_max_mms kwarg）。
+        """
         self._check_y_protected("move_x")
         job = self._call_arm(
             "move_x_position",
             timeout=timeout,
             target=_mm_to_m(x_mm),
             out_time=out_time,
+            v_max_mms=v_max_mms,   # 2026-07-28: 透传（之前被吞，target1.x 限速不生效）
         )
         origin = self.origin or ArmOrigin()
         try:
@@ -556,7 +723,7 @@ class ArmClient:
         返回:
             {"ok": bool, "angle": float, "raw_job": dict}
         """
-        self._call_car(
+        job = self._call_car(
             "set_storage_angle", timeout=timeout,
             angle=angle, speed=speed, sync=True,
         )
@@ -569,11 +736,21 @@ class ArmClient:
         }
 
     def grasp(self, on: bool, timeout: float = 10.0) -> dict:
-        # 修复 bug：原来 `_call_arm("grasp", bool(on), timeout=timeout)` 会让
-        # `_call_arm(self, name, timeout=20.0, *args, ...)` 把 bool(on) 当成
-        # timeout 位置参，再传 timeout=timeout 报 "got multiple values"。
-        # 改为 keyword-only timeout 传参。
-        return self._call_arm("grasp", bool(on), sync=True, timeout=timeout)
+        # ⚠️ 不能走 `_call_arm("grasp", bool(on), sync=True, timeout=timeout)`：
+        #   `_call_arm(self, name, timeout=20.0, *args, ...)` 的 `timeout` 是第 2 个
+        #   位置形参，`bool(on)` 位置传进去被当成 timeout（=True），再传
+        #   timeout=timeout 报 "got multiple values for argument 'timeout'"（target3.py 复现）。
+        # ⚠️ 也不能走 `_call_arm("grasp", on=bool(on), ...)`：
+        #   runtime ARM_ACTIONS["grasp"] lambda 透传 **kwargs 到 arm_base.grasp(value)，
+        #   arm_base.grasp 签名只接 `value`，收到 on/sync/timeout 全 TypeError → job failed，
+        #   同步路径下业务层不检查 status 就静默失败（球没吸起来）。
+        # 正解：直接调 http.execute_arm_action，它的 timeout 是 keyword-only（`def
+        # execute_arm_action(self, name, *args, timeout=None, ...)`），
+        # 位置参 `bool(on)` 进 *args，timeout=keyword 正常，到车端 arm_obj.grasp(True) 命中 value。
+        return self.http.execute_arm_action(
+            "grasp", bool(on),
+            timeout=timeout, sync=True,
+        )
 
     # ---- reset ----
 
@@ -669,6 +846,293 @@ class ArmClient:
             x_val = None
         return {"raw_x_m": float(x_val) if x_val is not None else 0.0,
                 "raw_y_m": float(y_val) if y_val is not None else 0.0}
+
+    # ---- realtime 真值路径（arm_feed 20Hz 守护线程缓存）----
+    #
+    # 与 _read_raw_state 的区别：
+    #   - _read_raw_state 走 y_get_position / x_get_position → 触发底层 calibrate
+    #     框架（已坏，实测同位置不同时间读数飘 0.3 / 22.5 / 46.9mm，详见 ARM_API §11）
+    #   - 本节两个方法走 /v1/realtime/arm/state（arm_feed 守护线程每 20Hz 刷新），
+    #     不进 job_queue、不打 ZMQ、不抢 car_lock，是业务层**唯一**可信 x/y 位置源
+    #
+    # 失败语义：HTTP 失败 / arm_feed 未启 / 字段 None → 返回 None。
+    # 调用方应自己处理 None（一般 raise RuntimeError 让外层兜底退出）。
+    #
+    # 2026-07-30：以前这两个方法把异常整个吞掉直接 return None，业务层只能
+    # 报"arm_feed 可能未启动"，实际最常见的原因是**网络不通**（换网段后
+    # main/settings.py 的 IP 没跟着改）。现在统一走 _read_arm_state_realtime()，
+    # 失败原因记进 self._last_realtime_error 并 logger.warning，调用方可以读
+    # last_realtime_error() 把真实原因带进错误信息。
+
+    def _read_arm_state_realtime(self) -> Optional[dict]:
+        """读 /v1/realtime/arm/state 的 arm_state dict。失败返回 None。
+
+        失败原因写进 ``self._last_realtime_error``（供 ``last_realtime_error()``
+        读取）并 ``logger.warning``，避免上层把「网络不通」误报成「arm_feed 未启动」。
+
+        Returns:
+            arm_state dict（含 x_mm / y_mm / active / ref_encoder ...），失败 → None。
+        """
+        try:
+            resp = self.http.get_arm_state()
+        except Exception as exc:
+            self._last_realtime_error = (
+                f"HTTP 请求失败({type(exc).__name__}: {exc})—— "
+                f"多半是 runtime 地址不对或网络不通，"
+                f"当前 api_base={getattr(self.http, 'api_base', '?')}"
+            )
+            logger.warning("realtime arm/state 读取失败: %s", self._last_realtime_error)
+            return None
+        if not isinstance(resp, dict):
+            self._last_realtime_error = f"响应不是 dict: {type(resp).__name__}"
+            logger.warning("realtime arm/state %s", self._last_realtime_error)
+            return None
+        st = resp.get("arm_state")
+        if not isinstance(st, dict):
+            self._last_realtime_error = "响应里没有 arm_state 字段（runtime 版本不匹配？）"
+            logger.warning("realtime arm/state %s", self._last_realtime_error)
+            return None
+        if not st.get("active", True):
+            # active=False 说明 arm_feed 守护线程真的没跑（急停 / cancel 后 _stop_flag）
+            self._last_realtime_error = (
+                "arm_feed 守护线程未运行(active=False)—— "
+                "急停或 cancel_job 后需 POST /v1/control/reset-stop 再重启 feed"
+            )
+            logger.warning("realtime arm/state %s", self._last_realtime_error)
+            return None
+        self._last_realtime_error = None
+        return st
+
+    def last_realtime_error(self) -> Optional[str]:
+        """最近一次 realtime 读取失败的原因（成功后清空，从未失败过 → None）。
+
+        业务层拿到 ``_read_x_mm_realtime`` / ``_read_y_mm_realtime`` 的 None 后，
+        应该把本方法的返回值带进自己的错误信息，否则用户看到的永远是
+        「arm_feed 可能未启动」这种猜测。
+        """
+        return getattr(self, "_last_realtime_error", None)
+
+    def _read_x_mm_realtime(self) -> Optional[float]:
+        """读机械臂 x 真值（mm，arm_feed 20Hz 缓存）。
+
+        业务层**唯一**可信 x 位置源。详见 ARM_API.md §11。
+        x_get_position action 走坏掉的 calibrate 框架，禁用。
+
+        Returns:
+            x_mm float，失败 / arm_feed 未启 → None（原因见 ``last_realtime_error()``）。
+        """
+        st = self._read_arm_state_realtime()
+        if st is None:
+            return None
+        x = st.get("x_mm")
+        if x is None:
+            self._last_realtime_error = "arm_state.x_mm 为 None（arm_feed 刚启动？）"
+            return None
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            self._last_realtime_error = f"arm_state.x_mm 不是数字: {x!r}"
+            return None
+
+    def _read_y_mm_realtime(self) -> Optional[float]:
+        """读机械臂 y 真值（mm，arm_feed 20Hz 缓存）。
+
+        与 _read_x_mm_realtime 同路径。arm_feed 未启 / 字段 None → 返回 None。
+
+        Returns:
+            y_mm float，失败 → None（原因见 ``last_realtime_error()``）。
+        """
+        st = self._read_arm_state_realtime()
+        if st is None:
+            return None
+        y = st.get("y_mm")
+        if y is None:
+            self._last_realtime_error = "arm_state.y_mm 为 None（arm_feed 刚启动？）"
+            return None
+        try:
+            return float(y)
+        except (TypeError, ValueError):
+            self._last_realtime_error = f"arm_state.y_mm 不是数字: {y!r}"
+            return None
+
+    # ---- 球检测验证 (BALL_VERIFIED_*, target1 位姿下) ----
+    #
+    # 2026-07-28 加: 业务层 (target2.fetch_balls 等等) 之外的一般 arm 客户端
+    # 调用方也能用 ArmClient.verify_ball(ball) 验证检测结果。默认阈值 = 顶层
+    # verify_ball() 的 BALL_VERIFIED_* (target1 位姿下 5 次实测基线, 蓝黄共用)。
+    # 阈值可临时覆盖 (例如换位姿校准)。
+
+    def verify_ball(
+        self,
+        ball: dict,
+        *,
+        cx_min: float = BALL_VERIFIED_CX_MIN,
+        cx_max: float = BALL_VERIFIED_CX_MAX,
+        cy_min: float = BALL_VERIFIED_CY_MIN,
+        cy_max: float = BALL_VERIFIED_CY_MAX,
+        w_min: float = BALL_VERIFIED_W_MIN,
+        w_max: float = BALL_VERIFIED_W_MAX,
+        h_min: float = BALL_VERIFIED_H_MIN,
+        h_max: float = BALL_VERIFIED_H_MAX,
+        area_min: float = BALL_VERIFIED_AREA_MIN_VERIFY,
+        area_max: float = BALL_VERIFIED_AREA_MAX_VERIFY,
+        score_min: float = BALL_VERIFIED_SCORE_MIN_VERIFY,
+        aspect_min: float = BALL_VERIFIED_ASPECT_MIN,
+        aspect_max: float = BALL_VERIFIED_ASPECT_MAX,
+    ) -> bool:
+        """验证 ball dict 是否在 BALL_VERIFIED_* 期望范围 (target1 位姿下)。
+
+        委托给模块级 ``verify_ball()`` 函数。详细语义见该函数 docstring。
+
+        Args:
+            ball: dict, 期望含 cx_norm / cy_norm / w_norm / h_norm / score 字段。
+            其他参数: 阈值覆盖, 默认值 = BALL_VERIFIED_*, 调用方可临时调。
+
+        Returns:
+            True = 在范围内 (球检测合理); False = 越界 (噪声框或位姿偏移)。
+        """
+        return verify_ball(
+            ball,
+            cx_min=cx_min, cx_max=cx_max,
+            cy_min=cy_min, cy_max=cy_max,
+            w_min=w_min, w_max=w_max,
+            h_min=h_min, h_max=h_max,
+            area_min=area_min, area_max=area_max,
+            score_min=score_min,
+            aspect_min=aspect_min, aspect_max=aspect_max,
+        )
+
+    # ---- x_speed safety watchdog（belt-slip 兜底）----
+    #
+    # 背景：x 轴是 motor_280 + 编码器 + 同步带，belt-slip 下电机在转但车不动。
+    # 纯开环 x_speed 不知道车动没动，堵转时空转烧带子/电机。
+    #
+    # 兜底策略：每次开环 x_speed 时起一个 daemon 线程，周期（默认 100ms）读
+    # realtime x_mm，若 max_stale_s 秒内 x 变化 < 0.5mm，自动调 x_speed(0) 停机。
+    # 见 ARM_API.md §10 + memory [[x-speed-safety-watchdog]]。
+    #
+    # latest-wins：再次调用 x_speed_with_safety 会取消前一个 watchdog + 设新速度；
+    # 显式 stop_x_speed_safety() 立即停。watchdog 不依赖 _call_arm 同步返回，
+    # 完全可以跟其他动作并发。
+
+    def x_speed_with_safety(
+        self,
+        velocity: float,
+        max_stale_s: float = 2.0,
+        poll_interval_s: float = 0.1,
+        move_threshold_mm: float = 0.5,
+        timeout: float = 10.0,
+    ) -> dict:
+        """开环 x_speed + 后台 watchdog 兜底 belt-slip 堵转。
+
+        Args:
+            velocity: 目标速度（m/s，正值向 x 增大方向，负值反向）。
+                     与车端 arm.x_speed(velocity) 同单位（m/s）。
+            max_stale_s: watchdog 容忍"无位移"最长时间（秒）。超此值自动 x_speed(0)。
+            poll_interval_s: watchdog 轮询间隔（秒）。
+            move_threshold_mm: 判定"x 有动"的最小位移（mm），避免编码器噪声误判。
+            timeout: car action HTTP 超时（秒）。
+
+        Returns:
+            ``/v1/execute`` 异步返回的 job dict（sync=False 不等完成）。
+
+        注意：
+          - 调用后 motor 立即按 velocity 转；调用方负责在合适时机调
+            ``stop_x_speed_safety()`` 或再调一次 ``x_speed_with_safety(0)``。
+          - latest-wins：再调一次会自动取消前一个 watchdog + 设新速度。
+        """
+        v_ms = float(velocity)
+        with self._x_safety_lock:
+            # 1) 取消前一个 watchdog（保留取消设置，但下面要立刻建新的）
+            self._cancel_x_safety_locked()
+
+            # 2) 起新 watchdog
+            start_x = self._read_x_mm_realtime()  # 起点（realtime 真值）
+            stop_event = threading.Event()
+            self._x_safety_stop_event = stop_event
+            self._x_safety_start_x_mm = start_x
+            self._x_safety_velocity_ms = v_ms
+
+            def _watchdog() -> None:
+                last_x = start_x
+                last_change_t = time.time()
+                # 在内部循环里访问 self，daemon 线程随 client 生命周期共存
+                while not stop_event.wait(poll_interval_s):
+                    cur = self._read_x_mm_realtime()
+                    if cur is None:
+                        # 读不到就继续等下一轮（realtime 偶发不可用）
+                        continue
+                    if abs(cur - last_x) > move_threshold_mm:
+                        last_x = cur
+                        last_change_t = time.time()
+                    elif (time.time() - last_change_t) > max_stale_s:
+                        # 卡住超时 → 强停 + 退出
+                        try:
+                            self._call_arm(
+                                "x_speed", timeout=5.0, sync=False, velocity=0.0
+                            )
+                            logger.warning(
+                                "x_speed_with_safety: x_mm %.1fmm 超 %ss 未变，"
+                                "已自动 x_speed(0)（belt-slip 兜底）",
+                                last_x, max_stale_s,
+                            )
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning(
+                                "x_speed_with_safety: 自动停机失败: %s", exc
+                            )
+                        return
+
+            t = threading.Thread(
+                target=_watchdog, daemon=True, name="x-safety-watchdog"
+            )
+            self._x_safety_thread = t
+            t.start()
+
+        # 3) 下发开环速度（异步，不等完成）
+        return self._call_arm(
+            "x_speed", timeout=timeout, sync=False, velocity=v_ms
+        )
+
+    def stop_x_speed_safety(self) -> dict:
+        """停 watchdog + 立即 x_speed(0)。
+
+        行为：
+          - 取消在跑的 watchdog 线程（latest-wins 的"前一个"被取消语义）。
+          - 下发一次 x_speed(0) 异步停止电机。
+
+        Returns:
+            ``/v1/execute`` 异步返回的 x_speed(0) job dict。
+
+        注意：即使当前没有 safety session（is_x_safety_active()=False），
+        调本方法也安全 —— watchdog 取消 no-op + x_speed(0) 必下。
+        """
+        with self._x_safety_lock:
+            self._cancel_x_safety_locked()
+        # 立即下发停车（async，不等完成）
+        return self._call_arm(
+            "x_speed", timeout=5.0, sync=False, velocity=0.0
+        )
+
+    def is_x_safety_active(self) -> bool:
+        """watchdog 线程是否在跑。
+
+        Returns:
+            True = 上一次 ``x_speed_with_safety()`` 起的 watchdog 还在监控中；
+            False = 没在跑（或已被 ``stop_x_speed_safety()`` / 新的
+            ``x_speed_with_safety()`` 取消）。
+        """
+        with self._x_safety_lock:
+            t = self._x_safety_thread
+            return t is not None and t.is_alive()
+
+    def _cancel_x_safety_locked(self) -> None:
+        """取消 watchdog（调用方必须持 ``_x_safety_lock``）。"""
+        if self._x_safety_stop_event is not None:
+            self._x_safety_stop_event.set()
+        self._x_safety_thread = None
+        self._x_safety_stop_event = None
+        self._x_safety_start_x_mm = None
+        self._x_safety_velocity_ms = 0.0
 
     def get_state(self) -> ArmState:
         raw = self._read_raw_state()

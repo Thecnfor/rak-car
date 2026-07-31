@@ -72,6 +72,11 @@ class ArmRunner:
         verify=True 时：move 后对比 actual vs target，
         偏差 > origin.step_loss_x_mm 时 warn（不重发，因为 x 是 motor_280 闭环，
         跑偏通常是机械卡阻，重发没意义）。
+
+        **已知约束（2026-07-17）**：
+        - ⚠️ **belt slip**：实测单次有效行程 ≈ 24-46mm，远距需分段 + `x_speed_with_safety`。
+        - ⚠️ **位置验证不准**：内部 `_verify_x` 走 `get_state().x_mm`（calibrate 框架坏）。
+          真值请用 `client._read_x_mm_realtime()`（详见 ARM_API.md §11）。
         """
         job = self.client.move_x(x_mm=x_mm, timeout=timeout or self.default_timeout_s)
         if verify:
@@ -107,18 +112,28 @@ class ArmRunner:
             )
 
     def _verify_x(self, x_mm: float) -> None:
-        """x 上层校验（x 是编码器闭环，正常不跑偏；偏差大多是机械卡阻）。"""
+        """x 上层校验（x 是编码器闭环，正常不跑偏；偏差大多是机械卡阻）。
+
+        **⚠️ 已知不可靠（2026-07-17）**：内部走 `get_state().x_mm`，而该字段走
+        `x_get_position` calibrate 框架，读数飘。**生产请改走
+        `client._read_x_mm_realtime()`**（realtime endpoint，20Hz arm_feed）做上层校验。
+
+        详见 ARM_API.md §11。修复需用户授权动底层。
+        """
         origin = self.client.origin
         threshold = origin.step_loss_x_mm if origin else 5.0
         try:
-            state = self.client.get_state()
+            state = self.client.get_state()  # ⚠️ x_mm 不可信
         except Exception as e:
             logger.warning("verify_x: 读状态失败: %s", e)
             return
         err = x_mm - state.x_mm
         if abs(err) > threshold:
             logger.warning(
-                "verify_x: target=%.1f actual=%.1f err=%.1fmm", x_mm, state.x_mm, err,
+                "verify_x: target=%.1f actual=%.1f err=%.1fmm "
+                "(注意：actual 走 calibrate 框架，可能本身就不准——"
+                "请用 _read_x_mm_realtime() 复核)",
+                x_mm, state.x_mm, err,
             )
 
     def set_arm_angle(self, angle: float, speed: int = 80,
@@ -135,6 +150,18 @@ class ArmRunner:
     def set_storage(self, side: str, timeout: Optional[float] = None) -> dict:
         """切换存储仓到 LEFT/RIGHT（写死角度的两档枚举）。"""
         return self.client.set_storage(side, timeout=timeout or self.default_timeout_s)
+
+    def set_storage_angle(self, angle: int, speed: int = 5,
+                          timeout: Optional[float] = None) -> dict:
+        """储存仓任意角度入口（业务层硬限 [75, 98]°，2026-07-18 user 加）。
+
+        委托给 `ArmClient.set_storage_angle`；越界会在 wrapper 层 raise ValueError。
+        详见 [ARM_API.md §6](../ARM_API.md#6-存储仓)。
+        """
+        return self.client.set_storage_angle(
+            angle, speed=speed,
+            timeout=timeout or self.default_timeout_s,
+        )
 
     def get_storage(self) -> str:
         """只读当前存储仓档位（客户端缓存，不会下发舵机动作）。"""

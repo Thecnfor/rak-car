@@ -29,7 +29,7 @@
 | `side` | `LEFT` / `MID` / `RIGHT`（大臂总线舵机） |
 | `hand` | `UP` / `MID` / `DOWN`（手爪 PWM 舵机） |
 | `grasping` | 真空泵状态（只读，业务层不可设） |
-| `storage_side` | `LEFT` / `RIGHT`（车体存储仓独立 PWM 舵机，port=1；写死 -42° / 90°） |
+| `storage_side` | `LEFT` / `RIGHT`（车体存储仓独立 PWM 舵机，port=1） |
 
 **为什么这么定**：
 

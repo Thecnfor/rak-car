@@ -1,288 +1,260 @@
 #!/usr/bin/python3
+# -*- coding: utf-8 -*-
 """test_arm_servo.py
-机械臂 大臂(bus 舵机,port=2)测试。
+大臂总线舵机 (ServoBus port=3) 简单测试。
 
-测试项:set_side("LEFT" / "MID" / "RIGHT") 后读回 arm_angle
-预期角度(arm_cfg.yaml:hand_cfg.hand.angle_list):
-  LEFT  =  93
-  MID   =   0
-  RIGHT = -93
+骨架:
+  preflight -> 手爪角预检 (hand 必须停在 UP=-90°,否则大臂往展开区走手爪
+             会被互斥规则挡 — 见 main/arm/api.py:464 展开区互斥)
+          -> 预提 y 轴到 -150mm (UP 方向,给大臂展开留出垂直空间,避免 y 保护区)
+          -> 大臂三档位来回走 N 轮 (MID → HALF → FAR → HALF → MID)
+          -> 每档位 car.get_arm_state 读回 arm_angle 与命令值比对
+          -> 收尾:回到 MID / 复位位 (=+90°) 安全姿态
+          -> postflight
 
-⚠️ 真实硬件,大臂会真的转动。先确认机械臂周围无障碍物。
+硬件:
+  大臂总线舵机  ServoBus port=3   (arm_cfg.yaml:arm_cfg.port)
+
+判定标准 (任一 FAIL 整体 FAIL):
+  1) API 层:每次 set_arm_angle HTTP 调用 status=succeeded,不抛异常
+  2) 反馈层:每次 car.get_arm_state 读回的 arm_angle 与命令值偏差 ≤ ±5°
+  3) 预检  :手爪在 UP=-90° 才能跑;非 UP 时直接 ABORT,提示先走 reset_all
+
+业务硬限(看 ARM_API.md §1.1 set_arm_angle, 2026-07-27 重定义):
+  angle ∈ [+90, -150]°  —— **只往负方向展开 (+90 是复位位)**,正方向 +30° 已禁 (LEFT=+93° 会撞车)
+  +90° = MID / 复位位 (init)
+  -60° = 半展开
+  -120°= 接近全展 (留 30° 余量,防协议触发)
+
+⚠️ 真实硬件,舵机真的会转。确认大臂周围没东西再跑。
 
 运行:
-  export RAK_CAR_SERVER_ORIGIN=http://192.168.3.60
-  python3 main/arm/test/test_arm_servo.py
+  PowerShell:
+    $env:RAK_CAR_SERVER_ORIGIN = "http://192.168.3.60"
+    python main\\arm\\test\\test_arm_servo.py
 """
 import os
 import sys
 import time
 
-# 把项目根目录(rak-car/)加到 sys.path,这样才能 import main.*
+# 让 main.* 可被 import
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
-from main.arm import ArmClient, ArmRunner  # noqa: E402
+from main.api_client import RuntimeApiClient  # noqa: E402
 from main.arm.test._runtime_guard import preflight, postflight  # noqa: E402
 
 
-# 期望角度表(与 arm_cfg.yaml:hand_cfg.hand.angle_list 对齐)
-EXPECTED_ANGLE = {
-    "LEFT": 93,
-    "MID": 0,
-    "RIGHT": -93,
-}
+# ---- 测试参数(可调) ----
+N_CYCLES = 3                # 来回循环轮数
+ANGLE_MID = 90              # MID / 复位位 (init 安全姿态, 2026-07-27 后)
+ANGLE_HALF = -60            # 半展开
+ANGLE_FAR = -120            # 接近全展 (留 30° 余量)
+SPEED = 80                  # 总线舵机速度
+ANGLE_TOLERANCE_DEG = 5     # 读回与命令的容许偏差
+HAND_REQUIRED_DEG = -90     # 手爪必须停在 UP=-90°,否则大臂展开被互斥规则挡
 
-# 测试序列:从当前方向出发 -> 走完全部 3 个目标 -> 回到 MID
-SEQUENCE = ["LEFT", "MID", "RIGHT", "MID"]
+SET_TIMEOUT_S = 14.0        # set_arm_angle 的 HTTP 超时 (大臂总线动作可能慢)
+READ_TIMEOUT_S = 8.0        # get_arm_state 的 HTTP 超时
+SETTLE_S = 0.8              # 到位后等 0.8s 再读,避总线还在追
 
-# runtime 重建期间等待稳定的时长
-WAIT_STABLE_S = 8.0
-# 单次 set_side 后等舵机物理到位
-SETTLE_S = 0.6
-# 读回 side 字段的最多重试次数(auto-init 重建会重置 MyCar.side=MID,需要重读)
-RETRY_READ = 4
-RETRY_DELAY_S = 0.4
+INITIAL_LIFT_Y_MM = -150    # 预提 y=-150mm,业务坐标系 y<0=向上
+LIFT_TIMEOUT_S = 18.0       # 抬升 move_y_position 的 HTTP 超时
+LIFT_SETTLE_S = 1.0         # 抬升后等待磁感/PWM 收敛再读回
 
-# 大臂总线舵机端口(arm_cfg.yaml:hand_cfg.hand.port=2)
-ARM_BUS_PORT = 2
+ANGLE_NAME = {90: "MID", -60: "HALF", -120: "FAR"}
+SEQ = [ANGLE_MID, ANGLE_HALF, ANGLE_FAR, ANGLE_HALF, ANGLE_MID]
 
 
-def read_bus_physical_angle(client) -> tuple[bool, int | None]:
-    """通过 realtime 端点读物理舵机角度(真实编码器,非 car state 缓存)。
-
-    Returns (ok, angle_degrees):
-      ok=True  + angle=int  → 读到了
-      ok=False              → 读失败(可能 runtime 卡 init / service 未注册)
+# ---- helpers ----
+def call_set_arm(c: RuntimeApiClient, angle: int, timeout: float) -> tuple:
+    """set_arm_angle 同步调用。kwargs 显式给 angle + speed, sync=True 必填
+    (runtime v2 默认 async 会立刻返回 status=running,见 memory execute-sync-default)。
     """
     try:
-        r = client.http.realtime_bus_servo_read(ARM_BUS_PORT)
-        if isinstance(r, dict) and r.get("ok") and "angle" in r:
-            return True, int(r["angle"])
-    except Exception:
-        pass
-    return False, None
-
-
-def _snapshot_health(client) -> dict:
-    """取 runtime health 的关键字段。HTTP 嵌套结构:
-        h = {ok: bool, state: {initialized, initializing, ...}, links: {...}}
-    返回 schema 平铺后用于判定:
-        {"ok": bool, "initialized": bool, "initializing": bool,
-         "ctrl_state": str|None, "raw": <原始 health dict>}
-    """
-    try:
-        h = client.http.get_health()
-    except Exception:
-        return {"ok": False, "initialized": False, "initializing": False,
-                "ctrl_state": None, "raw": None}
-    if not isinstance(h, dict):
-        return {"ok": False, "initialized": False, "initializing": False,
-                "ctrl_state": None, "raw": None}
-    s = h.get("state", {}) or {}
-    cs = s.get("controller_session", {}) or {}
-    return {
-        "ok": bool(h.get("ok", False)),
-        "initialized": bool(s.get("initialized", False)),
-        "initializing": bool(s.get("initializing", False)),
-        "ctrl_state": cs.get("state"),
-        "raw": h,
-    }
-
-
-def wait_runtime_stable(client, timeout_s: float = WAIT_STABLE_S) -> bool:
-    """等 runtime 不在 initializing 状态。返回 True=已稳定,False=超时。
-
-    防 LEFT/RIGHT 命令被 auto-init rebuild 吞掉 —— 详情见 CLAUDE.md
-    "debug-runtime-init-queue.md" H1 假设。
-    """
-    deadline = time.time() + timeout_s
-    last_snap = None
-    while time.time() < deadline:
-        last_snap = _snapshot_health(client)
-        if last_snap["ok"] and last_snap["initialized"] and not last_snap["initializing"]:
-            return True
-        time.sleep(0.2)
-    if last_snap is not None:
-        ctrl = last_snap.get("ctrl_state")
-        init_fl = last_snap.get("initializing")
-        ok_fl = last_snap.get("ok")
-        ready = last_snap.get("initialized")
-        print(
-            f"  [WARN] runtime {timeout_s:.0f}s 内未稳定 — "
-            f"ok={ok_fl} initialized={ready} initializing={init_fl} "
-            f"ctrl={ctrl}"
+        r = c.execute_arm_action(
+            "set_arm_angle",
+            angle=angle, speed=SPEED,
+            timeout=timeout, sync=True,
         )
-    return False
+        return r.get("status"), r.get("error")
+    except Exception as e:
+        return "exception", str(e)[:120]
 
 
-def emit_pre_set_health(client, label: str) -> None:
-    """每站跑前打个 health 看一眼,方便事后看出 auto-init 时机。"""
-    snap = _snapshot_health(client)
-    if not snap["ok"]:
-        print(f"  [NOHEALTH] pre {label}")
-        return
-    ip = "[REBUILD]" if snap["initializing"] else "[STABLE]"
-    print(
-        f"  {ip} pre {label}: initialized={snap['initialized']}  "
-        f"initializing={snap['initializing']}  ctrl={snap['ctrl_state']}"
-    )
+def call_read(c: RuntimeApiClient, timeout: float):
+    """car.get_arm_state 同步读舵机反馈。返回 (arm_angle, status_msg, error_msg)。"""
+    try:
+        r = c.execute_car_action("get_arm_state", timeout=timeout, sync=True)
+        if r.get("status") != "succeeded":
+            return None, r.get("status"), r.get("error")
+        result = r.get("result") or {}
+        return result.get("arm_angle"), "ok", None
+    except Exception as e:
+        return None, "exception", str(e)[:120]
 
 
+def call_lift_y(c: RuntimeApiClient, y_mm: float, timeout: float) -> tuple:
+    """move_y_position 同步调用。y_mm 业务坐标(负=UP),内部 mm→m。"""
+    target_m = y_mm / 1000.0
+    try:
+        r = c.execute_arm_action(
+            "move_y_position",
+            target=target_m,
+            timeout=timeout, sync=True,
+        )
+        return r.get("status"), r.get("error")
+    except Exception as e:
+        return "exception", str(e)[:120]
+
+
+def hand_precheck(c: RuntimeApiClient) -> bool:
+    """手爪预检:hand_angle 必须 = HAND_REQUIRED_DEG(=-90°/UP)。
+
+    大臂往展开区走时,非 UP 的手爪会被 api.py:464 的展开区互斥规则挡住 ——
+    不是遥操问题,是业务层软锁。先保证手爪在 UP,主循环才不会第一个 set_arm_angle
+    就报 ValueError。
+    """
+    try:
+        r = c.execute_car_action("get_arm_state", timeout=READ_TIMEOUT_S, sync=True)
+        hand = (r.get("result") or {}).get("hand_angle")
+    except Exception as e:
+        print(f"[FAIL] get_arm_state 异常: {str(e)[:120]}")
+        return False
+    if hand is None:
+        print(f"[FAIL] 手爪角读不回来 (hand_angle=None)")
+        return False
+    if hand != HAND_REQUIRED_DEG:
+        print(f"[ABORT] 手爪必须在 UP({HAND_REQUIRED_DEG}°) 才能跑大臂展开测试")
+        print(f"        当前 hand_angle = {hand}°")
+        print(f"        先手 set_hand_angle(-90°) 或 ArmClient.reset_all()")
+        return False
+    print(f"  [OK  ] hand_angle = {hand}° (UP), 可跑大臂三档")
+    return True
+
+
+# ---- main ----
 def main() -> int:
-    client = ArmClient.connect()
-    if not preflight(client):
-        sys.exit(1)
+    c = RuntimeApiClient()
+
+    # ---- runtime 就绪检查 ----
+    if not preflight(c):
+        return 1
     print()
 
-    runner = ArmRunner(client)
-
-    st = client.get_state()
-    print("=== 初始状态 ===")
-    print(f"  side={st.side}  arm_angle={st.arm_angle}")
+    # ---- 手爪预检 ----
+    print("=== 手爪预检 ===")
+    if not hand_precheck(c):
+        return 1
     print()
 
-    print("=== 大臂 bus 舵机测试 ===")
+    # ---- 预提 y 轴到 INITIAL_LIFT_Y_MM ----
+    print("=== 预提 y 轴 ===")
+    target_y_mm = INITIAL_LIFT_Y_MM
+    target_y_m = target_y_mm / 1000.0
+    direction = "UP" if target_y_mm < 0 else "DOWN"
+    print(f"    目标: y = {target_y_mm} mm ({direction}方向)")
+    status, err = call_lift_y(c, target_y_mm, LIFT_TIMEOUT_S)
+    ok_lift = (status == "succeeded")
+    flag = "OK  " if ok_lift else "FAIL"
+    print(f"  [{flag}] move_y_position(target={target_y_m:.3f} m)  "
+          f"status={status}  err={err}")
+    if not ok_lift:
+        print(f"[ABORT] 预提失败,主循环不跑 (可能 y 轴卡死 / 限位 / 编码器异常)")
+        return 1
+    time.sleep(LIFT_SETTLE_S)
+    try:
+        r = c.execute_car_action("get_arm_state", timeout=READ_TIMEOUT_S, sync=True)
+        y_now_m = (r.get("result") or {}).get("y")
+    except Exception as e:
+        print(f"  [WARN] 读回 y 失败: {str(e)[:80]}")
+        y_now_m = None
+    if y_now_m is not None:
+        y_now_mm = y_now_m * 1000.0
+        y_diff_mm = y_now_mm - target_y_mm
+        lift_within = (abs(y_diff_mm) <= 5.0)
+        lflag = "OK  " if lift_within else "WARN"
+        print(f"  [{lflag}] 当前 y = {y_now_mm:.1f} mm  "
+              f"Δ={y_diff_mm:+.1f} mm (目标 {target_y_mm} mm, 容差 ±5 mm)")
+        if not lift_within:
+            print(f"  [WARN] y 落位偏差超过容差,可手动 reset_y 后重跑")
+    else:
+        print(f"  [WARN] y 读不回来,跳过落位验证")
+    print()
+
     fails = 0
-    for side in SEQUENCE:
-        # ---- 跑前:runtime 必须稳定 + 设 side 前打 health ----
-        if not wait_runtime_stable(client):
-            print(f"  [FAIL] cmd={side:<6}  runtime 不稳定(在 rebuild) — 跳过本站")
-            fails += 1
-            continue
-        emit_pre_set_health(client, side)
+    total_set_ok = 0
+    total_read_ok = 0
+    total_within = 0
 
-        # ---- 下发 ----
-        # runner.set_side() 内部走 api_client.execute(),该函数在 job 入队后
-        # 返回 queued/running dict。我们不需要等到终态 —— 业务流(manual debug)关心
-        # 物理舵机是否转动,所以这里只 sleep 给舵机物理到位时间 + 健康检查,
-        # 避免 wait_job 在 runtime 抖动时把测试挂死。如果运维需要严格 done,
-        # 看 runtime_service.queued_jobs 是否清空即可。
-        try:
-            job = runner.set_side(side, timeout=10)
-        except Exception as e:
-            print(f"  [FAIL] cmd={side:<6}  {type(e).__name__}: {str(e)[:80]}")
-            fails += 1
-            continue
-
-        if not isinstance(job, dict):
-            print(f"  [FAIL] cmd={side:<6}  job 不是 dict: {type(job).__name__}: {str(job)[:60]}")
-            fails += 1
-            continue
-        job_id = job.get("id")
-        status = job.get("status")
-        # 业务 API 入队 = 命令已被 runtime 接受。timeout=10s 等下发的硬时限已过
-        # — 如果是 queued/running 不算"API 失败",我们只关心之后能不能看到物理反馈
-        api_accepted = (status in {"succeeded", "queued", "running"})
-
-        # ---- 等舵机物理到位 + 监听健康 ----
-        rebuild_seen_during_settle = False
-        deadline = time.time() + 3.0
-        while time.time() < deadline:
-            time.sleep(0.15)
-            snap = _snapshot_health(client)
-            if snap["initializing"]:
-                rebuild_seen_during_settle = True
-                # 等到重建结束再继续
-                while snap["initializing"]:
-                    time.sleep(0.2)
-                    snap = _snapshot_health(client)
-
-        # 现在读 job 终态(如果 runtime 已经在 background 处理好了;
-        # 我们容忍它没在 3s 内完成 —— 看物理反馈是终极判据)
-        try:
-            final_job = client.http.get_job(job_id) if job_id else {}
-        except Exception:
-            final_job = {}
-        status = final_job.get("status", status)
-        api_ok = (status == "succeeded")
-
-        # ---- 等舵机物理到位 ----
-        time.sleep(SETTLE_S)
-
-        # ---- 等 runtime 再次稳定(避免在 rebuild 中读)----
-        if not wait_runtime_stable(client):
-            print(f"  [WARN] cmd={side:<6}  runtime 跑后未稳定 — 结果可能不可信")
-
-        # ---- 读回判定 (容忍 runtime 中途 rebuild)----
-        # runtime auto-init 可能在 job done 之后、我们读 side 之前,把 MyCar 重建,
-        # 新建的 arm 实例默认 side="MID" — 即使 set_side('LEFT') 物理成功,servo side
-        # 也会被覆盖回 MID。这里重复读取 + 等稳定,直到读侧对上或重试上限。
-        expect = EXPECTED_ANGLE[side]
-        side_ok = False
-        angle_ok = False
-        cur = None
-        rebuild_seen = rebuild_seen_during_settle
-        for attempt in range(1, RETRY_READ + 1):
-            cur = client.get_state()
-            side_ok = (cur.side == side)
-            angle_ok = (cur.arm_angle == expect)
-            if side_ok:
-                break
-            # 等待 runtime 若正在 rebuild 跑完,再读一次
-            time.sleep(RETRY_DELAY_S)
-            wait_runtime_stable(client, timeout_s=WAIT_STABLE_S)
-            # 抽空观察一次健康(若发现 initializing 走过,标记 rebuild_seen)
-            snap = _snapshot_health(client)
-            if snap["initializing"]:
-                rebuild_seen = True
-
-        # ---- 同时读物理舵机角度(realtime 端点,真实编码器)----
-        phys_ok, phys_angle = read_bus_physical_angle(client)
-
-        angle_display = "—" if cur.arm_angle is None else f"{cur.arm_angle}"
-        phys_display = "—" if phys_angle is None else f"{phys_angle:+d}"
-        # 三态判定:
-        #   1) runtime side 字段对
-        #   2) 物理 bus 舵机角度对(最严)
-        #   3) api 成功
-        if cur.arm_angle is None:
-            label = f"api_accepted={api_accepted}  status={status!r}  angle=N/A"
-        else:
-            label = f"api_accepted={api_accepted}  status={status!r}  angle={angle_ok}"
-        phys_match = phys_ok and phys_angle is not None and abs(phys_angle - expect) <= 3
-        flag = "OK  " if (side_ok and api_accepted and phys_match) else "FAIL"
-        extra = ""
-        if not api_accepted:
-            err = job.get("error")
-            jid = job.get("id")
-            extra = (
-                f"  [diag] job.id={jid} status={status!r} "
-                f"error={str(err)[:120] if err else None}"
-            )
-        elif not side_ok and rebuild_seen:
-            extra = "  [NOTE] runtime 走过 auto-init rebuild,side 可能被重置"
-        elif side_ok and not phys_match and phys_ok:
-            extra = (
-                f"  [NOTE] runtime side={cur.side} 但物理角度 {phys_angle}° ≠ expect {expect}° — "
-                f"runtime state 与硬件不一致(硬件未真转 / 反向)"
-            )
-        elif not side_ok and phys_match:
-            extra = (
-                f"  [NOTE] 物理角度对({phys_angle}°)但 runtime side={cur.side} — "
-                f"runtime state 没同步"
-            )
-
-        # 显示尝试次数
-        tries_str = f"x{attempt}" if not side_ok else "x1"
-        ok_count = sum(int(x) for x in (side_ok, api_accepted, phys_match))
-
-        print(
-            f"  [{flag}] cmd={side:<6}  state.side={cur.side:<6}  "
-            f"phys={phys_display:>4}°/(exp {expect:+d}°)  tries={tries_str}  ok={ok_count}/3  {label}"
-        )
-        if extra:
-            print(extra)
-        # 判定标准:物理角度对 + API 入队成功(这是真正决定硬件好坏的判据)
-        if not (api_accepted and phys_match):
-            fails += 1
-
+    # ---- 主循环 ----
+    seq_str = " -> ".join(f"{a:>4}°/{ANGLE_NAME.get(a, '?')}" for a in SEQ)
+    print(f"=== {N_CYCLES} 轮 大臂三档位来回走 ===")
+    print(f"    序列: {seq_str}")
+    print(f"    容差 ±{ANGLE_TOLERANCE_DEG}°, speed={SPEED}")
     print()
-    total = len(SEQUENCE)
-    postflight(client, "after")
-    print(f"{'PASS' if fails == 0 else 'FAIL'}: {total - fails}/{total} ok")
-    return 0 if fails == 0 else 1
+    for i in range(1, N_CYCLES + 1):
+        print(f"--- 轮 #{i} ---")
+        for a in SEQ:
+            # ---- set ----
+            status, err = call_set_arm(c, a, SET_TIMEOUT_S)
+            ok_set = (status == "succeeded")
+            if ok_set:
+                total_set_ok += 1
+            else:
+                fails += 1
+            flag = "OK  " if ok_set else "FAIL"
+            print(f"  [{flag}] set_arm_angle({a:>5}°/{ANGLE_NAME.get(a, '?'):<4})  "
+                  f"speed={SPEED}  status={status}  err={err}")
+            time.sleep(SETTLE_S)
+
+            # ---- readback ----
+            arm, rs, re_ = call_read(c, READ_TIMEOUT_S)
+            if arm is None:
+                print(f"  [FAIL] get_arm_state 读不回来  status={rs}  err={re_}")
+                fails += 1
+                continue
+            total_read_ok += 1
+            diff = arm - a
+            within = (abs(diff) <= ANGLE_TOLERANCE_DEG)
+            if within:
+                total_within += 1
+            else:
+                fails += 1
+            rflag = "OK  " if within else "WARN"
+            print(f"  [{rflag}] readback arm_angle={arm:>5}°  "
+                  f"Δ={diff:+d}° (命令 {a}°, 容差 ±{ANGLE_TOLERANCE_DEG}°)")
+        print()
+
+    # ---- 收尾:MID 安全位 ----
+    print("=== 收尾:回到 MID 安全位 ===")
+    status, err = call_set_arm(c, ANGLE_MID, SET_TIMEOUT_S)
+    flag = "OK  " if status == "succeeded" else "FAIL"
+    print(f"  [{flag}] set_arm_angle({ANGLE_MID}°/{ANGLE_NAME[ANGLE_MID]})  status={status}  err={err}")
+    print()
+
+    # ---- 跑后 health ----
+    print("=== 跑后 health ===")
+    postflight(c, "after")
+    print()
+
+    # ---- 总结 ----
+    total_moves = N_CYCLES * len(SEQ)
+    print("=== 总结 ===")
+    print(f"  SET    调用  : {total_set_ok}/{total_moves} succeeded")
+    print(f"  READBACK     : {total_read_ok}/{total_moves} 成功读回 arm_angle")
+    print(f"    ├─ 容差内  : {total_within}")
+    print(f"    └─ 容差外  : {total_read_ok - total_within}")
+    print()
+    if fails == 0:
+        print("结果: PASS  (大臂舵机响应正常,反馈与命令一致)")
+        rc = 0
+    else:
+        print(f"结果: FAIL  ({fails} 项不通过)")
+        rc = 1
+    print()
+    return rc
 
 
 if __name__ == "__main__":

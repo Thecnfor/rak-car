@@ -9,7 +9,8 @@ import os
 
 
 # 对外给局域网同事访问的默认地址
-PUBLIC_HOST = "192.168.6.231"
+# 2026-07-30: Jetson 换网段 192.168.6.231 → 192.168.5.230（PC 在 192.168.5.231）。
+PUBLIC_HOST = "192.168.5.230"
 PUBLIC_STREAM_PORT = 5050
 PUBLIC_STREAM_PATH = "/stream/"
 

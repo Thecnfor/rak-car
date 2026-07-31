@@ -1,0 +1,940 @@
+#!/usr/bin/python3
+"""task4 / target4 —— 巡航 + x 轴扫描搜索目标球类。
+
+策略 (一一对应 task4 业务阶段 A, 即 "摄像机找不到球怎么办"):
+  - **三段式状态机** (2026-07-28 v2 重设计):
+      SEARCH  : 没识别到目标颜色 → 底盘前后交替 + x 扫描 (找球)
+      ADJUST  : 识别到目标颜色但不在 BALL_VERIFIED_* → PD 微调底盘+x 把球移到抓取位
+                (cx_err → arm_x step; cy_err → chassis step, --flip-cx/--flip-cy 反向)
+      LOCKED  : 球进 BALL_VERIFIED_* (cx ∈ [0.05,0.18], cy ∈ [-0.67,-0.58])
+                → 连续 CONFIRM_FRAMES 帧命中 → 返回 ball 字典 + 现场状态
+  - **底盘** (默认 forward 模式):
+      - **SEARCH 阶段 (没识别到球)**: 底盘**每轮前移 5cm**(持续进, ball_grace 闪烁缓冲外),
+        同时 x 在 [-240, -270] 范围扫。"停一会走一会"/振荡都是错逻辑, 2026-07-29 v6 拆掉。
+      - **ADJUST 阶段 (识别到球但没进 BALL_VERIFIED_*)**: 按 cy_err **前进/后退 2cm** 微调
+        (cy 偏上 → 前进; cy 偏下 → 后退)。**这是底盘唯一允许后退的地方**, 用户原话:
+        "扫到黄球的时候才可以为了确定坐标而后退"。
+      - **ADJUST 阶段 (识别到球但没进 BALL_VERIFIED_*)**: 按 cy_err 前进/后退 2cm 微调
+        (cy 偏上 → 前进; cy 偏下 → 后退; 这是**唯一允许后退的地方**)
+      - 可切 --chassis-mode lateral (横移异速 S 形) / none (不动底盘)
+  - **x 轴扫描**: [x_min_mm, x_max_mm] 范围内 25mm 单步 (默认 [-280, -240])。
+    SEARCH 阶段扫, ADJUST 阶段按 cx_err 单步调整。
+
+⚠️ 默认扫描范围 [-280, -240] mm (用户 2026-07-28 指定 = 收割区球带)。
+   **低于物理墙 -119.5mm** (target1.py 实测): x 走到 -119.5 附近会撞墙,
+   stall 检测兜底 → 停在物理墙。业务层接受这个行为, 这里只打 warning 不阻拦。
+   如要改回安全范围, 用 --x-min / --x-max 显式覆盖。
+
+⚠️ 本脚本不做的事 (硬约束):
+  - 不调 move_y / 舵机 (set_arm_angle / set_hand_angle) / 真空泵 (grasp) / 仓 (set_storage)
+  - 不调 y / 舵机是为了避免撞车风险 (y 保护区 [0, -30] / arm 展开区)
+  - 找到目标后返回, 由调用方决定下一步 (target1 / target3 / test_blue)
+
+⚠️ 安全约束:
+  - x 单步 <= 30mm (受 belt-slip 单次有效行程 24-46mm 限制)
+  - y 必须在保护区外 (默认 -190mm 观察位) 才能跑
+  - realtime x 唯一真值 (calibrate 框架坏, 详见 ARM_API §11)
+  - 默认 execute: 真动底盘和 x; --dry-run 时仅打印检测 + 建议动作
+  - 横移 (lateral) 时: x 与底盘同步; 如果横移方向反了, 现场反馈后改 _lateral_speeds 顺序
+
+⚠️ 退出前必须把底盘刹住 (set_wheel_speeds([0,0,0,0])), 用 try/finally 兜底。
+
+⚠️ forward 模式注意 (2026-07-28): 每轮调 car.move_for([0.05, 0, 0]), 走完自动停。
+   chassis_speed 参数在 forward 模式下被忽略, 步距用 DEFAULT_CHASSIS_STEP_M=0.05m。
+   lateral 模式仍然用 set_wheel_speeds + chassis_speed (S 形连续横移)。
+
+CLI 跑法 (默认 execute; 横移 + x 扫描; --dry-run 仅打印):
+    # 1. 真跑 (横移 + x 扫描 + 检测, 默认)
+    python main/arm/each_task/task4/target4.py --color yellow
+    # 2. dry-run 只打印 (不动底盘不动 x)
+    python -m main.arm.each_task.task4.target4 --color yellow --dry-run
+    # 3. 改前后模式 (旧行为)
+    python -m main.arm.each_task.task4.target4 --color yellow \\
+        --chassis-mode forward
+    # 4. 关闭底盘, 只动 x (调试 x 扫描)
+    python -m main.arm.each_task.task4.target4 --color yellow \\
+        --chassis-mode none --max-duration 20
+    # 5. 自定义扫描范围 (回到安全区)
+    python -m main.arm.each_task.task4.target4 --color yellow \\
+        --x-min -115 --x-max 0
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import time
+from typing import Any, Callable, Optional
+
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+try:  # noqa: E402
+    from .constants import (  # noqa: E402
+        LOG_PREFIX_TASK4,
+        COLOR_BLUE, COLOR_YELLOW,
+        # 2026-07-28: ADJUST 阶段需要 BALL_VERIFIED_* 中点作为 (target_cx, target_cy)
+        BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX,
+        BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX,
+    )
+    from . import target2
+except ImportError:  # pragma: no cover —— 兼容直接 python 文件运行
+    from main.arm.each_task.task4.constants import (  # type: ignore
+        LOG_PREFIX_TASK4, COLOR_BLUE, COLOR_YELLOW,
+        BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX,
+        BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX,
+    )
+    from main.arm.each_task.task4 import target2  # type: ignore
+
+from main.arm import ArmClient, ArmRunner  # noqa: E402
+try:
+    from main.chassis import ChassisClient  # type: ignore  # noqa: E402
+except ImportError:  # pragma: no cover —— chassis 包未就绪时仍可单跑 x 扫描
+    ChassisClient = None  # type: ignore
+
+
+LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
+
+# ---- 默认参数 ----
+DEFAULT_X_MIN_MM: float = -270.0          # x 扫描终点 (用户 2026-07-29: 范围改成 [-240, -270],
+                                             # 30mm 比原来 -280 更保守)
+DEFAULT_X_MAX_MM: float = -240.0          # x 扫描起点 (用户 2026-07-28: -240 → -270)
+DEFAULT_X_STEP_MM: float = 25.0           # 单次 x 步长 (≤ belt-slip 极限 24-46mm 的保守值)
+DEFAULT_STEP_INTERVAL_S: float = 0.5      # 每轮检测+动作间隔 (秒)
+DEFAULT_MAX_DURATION_S: float = 60.0      # 总超时 (秒)
+DEFAULT_CONFIRM_FRAMES: int = 1           # 找到目标立即停 (不再要连续帧, 用户 2026-07-27 改)
+DEFAULT_CHASSIS_SPEED: float = 0.05       # 底盘巡航速度 (m/s 量级, 5cm/s; 具体看车端换算) —— 仅 lateral 模式用
+DEFAULT_CHASSIS_MODE: str = "forward"    # 默认底盘前移 (用户 2026-07-28: 每轮前进 5cm)
+DEFAULT_CHASSIS_STEP_M: float = 0.05      # forward 模式每轮前移 5cm (用户 2026-07-28 指定)
+DEFAULT_CHASSIS_OSCILLATE: bool = False   # 2026-07-29 v6: 默认只前进 (oscillate=False, 用户原话
+                                              # "底盘每次前进一点点, 扫到黄球的时候才可以为了确定坐标而后退")。
+                                              # 后退唯一发生在 ADJUST 阶段 (球识别到 + cy_err>0 → -2cm)。
+                                              # 加 --chassis-oscillate 切 oscillate (偶/奇轮 +/-5cm)。
+DEFAULT_VERIFY_TARGET1_POSE: bool = True  # 结束条件: 球必须落在 BALL_VERIFIED_* 才算 found (2026-07-28)
+
+# ---- ADJUST 闭环 (球识别后微调底盘+x 把球移到抓取位) ----
+# 2026-07-28: 球识别到不等于停, 要主动 PD 调整到 BALL_VERIFIED_* 区间
+# (target1.py 位姿下蓝黄共用基线, 见 constants.py:105-118)。
+ADJUST_X_STEP_MM: float = 10.0            # 微调 x 步长 (小于搜索 25mm)
+ADJUST_CHASSIS_STEP_M: float = 0.02       # 微调底盘步长 2cm (小于搜索 5cm)
+ADJUST_DEADBAND_X: float = 0.01           # cx_err 绝对值 < 此值不调 (避免抖动)
+ADJUST_DEADBAND_Y: float = 0.01           # cy_err 绝对值 < 此值不调
+ADJUST_MAX_NO_PROGRESS: int = 6           # 连续 N 轮 err 不减小 → 放弃 (球不在可达范围)
+ADJUST_MAX_ROUNDS: int = 40               # ADJUST 总轮数上限 (避免无限循环)
+# 方向符号 (现场反馈反了改这里或 CLI --flip-cx/--flip-cy):
+#   推导: arm_x 更负 → 相机更靠左 → 球在画面里更靠右 → cx ↑
+#   目标 cx=0.115 (BALL_VERIFIED_* 中点)。
+#     cx_err > 0 (球在目标右侧) → arm_x 朝正向 (向 0) → x_delta > 0
+#     cx_err < 0 (球在目标左侧) → arm_x 朝负向 (向 -280) → x_delta < 0
+#   公式: x_delta = sign(cx_err) * step  → ADJUST_X_SIGN = +1 (默认)
+ADJUST_X_SIGN: int = +1                   # 2026-07-28: 旧 -1 取反, 让 x 推球方向反了
+# 底盘: 前移 → 球相对往后 (cy ↑); 后退 → 球相对往前 (cy ↓)。
+#   目标 cy=-0.63 (BALL_VERIFIED_* 中点)。
+#     cy_err > 0 (球在目标下方) → 底盘后退 → c_delta < 0
+#     cy_err < 0 (球在目标上方) → 底盘前进 → c_delta > 0
+#   公式: c_delta = -sign(cy_err) * step  → ADJUST_CHASSIS_SIGN = +1 (默认)
+ADJUST_CHASSIS_SIGN: int = +1             # 2026-07-28: 底盘方向推导同 x 验证正确
+DEFAULT_SCAN_MODE: str = "sweep"          # 默认来回扫 (2026-07-28: oneway 到端点会 break 提前退出, 不实用)
+DEFAULT_MAX_X_CYCLES: int = 5              # sweep 模式完整扫 N 圈仍无球 → 放弃 (避免无限循环)
+# 闪烁缓冲: 检测到球后, 后续 N 轮即便 matched=0 也不进 SEARCH 底盘前移
+# 防止 ADJUST→SEARCH 快速切换导致"检测到球还继续往前走"假象
+DEFAULT_BALL_GRACE_ROUNDS: int = 3         # 最近 N 轮见过球 → 禁底盘前移 (仅 x 扫描)
+Y_PROTECTED_MAX_MM: float = -30.0         # y ∈ [0, -30] 保护区上界
+X_BELT_SLIP_MAX_STEP_MM: float = 30.0     # x 单步上限 (兼容 belt-slip)
+X_PHYSICAL_WALL_MM: float = -119.5        # 物理墙参考值 (target1.py 实测 ≈ -119.5mm)
+# ⚠️ 默认扫描范围 [-270, -240] **低于物理墙**; 业务层已实测 target1 撞墙停在 -119.5mm
+#    (详见 target1.py:docstring). 用户接受撞墙 stall 兜底, 这里只打 warning 不阻拦。
+
+
+# ---------- 内部 helper ----------
+
+def _read_x_mm(client: ArmClient) -> Optional[float]:
+    """realtime x 真值, 失败 None (calibrate 框架坏, 见 ARM_API §11)."""
+    try:
+        return client._read_x_mm_realtime()
+    except Exception:
+        return None
+
+
+def _read_y_mm(client: ArmClient) -> Optional[float]:
+    """realtime y 真值, 失败 None."""
+    try:
+        return client._read_y_mm_realtime()
+    except Exception:
+        return None
+
+
+def _check_preconditions(client: ArmClient, x_min_mm: float, x_max_mm: float,
+                         x_step_mm: float) -> Optional[str]:
+    """启动前预检; 不通过返回错误 reason (str), 通过返回 None.
+
+    注意: y 保护区只打 warning, 不阻断 —— prepare pose 第一步会 move_y(-133)
+    自动出保护区。其它检查 (x 范围 / 步长 / realtime x) 必须通过。
+    """
+    # y 保护区: 仅 warning, 交给 prepare pose 自动 move_y 出保护区
+    y_mm = _read_y_mm(client)
+    if y_mm is None:
+        print(f"  [{LOG_PREFIX}] ⚠️ realtime y 读不到, prepare pose 的 "
+              f"move_y 会以车端 y_get_position 兜底")
+    elif y_mm > Y_PROTECTED_MAX_MM:
+        print(f"  [{LOG_PREFIX}] ⚠️ y={y_mm:+.1f}mm 在保护区 [0, -30]; "
+              f"交给 prepare pose 自动 move_y({DEFAULT_PREP_Y_MM}) 出保护区")
+
+    # x 范围合理性
+    if x_min_mm >= x_max_mm:
+        return f"x_min={x_min_mm} 必须 < x_max={x_max_mm}"
+    if not (0.0 < x_step_mm <= X_BELT_SLIP_MAX_STEP_MM):
+        return (f"x_step_mm={x_step_mm} 超出 (0, {X_BELT_SLIP_MAX_STEP_MM}] "
+                f"(belt-slip 限制)")
+
+    # realtime x 可用
+    cur_x_mm = _read_x_mm(client)
+    if cur_x_mm is None:
+        return "x_realtime_unavailable"
+    return None
+
+
+def _stop_chassis(chassis_client: Optional["ChassisClient"]) -> None:
+    """退出前必须停底盘 (best-effort, 失败不抛)."""
+    if chassis_client is None:
+        return
+    try:
+        chassis_client.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+    except Exception as e:
+        print(f"  [{LOG_PREFIX}] 停底盘失败 (忽略): "
+              f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+
+
+# ---- mecanum 4 轮速度分配 ----
+# 约定 wheel 顺序: [FL, FR, RL, RR] (前左, 前右, 后左, 后右)
+# 横移 (lateral) 模式: 斜对角同向, 邻角反向。
+#  - 右移 (sign=+1): FL=-v, FR=+v, RL=+v, RR=-v
+#  - 左移 (sign=-1): FL=+v, FR=-v, RL=-v, RR=+v
+# 前进 (forward) 模式: 四轮同速 [v, v, v, v]
+# 如果方向反了, 调 --chassis-axis-sign (-1 翻转)
+
+def _lateral_speeds(speed: float, sign: int) -> list[float]:
+    """横移 4 轮速度 (sign=+1 右移, -1 左移)."""
+    v = speed * sign
+    return [-v, +v, +v, -v]
+
+
+def _forward_speeds(speed: float) -> list[float]:
+    """前进 4 轮速度 (四轮同向)."""
+    return [speed, speed, speed, speed]
+
+
+# ---- 准备位姿 (顺序跟 target1.py 一致) ----
+#   1. move_y       出 y 保护区 [0, -30]
+#   2. set_arm_angle(+90°)  MID / 复位位, init 例外位, 保护区允许 (2026-07-27 arm 0°→90°)
+#   3. set_hand_angle(0°)  DOWN, arm=+90° 已在复位安全带 (>= +30°),
+#                            api.py:432-435 自动跳过 y 保护区拦截
+#   4. move_x       belt-slip 安全 (走 runner 默认 verify)
+
+DEFAULT_PREP_Y_MM: float = -133.0
+"""用户 2026-07-28: -150 → -133 (跟 target1 / target3 对齐)"""
+DEFAULT_PREP_X_MM: float = -220.0
+DEFAULT_PREP_ARM_DEG: float = 90.0
+DEFAULT_PREP_HAND_DEG: float = 0.0
+
+
+def _go_observe_pose(
+    client: ArmClient,
+    runner: ArmRunner,
+    *,
+    y_mm: float = DEFAULT_PREP_Y_MM,
+    x_mm: float = DEFAULT_PREP_X_MM,
+    arm_deg: float = DEFAULT_PREP_ARM_DEG,
+    hand_deg: float = DEFAULT_PREP_HAND_DEG,
+) -> dict:
+    """抬到观察位姿 (跟 target1.py 同序)."""
+    print(f"  [{LOG_PREFIX}/prep] 准备位姿: y={y_mm} → "
+          f"arm={arm_deg}° → hand={hand_deg}° → x={x_mm}")
+
+    # 1. y 出保护区
+    print(f"  [{LOG_PREFIX}/prep] [1/4] move_y({y_mm})")
+    runner.move_y(y_mm, timeout=30.0)
+
+    # 2. arm MID / 复位位 (init 例外位, 保护区允许)
+    print(f"  [{LOG_PREFIX}/prep] [2/4] set_arm_angle({arm_deg}°)")
+    client.set_arm_angle(arm_deg, speed=80, timeout=10.0)
+
+    # 3. hand DOWN —— arm=+90° 已在复位安全带 (>= +30°), api.py:432-435 自动跳过 y 保护区拦截
+    #    保留底层直调作为防御纵深 (跟 target1.py / test_blue.py 同款)
+    print(f"  [{LOG_PREFIX}/prep] [3/4] set_hand_angle({hand_deg}°) "
+          f"(底层直调绕拦截)")
+    client._call_arm(
+        "set_hand_angle", timeout=10.0, sync=True,
+        angle=hand_deg, speed=80,
+    )
+
+    # 4. x (belt-slip 安全, 走 runner 默认 verify; v_max_mms 是 ArmClient.move_x 参,
+    #    runner.move_x 不接, 用默认 40mm/s)
+    print(f"  [{LOG_PREFIX}/prep] [4/4] move_x({x_mm})  "
+          f"(belt-slip 安全, 走 runner verify)")
+    try:
+        runner.move_x(x_mm, timeout=30.0)
+    except Exception as e:
+        print(f"  [{LOG_PREFIX}/prep] move_x({x_mm}) 异常: "
+              f"{type(e).__name__}: {str(e)[:80]}")
+        # 不抛 — 让后续扫描继续, 只是从当前位置开始
+
+    final_x = client._read_x_mm_realtime()
+    print(f"  [{LOG_PREFIX}/prep] 完成 (realtime x={final_x}mm)")
+    return {
+        "y_mm": y_mm,
+        "x_mm": x_mm,
+        "arm_deg": arm_deg,
+        "hand_deg": hand_deg,
+        "actual_x_mm": final_x,
+    }
+
+
+# ---------- 核心 step ----------
+
+def step_target4(
+    arm_client: ArmClient,
+    http_client,
+    chassis_client: Optional["ChassisClient"] = None,
+    runner: Optional[ArmRunner] = None,
+    *,
+    color: str = COLOR_YELLOW,
+    x_min_mm: float = DEFAULT_X_MIN_MM,
+    x_max_mm: float = DEFAULT_X_MAX_MM,
+    x_step_mm: float = DEFAULT_X_STEP_MM,
+    step_interval_s: float = DEFAULT_STEP_INTERVAL_S,
+    max_duration_s: float = DEFAULT_MAX_DURATION_S,
+    confirm_frames: int = DEFAULT_CONFIRM_FRAMES,
+    chassis_mode: str = DEFAULT_CHASSIS_MODE,  # "lateral" | "forward" | "none"
+    chassis_speed: float = DEFAULT_CHASSIS_SPEED,
+    dry_run: bool = False,   # 默认直接执行 (跟 task4 其他 target 脚本一致); --dry-run 显式开启
+    on_chassis_step: Optional[Callable[[int], None]] = None,
+    scan_mode: str = DEFAULT_SCAN_MODE,  # "oneway" | "sweep"
+    chassis_oscillate: bool = DEFAULT_CHASSIS_OSCILLATE,  # forward 模式前后交替 (偶数轮 +, 奇数轮 -)
+    verify_target1_pose: bool = DEFAULT_VERIFY_TARGET1_POSE,  # 球必须落在 BALL_VERIFIED_* 才算 found
+    max_x_cycles: int = DEFAULT_MAX_X_CYCLES,  # sweep 模式完整扫 N 圈仍无球 → 放弃
+    adjust_x_step_mm: float = ADJUST_X_STEP_MM,
+    adjust_chassis_step_m: float = ADJUST_CHASSIS_STEP_M,
+    adjust_max_no_progress: int = ADJUST_MAX_NO_PROGRESS,
+    adjust_max_rounds: int = ADJUST_MAX_ROUNDS,
+    adjust_x_sign: int = ADJUST_X_SIGN,       # cx_err → arm_x 方向 (+1/-1)
+    adjust_chassis_sign: int = ADJUST_CHASSIS_SIGN,  # cy_err → chassis 方向 (+1/-1)
+    ball_grace_rounds: int = DEFAULT_BALL_GRACE_ROUNDS,  # 检测到球后禁底盘前移的轮数 (防闪烁)
+    # 准备位姿 (开头自动跑: y → arm → hand → x; 跟 target1.py 同序)
+    do_prep_pose: bool = True,
+    prep_y_mm: float = DEFAULT_PREP_Y_MM,
+    prep_x_mm: float = DEFAULT_PREP_X_MM,
+    prep_arm_deg: float = DEFAULT_PREP_ARM_DEG,
+    prep_hand_deg: float = DEFAULT_PREP_HAND_DEG,
+) -> dict:
+    """巡航 + x 轴扫描寻找目标颜色球类。
+
+    Args:
+        arm_client: ArmClient (用 move_x / _read_x_mm_realtime)。
+        http_client: RuntimeApiClient (给 target2.fetch_balls 用)。
+        chassis_client: ChassisClient (None 表示仅 x 扫描不动底盘)。
+        color: "blue" / "yellow"。
+        x_min_mm / x_max_mm: x 扫描范围 (软限位边界)。
+        x_step_mm: x 单步长 (mm, ≤ 30mm 兼容 belt-slip)。
+        step_interval_s: 每轮间隔 (秒)。
+        max_duration_s: 总超时 (秒)。
+        confirm_frames: 命中目标需连续多少帧。
+        chassis_mode: "forward" 直线巡航 / "none" 不动底盘。
+        chassis_speed: 底盘速度 (传给 set_wheel_speeds 的四轮相同值)。
+        dry_run: True 只检测不动作; False 才动 x / 底盘。
+        on_chassis_step: 自定义底盘动作回调 (round_idx) -> None;
+                         非 None 时 chassis_client / chassis_mode 被忽略。
+        do_prep_pose: 开头是否自动跑"准备位姿" (y→arm→hand→x,
+                      顺序跟 target1.py 一致); 默认 True。
+        prep_y_mm / prep_x_mm / prep_arm_deg / prep_hand_deg:
+                      准备位姿的目标值; 默认 -133 / -220 / 0° / 0°。
+
+    Returns:
+        dict:
+          - ok              : bool
+          - found           : bool
+          - ball            : dict | None (命中时的球字段, 见 target2.fetch_balls)
+          - final_x_mm      : float (退出时的 realtime x)
+          - rounds          : int (总轮数)
+          - elapsed_s       : float
+          - reason          : str | None (退出原因: "found" / "max_duration_exceeded"
+                                       / "x_soft_limit" / "chassis_error" /
+                                       "precondition_failed" / "target_lost_at_end")
+          - history         : list[dict] (最近若干轮状态, 便于回溯)
+    """
+    print(f"\n========== {LOG_PREFIX} step_target4 ==========")
+    print(f"  模式: {'DRY-RUN (不动硬件)' if dry_run else 'EXECUTE (动硬件)'}")
+    print(f"  颜色: {color}  x: [{x_min_mm:+.1f}, {x_max_mm:+.1f}] mm  "
+          f"x_step={x_step_mm:+.1f}mm  step_interval={step_interval_s}s")
+    print(f"  底盘: chassis_mode={chassis_mode}  chassis_speed={chassis_speed}  "
+          f"custom={'yes' if on_chassis_step else 'no'}")
+    print(f"  底盘前后交替: {'ON' if chassis_oscillate else 'OFF'}  (仅 forward 模式生效)"
+          f"  (默认 OFF; chassis 唯一允许后退的位置是 ADJUST cy_err 调整)")
+    print(f"  结束条件: {'球必须落在 BALL_VERIFIED_* (target1 位姿基线)' if verify_target1_pose else '只看颜色命中'}")
+    print(f"  超时: {max_duration_s}s  命中需连续: {confirm_frames} 帧")
+
+    # ---- 物理墙 warning (不阻拦, 仅提醒) ----
+    if min(x_min_mm, x_max_mm) < X_PHYSICAL_WALL_MM:
+        print(f"  ⚠️ 扫描范围 [{x_min_mm:+.1f}, {x_max_mm:+.1f}]mm 低于 "
+              f"物理墙 {X_PHYSICAL_WALL_MM:+.1f}mm; 实际会在物理墙 stall 兜底,"
+              f"最终 x ≈ {X_PHYSICAL_WALL_MM:+.1f}mm")
+
+    # 预检 (dry-run 也跑, 早暴露问题)
+    pre_fail = _check_preconditions(arm_client, x_min_mm, x_max_mm, x_step_mm)
+    if pre_fail is not None:
+        print(f"  [{LOG_PREFIX}] 预检失败: {pre_fail}")
+        return {"ok": False, "found": False, "ball": None,
+                "rounds": 0, "elapsed_s": 0.0, "reason": "precondition_failed",
+                "history": []}
+
+    # ---- 准备位姿 (y → arm → hand → x, 跟 target1.py 同序) ----
+    prep_result = None
+    if do_prep_pose and not dry_run:
+        if runner is None:
+            # 兜底: 自动建一个 ArmRunner (调用方没传)
+            runner = ArmRunner(arm_client)
+        prep_result = _go_observe_pose(
+            arm_client, runner,
+            y_mm=prep_y_mm, x_mm=prep_x_mm,
+            arm_deg=prep_arm_deg, hand_deg=prep_hand_deg,
+        )
+    elif do_prep_pose and dry_run:
+        print(f"  [{LOG_PREFIX}] [dry-run] 跳过准备位姿 (避免误触硬件)")
+        prep_result = {"dry_run": True,
+                       "y_mm": prep_y_mm, "x_mm": prep_x_mm,
+                       "arm_deg": prep_arm_deg, "hand_deg": prep_hand_deg}
+
+    cur_x_mm = _read_x_mm(arm_client)
+    assert cur_x_mm is not None  # 预检已通过
+
+    # 扫描方向: 默认从 x_max → x_min (oneway)
+    if x_max_mm > x_min_mm:
+        scan_direction = -1   # max > min, 向 min 走
+    else:
+        scan_direction = +1   # max < min, 向 max 走
+
+    # sweep 模式来回扫: 初始方向与 oneway 相同, 触界反转
+    direction = scan_direction
+
+    # oneway: 把"虚拟起点"设到 x_max (如果 cur_x 在范围内, 保持; 否则对齐)
+    if scan_mode == "oneway":
+        if (scan_direction == -1 and cur_x_mm > x_max_mm) or \
+           (scan_direction == +1 and cur_x_mm < x_max_mm):
+            cur_x_mm = x_max_mm   # 从起点开始
+        # else: 已在 [x_min, x_max] 范围内, 从当前位置继续向终点走
+
+    n_rounds = 0
+    n_hits = 0  # 连续命中帧数 (球进 BALL_VERIFIED_* 才计)
+    n_adjust_no_progress: int = 0  # ADJUST 阶段连续未收敛轮数
+    n_adjust_rounds: int = 0       # ADJUST 阶段总轮数
+    n_x_cycles: int = 0            # 完整扫了 N 圈 x 范围 (sweep 模式触底一次算半圈)
+    n_rounds_since_ball: int = 0   # 上次见到球 (matched>0) 之后的轮数; 用于 SEARCH 阶段闪烁缓冲
+    prev_adjust_err: Optional[float] = None
+    history: list[dict] = []
+    found_ball: Optional[dict] = None
+    t_start = time.monotonic()
+    final_reason: str = "unknown"
+
+    # ADJUST 目标点 (BALL_VERIFIED_* 中点): 球调到这里 = 在抓取位
+    target_cx = (BALL_VERIFIED_CX_MIN + BALL_VERIFIED_CX_MAX) / 2.0  # ≈ 0.115
+    target_cy = (BALL_VERIFIED_CY_MIN + BALL_VERIFIED_CY_MAX) / 2.0  # ≈ -0.625
+
+    try:
+        while True:
+            n_rounds += 1
+            elapsed = time.monotonic() - t_start
+
+            # ---- 超时检查 ----
+            if elapsed >= max_duration_s:
+                final_reason = "max_duration_exceeded"
+                print(f"  [{LOG_PREFIX}] 超时 {max_duration_s:.1f}s, 退出")
+                break
+
+            # ---- 1. 视觉检测 ----
+            # 2026-07-28: verify_target1_pose=False —— 搜索/扫描位姿下球
+            # 不在 BALL_VERIFIED_* 期望范围, 不加这个会被误伤过滤掉。
+            try:
+                balls = target2.fetch_balls(
+                    http_client,
+                    color_filter=color,
+                    verify_target1_pose=False,
+                )
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] fetch_balls 异常 "
+                      f"({type(e).__name__}: {str(e)[:60]}), 视作无目标",
+                      flush=True)
+                balls = []
+
+            matched = [b for b in balls if b.get("color") == color]
+
+            # 闪烁缓冲: 球检测计数器, ADJUST 阶段持续更新。
+            # matched>0 → 立刻归零 (刚见球, 下 K 轮允许 ADJUST 但不允 SEARCH 底盘前移)
+            # matched=0 → 累加, 超过 ball_grace_rounds 才解禁 SEARCH 底盘
+            if matched:
+                n_rounds_since_ball = 0
+            else:
+                n_rounds_since_ball += 1
+
+            # 验证球是否落在 target1 位姿下的期望范围 (BALL_VERIFIED_*)。
+            # verify_target1_pose=False 时, 只按颜色命中就认 (旧行为, 兼容)。
+            # verify_target1_pose=True 时, 必须 cx/cy/w/h/score/area/aspect 全在
+            # BALL_VERIFIED_* 区间才算命中, 否则进入 ADJUST 阶段继续微调。
+            if verify_target1_pose:
+                verified = [b for b in matched if arm_client.verify_ball(b)]
+                n_unverified = len(matched) - len(verified)
+                if n_unverified > 0 and (n_rounds % 5 == 1):
+                    # 节流打印 (避免每轮都打)
+                    print(f"  [{LOG_PREFIX}] {n_unverified}/{len(matched)} 球颜色命中但不在 "
+                          f"BALL_VERIFIED_*, 需 ADJUST")
+            else:
+                verified = matched
+
+            # ---- 2. LOCKED 判定 (球进 BALL_VERIFIED_*, 抓取位) ----
+            if verified:
+                n_hits += 1
+                if n_hits >= confirm_frames:
+                    found_ball = verified[0]
+                    final_reason = "found"
+                    print(f"  [{LOG_PREFIX}] ✓ 球进抓取位 {color} "
+                          f"cx={found_ball['cx_norm']:+.3f} (target {target_cx:+.3f})  "
+                          f"cy={found_ball['cy_norm']:+.3f} (target {target_cy:+.3f})  "
+                          f"score={found_ball['score']:.3f}  "
+                          f"(连续 {n_hits} 帧)")
+                    break
+            else:
+                if n_hits > 0:
+                    print(f"  [{LOG_PREFIX}] 球离开抓取位 (前 {n_hits} 帧 LOCKED, 本轮无 verified)")
+                n_hits = 0
+
+            # ---- 2.5 ADJUST 阶段 (球识别到但没进 BALL_VERIFIED, 微调底盘+x) ----
+            # 2026-07-28 重设计: 不是"识别就停", 而是主动 PD 控制把球移到抓取位
+            # (target_cx, target_cy)。cx_err/cy_err → 微调 x 和底盘。
+            if matched:
+                # 选离目标最近的球 (err 最小) 做调整对象
+                def _ball_err(b: dict) -> float:
+                    cx = float(b.get("cx_norm", 0.0))
+                    cy = float(b.get("cy_norm", 0.0))
+                    return (cx - target_cx) ** 2 + (cy - target_cy) ** 2
+                best = min(matched, key=_ball_err)
+                cx_err = float(best.get("cx_norm", 0.0)) - target_cx   # 正: 球偏右
+                cy_err = float(best.get("cy_norm", 0.0)) - target_cy   # 正: 球偏下
+                cur_err = (cx_err ** 2 + cy_err ** 2) ** 0.5
+
+                # 进度监控: err 减小 → 收敛; 否则累计 n_adjust_no_progress
+                if prev_adjust_err is None or cur_err < prev_adjust_err - 0.005:
+                    n_adjust_no_progress = 0
+                    prev_adjust_err = cur_err
+                else:
+                    n_adjust_no_progress += 1
+
+                # 死区: err 很小就不调, 避免在目标附近抖动
+                # ⚠️ LOCKED 守卫: n_hits > 0 表示球已进 BALL_VERIFIED_* 至少 1 帧,
+                # 下一轮在攒 confirm_frames。**这段时间冻结底盘**, 只让 x 微调,
+                # 避免 "已识别最佳位置 → 底盘还在动" 的闪烁 (尤其 confirm_frames ≥ 2 时)
+                lock_confirming = (n_hits > 0)
+                moved_x = False
+                moved_c = False
+                if abs(cx_err) > ADJUST_DEADBAND_X:
+                    # cx_err > 0: 球偏右 → 需要把球移左 → arm_x 朝正向 (向 0) 走
+                    # 用 adjust_x_sign: 默认 -1, 用户反馈反了就 +1 (--flip-cx-sign)
+                    # x_step_dir: cx_err>0 球偏右 → arm_x 朝正向走把球移左; 反之朝负向
+                    x_step_dir = +1 if cx_err > 0 else -1
+                    x_delta = adjust_x_sign * x_step_dir * adjust_x_step_mm
+                    new_x = cur_x_mm + x_delta
+                    new_x = max(x_min_mm, min(x_max_mm, new_x))
+                    if not dry_run and abs(new_x - cur_x_mm) > 0.5:
+                        try:
+                            arm_client.move_x(new_x, timeout=10.0)
+                            cur_x_mm = new_x
+                            moved_x = True
+                        except Exception as e:
+                            print(f"  [{LOG_PREFIX}] ADJUST move_x({new_x:+.1f}) 异常: "
+                                  f"{type(e).__name__}: {str(e)[:60]}")
+                if abs(cy_err) > ADJUST_DEADBAND_Y and not lock_confirming:
+                    # cy_err > 0: 球偏下 → 底盘后退把球移上; cy_err < 0 球偏上 → 前进
+                    # adjust_chassis_sign 默认 +1, 用户反馈反了就 -1 (--flip-cy-sign)
+                    # ⚠️ LOCKED 守卫: n_hits>0 时跳过底盘 (攒 confirm_frames 阶段冻结底盘, 只 x 微调)
+                    c_step_dir = +1 if cy_err < 0 else -1
+                    c_delta = adjust_chassis_sign * c_step_dir * adjust_chassis_step_m
+                    if not dry_run and chassis_client is not None and chassis_mode != "none":
+                        try:
+                            chassis_client.http.execute_car_action(
+                                "move_for",
+                                [c_delta, 0.0, 0.0],
+                                sync=True, timeout=10.0,
+                            )
+                            moved_c = True
+                        except Exception as e:
+                            print(f"  [{LOG_PREFIX}] ADJUST move_for({c_delta:+.3f}) 异常: "
+                                  f"{type(e).__name__}: {str(e)[:60]}")
+
+                n_adjust_rounds += 1
+                # 详细打印 ADJUST 方向 (含 x_delta / c_delta 数值) — 方便现场判断方向对错
+                # 如果球不收敛但 ADJUST 一直往一个方向走 → 方向反了, --flip-cx/--flip-cy
+                direction_str = (
+                    f"x_delta={x_delta:+.1f}mm{' →' if moved_x else ''}  "
+                    f"c_delta={c_delta:+.3f}m{' →' if moved_c else ''}"
+                )
+                if moved_x or moved_c:
+                    print(f"  [{LOG_PREFIX}] ADJUST cx_err={cx_err:+.3f} cy_err={cy_err:+.3f} "
+                          f"cur_err={cur_err:.3f}  {direction_str}  "
+                          f"(no_progress {n_adjust_no_progress}/{adjust_max_no_progress})")
+                elif lock_confirming and abs(cy_err) > ADJUST_DEADBAND_Y:
+                    # 球在 BALL_VERIFIED_* 内, 攒 confirm_frames 阶段冻结底盘 — 显式打 log
+                    print(f"  [{LOG_PREFIX}] ADJUST 冻结底盘 (n_hits={n_hits}/{confirm_frames} 攒命中中, "
+                          f"只 x 微调) cy_err={cy_err:+.3f} c_delta 跳过")
+
+                # 退出条件: 持续不收敛 / 超过 ADJUST 总轮数
+                if n_adjust_no_progress >= adjust_max_no_progress:
+                    final_reason = "adjust_no_progress"
+                    print(f"  [{LOG_PREFIX}] ADJUST 连续 {adjust_max_no_progress} 轮无收敛, 球可能不在可达范围, 退出")
+                    break
+                if n_adjust_rounds >= adjust_max_rounds:
+                    final_reason = "adjust_max_rounds_exceeded"
+                    print(f"  [{LOG_PREFIX}] ADJUST 总轮数 {n_adjust_rounds} 超过上限, 退出")
+                    break
+
+                # ---- 移动后立即重检测: 球可能已进 BALL_VERIFIED_*, 不等下一轮 step_interval ----
+                # 2026-07-28 v3: 之前要等 step_interval=0.5s 下一轮才检查, 期间 ADJUST 继续跑
+                # 可能把球又移出区间; 现在移动后立即重 fetch + verify, 命中就 break。
+                if not dry_run and (moved_x or moved_c) and verify_target1_pose:
+                    time.sleep(0.15)   # 相机稳定
+                    try:
+                        balls_post = target2.fetch_balls(
+                            http_client, color_filter=color,
+                            verify_target1_pose=False,
+                        )
+                        matched_post = [b for b in balls_post if b.get("color") == color]
+                        verified_post = [b for b in matched_post if arm_client.verify_ball(b)]
+                        if verified_post:
+                            n_hits += 1
+                            if n_hits >= confirm_frames:
+                                found_ball = verified_post[0]
+                                final_reason = "found"
+                                print(f"  [{LOG_PREFIX}] ✓ ADJUST 后球进抓取位 "
+                                      f"(重检测, 立即停) cx={found_ball['cx_norm']:+.3f} "
+                                      f"cy={found_ball['cy_norm']:+.3f}")
+                                break
+                            else:
+                                print(f"  [{LOG_PREFIX}] 重检测命中 verified 但 streak "
+                                      f"{n_hits}/{confirm_frames} 还差, 下一轮确认")
+                        else:
+                            # 重检测没 verified → 重置 streak, 避免漏帧假阳
+                            n_hits = 0
+                    except Exception as e:
+                        print(f"  [{LOG_PREFIX}] ADJUST 后重检测异常: "
+                              f"{type(e).__name__}: {str(e)[:60]}", flush=True)
+
+                # 跳过 SEARCH 阶段的底盘/x 扫描 (避免与 ADJUST 冲突)
+                log_entry = {
+                    "round": n_rounds,
+                    "elapsed_s": round(elapsed, 2),
+                    "state": "ADJUST",
+                    "cx_err": round(cx_err, 4),
+                    "cy_err": round(cy_err, 4),
+                    "cur_err": round(cur_err, 4),
+                    "x_mm": round(cur_x_mm, 1),
+                    "moved_x": moved_x,
+                    "moved_c": moved_c,
+                }
+                history.append(log_entry)
+                print(f"  [{LOG_PREFIX}] r{n_rounds:03d} t={elapsed:5.1f}s  "
+                      f"[ADJUST] x={cur_x_mm:+6.1f}mm  cx_err={cx_err:+.3f}  "
+                      f"cy_err={cy_err:+.3f}  cur_err={cur_err:.3f}")
+                time.sleep(max(0.0, step_interval_s))
+                continue  # 不进 SEARCH 阶段
+
+            # ---- 3. 底盘巡航 (2026-07-29 v6: 回到 v3 简洁逻辑) ----
+            # 用户原话: "底盘每次前进一点点, 扫到黄球的时候才可以为了确定坐标而后退"
+            # → forward 模式每轮 5cm (ball_grace 闪烁缓冲外), ADJUST 阶段才能 -5cm (cy_err 决定方向)
+            # 没有 chassis_rest / forward_rest 间隔; 只要不在 ball_grace 就前移。
+            in_ball_grace = (n_rounds_since_ball <= ball_grace_rounds)
+            if not dry_run and chassis_mode != "none" and not in_ball_grace:
+                if on_chassis_step is not None:
+                    try:
+                        on_chassis_step(n_rounds)
+                    except Exception as e:
+                        final_reason = "chassis_error"
+                        print(f"  [{LOG_PREFIX}] on_chassis_step 异常: "
+                              f"{type(e).__name__}: {str(e)[:60]}")
+                        break
+                elif chassis_client is not None:
+                    try:
+                        if chassis_mode == "lateral":
+                            # 横移方向跟 x 扫描方向同步: x ← 时底盘 ←; 触界反向一起翻
+                            # 连续 set_wheel_speeds (S 型搜索, 走期间 x 一起扫)
+                            lateral_sign = +1 if direction > 0 else -1
+                            speeds = _lateral_speeds(chassis_speed, lateral_sign)
+                            chassis_client.set_wheel_speeds(speeds)
+                        elif chassis_mode == "forward":
+                            # 2026-07-28: 改成"每轮前移 5cm 离散 step" (不是连续 set_wheel_speeds)。
+                            # 用 car.move_for([x,y,theta]) 走一次性 5cm 步进 —— 车端走完自动停。
+                            # chassis_speed 在 forward 模式无意义, 用 DEFAULT_CHASSIS_STEP_M。
+                            # ChassisClient 没直接暴露 move_for (api.py:20), 走 http.execute_car_action
+                            # 调 runtime CAR_ACTIONS["move_for"] (runtime/core/actions.py:15)。
+                            # 2026-07-29 v6: 默认 oscillate=False (只前移, 不振荡);
+                            # 后退只发生在 ADJUST 阶段 (球识别到 + cy_err>0 → move_for -2cm 调球位)
+                            # 退出条件仍是 ball_grace / ADJUST→LOCKED / max_duration / x_max_cycles
+                            step_m = DEFAULT_CHASSIS_STEP_M
+                            if chassis_oscillate:
+                                # 偶数轮前进 (+), 奇数轮后退 (-); n_rounds 从 1 开始
+                                sign = -1 if (n_rounds % 2 == 1) else +1
+                                step_m = step_m * sign
+                            chassis_client.http.execute_car_action(
+                                "move_for",
+                                [step_m, 0.0, 0.0],
+                                sync=True, timeout=10.0,
+                            )
+                        else:
+                            # "none" 走这里不该进 (外层 if 拦了), 兜底给个 0 速度
+                            speeds = _forward_speeds(0.0)
+                            chassis_client.set_wheel_speeds(speeds)
+                    except Exception as e:
+                        final_reason = "chassis_error"
+                        print(f"  [{LOG_PREFIX}] 底盘下发失败: "
+                              f"{type(e).__name__}: {str(e)[:60]}")
+                        break
+
+            # ---- 4. x 轴扫描 ----
+            if scan_mode == "oneway":
+                # 2026-07-28 v2: 单向到达端点不 break, 翻转方向 + 计数, 继续扫。
+                # 兜底: n_x_cycles >= max_x_cycles 才放弃 (避免 x 范围太小时秒退)。
+                next_x_mm = cur_x_mm + scan_direction * x_step_mm
+                end_x = x_min_mm if scan_direction == -1 else x_max_mm
+                if (scan_direction == -1 and next_x_mm <= end_x) or \
+                   (scan_direction == +1 and next_x_mm >= end_x):
+                    # 触底 → 翻转方向 + 计半圈
+                    scan_direction = -scan_direction
+                    n_x_cycles += 1
+                    new_end = x_min_mm if scan_direction == -1 else x_max_mm
+                    print(f"  [{LOG_PREFIX}] oneway 触底 x={end_x:+.1f}mm, 翻转方向 + "
+                          f"n_x_cycles={n_x_cycles}/{max_x_cycles}")
+                    if n_x_cycles > max_x_cycles:
+                        final_reason = "x_max_cycles_exceeded"
+                        print(f"  [{LOG_PREFIX}] oneway 扫满 {n_x_cycles} 圈仍无目标, 退出")
+                        break
+                    # 下一轮从另一端开始 (本轮先不动 x, 让底盘走)
+                    next_x_mm = cur_x_mm
+                # 软限位二次校验
+                next_x_mm = max(x_min_mm, min(x_max_mm, next_x_mm))
+            else:
+                # sweep: 来回扫; 每触一次端点 n_x_cycles += 1, 满 max_x_cycles 退出
+                next_x_mm = cur_x_mm + direction * x_step_mm
+                if next_x_mm > x_max_mm:
+                    next_x_mm = x_max_mm
+                    direction = -1
+                    n_x_cycles += 1
+                    print(f"  [{LOG_PREFIX}] sweep 触右端 x={x_max_mm:+.1f}mm, 翻转 + "
+                          f"n_x_cycles={n_x_cycles}/{max_x_cycles}")
+                elif next_x_mm < x_min_mm:
+                    next_x_mm = x_min_mm
+                    direction = +1
+                    n_x_cycles += 1
+                    print(f"  [{LOG_PREFIX}] sweep 触左端 x={x_min_mm:+.1f}mm, 翻转 + "
+                          f"n_x_cycles={n_x_cycles}/{max_x_cycles}")
+                if n_x_cycles > max_x_cycles:
+                    final_reason = "x_max_cycles_exceeded"
+                    print(f"  [{LOG_PREFIX}] sweep 扫满 {n_x_cycles} 圈仍无目标, 退出")
+                    break
+
+            if not dry_run:
+                if next_x_mm != cur_x_mm:
+                    try:
+                        arm_client.move_x(next_x_mm, timeout=15.0)
+                    except Exception as e:
+                        final_reason = "move_x_error"
+                        print(f"  [{LOG_PREFIX}] move_x({next_x_mm:+.1f}) 异常: "
+                              f"{type(e).__name__}: {str(e)[:60]}")
+                        break
+                    # belt-slip 兜底: realtime x 几乎没动 → 警告
+                    actual_x = _read_x_mm(arm_client)
+                    if actual_x is None:
+                        print(f"  [{LOG_PREFIX}] realtime x 读不到, 继续但请注意")
+                    elif abs(actual_x - next_x_mm) > 30.0:
+                        print(f"  [{LOG_PREFIX}] ⚠️ belt-slip: "
+                              f"命令 x={next_x_mm:+.1f}mm 实际={actual_x:+.1f}mm "
+                              f"偏差={actual_x - next_x_mm:+.1f}mm")
+                cur_x_mm = next_x_mm
+            else:
+                # dry-run: 打印建议动作, 不下发
+                cur_x_mm = next_x_mm
+
+            # ---- 5. 日志 ----
+            log_entry = {
+                "round": n_rounds,
+                "elapsed_s": round(elapsed, 2),
+                "x_mm": round(cur_x_mm, 1),
+                "direction": "→" if direction > 0 else "←",
+                "matched": len(matched),
+                "total": len(balls),
+            }
+            history.append(log_entry)
+            print(f"  [{LOG_PREFIX}] r{n_rounds:03d} t={elapsed:5.1f}s  "
+                  f"x={cur_x_mm:+6.1f}mm {log_entry['direction']}  "
+                  f"balls={len(balls):2d}  hit={len(matched):2d}  "
+                  f"streak={n_hits}/{confirm_frames}")
+
+            time.sleep(max(0.0, step_interval_s))
+
+    except KeyboardInterrupt:
+        final_reason = "keyboard_interrupt"
+        print(f"\n  [{LOG_PREFIX}] Ctrl-C 中断")
+    finally:
+        # ---- 退出前必停底盘 ----
+        if not dry_run:
+            _stop_chassis(chassis_client if on_chassis_step is None else None)
+
+    elapsed = time.monotonic() - t_start
+    print(f"========== {LOG_PREFIX} 完成 "
+          f"(reason={final_reason}, rounds={n_rounds}, {elapsed:.1f}s) ==========\n")
+
+    return {
+        "ok": final_reason in ("found", "max_duration_exceeded",
+                               "keyboard_interrupt",
+                               "x_end_reached_no_target"),
+        "found": found_ball is not None,
+        "ball": found_ball,
+        "final_x_mm": cur_x_mm,
+        "rounds": n_rounds,
+        "elapsed_s": elapsed,
+        "reason": final_reason,
+        "history": history[-10:],   # 最近 10 帧, 避免结果巨大
+        "prep": prep_result,        # 准备位姿结果 (或 dry-run 占位)
+    }
+
+
+# ---------- CLI ----------
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="task4 target4: 巡航 + x 轴扫描搜索目标球类 (默认 execute; --dry-run 只打印)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    # 执行模式
+    p.add_argument("--dry-run", action="store_true",
+                   help="dry-run 模式 (默认 execute, 真动硬件; "
+                        "加此参数只打印不动)")
+    # 搜索参数
+    p.add_argument("--color", choices=[COLOR_BLUE, COLOR_YELLOW],
+                   default=COLOR_YELLOW,
+                   help="目标颜色")
+    p.add_argument("--x-min", type=float, default=DEFAULT_X_MIN_MM,
+                   help=f"x 扫描下界 (mm, 默认 {DEFAULT_X_MIN_MM}, "
+                        f"低于物理墙 {X_PHYSICAL_WALL_MM} 时打 warning)")
+    p.add_argument("--x-max", type=float, default=DEFAULT_X_MAX_MM,
+                   help=f"x 扫描上界 (mm, 默认 {DEFAULT_X_MAX_MM})")
+    p.add_argument("--x-step", type=float, default=DEFAULT_X_STEP_MM,
+                   help=f"x 单步 (mm, ≤ {X_BELT_SLIP_MAX_STEP_MM} belt-slip 限制)")
+    p.add_argument("--step-interval", type=float, default=DEFAULT_STEP_INTERVAL_S,
+                   help="每轮间隔 (秒)")
+    p.add_argument("--max-duration", type=float, default=DEFAULT_MAX_DURATION_S,
+                   help="总超时 (秒)")
+    p.add_argument("--confirm-frames", type=int, default=DEFAULT_CONFIRM_FRAMES,
+                   help="命中需连续帧数")
+    # 底盘参数
+    p.add_argument("--chassis-mode", choices=["lateral", "forward", "none"],
+                   default=DEFAULT_CHASSIS_MODE,
+                   help=f"底盘模式 (默认 {DEFAULT_CHASSIS_MODE}; "
+                        f"forward=每轮前移 5cm 离散 step (car.move_for); "
+                        f"lateral=横移异速 S 形 (set_wheel_speeds + chassis_speed); "
+                        f"none=不动)")
+    p.add_argument("--chassis-speed", type=float, default=DEFAULT_CHASSIS_SPEED,
+                   help="底盘速度 (m/s, 仅 lateral 模式传给 set_wheel_speeds; "
+                        "forward 模式用 DEFAULT_CHASSIS_STEP_M=0.05m)")
+    p.add_argument("--no-chassis", action="store_true",
+                   help="等价于 --chassis-mode none (不起底盘, 只动 x)")
+    p.add_argument("--chassis-oscillate", dest="chassis_oscillate",
+                   action="store_true", default=DEFAULT_CHASSIS_OSCILLATE,
+                   help=f"forward 模式 SEARCH 阶段前后交替 (偶数轮 +, 奇数轮 -; "
+                        f"默认 {DEFAULT_CHASSIS_OSCILLATE}, 加此参数切 oscillate "
+                        f"⚠️ 2026-07-29: 默认 oscillate=False 唯一允许 chassis 后退的位置是 ADJUST 阶段)")
+    p.add_argument("--no-chassis-oscillate", dest="chassis_oscillate",
+                   action="store_false",
+                   help="SEARCH 阶段只前进不后退 (默认)")
+    # 结束条件
+    p.add_argument("--no-verify-pose", dest="verify_target1_pose",
+                   action="store_false", default=DEFAULT_VERIFY_TARGET1_POSE,
+                   help=f"关掉 BALL_VERIFIED_* 验证 (只看颜色命中; 默认开 {DEFAULT_VERIFY_TARGET1_POSE})")
+    # ADJUST 方向符号 (现场反馈反了用这两个 flag)
+    p.add_argument("--flip-cx-sign", dest="adjust_x_sign",
+                   action="store_const", const=-1, default=ADJUST_X_SIGN,
+                   help=f"翻转 cx_err → arm_x 方向符号 (默认 {ADJUST_X_SIGN:+d})")
+    p.add_argument("--flip-cy-sign", dest="adjust_chassis_sign",
+                   action="store_const", const=-1, default=ADJUST_CHASSIS_SIGN,
+                   help=f"翻转 cy_err → chassis 方向符号 (默认 {ADJUST_CHASSIS_SIGN:+d})")
+    # 扫描模式
+    p.add_argument("--scan-mode", choices=["oneway", "sweep"],
+                   default=DEFAULT_SCAN_MODE,
+                   help=f"x 扫描模式: sweep=来回扫 (默认 {DEFAULT_SCAN_MODE}); "
+                        f"oneway=单向到端点翻方向继续")
+    p.add_argument("--max-x-cycles", type=int, default=DEFAULT_MAX_X_CYCLES,
+                   help=f"sweep 扫满 N 圈仍无目标 → 放弃 (默认 {DEFAULT_MAX_X_CYCLES}, "
+                        f"防 x 范围过小秒退)")
+    p.add_argument("--ball-grace-rounds", type=int, default=DEFAULT_BALL_GRACE_ROUNDS,
+                   help=f"检测到球后 K 轮内即便 matched=0 也禁止底盘前移 (默认 {DEFAULT_BALL_GRACE_ROUNDS}, "
+                        f"防 ADJUST→SEARCH 闪烁导致 '检测到球还继续往前走')")
+    # 准备位姿
+    p.add_argument("--no-prep", action="store_true",
+                   help="跳过开头自动准备位姿 (默认 True; 加此 flag 跳过)")
+    p.add_argument("--prep-y", type=float, default=DEFAULT_PREP_Y_MM,
+                   help=f"准备位姿 y (mm, 默认 {DEFAULT_PREP_Y_MM})")
+    p.add_argument("--prep-x", type=float, default=DEFAULT_PREP_X_MM,
+                   help=f"准备位姿 x (mm, 默认 {DEFAULT_PREP_X_MM})")
+    p.add_argument("--prep-arm", type=float, default=DEFAULT_PREP_ARM_DEG,
+                   help=f"准备位姿大臂角 (°, 默认 {DEFAULT_PREP_ARM_DEG})")
+    p.add_argument("--prep-hand", type=float, default=DEFAULT_PREP_HAND_DEG,
+                   help=f"准备位姿手爪角 (°, 默认 {DEFAULT_PREP_HAND_DEG})")
+    return p
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
+    dry_run = args.dry_run   # CLI 默认 execute; --dry-run 显式开启
+    chassis_mode = "none" if args.no_chassis else args.chassis_mode
+
+    from main.api_client import RuntimeApiClient  # noqa: E402
+    http = RuntimeApiClient()
+    arm = ArmClient.connect()
+    runner = ArmRunner(arm)
+
+    chassis: Optional[ChassisClient] = None
+    if ChassisClient is not None and chassis_mode != "none":
+        try:
+            chassis = ChassisClient.connect()
+        except Exception as e:
+            print(f"  [{LOG_PREFIX}] chassis client 连不上: "
+                  f"{type(e).__name__}: {str(e)[:80]}", flush=True)
+            chassis = None
+
+    result = step_target4(
+        arm, http, chassis, runner,
+        color=args.color,
+        x_min_mm=args.x_min,
+        x_max_mm=args.x_max,
+        x_step_mm=args.x_step,
+        step_interval_s=args.step_interval,
+        max_duration_s=args.max_duration,
+        confirm_frames=args.confirm_frames,
+        chassis_mode=chassis_mode,
+        chassis_speed=args.chassis_speed,
+        scan_mode=args.scan_mode,
+        max_x_cycles=args.max_x_cycles,
+        do_prep_pose=not args.no_prep,
+        prep_y_mm=args.prep_y,
+        prep_x_mm=args.prep_x,
+        prep_arm_deg=args.prep_arm,
+        prep_hand_deg=args.prep_hand,
+        chassis_oscillate=args.chassis_oscillate,
+        verify_target1_pose=args.verify_target1_pose,
+        adjust_x_sign=args.adjust_x_sign,
+        adjust_chassis_sign=args.adjust_chassis_sign,
+        ball_grace_rounds=args.ball_grace_rounds,
+        dry_run=dry_run,
+    )
+    print(f"[{LOG_PREFIX}] 结果: {result}")
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
