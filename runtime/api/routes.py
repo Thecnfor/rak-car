@@ -1419,7 +1419,7 @@ def create_runtime_router(service, camera_stream_service):
         # ---- task_state push loop（边走边看侧摄目标）----
         task_push_task = None
         task_subscribed = False
-        task_push_hz = 10.0  # task_feed 默认刷新频率
+        task_push_hz = 30.0  # 2026-07-31: 匹配 task_feed 默认 30Hz（my_car.py:1461），原 10Hz 浪费 3 倍数据
 
         async def _task_push_loop():
             last_updated_at = None
