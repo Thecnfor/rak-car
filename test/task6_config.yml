@@ -1,0 +1,27 @@
+# 任务六配置 — test/get_order.py 专用
+# 坐标系: X: 0=右, 负=左; Y: 0=底, 负=上
+# 大臂: +90=MID(init), -95=推杆方向; 末端: -90=UP(init), 0=DOWN
+
+get_order:
+  _doc: |
+    任务六: 智能接单
+    推杆姿势: X=-200, arm=-95°, hand=-90°→-45°, Y=0
+    扫动: X -200→-120 (100mm/s) 推杆, Y=0
+    复位: X=-150, arm=-85°, hand=-45°, Y=-120
+
+  push_bar_pose:
+    x_mm: -200
+    arm_angle_deg: -95
+    hand_angle_deg: -90
+    y_mm: 0
+
+  sweep_x_end_mm: -120
+  sweep_speed_mms: 100
+
+  reposition_pose:
+    x_mm: -150
+    arm_angle_deg: -85
+    hand_angle_deg: -45
+    y_mm: -120
+
+  v_max_arm_x_mms: 80
