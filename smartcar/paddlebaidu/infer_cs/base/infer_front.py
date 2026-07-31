@@ -108,6 +108,9 @@ class ClintInterface:
     def __init__(self, name):
         self.configs = get_yaml('config_car.yml')['infer_cfg']
         self.name = name
+        # 2026-07-31：保护 zmq.REQ/REP 的 send/recv 与 reset_client，
+        # 否则并发场景会触发 EFSM（"Operation cannot be accomplished in current state"）
+        self._socket_lock = threading.Lock()
         logger.info("{}连接服务器...".format(name))
         model_cfg = self.get_config(name)
         self.img_size = model_cfg['img_size']
