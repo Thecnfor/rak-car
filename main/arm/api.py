@@ -833,7 +833,7 @@ class ArmClient:
                 def _safe_move(nx: float, ny: float) -> dict:
                     self._check_y_protected("find_target")
                     self._check_safe(y_mm=ny)
-                    return self.move_xy(nx, ny, timeout=10.0)
+                    return self.move_xy(nx, ny, timeout=5.0)   # 2026-07-31: 5s（伺服高频）
                 move_fn = _safe_move
             return original(selector, x_mm=x_mm, y_mm=y_mm, move_fn=move_fn, **kwargs)
 

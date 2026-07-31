@@ -193,6 +193,7 @@ class ServoTrace:
     y_mm: float
     score: float
     selected_track_id: Optional[int]
+    is_miss: bool = False           # 2026-07-31: 区分 hit / miss，调试连续性
 
 
 @dataclass(frozen=True)
@@ -307,6 +308,13 @@ class ArmVisionClient:
             pick = current_selector.apply_strategy(candidates) if candidates else None
             if pick is None:
                 consecutive_misses += 1
+                trace.append(ServoTrace(
+                    t_s=time.time() - t0, iteration=i,
+                    dx_norm=0.0, dy_norm=0.0,
+                    x_mm=last_x_mm, y_mm=last_y_mm,
+                    score=0.0, selected_track_id=None,
+                    is_miss=True,
+                ))
                 if on_missing_track == "abort" and consecutive_misses >= 5:
                     raise RuntimeError(
                         f"find_target: 连续 {consecutive_misses} 帧未检测到 {current_selector}"
