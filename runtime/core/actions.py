@@ -56,7 +56,7 @@ ARM_ACTIONS = {
     # 2026-07-16 新加：opt-in 撞墙复位 + 复合复位。
     # 不接入 _create_car_locked / ensure_initialized / _auto_init_kwargs，避免 fb24b1a 描述的 pm2 循环。
     "reset_x": lambda arm_obj, *args, **kwargs: arm_obj.reset_x(**kwargs),
-    "reset_all": lambda arm_obj, *args, **kwargs: arm_obj.reset_all(**kwargs),
+    "reset_all": lambda arm_obj, *args, **kwargs: arm_obj.reset_all(*args, **kwargs),
     # 2026-07-31 PR#13: 复合动作 (arm_base.composite_*)。业务层用 composite_* 替换
     # 原 pick/release/go_home 的三步串行,实现 2-3 路电机真并发。
     # 与 reset_all 同样的设计:JOB 内 ThreadPoolExecutor,JOB 间 arm_queue 仍串行。

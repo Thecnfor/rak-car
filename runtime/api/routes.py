@@ -329,8 +329,12 @@ def _ws_op_config(_service, _payload):
     return {"ok": True, "op": "config", "data": {"config": settings.get_runtime_settings()}}
 
 
-def _ws_op_infer_state(service, _payload):
+def _ws_op_infer_state(service, payload):
     return {"ok": True, "op": "infer_state", "data": {"infer": service.get_infer_state()}}
+
+
+def _ws_op_infer_drop_oldest(service, payload):
+    return {"ok": True, "op": "infer_drop_oldest", "data": service.infer_drop_oldest(timeout_s=payload.get("timeout_s"))}
 
 
 def _ws_op_create_job(service, payload):
@@ -566,6 +570,7 @@ _WS_OP_DISPATCH = {
     "actions": _ws_op_actions,
     "config": _ws_op_config,
     "infer_state": _ws_op_infer_state,
+    "infer_drop_oldest": _ws_op_infer_drop_oldest,
     "create_job": _ws_op_create_job,
     "get_job": _ws_op_get_job,
     "execute": _ws_op_execute,
@@ -752,6 +757,14 @@ def create_runtime_router(service, camera_stream_service):
     @router_v1.get("/infer/state")
     def v1_infer_state():
         return {"ok": True, "infer": service.get_infer_state()}
+
+    @router_v1.post("/infer/drop-oldest")
+    def v1_infer_drop_oldest(payload: dict = Body(default={})):
+        """2026-08-01：触发后端按 LRU 卸载非 eager 模型（OOM 主动缓解）。
+
+        payload.timeout_s：单端口超时（默认取 settings.get_infer_health_timeout）。
+        """
+        return service.infer_drop_oldest(timeout_s=payload.get("timeout_s"))
 
     @router_v1.post("/estop")
     def v1_estop(payload: dict = Body(default={})):

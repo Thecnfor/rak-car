@@ -59,14 +59,14 @@ class LaneFollowProfile:
     lost_line_ms: Optional[float] = None  # 笔直居中路段误差本来就会齐 0，默认不按丢线处理
 
     # --- 速度曲线（#2 补齐） ---
-    v_max: float = 0.24
+    v_max: float = 0.30
     v_min: float = 0.12
     kappa_full: float = 0.9
-    dkappa_full: float = 1.5
+    dkappa_full: float = 1.4
 
     # --- P 项 ---
     kp_y: float = 0.80
-    kp_theta: float = 1.5
+    kp_theta: float = 1.2
 
     # --- 横向 I 项（消除直行稳态偏差）---
     ki_y: float = 0.40

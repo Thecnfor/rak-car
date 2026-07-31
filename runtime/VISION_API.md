@@ -659,3 +659,26 @@ while True:
 服务端行为：后台起 asyncio 任务，按 20Hz 轮询 `get_arm_state()`，**只在 `updated_at` 变化时 push**。`op: unsubscribe_arm_state` 或连接断开时自动 cancel 任务。
 
 完整端点表与字段语义见 [../main/arm/ARM_API.md §2](../main/arm/ARM_API.md#2-runtime-http--ws-端点)。
+
+## 8. 推理后端 OOM 韧性字段（2026-08-01）
+
+`GET /v1/infer/state` 在 `models[*]` 上增加下列字段，向后兼容（旧字段保留）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `loaded` | bool | 模型当前是否已加载（懒加载路径下，未请求时为 false） |
+| `mem_estimate_mb` | float | 该模型加载时的 RSS 增量估算（基于 `/proc/self/status` VmRSS） |
+| `last_used_at` | float | 最近一次推理调用的 unix 时间戳；idle-unload 据此决策 |
+| `lazy_load_count` | int | 累计被懒加载的次数（每卸载后重加载会 +1） |
+
+主动卸载接口：
+
+```bash
+curl -X POST http://192.168.6.231:5050/v1/infer/drop-oldest \
+     -H 'Content-Type: application/json' \
+     -d '{"timeout_s": 2.0}'
+```
+
+返回 `{ok, results: [{name, port, ok, payload}]}`。`payload.evicted` 是被卸载的模型及 `idle_s`；`payload.rss_mb` 是卸载前推理进程的 RSS。
+
+WS 入口：`op: "infer_drop_oldest"`（同 HTTP 字段）。

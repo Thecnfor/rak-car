@@ -47,6 +47,22 @@ INFER_READY_TIMEOUT = 45.0
 INFER_HEALTH_TIMEOUT = 2.0
 INFER_BACKEND_SCRIPT = "/home/jetson/workspace/rak-car/smartcar/paddlebaidu/infer_cs/base/infer_back_end.py"
 
+# 2026-08-01：OOM 韧性相关默认值（详见 .trae/specs/system-arch-optimization/spec.md）
+# 推理后端启动时只预热 INFER_EAGER_MODELS（默认 lane）；其余走懒加载。
+INFER_EAGER_MODELS_DEFAULT = "lane"
+# 闲置超过该秒数且不在 INFER_EAGER_MODELS 内的模型会被后台 tick 自动卸载。
+INFER_IDLE_UNLOAD_SECONDS_DEFAULT = 300.0
+# 推理进程内单帧推理硬超时：超过返回 [] 而不阻塞后续（防 EFSM 雪崩）。
+INFER_FRAME_TIMEOUT_S_DEFAULT = 5.0
+# 推理进程 RSS 软限；连续 2 个 probe 周期超限按 OOM_POLICY 卸载。
+INFER_RSS_LIMIT_MB_DEFAULT = 1200
+# OOM 卸载策略：drop_oldest / drop_ocr / none。
+INFER_OOM_POLICY_DEFAULT = "drop_oldest"
+# runtime 进程内存压力阈值；超过则 feeds 按 ir→odom→arm→task 顺序降档。
+CAR_MEMORY_PRESSURE_MB_DEFAULT = 1500
+# runtime 进程 RSS 硬软限；超过只 warn + 上报 /v1/health；95% 主动 gc + drop_oldest。
+CAR_RSS_LIMIT_MB_DEFAULT = 1800
+
 # 任务队列
 JOB_HISTORY_LIMIT = 100
 DEFAULT_JOB_WAIT_TIMEOUT = 300.0
@@ -202,6 +218,62 @@ def get_infer_backend_script():
     return os.getenv("RAK_CAR_INFER_BACKEND_SCRIPT", INFER_BACKEND_SCRIPT)
 
 
+def get_infer_eager_models():
+    """启动时预热的模型名（逗号分隔）。默认仅 lane；其余走懒加载。"""
+    raw = os.getenv("RAK_INFER_EAGER_MODELS", INFER_EAGER_MODELS_DEFAULT)
+    return [m.strip() for m in raw.split(",") if m.strip()]
+
+
+def get_infer_idle_unload_seconds():
+    return float(
+        os.getenv(
+            "RAK_INFER_IDLE_UNLOAD_SECONDS",
+            str(INFER_IDLE_UNLOAD_SECONDS_DEFAULT),
+        )
+    )
+
+
+def get_infer_frame_timeout_s():
+    return float(
+        os.getenv(
+            "RAK_INFER_FRAME_TIMEOUT_S",
+            str(INFER_FRAME_TIMEOUT_S_DEFAULT),
+        )
+    )
+
+
+def get_infer_rss_limit_mb():
+    return int(
+        os.getenv(
+            "RAK_INFER_RSS_LIMIT_MB",
+            str(INFER_RSS_LIMIT_MB_DEFAULT),
+        )
+    )
+
+
+def get_infer_oom_policy():
+    raw = os.getenv("RAK_INFER_OOM_POLICY", INFER_OOM_POLICY_DEFAULT)
+    return str(raw).strip().lower() or INFER_OOM_POLICY_DEFAULT
+
+
+def get_car_memory_pressure_mb():
+    return int(
+        os.getenv(
+            "RAK_CAR_MEMORY_PRESSURE_MB",
+            str(CAR_MEMORY_PRESSURE_MB_DEFAULT),
+        )
+    )
+
+
+def get_car_rss_limit_mb():
+    return int(
+        os.getenv(
+            "RAK_CAR_RSS_LIMIT_MB",
+            str(CAR_RSS_LIMIT_MB_DEFAULT),
+        )
+    )
+
+
 def get_public_api_base():
     return f"http://{get_public_api_host()}:{get_public_api_port()}"
 
@@ -241,5 +313,12 @@ def get_runtime_settings():
         "infer_ready_timeout": get_infer_ready_timeout(),
         "infer_health_timeout": get_infer_health_timeout(),
         "infer_backend_script": get_infer_backend_script(),
+        "infer_eager_models": get_infer_eager_models(),
+        "infer_idle_unload_seconds": get_infer_idle_unload_seconds(),
+        "infer_frame_timeout_s": get_infer_frame_timeout_s(),
+        "infer_rss_limit_mb": get_infer_rss_limit_mb(),
+        "infer_oom_policy": get_infer_oom_policy(),
+        "car_memory_pressure_mb": get_car_memory_pressure_mb(),
+        "car_rss_limit_mb": get_car_rss_limit_mb(),
         "job_history_limit": JOB_HISTORY_LIMIT,
     }

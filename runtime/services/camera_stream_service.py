@@ -442,24 +442,61 @@ class CameraStreamService:
             raise RuntimeError("JPEG 编码失败")
         return buffer.tobytes()
 
+    # 2026-08-01：内存压力降档入口。
+    # runtime 的 ResourceProbeThread 检测到 RSS > 85% 软限时调 set_encode_quality(60, 0.5)：
+    #   - quality: MJPEG JPEG 质量 (默认 80, 高水位降到 60)
+    #   - scale:   帧分辨率缩放 (默认 1.0, 高水位降到 0.5 → 320×240)
+    # 调用线程安全：写 _quality / _scale 由 _encoder_lock 串行；_encoder_loop 每拍重读。
+    def set_encode_quality(self, quality=None, scale=None):
+        with getattr(self, "_encoder_lock", threading.Lock()):
+            if quality is not None:
+                try:
+                    self.quality = max(1, min(100, int(quality)))
+                except (TypeError, ValueError):
+                    pass
+            if scale is not None:
+                try:
+                    s = float(scale)
+                    self._scale = max(0.25, min(1.0, s))
+                except (TypeError, ValueError):
+                    self._scale = 1.0
+
     def _encoder_loop(self):
         """JPEG 编码后台线程：每个 fps tick 把 cam1+cam2 都编码一次。
 
         设计目的：把 cv2.imencode 从 per-connection 路径挪到单线程，
         N 个 MJPEG 客户端只跑 1 次编码（之前是 N 次）。
+
+        2026-08-01：内存压力降档 —— `_scale < 1.0` 时把帧 resize 到更小尺寸再编码。
         """
+        import threading as _threading
+        if not hasattr(self, "_encoder_lock"):
+            self._encoder_lock = _threading.Lock()
+        if not hasattr(self, "_scale"):
+            self._scale = 1.0
         cams = ("cam1", "cam2")
         while self.running:
             try:
+                # 读最新 quality / scale（线程安全：写者持 _encoder_lock；这里不持锁读取)
+                cur_quality = self.quality
+                cur_scale = getattr(self, "_scale", 1.0)
                 for cam_id in cams:
                     if not self.running:
                         break
                     frame = self.get_frame_or_placeholder(cam_id)
+                    if cur_scale < 0.999:
+                        try:
+                            h, w = frame.shape[:2]
+                            new_w = max(64, int(w * cur_scale))
+                            new_h = max(48, int(h * cur_scale))
+                            frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                        except cv2.error:
+                            pass
                     try:
                         ok, buf = cv2.imencode(
                             ".jpg",
                             frame,
-                            [int(cv2.IMWRITE_JPEG_QUALITY), self.quality],
+                            [int(cv2.IMWRITE_JPEG_QUALITY), cur_quality],
                         )
                     except cv2.error:
                         self.clear_frame(cam_id, preserve_meta=True)

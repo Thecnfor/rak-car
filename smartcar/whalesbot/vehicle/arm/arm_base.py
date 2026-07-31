@@ -678,13 +678,21 @@ class ArmController:
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
                   reset_x_velocity: float = 0.02,
-                  timeout: float = 60.0):
+                  timeout: float = 60.0,
+                  reset_x: bool = True):
         """
         复合复位:x 撞墙 + 大臂 + 手爪 三路并行,完成后 reset_y 触底串行。
 
-        为什么不接入 _create_car_locked / ensure_initialized / _auto_init_kwargs:
+        2026-07-31 改造: 加 reset_x=True 默认参数 (历史默认行为)。
+          - reset_x=True  (默认): 与原来完全一致,x 撞墙 + arm + hand 三路并行
+          - reset_x=False: 跳过 reset_x 撞墙,只并行 arm + hand,最后 reset_y 串行收尾。
+            给 ensure_initialized 复用路径 (auto-init 自愈循环) 用,避免反复撞墙触发
+            commit fb24b1a 描述的 PM2 死循环。
+
+        为什么不能无条件接入 _create_car_locked / ensure_initialized:
           commit fb24b1a 已根治"reset_x 撞墙 + auto-init 反复调用"的 PM2 死循环。
-          此方法仅 opt-in 触发（POST /v1/execute 显式调），不进 auto-init 路径。
+          此方法由 _create_car_locked 显式调用 (reset_x=True),
+          ensure_initialized 复用路径显式传 reset_x=False,跳过撞墙。
 
         并行原理:
           - x 是 motor_280 编码器电机,大臂/手爪是 PWM/bus 舵机,三者在物理上独立。
@@ -701,14 +709,18 @@ class ArmController:
             x_direction: x 撞墙方向,默认 "right"
             reset_x_velocity: x 撞墙速度 (m/s),默认 0.02
             timeout: 并行阶段总超时 (s)
+            reset_x: 是否包含 x 撞墙 (默认 True)
 
         Returns:
-            dict: {"x": bool, "arm": ..., "hand": ..., "y": ...}
+            dict: {"x": bool|None, "arm": bool, "hand": bool, "y": bool}
+                  reset_x=False 时 "x": None (表示跳过)
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         results = {}
 
         def _do_x():
+            if not reset_x:
+                return ("x", None)
             return ("x", self.reset_x(direction=x_direction,
                                        reset_velocity=reset_x_velocity))
 
@@ -1018,6 +1030,7 @@ class ArmController:
         x_direction: str = "right",
         reset_x_velocity: float = 0.02,
         timeout: float = 60.0,
+        reset_x: bool = True,
     ) -> dict:
         """复合复位 + y 最后：x 撞墙 + 大臂 + 手爪 三路并行,reset_y 触底串行收尾。
 
@@ -1027,11 +1040,14 @@ class ArmController:
             "触底磁感应是绝对零点" + 并行失败回滚复杂；
           - 与 reset_all 等价(参数完全相同),但作为独立入口便于上层按名字区分
             "完整复位" vs "运行时多轴并行"。
+          - reset_x=False 时跳过 reset_x 撞墙,只并行 arm + hand（与 reset_all 同语义）。
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         results = {}
 
         def _do_x():
+            if not reset_x:
+                return ("x", None)
             return ("x", self.reset_x(direction=x_direction,
                                        reset_velocity=reset_x_velocity))
 

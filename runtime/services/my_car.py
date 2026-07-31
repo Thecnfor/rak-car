@@ -784,14 +784,55 @@ class MyCar(MecanumDriver):
 
     def ernie_bot_init(self):
         """
-        初始化文心一言分析
-
-        初始化、图像分析和订单分析的文心一言接口。
+        2026-08-01：ERNIE 改为 lazy 属性，避免 MyCar init 时立刻发起 HTTPS 连接
+        （原版两个 ErnieBotWrap() 各开一次 access_token 刷新/鉴权握手，比赛长时间运行
+        会因 race + 关闭抖动累积连接数）。访问 `self.image_analysis` / `self.order_analysis`
+        时才真正构造。
         """
-        self.image_analysis = ErnieBotWrap()
+        self._ernie_image = None
+        self._ernie_order = None
+        self._ernie_image_lock = threading.Lock()
+        self._ernie_order_lock = threading.Lock()
+        self.order_analysis_prompt = str(OrderPrompt())  # 字符串缓存，纯文本
+        self._action_bot = None
+        self._hum_analysis = None
+        self._action_bot_lock = threading.Lock()
+        self._hum_analysis_lock = threading.Lock()
 
-        self.order_analysis = ErnieBotWrap()
-        self.order_analysis.set_promt(str(OrderPrompt()))
+    @property
+    def image_analysis(self):
+        if self._ernie_image is None:
+            with self._ernie_image_lock:
+                if self._ernie_image is None:
+                    self._ernie_image = ErnieBotWrap()
+        return self._ernie_image
+
+    @property
+    def order_analysis(self):
+        if self._ernie_order is None:
+            with self._ernie_order_lock:
+                if self._ernie_order is None:
+                    inst = ErnieBotWrap()
+                    inst.set_promt(self.order_analysis_prompt)
+                    self._ernie_order = inst
+        return self._ernie_order
+
+    @property
+    def hum_analysis(self):
+        # 兼容旧 yiyan_get_humattr 调用，懒构造。
+        if self._hum_analysis is None:
+            with self._hum_analysis_lock:
+                if self._hum_analysis is None:
+                    self._hum_analysis = ErnieBotWrap()
+        return self._hum_analysis
+
+    @property
+    def action_bot(self):
+        if self._action_bot is None:
+            with self._action_bot_lock:
+                if self._action_bot is None:
+                    self._action_bot = ErnieBotWrap()
+        return self._action_bot
 
     def animal_image_analysis(self):
         dets = self.get_detection_results()
@@ -1384,6 +1425,11 @@ class MyCar(MecanumDriver):
             self._lane_feed_stop = None
         return {"stopped": True}
 
+    def restart_lane_feed(self, hz: float = 50.0):
+        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
+        self.stop_lane_feed()
+        return self.start_lane_feed(hz=hz)
+
     # === arm 位置推送守护线程（实时 y/x,给 WS subscribe_arm_state 订阅） ===
     def start_arm_feed(self, hz: float = 20.0):
         """启动机械臂 y/x 位置守护线程,持续刷新 streamer.arm_state。
@@ -1456,6 +1502,11 @@ class MyCar(MecanumDriver):
             self._arm_feed_thread = None
             self._arm_feed_stop = None
         return {"stopped": True}
+
+    def restart_arm_feed(self, hz: float = 20.0):
+        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
+        self.stop_arm_feed()
+        return self.start_arm_feed(hz=hz)
 
     # === 侧摄目标检测推送守护线程（实时 task 检测结果,给 WS subscribe_task_detection 订阅） ===
     def start_task_feed(self, hz: float = 30.0):
@@ -1582,6 +1633,11 @@ class MyCar(MecanumDriver):
             self._task_feed_thread = None
             self._task_feed_stop = None
         return {"stopped": True}
+
+    def restart_task_feed(self, hz: float = 30.0):
+        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
+        self.stop_task_feed()
+        return self.start_task_feed(hz=hz)
 
     # === 2026-07-31：左右 IR 距离缓存守护线程（实时 IR,给 /realtime/ir/state 轮询 / WS 订阅） ===
     def start_ir_feed(self, hz: float = 50.0):

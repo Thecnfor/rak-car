@@ -259,3 +259,54 @@ runtime 默认 init 流程（`_create_car_locked(reset_arm=False)`）调 `reset_
 详见 [../main/arm/ARM_API.md](../main/arm/ARM_API.md) §2。
 
 详细端点表参见 `main/API_REFERENCE.md` 中「实时硬件控制（50Hz 直达路径）」章节。
+
+## 内存管理 (OOM 韧性)
+
+比赛前 24h+ 长跑后 Jetson Nano 2GB 内存会被推理模型 + 守护线程 + MJPEG 编码器吃满，触发 OOM kill。2026-08-01 改造点（详见 `.trae/specs/system-arch-optimization/spec.md`）：
+
+### 推理后端：按需加载 + LRU 卸载
+
+`infer_back_end.py` 启动时默认只预热 `lane`；`task` / `ocr` / ERNIE 在首次 ZMQ REQ 时懒加载。后台 tick 每 60s 扫一次：模型 `last_used_at` 超过 `RAK_INFER_IDLE_UNLOAD_SECONDS`（默认 300s）且不在 `_eager_models` 内的，从 `infer_dict` pop 后 `gc.collect()`。
+
+```bash
+# 主动卸载（OOM 应急）：强制按 LRU 卸载非 eager 模型
+curl -X POST http://localhost:5050/v1/infer/drop-oldest
+# {"ok": true, "results": [{"name": "task", "ok": true, "payload": {"evicted": [...], "rss_mb": 943.2}}, ...]}
+```
+
+单帧推理加超时（`RAK_INFER_FRAME_TIMEOUT_S`，默认 5s）—— 超时返回 `[]` 而不阻塞 REP 线程；EFSM 时强制 socket 重建。pm2 重启时 `atexit` + `SIGTERM` handler 主动 `socket.close(linger=0)` + `context.term()`，避免 `Address already in use`。
+
+### runtime 进程：内存压力降档
+
+`CarRuntimeService._resource_probe_loop` 每 30s 读 `psutil.Process(...).memory_info().rss`：
+
+| 阈值（默认） | 行为 |
+| --- | --- |
+| RSS > `RAK_CAR_MEMORY_PRESSURE_MB` (1500MB) | 按 `ir → odom → arm → task → lane` 顺序把对应 feed hz 砍半（lane 永不降档） |
+| RSS < `RAK_CAR_MEMORY_PRESSURE_MB - 200` 持续 60s | 反向按相反顺序恢复 |
+| RSS > 95% × `RAK_CAR_RSS_LIMIT_MB` (1710MB) | MJPEG 编码器 quality 80→60、scale 1.0→0.5（320×240） |
+
+`feeds.degraded` 字段在 `/v1/health` 上报当前被降档的 feed 列表；`resource.rss_mb` 实时 RSS。
+
+```jsonc
+// GET /v1/health.state
+{
+  "feeds": {
+    "lane_state": {"active": true, "mode": "external_feed"},
+    "arm_state":  {"active": true, "mode": "arm_feed"},
+    "task_state": {"active": true, "mode": "task_feed"},
+    "ir_state":   {"active": true, "mode": "ir_feed"},
+    "odom_state": {"active": true, "mode": "odom_feed"},
+    "degraded": ["ir", "odom"]   // ← 2026-08-01 新增
+  },
+  "resource": {                  // ← 2026-08-01 新增
+    "rss_mb": 1623.5,
+    "pressure_mb": 1500,
+    "hard_limit_mb": 1800
+  }
+}
+```
+
+### MyCar 启动瘦身：ERNIE 懒实例化
+
+`MyCar.__init__` 不再 `ErnieBotWrap()` × 2（避免 init 时立刻发起 HTTPS access_token 刷新）。`self.image_analysis` / `self.order_analysis` / `self.hum_analysis` / `self.action_bot` 改为 `@property`，首次访问才构造（double-checked locking）。

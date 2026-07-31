@@ -153,6 +153,13 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 | `RAK_CAR_INFER_POLL_INTERVAL` | `1.0` | Seconds between backend-ready polls |
 | `RAK_CAR_INFER_READY_TIMEOUT` | `45` | Max seconds to wait for a backend before failing health |
 | `RAK_CAR_INFER_HEALTH_TIMEOUT` | `2.0` | Per-call timeout used by `/v1/health` when probing inference |
+| `RAK_INFER_EAGER_MODELS` | `lane` | Comma-separated model names that pre-load at startup. Default only `lane` (others lazy-loaded on first call) |
+| `RAK_INFER_IDLE_UNLOAD_SECONDS` | `300` | Idle threshold for the backend's LRU unload loop; models not called within this window are dropped |
+| `RAK_INFER_FRAME_TIMEOUT_S` | `5.0` | Per-frame inference timeout. `image` request exceeding this returns `[]` instead of blocking the REP loop |
+| `RAK_INFER_RSS_LIMIT_MB` | `1200` | Backend-process RSS soft cap; passed through for monitoring |
+| `RAK_INFER_OOM_POLICY` | `drop_oldest` | OOM unload policy: `drop_oldest` (LRU) / `drop_ocr` / `none` |
+| `RAK_CAR_MEMORY_PRESSURE_MB` | `1500` | runtime RSS threshold that triggers feed-degrade (ir→odom→arm→task, lane is never degraded) |
+| `RAK_CAR_RSS_LIMIT_MB` | `1800` | runtime RSS hard limit; `>95%` also drops MJPEG quality (80→60) and resolution (×0.5) |
 
 ## Conventions and gotchas
 

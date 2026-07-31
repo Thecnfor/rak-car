@@ -66,7 +66,7 @@ class Waypoint:
 # 默认 8 任务点位 + 1 终点。换场地改这里。
 DEFAULT_WAYPOINTS: List[Waypoint] = [
     Waypoint("seed",        task_module="main.tasks.auto_seeding",
-             ir_threshold_m=0.50, ir_side="right",
+             ir_threshold_m=0.7, ir_side="right",
              dis_at_least_m=1.20, trigger_op="AND"),
     Waypoint("scout_pests", task_module="main.tasks.scout_pests",
              ir_threshold_m=0.50, ir_side="right",
