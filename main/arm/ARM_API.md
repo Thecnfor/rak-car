@@ -375,10 +375,15 @@ WS   /v1/ws
 
 | action | 底层 `car.arm` 方法 | 关键参数 |
 | --- | --- | --- |
-| `reset_position` | `arm.reset_position()` | — |
+| `reset_position` | `arm.reset_position()` | —（init 入口；2026-07-31 重写为 arm+hand 并行 + reset_y 串行收尾，耗时 ~0.8s） |
 | `reset_y` | `arm.reset_y()` | — |
 | `reset_x` | `arm.reset_x(direction="right", reset_velocity=0.02, ...)` | `direction?` (left/right), `reset_velocity?` (m/s), `seek_timeout?`, `no_move_hard_timeout?`, `min_pre_trigger_disp_m?` |
 | `reset_all` | `arm.reset_all(arm_angle=0, hand_angle=-90, ...)` | `arm_angle?`, `hand_angle?`, `x_direction?`, `reset_x_velocity?`, `timeout?` |
+| `composite_run` | `arm.composite_run(arm=None, x=None, y=None, hand=None, speed=80, timeout=30.0, y_pid_timeout=10.0)` | **2026-07-31 新增**：四电机通用并行驱动器，任一参数 None 即跳过。详见 §9.6 |
+| `composite_run_reset` | `arm.composite_run_reset(arm_angle=90, hand_angle=-90, x_direction="right", reset_x_velocity=0.02, timeout=60.0)` | **2026-07-31 新增**：x 撞墙 + arm + hand 并行 + reset_y 串行收尾。详见 §9.6 |
+| `composite_pick` | `arm.composite_pick(arm_angle, x, y, hand=0.0, speed=80, timeout=30.0)` | arm ‖ xy → hand → grasp（业务层常用） |
+| `composite_release` | `arm.composite_release(drop_x=0.0, drop_y=0.03, hand=0.0, speed=80, timeout=30.0)` | hand → position → grasp(False)（保守序列） |
+| `composite_go_home` | `arm.composite_go_home(hand=-90.0, arm=0.0, speed=80, timeout=30.0)` | arm ‖ xy → hand（hand 放最后避免撞大臂） |
 | `set_arm_pose` | `arm.set_arm_pose(x=None, y=None, arm=None, hand=None)` | x?, y?, arm?, hand? |
 | `set_hand_angle` | `arm.set_hand_angle(angle, speed=80)` | `angle` (UP/MID/DOWN/int), `speed?` |
 | `set_arm_angle` | `arm.set_arm_angle(angle, speed=80)` | `angle` (LEFT/MID/RIGHT/int), `speed?` |
@@ -448,18 +453,17 @@ http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 
 ## 5. 启动归零（init 流程）
 
-`runtime _create_car_locked` 每次创建 `MyCar` 后：
+`runtime _create_car_locked` 每次创建 `MyCar` 后（**当前 2026-07-31 行为**）：
 
-1. `reset_arm=False`（默认，**2026-07-16 改**）：调 `arm.reset_all` —— **大臂(set_arm_angle 0°) + 手爪(set_hand_angle -90°) + x(撞右墙 calibrate) 三路 ThreadPoolExecutor 并行**，收齐后串行 `reset_y()` 触底
-2. `reset_arm=True`：调 `arm.reset_position`（仅 `reset_y`，不含 x 撞墙；向后兼容）
+1. `arm.reset_position()` —— 大臂（+90°）+ 手爪（-90°/UP）**并行下发**，完成后串行 `reset_y()` 触底定原点；
+   - 整体耗时 ~0.8s（2026-07-31 改并行前是 ~1.5s 串行）
+   - 详见 [arm_base.py#L1193-L1265](../../smartcar/whalesbot/vehicle/arm/arm_base.py) 实现
+2. `if settings.get_reset_x_on_init() and car.arm is not None:` —— 根据 `arm_origin.yaml` 的 `reset_x_on_init` 标志决定是否撞右墙定 x 原点（env `RAK_CAR_RESET_X_VELOCITY` 控制撞墙速度，默认 0.06 m/s）
+   - 撞墙速度过 0.06 会触发 "no_move_hard_timeout"，稳态推荐 `0.02` (见 §9.5)
 
-为何默认走 reset_all？
+当前 init 流程**不再**默认调 `reset_all`（即"含 x 撞墙"）。`reset_all` / `composite_run_reset` 是业务层 opt-in 入口。
 
-- 用户原话："机器初始化时大臂 + 末端 PWM + x 轴到位后才 y 轴"（2026-07-16）
-- y 必须等前三个到位：reset_y 触底是绝对零点，前三个不完成 y 不能定
-- 大臂 + 手爪 + x 三个独立动作并行：x=motor_280、大臂=ServoBus(port=3)、手爪=ServoPwm(port=2)，serial_mc602.lock FIFO 串行化串口写入，Python 层三线程并发不冲突
-- reset_x 失败/超时/急停只 logger.warning 不抛（避免触发 `_should_probe_controller` recover loop，commit `fb24b1a` 描述的 PM2 死循环已规避）
-- auto-init retry 默认走 `reset_arm=True`（settings.get_reset_arm_on_auto_init() 默认 True），不走 reset_all 不撞墙
+> **历史**：2026-07-16 改 init 默认走 `reset_all`（大臂+手爪+x 撞墙三路并行 → y 串行），后因 x 撞墙 PM2 风险 + 业务层多入口混乱，2026-07-31 改回 `reset_position` + 条件性 `reset_x`。`reset_all` 不进 auto-init 路径。
 
 复用现有 `MyCar` 时（`ensure_initialized` 走 reused 分支），同样会幂等调一次 `start_arm_feed(hz=20)`。
 
@@ -669,6 +673,88 @@ x 位置仍主要靠视觉闭环控制（`move_to_detection_target` + `subscribe
 0.03 失败的根因是 stall 判定阈值太严（1e-5m = 0.01mm），撞墙瞬间机械臂物理抖动幅度超过阈值，`stall_since` 反复重置凑不齐 DWELL_TIME。修复：阈值放宽到 1e-3m (1mm)。
 
 **推荐速度**：业务用 0.02 m/s（对电机最温柔），调试用 0.04 m/s（最快 4s）。
+
+### 9.6 `composite_run` / `composite_run_reset` — 四电机通用并行驱动器（2026-07-31 新增）
+
+> 业务层最常用：一次 HTTP 提交，1-4 路电机同时驱动。比手工编排 `composite_pick` / `composite_go_home` 等闭包方法更灵活。
+
+#### 9.6.1 `composite_run` —— 业务层首选
+
+任意 1-4 路并行（None = 跳过），**Python 层并发**，物理 `serial_mc602.lock` FIFO 不可破（这是硬件约束，不可消除，但 set_*_angle 等舵机阻塞在物理到位期间 PID 闭环可继续跑 — 与 `composite_*` 同策略）。
+
+```
+POST /v1/execute
+{"target":"arm","name":"composite_run",
+ "kwargs":{"arm":30,"x":0.10,"y":-0.13,"hand":0,"timeout":30}}
+```
+
+参数（全可选，全 None 视为空动作）：
+
+| 参数 | 单位 | 说明 |
+| --- | --- | --- |
+| `arm` | 度（或 "LEFT"/"MID"/"RIGHT"） | 大臂目标角度 |
+| `x` | m | 水平目标位置；走 `move_x_position` PID |
+| `y` | m | 竖直目标位置；走 `move_y_position` PID |
+| `hand` | 度（或 "UP"/"MID"/"DOWN"） | 手爪目标角度 |
+| `speed` | 1-100（默认 80） | 舵机速度（仅 arm/hand 生效） |
+| `timeout` | s（默认 30） | 并行阶段总超时 |
+
+返回：
+
+```python
+{"ok": bool,
+ "steps": {"arm": bool, "x": bool, "y": bool, "hand": bool}}
+```
+
+失败语义：任一子路异常 → `logger.warning` + 该路 `False`，不进 `_should_probe_controller` recover。`ok=true` 仅当全 True。
+
+业务层调用入口（`RuntimeApiClient` 与 `RuntimeWsClient` 同构）：
+
+```python
+from main.api_client import RuntimeApiClient
+client = RuntimeApiClient("http://192.168.6.231:5050")
+result = client.execute("arm", "composite_run",
+    arm=30, x=0.10, y=-0.13, hand=0, timeout=30)
+# result 是 job dict；拿到 .result 即上述 {"ok": ..., "steps": ...}
+```
+
+#### 9.6.2 `composite_run_reset` —— 撞墙完整复位
+
+等价 `reset_all`，作为独立入口便于业务层按名字区分。**trigger 注意：撞墙会物理推动 x 到墙边，必须在安全环境。**
+
+```
+POST /v1/execute
+{"target":"arm","name":"composite_run_reset",
+ "kwargs":{"arm_angle":90,"hand_angle":-90,"x_direction":"right",
+           "reset_x_velocity":0.02,"timeout":60}}
+```
+
+参数：同 `reset_all`（见 §3.1 表格）。
+
+返回：`{"x": bool, "arm": bool, "hand": bool, "y": bool}`（与 `reset_all` 一致）。
+
+#### 9.6.3 选型速查
+
+| 想做什么 | 用什么 |
+| --- | --- |
+| 抓一个物体到某位姿 | `composite_pick`（业务封装）或 `composite_run(arm=, x=, y=, hand=)` + 后续 `grasp(True)` |
+| 放开物体到某位姿 | `composite_release`（业务封装）或 `composite_run(x=, y=, hand=)` + 后续 `grasp(False)` |
+| 同时动大臂 + xy（轻量） | `composite_run(arm=, x=, y=)` |
+| 仅同时动大臂 + 手爪 | `composite_run(arm=, hand=)` |
+| reset 含 x 撞墙 | `composite_run_reset` 或 `reset_all` |
+| reset 不含 x 撞墙（init 默认） | 什么都不调 — `runtime _create_car_locked` 默认自动跑 `reset_position`（arm+hand 并行 + y 串行） |
+
+#### 9.6.4 真机测试结果（2026-07-31 main 验证）
+
+`main/test/verify_composite_run_realtime.py`（gitignored 本地脚本）：
+
+| TP | 任务 | 耗时 | y 实际位置 | 误差 |
+| --- | --- | --- | --- | --- |
+| TP2 | `composite_run(arm=0, x=0, y=-0.10, hand=-90)` | 2.0s | -99.97mm | 0.03mm |
+| TP3 | `composite_run(arm=30, x=0.10, y=-0.13, hand=0)` | 2.0s | -130.04mm | 0.04mm |
+| TP5 审计 | 100Hz 采样期间 `composite_run` 跑一次 | — | — | 同一 10ms 窗口内 x/y 同变化 49 次 |
+
+> **已知限制**：x 编码器读不到增量（CLAUDE.md 已删 `reset_x`，x 由视觉闭环控制）。本 PR 不修这个硬件层问题。`composite_run` 自身并发调度正确（审计采样验证），让 x 真正到位需要另起 PR。
 
 ---
 
