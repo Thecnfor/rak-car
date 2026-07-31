@@ -280,3 +280,27 @@ class ArmRunner:
             arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
             hand=0.0, speed=80, timeout=30.0,
         )
+
+    def track_vision_target(self, selector, *,
+                            x_mm: float, y_mm: float,
+                            arm_angle: float = 90.0, hand: float = -90.0,
+                            hz: float = 30.0,
+                            mm_per_norm: float = 30.0,
+                            timeout: float = 30.0):
+        """持续实时追踪（永不收敛停）：WS 推送驱动，timeout 后返回。
+
+        与 move_to_vision_target_realtime 区别：
+          - realtime 版找到目标居中就停；track 版持续跟（即使居中也保持）
+          - on_missing_track='wait' 默认（短暂丢失不 abort）
+
+        适用：目标会移动的场景（边走边跟、流水线）。
+        """
+        # composite_run 粗定位（保持 arm_angle，不强切）
+        self.client.composite_run(
+            arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
+        )
+        return self.client._make_vision_with_move().find_target_track(
+            selector, x_mm=x_mm, y_mm=y_mm,
+            hz=hz, mm_per_norm=mm_per_norm,
+            timeout=timeout,
+        )
