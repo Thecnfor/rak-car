@@ -15,6 +15,7 @@ class LabelInfo:
     id: int
     name: str
     desc: str
+    real_height_m: float = 0.0   # 业务目标物理高度 (米), 用于深度估计; 0.0 = 未知
 
     def __str__(self) -> str: return f"Label({self.name})"
 
@@ -42,27 +43,29 @@ class Label(str, Enum):
     WATER_L3      = "water_l3"
 
 
+# 8 类主要目标填实物理高度 (米), 用于视觉伺服 compute_depth.
+# 物理世界标定后可现场修正; 其他 label 留 0.0 走 fallback.
 LABELS: Tuple[LabelInfo, ...] = (
-    LabelInfo(1,  "animal",        "动物"),
-    LabelInfo(2,  "ball_blue",     "蓝色球"),
-    LabelInfo(3,  "ball_yellow",   "黄色球"),
-    LabelInfo(4,  "cylinder_1",    "圆柱体（1号）"),
-    LabelInfo(5,  "cylinder_2",    "圆柱体（2号）"),
-    LabelInfo(6,  "cylinder_3",    "圆柱体（3号）"),
-    LabelInfo(7,  "cylinder_set",  "圆柱体组合"),
-    LabelInfo(8,  "h_dou_jiao",    "豆角"),
-    LabelInfo(9,  "h_fan_qie",     "番茄"),
-    LabelInfo(10, "h_jin_zhen_gu", "金针菇"),
-    LabelInfo(11, "h_mo_gu",       "蘑菇"),
-    LabelInfo(12, "h_qin_cai",     "芹菜"),
-    LabelInfo(13, "h_qing_jiao",   "青椒"),
-    LabelInfo(14, "h_tu_dou",      "土豆"),
-    LabelInfo(15, "h_xi_lan_hua",  "西兰花"),
-    LabelInfo(16, "h_you_cai",     "油菜"),
-    LabelInfo(17, "water",         "水容器"),
-    LabelInfo(18, "water_l1",      "水容器（等级1）"),
-    LabelInfo(19, "water_l2",      "水容器（等级2）"),
-    LabelInfo(20, "water_l3",      "水容器（等级3）"),
+    LabelInfo(1,  "animal",        "动物",        real_height_m=0.30),
+    LabelInfo(2,  "ball_blue",     "蓝色球",      real_height_m=0.06),
+    LabelInfo(3,  "ball_yellow",   "黄色球",      real_height_m=0.06),
+    LabelInfo(4,  "cylinder_1",    "圆柱体(1号)",  real_height_m=0.10),
+    LabelInfo(5,  "cylinder_2",    "圆柱体(2号)",  real_height_m=0.10),
+    LabelInfo(6,  "cylinder_3",    "圆柱体(3号)",  real_height_m=0.10),
+    LabelInfo(7,  "cylinder_set",  "圆柱体组合",    real_height_m=0.10),
+    LabelInfo(8,  "h_dou_jiao",    "豆角",        real_height_m=0.20),
+    LabelInfo(9,  "h_fan_qie",     "番茄",        real_height_m=0.07),
+    LabelInfo(10, "h_jin_zhen_gu", "金针菇",      real_height_m=0.0),
+    LabelInfo(11, "h_mo_gu",       "蘑菇",        real_height_m=0.0),
+    LabelInfo(12, "h_qin_cai",     "芹菜",        real_height_m=0.0),
+    LabelInfo(13, "h_qing_jiao",   "青椒",        real_height_m=0.10),
+    LabelInfo(14, "h_tu_dou",      "土豆",        real_height_m=0.08),
+    LabelInfo(15, "h_xi_lan_hua",  "西兰花",      real_height_m=0.0),
+    LabelInfo(16, "h_you_cai",     "油菜",        real_height_m=0.0),
+    LabelInfo(17, "water",         "水容器",       real_height_m=0.15),
+    LabelInfo(18, "water_l1",      "水容器(等级1)", real_height_m=0.15),
+    LabelInfo(19, "water_l2",      "水容器(等级2)", real_height_m=0.15),
+    LabelInfo(20, "water_l3",      "水容器(等级3)", real_height_m=0.15),
 )
 
 
@@ -84,6 +87,17 @@ def get_label_info(name: str) -> LabelInfo:
         if info.name == name:
             return info
     raise ValueError(f"未知 label: {name!r}（共 20 项，参考 LABELS）")
+
+
+def get_real_height_m(name: str) -> float:
+    """label 名 → 物理高度 (m); 找不到或 0.0 走 fallback.
+
+    用于 ArmVisionClient.compute_depth / 视觉伺服深度估计.
+    """
+    try:
+        return get_label_info(name).real_height_m
+    except ValueError:
+        return 0.0
 
 
 def is_in_group(name: str, group: str) -> bool:

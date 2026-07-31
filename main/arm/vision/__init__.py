@@ -25,6 +25,9 @@ __all__ = [
 class ArmVisionClient(ServoLoop, RealtimeLoop):
     """末端摄像头视觉伺服客户端. 主路径 task_feed 30Hz cache; WS 路径走 push."""
 
+    DEFAULT_FOCAL_LENGTH_PX = 600.0
+    DEFAULT_REF_DEPTH_M = 0.30
+
     def __init__(self, http, *, default_timeout_s: float = 10.0):
         self.http = http
         self.default_timeout_s = default_timeout_s
@@ -36,6 +39,20 @@ class ArmVisionClient(ServoLoop, RealtimeLoop):
     @staticmethod
     def group(name: str):
         return LABEL_GROUPS[name]
+
+    @staticmethod
+    def compute_depth(bbox_pixels, target_real_height_m: float,
+                      focal_length_px: float = 600.0) -> float:
+        """从 bbox 像素高反推物理距离 (m).
+
+        depth_m = (target_real_height_m * focal_length_px) / bbox_height_px.
+        bbox_height=0 / target_real_height=0 / bbox_pixels=None 时走 fallback (0.30m).
+        """
+        if bbox_pixels is None or bbox_pixels.height <= 0:
+            return ArmVisionClient.DEFAULT_REF_DEPTH_M
+        if target_real_height_m <= 0:
+            return ArmVisionClient.DEFAULT_REF_DEPTH_M
+        return (target_real_height_m * focal_length_px) / bbox_pixels.height
 
     def get_state(self) -> List[Detection]:
         return _parse_cache(self.http.get_vision_task_cache())
