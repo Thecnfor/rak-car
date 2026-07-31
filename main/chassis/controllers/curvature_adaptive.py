@@ -38,7 +38,16 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         kappa_axis_center: float = 1.0,
         kappa_axis_width: float = 0.5,
         vy_floor: float = 0.15,
+        omega_floor: float = 0.15,
         r_eff: float = 0.30,
+        ki_curve_boost: float = 1.5,
+        # ---- 急弯专用参数（kappa >= sharp_kappa_threshold 时生效） ----
+        sharp_kappa_threshold: float = 2.5,
+        sharp_v_min: float = 0.06,
+        sharp_kp_theta: float = 1.50,
+        sharp_omega_gain: float = 0.90,
+        sharp_ki_curve_boost: float = 2.5,
+        sharp_k_curvature: float = 0.55,
     ) -> None:
         self.v_max = float(v_max)
         self.v_min = float(v_min)
@@ -65,8 +74,16 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self.kappa_axis_center = float(kappa_axis_center)
         self.kappa_axis_width = max(float(kappa_axis_width), 1e-3)
         self.vy_floor = max(0.0, min(float(vy_floor), 1.0))
+        self.omega_floor = max(0.0, min(float(omega_floor), 1.0))
         self._axis_mix: float = 0.0
         self.r_eff = float(r_eff)
+        self.ki_curve_boost = max(0.0, float(ki_curve_boost))
+        self.sharp_kappa_threshold = max(0.0, float(sharp_kappa_threshold))
+        self.sharp_v_min = float(sharp_v_min)
+        self.sharp_kp_theta = float(sharp_kp_theta)
+        self.sharp_omega_gain = float(sharp_omega_gain)
+        self.sharp_ki_curve_boost = max(0.0, float(sharp_ki_curve_boost))
+        self.sharp_k_curvature = float(sharp_k_curvature)
 
         self._kappa_ema: float = 0.0
         self._prev_ea: Optional[float] = None
@@ -104,10 +121,12 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         )
         return max(kappa, 0.0)
 
-    def _vx_from_kappa(self, kappa: float) -> float:
+    def _vx_from_kappa(self, kappa: float, v_min: Optional[float] = None) -> float:
+        if v_min is None:
+            v_min = self.v_min
         scale = math.exp(-kappa)
-        vx = self.v_min + (self.v_max - self.v_min) * scale
-        return max(self.v_min, min(self.v_max, vx))
+        vx = v_min + (self.v_max - v_min) * scale
+        return max(v_min, min(self.v_max, vx))
 
     def _axis_mix_from_kappa(self, kappa: float) -> float:
         z = (kappa - self.kappa_axis_center) / self.kappa_axis_width
@@ -168,27 +187,39 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self._update_ey_integral(state, dt)
         self._update_ea_integral(state, dt)
 
+        # 急弯检测：kappa 超过阈值时切到强化参数组
+        is_sharp = kappa >= self.sharp_kappa_threshold
+
         if released:
             vx = self.v_max
         else:
-            vx = self._vx_from_kappa(kappa)
+            eff_v_min = self.sharp_v_min if is_sharp else self.v_min
+            vx = self._vx_from_kappa(kappa, v_min=eff_v_min)
 
-        vy_raw = -self.kp_y * float(state.error_y) - self.ki_y * self._ey_integral
+        eff_ki_boost = self.sharp_ki_curve_boost if is_sharp else self.ki_curve_boost
+        i_boost = 1.0 + eff_ki_boost * kappa
 
-        boost = 1.0 + self.omega_gain * min(kappa, KAPPA_HARD_CAP)
+        vy_raw = -self.kp_y * float(state.error_y) - self.ki_y * self._ey_integral * i_boost
+
+        eff_omega_gain = self.sharp_omega_gain if is_sharp else self.omega_gain
+        boost = 1.0 + eff_omega_gain * min(kappa, KAPPA_HARD_CAP)
         # 前馈符号：用 state.error_angle 实时方向更新 _prev_sign，
         # 而不是用 _prev_ea 兜底（_prev_ea 在 has_error=False 时被复位会丢符号）。
         ea_now = float(state.error_angle)
         if ea_now != 0.0:
             self._prev_sign = math.copysign(1.0, ea_now)
 
-        # 直道 kp_theta 用更小的 straight 值，弯道不变
+        # 直道 kp_theta 用更小的 straight 值，弯道不变，急弯用 sharp
         self._axis_mix = self._axis_mix_from_kappa(kappa)
-        kp_theta_eff = self.kp_theta_straight + (self.kp_theta - self.kp_theta_straight) * self._axis_mix
+        if is_sharp:
+            kp_theta_eff = self.sharp_kp_theta
+        else:
+            kp_theta_eff = self.kp_theta_straight + (self.kp_theta - self.kp_theta_straight) * self._axis_mix
+        eff_k_curvature = self.sharp_k_curvature if is_sharp else self.k_curvature
         omega_raw = (
             +kp_theta_eff * ea_now * boost
-            + self.k_curvature * self._dkappa_ema * self._prev_sign
-            + self.ki_theta * self._ea_integral * boost
+            + eff_k_curvature * self._dkappa_ema * self._prev_sign
+            + self.ki_theta * self._ea_integral * boost * i_boost
         )
         if omega_raw > self.omega_cap:
             omega_raw = self.omega_cap
@@ -197,19 +228,30 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
 
         vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
         vy_decided = vy_keep * vy_raw
-        omega_decided = self._axis_mix * omega_raw
+        omega_keep = self.omega_floor + (1.0 - self.omega_floor) * self._axis_mix
+        omega_decided = omega_keep * omega_raw
 
         return mecanum_inverse(vx, vy_decided, omega_decided, self.r_eff)
 
     def debug_snapshot(self) -> dict:
         vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
+        omega_keep = self.omega_floor + (1.0 - self.omega_floor) * self._axis_mix
+        kappa_now = max(
+            self._kappa_ema / self.kappa_full
+            + self._dkappa_ema / self.dkappa_full,
+            0.0,
+        )
         return {
+            "kappa": kappa_now,
             "kappa_ema": self._kappa_ema,
             "dkappa_ema": self._dkappa_ema,
+            "is_sharp": kappa_now >= self.sharp_kappa_threshold,
             "straight_streak_ms": self._straight_streak_ms,
             "axis_mix": self._axis_mix,
             "vy_keep": vy_keep,
             "vy_floor": self.vy_floor,
+            "omega_keep": omega_keep,
+            "omega_floor": self.omega_floor,
             "ey_int": self._ey_integral,
             "ki_y": self.ki_y,
             "ea_int": self._ea_integral,

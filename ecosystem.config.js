@@ -28,13 +28,17 @@ module.exports = {
         RAK_CAR_INFER_POLL_INTERVAL: "1.0",
         RAK_CAR_INFER_READY_TIMEOUT: "45",
         RAK_CAR_INFER_HEALTH_TIMEOUT: "2.0",
-        /* 按需加载模型：只常驻 lane + task，OCR 按需加载（节省 ~300MB 内存） */
-        RAK_INFER_EAGER_MODELS: "lane,task",
+        /* 4GB RAM 缓解：先不预热任何模型,首次调用时再加载(~400ms 冷启动 vs ~150MB*2 常驻) */
+        RAK_INFER_EAGER_MODELS: "",
+        /* 模型 idle 60s 就卸,腾内存给其他进程 (默认 300 太长) */
+        RAK_INFER_IDLE_UNLOAD_SECONDS: "60",
         /* 抑制 Paddle C++ 端的 IR pass verbose (0=INFO, 1=WARNING, 2=ERROR, 3=FATAL) */
         GLOG_minloglevel: "2",
         FLAGS_minloglevel: "2",
         PYTHONWARNINGS: "ignore",
       },
+      /* 兜底: runtime/server.py 单进程泄漏超过 1.2GB 自动 PM2 重启 (仅看父进程 RSS, infer_back_end 子进程管不到) */
+      max_memory_restart: "1200M",
     },
   ],
 };

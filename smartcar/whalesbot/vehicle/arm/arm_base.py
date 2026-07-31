@@ -677,7 +677,7 @@ class ArmController:
 
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
-                  reset_x_velocity: float = 0.04,
+                  reset_x_velocity: float = 0.03,
                   timeout: float = 60.0,
                   reset_x: bool = True):
         """
@@ -707,7 +707,7 @@ class ArmController:
             arm_angle: 大臂目标角度 (°),默认 0=MID
             hand_angle: 手爪目标角度 (°),默认 -90=UP
             x_direction: x 撞墙方向,默认 "right"
-            reset_x_velocity: x 撞墙速度 (m/s),默认 0.04
+            reset_x_velocity: x 撞墙速度 (m/s),默认 0.03
             timeout: 并行阶段总超时 (s)
             reset_x: 是否包含 x 撞墙 (默认 True)
 
@@ -1028,7 +1028,7 @@ class ArmController:
         arm_angle: float = 90,
         hand_angle: float = -90,
         x_direction: str = "right",
-        reset_x_velocity: float = 0.04,
+        reset_x_velocity: float = 0.03,
         timeout: float = 60.0,
         reset_x: bool = True,
     ) -> dict:
