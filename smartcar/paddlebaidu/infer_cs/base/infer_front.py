@@ -105,12 +105,42 @@ class ClintInterface:
     #         {'name':'mot', 'infer_type':'MotHuman', 'params': [], 'port':5006, 'img_size':None}
     #         ]
     
-    def __init__(self, name):
+    def __init__(self, name, socket_timeout_ms=None):
         self.configs = get_yaml('config_car.yml')['infer_cfg']
         self.name = name
         # 2026-07-31：保护 zmq.REQ/REP 的 send/recv 与 reset_client，
         # 否则并发场景会触发 EFSM（"Operation cannot be accomplished in current state"）
         self._socket_lock = threading.Lock()
+        # 2026-08-01：超时缩短到 500ms（默认 2000ms）。
+        # lane_feed 50Hz 一次 2s 超时直接卡死守护线程；500ms 配合守护线程的
+        # backoff 退避比 "等 2s 再重试" 鲁棒得多。
+        # env: RAK_CAR_INFER_CLIENT_TIMEOUT_MS（毫秒）可覆盖
+        if socket_timeout_ms is None:
+            env_ms = os.environ.get("RAK_CAR_INFER_CLIENT_TIMEOUT_MS")
+            if env_ms and env_ms.isdigit():
+                socket_timeout_ms = int(env_ms)
+            else:
+                socket_timeout_ms = 500
+        self._socket_timeout_ms = int(socket_timeout_ms)
+        # 2026-08-01：reset 限速。EFSM/死 socket 时连续 reset 会让 ZMQ 状态机
+        # 雪崩（旧 bug 之一：连续 EAGAIN → 反复 close/open → 上下文抖）。
+        # 1s 内最多 reset 3 次。
+        self._reset_count = 0
+        self._reset_window_start = 0.0
+        self._reset_max_per_window = 3
+        self._reset_window_s = 1.0
+        # 统计：让上层能看到"客户端活着但后端抖"
+        self.stats = {
+            "send_count": 0,
+            "recv_count": 0,
+            "err_count": 0,
+            "reset_count": 0,
+            "timeout_count": 0,
+            "last_err": None,
+            "last_err_at": 0.0,
+            "last_recv_at": 0.0,
+            "last_state_at": 0.0,
+        }
         logger.info("{}连接服务器...".format(name))
         model_cfg = self.get_config(name)
         self.img_size = model_cfg['img_size']
@@ -143,22 +173,83 @@ class ClintInterface:
                 return conf
             
     @staticmethod
-    def get_zmp_client(port):
+    def get_zmp_client(port, socket_timeout_ms=500):
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
         socket.setsockopt(zmq.LINGER, 0)
-        socket.setsockopt(zmq.RCVTIMEO, 2000)
-        socket.setsockopt(zmq.SNDTIMEO, 2000)
+        # 2026-08-01：超时参数化（默认 500ms）。REQ/REP 默认阻塞，
+        # 短超时让上层 backoff 退避更细；2s 太长。
+        socket.setsockopt(zmq.RCVTIMEO, socket_timeout_ms)
+        socket.setsockopt(zmq.SNDTIMEO, socket_timeout_ms)
         socket.connect(f"tcp://127.0.0.1:{port}")
         return socket
 
+    def _maybe_rate_limit_reset_locked(self):
+        """reset 限速：1s 窗内最多 3 次，超过就直接放弃。返回 True=允许 reset。"""
+        now = time.time()
+        if now - self._reset_window_start > self._reset_window_s:
+            self._reset_window_start = now
+            self._reset_count = 0
+        if self._reset_count >= self._reset_max_per_window:
+            return False
+        self._reset_count += 1
+        return True
+
     def reset_client(self):
         with self._socket_lock:
+            self._reset_client_locked()
+
+    def _reset_client_locked(self):
+        """必须在 self._socket_lock 已持有的前提下调用,避免 race。
+
+        2026-08-01：限速 + 激进自愈：
+          - 1s 窗内最多 reset 3 次（防止 EFSM 雪崩）
+          - 连续 30s 拿不到有效 state/recv → 尝试重启 infer_back_end.py（后端进程可能被 OOM killer 杀）
+        """
+        # 激进自愈:若 reset_count 累计 > 20 且距上次成功 recv/send > 30s,
+        # 说明单纯重连 socket 没用,后端进程可能死了 → 尝试重启 infer_back_end.py。
+        now = time.time()
+        last_activity = max(
+            self.stats.get("last_err_at") or 0.0,
+            self.stats.get("last_state_at") or 0.0,
+        )
+        total_reset = self.stats.get("reset_count", 0) + self._reset_count
+        backend_considered_dead = (
+            total_reset >= 20
+            and last_activity > 0
+            and (now - last_activity) > 30.0
+        )
+        # rate limit (1s 窗 3 次)
+        if now - self._reset_window_start > self._reset_window_s:
+            self._reset_window_start = now
+            self._reset_count = 0
+        if self._reset_count >= self._reset_max_per_window:
+            self.stats["err_count"] += 1
+            self.stats["last_err"] = "reset_rate_limited"
+            self.stats["last_err_at"] = now
+            raise RuntimeError(
+                "{} client reset rate-limited (>{} in {}s)".format(
+                    self.name, self._reset_max_per_window, self._reset_window_s,
+                )
+            )
+        self._reset_count += 1
+
+        if backend_considered_dead:
+            logger.warning(
+                "%s infer backend appears dead (reset_count=%d, last_activity=%.0fs ago) → trying restart infer_back_end.py",
+                self.name, total_reset, now - last_activity,
+            )
             try:
-                self.client.close()
-            except Exception:
-                pass
-            self.client = self.get_zmp_client(self.port)
+                self._try_restart_infer_backend_locked()
+            except Exception as exc:
+                logger.warning("%s try_restart_infer_backend failed: %s", self.name, exc)
+
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        self.client = self.get_zmp_client(self.port, self._socket_timeout_ms)
+        self.stats["reset_count"] += 1
 
     def __call__(self, *args, **kwds):
         return self.get_infer(*args, **kwds)
@@ -168,15 +259,32 @@ class ClintInterface:
         with self._socket_lock:
             try:
                 self.client.send(data)
+                self.stats["send_count"] += 1
                 response = self.client.recv()
+                self.stats["recv_count"] += 1
+                now = time.time()
+                self.stats["last_recv_at"] = now
+                self.stats["last_state_at"] = now
             except zmq.Again:
+                self.stats["timeout_count"] += 1
+                self.stats["err_count"] += 1
+                self.stats["last_err"] = "state_timeout"
+                self.stats["last_err_at"] = time.time()
                 logger.warning("{}服务器状态探测超时".format(self.name))
-                # 锁内重建 socket,避免 reset_client 持有锁时别处又抢 socket
-                self._reset_client_locked()
+                try:
+                    self._reset_client_locked()
+                except RuntimeError:
+                    pass
                 return None
             except zmq.ZMQError as exc:
+                self.stats["err_count"] += 1
+                self.stats["last_err"] = "state_zmq_err:{}".format(exc)
+                self.stats["last_err_at"] = time.time()
                 logger.warning("{}服务器状态探测失败: {}".format(self.name, exc))
-                self._reset_client_locked()
+                try:
+                    self._reset_client_locked()
+                except RuntimeError:
+                    pass
                 return None
         response = json.loads(response)
         return response
@@ -189,21 +297,81 @@ class ClintInterface:
         with self._socket_lock:
             try:
                 self.client.send(data)
+                self.stats["send_count"] += 1
                 response = self.client.recv()
-            except (zmq.Again, zmq.ZMQError) as exc:
-                # 锁内重建,避免把"半连接"socket 留给下一调用方
-                self._reset_client_locked()
+                self.stats["recv_count"] += 1
+                self.stats["last_recv_at"] = time.time()
+            except zmq.Again:
+                self.stats["timeout_count"] += 1
+                self.stats["err_count"] += 1
+                self.stats["last_err"] = "infer_timeout"
+                self.stats["last_err_at"] = time.time()
+                try:
+                    self._reset_client_locked()
+                except RuntimeError:
+                    pass
+                raise RuntimeError("{}推理请求超时".format(self.name))
+            except zmq.ZMQError as exc:
+                self.stats["err_count"] += 1
+                self.stats["last_err"] = "infer_zmq_err:{}".format(exc)
+                self.stats["last_err_at"] = time.time()
+                try:
+                    self._reset_client_locked()
+                except RuntimeError:
+                    pass
                 raise RuntimeError("{}推理请求失败: {}".format(self.name, exc))
         response = json.loads(response)
         return response
 
-    def _reset_client_locked(self):
-        """必须在 self._socket_lock 已持有的前提下调用,避免 race。"""
+    def _try_restart_infer_backend_locked(self):
+        """激进自愈：lane/task 后端进程被 OOM killer 杀后,尝试重启 infer_back_end.py。
+
+        只在当前进程自己有启动权限、且环境里没 RAK_CAR_INFER_AUTO_START=0 才做。
+        runtime 托管的后端进程 PID 记录在 smartcar/paddlebaidu/infer_cs/base 下
+        的 .infer_backend_${PORT}.pid, 这里也查一下。
+        """
+        import os as _os
+        import subprocess as _subp
+        if _os.environ.get("RAK_CAR_INFER_AUTO_START", "1") == "0":
+            return
+        # 后端脚本: smartcar/paddlebaidu/infer_cs/base/infer_back_end.py
+        base_dir = _os.path.dirname(_os.path.abspath(__file__))
+        script = _os.path.join(base_dir, "infer_back_end.py")
+        if not _os.path.isfile(script):
+            return
+        python = _os.environ.get("PYTHON", "/usr/bin/python3")
+        pid_file = _os.path.join(base_dir, ".infer_backend_{}.pid".format(self.port))
+        # 若 PID 文件存在,检查进程还活着
+        if _os.path.isfile(pid_file):
+            try:
+                with open(pid_file) as fp:
+                    old_pid = int(fp.read().strip() or "0")
+                if old_pid > 1 and _os.path.isdir("/proc/{}".format(old_pid)):
+                    # 进程还活着, 不要重复启动
+                    return
+            except Exception:
+                pass
+        # 启动一个后台实例,stdout/stderr 全部吞掉,避免阻塞 REP 循环
         try:
-            self.client.close()
+            proc = _subp.Popen(
+                [python, script],
+                cwd=base_dir,
+                stdout=_subp.DEVNULL, stderr=_subp.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            raise RuntimeError("Popen infer_back_end.py failed: {}".format(exc))
+        # 写 PID 文件 (best effort)
+        try:
+            with open(pid_file, "w") as fp:
+                fp.write(str(proc.pid))
         except Exception:
             pass
-        self.client = self.get_zmp_client(self.port)
+        logger.warning(
+            "%s infer_backend restarted: pid=%s (base_dir=%s)",
+            self.name, proc.pid, base_dir,
+        )
+
 
 def main_client():
     from camera import Camera

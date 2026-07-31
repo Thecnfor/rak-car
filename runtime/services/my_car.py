@@ -1301,6 +1301,73 @@ class MyCar(MecanumDriver):
                 distance=self.get_distance(),
             )
 
+    def _lane_feed_inner_loop(
+        self, stop_event, period, get_frame, norm_id, feed_infer, set_state, health
+    ):
+        """lane_feed 单次"健康循环"。外层 while True + try/except 包住,任何崩溃都不允许守护线程死亡。"""
+        backoff = 1
+        max_backoff = 20  # 20 * period = 1s @ period=50ms
+        while not stop_event.is_set():
+            health["last_iter_at"] = time.time()
+            health["iter_count"] += 1
+            try:
+                img = get_frame(norm_id) if get_frame is not None else None
+                if img is None:
+                    if stop_event.wait(period):
+                        return
+                    continue
+                result = feed_infer.get_infer(img)
+                if not isinstance(result, (list, tuple)) or len(result) < 2:
+                    raise RuntimeError("lane feed: unexpected result shape %r" % (result,))
+                error_y = float(result[0])
+                error_angle = float(result[1])
+                backoff = 1
+                health["ok_count"] += 1
+                health["last_ok_at"] = time.time()
+                health["last_err"] = None
+                if set_state is not None:
+                    set_state(
+                        active=True,
+                        mode="external_feed",
+                        error_y=error_y,
+                        error_angle=error_angle,
+                        forward_speed=None,
+                        lateral_speed=None,
+                        angular_speed=None,
+                        distance=self.get_distance(),
+                    )
+            except Exception as exc:
+                wait_s = min(period * backoff, period * max_backoff)
+                health["err_count"] += 1
+                health["last_err"] = str(exc)
+                health["last_err_at"] = time.time()
+                if health["err_count"] <= 5 or health["err_count"] % 20 == 0:
+                    logger.warning(
+                        "lane feed transient err (errs=%d, backoff=%d, wait=%.2fs): %s",
+                        health["err_count"], backoff, wait_s, exc,
+                    )
+                backoff = min(backoff * 2, max_backoff)
+                if set_state is not None:
+                    try:
+                        set_state(
+                            active=True,
+                            mode="external_feed_stale",
+                            error_y=0.0,
+                            error_angle=0.0,
+                            forward_speed=None,
+                            lateral_speed=None,
+                            angular_speed=None,
+                            distance=self.get_distance(),
+                            last_error=str(exc),
+                        )
+                    except Exception:
+                        pass
+                if stop_event.wait(wait_s):
+                    return
+                continue
+            if stop_event.wait(period):
+                return
+
     def start_lane_feed(self, hz: float = 50.0):
         """
         启动 lane 误差缓存守护线程（只刷 lane_state，不下发轮速）。
@@ -1311,86 +1378,105 @@ class MyCar(MecanumDriver):
 
         重要：不会调用任何 set_velocity / set_wheel_speeds,
         不会与客户端外环的轮速下发抢锁。
+
+        2026-08-01 鲁棒性改造:
+          - 守护线程拥有**独立**的 ClintInterface 实例,不再复用 self.crusie。
+            业务路径 (get_lane_results) 和守护线程共用 self.crusie 时,REQ socket
+            串行化互相 block,一次慢调用会让 lane_feed 抖到 EAGAIN。
+          - 守护线程不再因 self._stop_flag=True 退出 (急停只是"硬件协作停", 不
+            应该关闭 lane_feed),只响应 stop_event。
+          - 推理失败时仍写 active=True + last_error, 前端能看到 "守护线程还活着,
+            只是推理抖了"。
+          - 加 _lane_feed_health 心跳字段, runtime_service 的 watchdog 拿这个判断。
         """
         with self._lane_feed_lock:
-            if self._lane_feed_thread is not None and self._lane_feed_thread.is_alive():
+            # 2026-08-01：修复幂等检查。
+            # 旧检查: _lane_feed_thread is not None AND is_alive()
+            #   - 守护线程**自然死**（while 退出 / 未捕获异常）时 _lane_feed_thread 引用
+            #     仍存在但 is_alive=False → 检查 True and False = False → start 不 return
+            #     → 重复创建**第二个**守护线程！然后 2x feed 同时打 ZMQ 5001 → 雪崩。
+            # 新检查: 只要 is_alive() 就返回（thread is None 时它也不是 alive 的）。
+            try:
+                alive_now = (
+                    self._lane_feed_thread is not None
+                    and self._lane_feed_thread.is_alive()
+                )
+            except Exception:
+                alive_now = False
+            if alive_now:
                 return {"started": False, "reason": "already_running", "hz": hz}
             self._lane_feed_stop = threading.Event()
             stop_event = self._lane_feed_stop
             period = 1.0 / max(float(hz), 1.0)
 
+            # 守护线程独立 ClintInterface,与业务 self.crusie 隔开。
+            # 即便业务路径短时卡 socket 也不影响 lane_feed。
+            try:
+                feed_infer = ClintInterface("lane")
+            except Exception as exc:
+                logger.warning("lane_feed 创建独立 ClintInterface 失败: %s", exc)
+                feed_infer = self.crusie  # fallback
+
             def _feed_loop():
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_lane_state", None) if streamer else None
                 get_frame = getattr(streamer, "get_frame", None) if streamer else None
-                # 复用 self.crusie (ClintInterface("lane"))，不重新 connect。
-                # 不再 cap_front.read() / cv2.putText / update_frame —— 这些是
-                # 调试期副作用，会和 _capture_loop 抢摄像头 + frame_lock + GIL，
-                # 把前端 /stream/frame/cam1.jpg 的吞吐从 233 fps 砸到 57 fps。
-                # 这里只从 streamer.frames["cam1"] 读最新缓存帧 (≤50ms)，
-                # ClintInterface.get_infer 内部 resize 128x128 + jpeg + ZMQ REQ/REP。
-                infer_client = self.crusie
                 norm_id = (
                     streamer.normalize_cam_id("cam1")
                     if (streamer is not None and hasattr(streamer, "normalize_cam_id"))
                     else "cam1"
                 )
-                # 2026-07-31 lane 推理断连修复:
-                # 旧逻辑连续 5 次异常就 break, 守护线程永久退出, lane_state 永远停在
-                # idle, 外环拿不到误差信号 -> 车在路上突然失明。
-                # 新逻辑:
-                #   - 连续异常不退出, 只递增 backoff(period*2^n, 封顶 1s)
-                #   - 每收到一次正常 result, 计数清零并恢复原 period
-                #   - 仍然走 stop_event / _stop_flag 优雅退出
-                # backoff 状态
+
+                # 心跳字段:watchdog 用它判断"守护线程是否还在喂数据"
+                health = {
+                    "alive": True,
+                    "started_at": time.time(),
+                    "last_iter_at": 0.0,
+                    "last_ok_at": 0.0,
+                    "iter_count": 0,
+                    "ok_count": 0,
+                    "err_count": 0,
+                    "last_err": None,
+                    "last_err_at": 0.0,
+                }
+                self._lane_feed_health = health
+
+                # backoff 状态:连续异常不退出,只拉长间隔
                 backoff = 1
                 max_backoff = 20  # 20 * period = 1s @ period=50ms
+                # 2026-08-01:不再因 _stop_flag 退出 — 急停只应该停硬件,守护线程
+                # 应当保持跑(后续可被 stop_event 或 watchdog 收尾)。
+                # 2026-08-01:最外层加 while True + try/except 包住整个健康循环,
+                # 任何"未捕获的致命异常"(set_state 抛 / self 引用被置 None / streamer 被替换)
+                # 都只退出内层、外层立即重建 health + 继续跑。守护线程**绝不**自然死亡。
+                outer_crash = 0
                 while not stop_event.is_set():
-                    if self._stop_flag:
-                        break
                     try:
-                        img = get_frame(norm_id) if get_frame is not None else None
-                        if img is None:
-                            # _capture_loop 还没捕到第一帧；下一拍重试，不退出
-                            stop_event.wait(period)
-                            continue
-                        result = infer_client.get_infer(img)
-                        # ClintInterface.get_infer 返回 list[float, float]
-                        if not isinstance(result, (list, tuple)) or len(result) < 2:
-                            logger.warning(
-                                "lane feed: unexpected result shape %r", result
-                            )
-                            stop_event.wait(period)
-                            continue
-                        error_y = float(result[0])
-                        error_angle = float(result[1])
-                        backoff = 1  # 恢复正常, 退避复位
-                        if set_state is not None:
-                            set_state(
-                                active=True,
-                                mode="external_feed",
-                                error_y=error_y,
-                                error_angle=error_angle,
-                                forward_speed=None,
-                                lateral_speed=None,
-                                angular_speed=None,
-                                distance=self.get_distance(),
-                            )
-                    except Exception as exc:
-                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出。
-                        # 旧版本累计 5 次直接 break, 导致 lane_feed 永久死掉,
-                        # 必须手动重启 lane_feed, 这是 issue "前置推理突然断掉"
-                        # 的根因。改为连续异常也不退出, 用 backoff 拉长间隔,
-                        # 一旦 ZMQ 恢复立刻复位 backoff=1 续跑。
-                        wait_s = min(period * backoff, period * max_backoff)
-                        logger.warning(
-                            "lane feed transient err (backoff=%d, wait=%.2fs): %s",
-                            backoff, wait_s, exc,
+                        self._lane_feed_inner_loop(
+                            stop_event=stop_event,
+                            period=period,
+                            get_frame=get_frame,
+                            norm_id=norm_id,
+                            feed_infer=feed_infer,
+                            set_state=set_state,
+                            health=health,
                         )
-                        backoff = min(backoff * 2, max_backoff)
-                        stop_event.wait(wait_s)
+                    except Exception as exc:
+                        outer_crash += 1
+                        health["err_count"] += 1
+                        health["last_err"] = "outer_crash#{}: {}".format(outer_crash, exc)
+                        health["last_err_at"] = time.time()
+                        if outer_crash <= 5 or outer_crash % 20 == 0:
+                            logger.warning(
+                                "lane_feed outer_loop crashed (crash#%d), re-enter in %.2fs: %s",
+                                outer_crash, min(period * 20, 1.0), exc,
+                            )
+                        # 重建 health 里的 iter 标记,让 watchdog 看到 "活着"
+                        health["last_iter_at"] = time.time()
+                        stop_event.wait(min(period * 20, 1.0))
                         continue
-                    stop_event.wait(period)
+                # 正常退出路径(只有显式 stop_lane_feed 才走这里)
+                health["alive"] = False
                 if set_state is not None:
                     try:
                         set_state(
@@ -1407,27 +1493,39 @@ class MyCar(MecanumDriver):
             self._lane_feed_thread = threading.Thread(target=_feed_loop, name="lane-feed")
             self._lane_feed_thread.daemon = True
             self._lane_feed_thread.start()
+            # 把独立 infer client 引用挂在实例上,debug 时可观察
+            self._lane_feed_infer = feed_infer
             return {"started": True, "hz": hz}
 
-    def stop_lane_feed(self):
+    def stop_lane_feed(self, force: bool = False):
         """
         停止 lane 误差缓存守护线程，并把 lane_state 复位成 idle。
+
+        设计原则: **消费者脚本的生命周期绝不应该杀掉生产者守护线程。**
+        默认 force=False → no-op, 只有显式 force=True(运维 / runtime 关闭路径) 才真的停。
         """
+        if not force:
+            logger.warning("stop_lane_feed called without force=True → NOOP (守护线程不关)")
+            return {"stopped": False, "reason": "noop_without_force"}
         with self._lane_feed_lock:
             stop_event = self._lane_feed_stop
             thread = self._lane_feed_thread
         if stop_event is not None:
             stop_event.set()
+        joined = True
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=5.0)
+            joined = not thread.is_alive()
         with self._lane_feed_lock:
-            self._lane_feed_thread = None
-            self._lane_feed_stop = None
-        return {"stopped": True}
+            if joined:
+                self._lane_feed_thread = None
+                self._lane_feed_stop = None
+        return {"stopped": True, "joined": joined}
 
-    def restart_lane_feed(self, hz: float = 50.0):
-        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
-        self.stop_lane_feed()
+    def restart_lane_feed(self, hz: float = 50.0, force: bool = False):
+        """force=True 才 stop+start；否则只是 start(幂等,不丢状态)。"""
+        if force:
+            self.stop_lane_feed(force=True)
         return self.start_lane_feed(hz=hz)
 
     # === arm 位置推送守护线程（实时 y/x,给 WS subscribe_arm_state 订阅） ===
@@ -1444,7 +1542,14 @@ class MyCar(MecanumDriver):
             self._arm_feed_thread = None
             self._arm_feed_stop = None
         with self._arm_feed_lock:
-            if self._arm_feed_thread is not None and self._arm_feed_thread.is_alive():
+            try:
+                alive_now = (
+                    self._arm_feed_thread is not None
+                    and self._arm_feed_thread.is_alive()
+                )
+            except Exception:
+                alive_now = False
+            if alive_now:
                 return {"started": False, "reason": "already_running", "hz": hz}
             self._arm_feed_stop = threading.Event()
             stop_event = self._arm_feed_stop
@@ -1453,30 +1558,61 @@ class MyCar(MecanumDriver):
             def _arm_feed_loop():
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_arm_state", None) if streamer else None
+                # 2026-08-01：心跳字段, runtime_service 的 feed watchdog 巡检用
+                health = {
+                    "alive": True,
+                    "started_at": time.time(),
+                    "last_iter_at": 0.0,
+                    "last_ok_at": 0.0,
+                    "iter_count": 0,
+                    "ok_count": 0,
+                    "err_count": 0,
+                    "last_err": None,
+                    "last_err_at": 0.0,
+                }
+                self._arm_feed_health = health
+                # 2026-08-01：外层绝不死 while True + try/except
+                outer_crash = 0
                 while not stop_event.is_set():
-                    if self._stop_flag:
-                        break
                     try:
-                        y_m = self.arm.y_get_position() if self.arm is not None else None
-                        x_m = self.arm.x_get_position() if self.arm is not None else None
-                        # SDK 坐标系:  y=触底=0, 撞墙=0, 负=向上/远离触底/远离墙
-                        # 业务坐标系:  y_mm = y_m * 1000, x_mm = x_m * 1000
-                        # 业务层和 SDK 一致,都是"触底/撞墙=0,负=上/远离墙"
-                        y_mm = (y_m * 1000.0) if y_m is not None else None
-                        x_mm = (x_m * 1000.0) if x_m is not None else None
-                        ref = getattr(self.arm, "_y_ref_encoder_at_zero", None)
-                        if set_state is not None:
-                            set_state(
-                                active=True,
-                                mode="arm_feed",
-                                y_m=y_m, x_m=x_m,
-                                y_mm=y_mm, x_mm=x_mm,
-                                ref_encoder=ref,
-                            )
+                        health["last_iter_at"] = time.time()
+                        health["iter_count"] += 1
+                        try:
+                            y_m = self.arm.y_get_position() if self.arm is not None else None
+                            x_m = self.arm.x_get_position() if self.arm is not None else None
+                            y_mm = (y_m * 1000.0) if y_m is not None else None
+                            x_mm = (x_m * 1000.0) if x_m is not None else None
+                            ref = getattr(self.arm, "_y_ref_encoder_at_zero", None)
+                            health["ok_count"] += 1
+                            health["last_ok_at"] = time.time()
+                            health["last_err"] = None
+                            if set_state is not None:
+                                set_state(
+                                    active=True,
+                                    mode="arm_feed",
+                                    y_m=y_m, x_m=x_m,
+                                    y_mm=y_mm, x_mm=x_mm,
+                                    ref_encoder=ref,
+                                )
+                        except Exception as exc:
+                            health["err_count"] += 1
+                            health["last_err"] = str(exc)
+                            health["last_err_at"] = time.time()
+                            if health["err_count"] <= 5 or health["err_count"] % 20 == 0:
+                                logger.warning("arm feed transient err (errs=%d): %s", health["err_count"], exc)
                     except Exception as exc:
-                        logger.warning("arm feed transient err: {}".format(exc))
-                    stop_event.wait(period)
-                # 退出时 active=False,前端能感知
+                        outer_crash += 1
+                        health["err_count"] += 1
+                        health["last_err"] = "outer_crash#{}: {}".format(outer_crash, exc)
+                        health["last_err_at"] = time.time()
+                        if outer_crash <= 5 or outer_crash % 20 == 0:
+                            logger.warning("arm_feed outer_loop crashed#%d: %s", outer_crash, exc)
+                        health["last_iter_at"] = time.time()
+                        stop_event.wait(min(period * 20, 1.0))
+                        continue
+                    if stop_event.wait(period):
+                        break
+                health["alive"] = False
                 if set_state is not None:
                     try:
                         set_state(active=False, mode="idle")
@@ -1488,27 +1624,112 @@ class MyCar(MecanumDriver):
             self._arm_feed_thread.start()
             return {"started": True, "hz": hz}
 
-    def stop_arm_feed(self):
+    def stop_arm_feed(self, force: bool = False):
         if not hasattr(self, "_arm_feed_lock"):
-            return {"stopped": True}
+            return {"stopped": True, "reason": "never_started"}
+        if not force:
+            logger.warning("stop_arm_feed called without force=True → NOOP")
+            return {"stopped": False, "reason": "noop_without_force"}
         with self._arm_feed_lock:
             stop_event = self._arm_feed_stop
             thread = self._arm_feed_thread
         if stop_event is not None:
             stop_event.set()
+        joined = True
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=5.0)
+            joined = not thread.is_alive()
         with self._arm_feed_lock:
-            self._arm_feed_thread = None
-            self._arm_feed_stop = None
-        return {"stopped": True}
+            if joined:
+                self._arm_feed_thread = None
+                self._arm_feed_stop = None
+        return {"stopped": True, "joined": joined}
 
-    def restart_arm_feed(self, hz: float = 20.0):
-        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
-        self.stop_arm_feed()
+    def restart_arm_feed(self, hz: float = 20.0, force: bool = False):
+        """force=True 才 stop+start；否则只是 start(幂等)。"""
+        if force:
+            self.stop_arm_feed(force=True)
         return self.start_arm_feed(hz=hz)
 
     # === 侧摄目标检测推送守护线程（实时 task 检测结果,给 WS subscribe_task_detection 订阅） ===
+    def _task_feed_inner_loop(
+        self, stop_event, period, get_stream_frame, get_fallback, feed_infer, set_state, health,
+    ):
+        """task_feed 单次"健康循环",外层 while True + try/except 包住,守护线程绝不死。"""
+        backoff = 1
+        max_backoff = 20  # 20 * period = 1s @ period~33ms
+        while not stop_event.is_set():
+            health["last_iter_at"] = time.time()
+            health["iter_count"] += 1
+            try:
+                img = None
+                if get_stream_frame is not None:
+                    try:
+                        img = get_stream_frame("cam2")
+                    except Exception:
+                        img = None
+                if img is None and get_fallback is not None:
+                    img = get_fallback()
+                if img is None:
+                    stop_event.wait(period)
+                    continue
+                if feed_infer is None:
+                    stop_event.wait(period)
+                    continue
+                raw = feed_infer.get_infer(img)
+                backoff = 1
+                health["ok_count"] += 1
+                health["last_ok_at"] = time.time()
+                health["last_err"] = None
+                if set_state is not None:
+                    set_state(
+                        active=True,
+                        mode="task_feed",
+                        detections=[
+                            {
+                                "cls_id": int(d[0]) if len(d) > 0 else None,
+                                "det_id": int(d[1]) if len(d) > 1 else None,
+                                "label": str(d[2]) if len(d) > 2 else "",
+                                "score": float(d[3]) if len(d) > 3 else 0.0,
+                                "bbox_norm": {
+                                    "x_center": float(d[4]) if len(d) > 4 else 0.0,
+                                    "y_center": float(d[5]) if len(d) > 5 else 0.0,
+                                    "width":    float(d[6]) if len(d) > 6 else 0.0,
+                                    "height":   float(d[7]) if len(d) > 7 else 0.0,
+                                }
+                            }
+                            for d in (raw or []) if len(d) >= 8
+                        ],
+                        count=len(raw or []),
+                    )
+            except Exception as exc:
+                wait_s = min(period * backoff, period * max_backoff)
+                health["err_count"] += 1
+                health["last_err"] = str(exc)
+                health["last_err_at"] = time.time()
+                if health["err_count"] <= 5 or health["err_count"] % 20 == 0:
+                    logger.warning(
+                        "task feed transient err (errs=%d, backoff=%d, wait=%.2fs): %s",
+                        health["err_count"], backoff, wait_s, exc,
+                    )
+                backoff = min(backoff * 2, max_backoff)
+                if set_state is not None:
+                    try:
+                        set_state(
+                            active=True,
+                            mode="task_feed_stale",
+                            detections=[],
+                            count=0,
+                            last_error=str(exc),
+                        )
+                    except Exception:
+                        pass
+                if stop_event.wait(wait_s):
+                    return
+                continue
+            if stop_event.wait(period):
+                return
+
     def start_task_feed(self, hz: float = 30.0):
         """启动侧摄目标检测守护线程,持续刷新 streamer.task_state。
 
@@ -1525,6 +1746,13 @@ class MyCar(MecanumDriver):
           - 增加 fallback: 如果 streamer 取不到帧(摄像头掉线),fallback 到 cap_side.read()
             (Camera.read 是同步阻塞等 camera.update 线程写 self.frame)
 
+        2026-08-01 鲁棒性改造:
+          - 守护线程拥有**独立** ClintInterface,不再复用 self.task_det。
+            arm_runner / get_detection_results 等业务路径会瞬时抢 socket。
+          - 守护线程不再因 self._stop_flag 退出,只响应 stop_event。
+          - 推理失败时写 active=True + last_error。
+          - 加 _task_feed_health 心跳字段。
+
         业务场景:"边走边看"侧摄目标 — 不必每帧调 sync /v1/vision/task（5-15s 阻塞）,
         直接读 /v1/realtime/vision/task 缓存或订阅 WS subscribe_task_detection。
         """
@@ -1533,11 +1761,25 @@ class MyCar(MecanumDriver):
             self._task_feed_thread = None
             self._task_feed_stop = None
         with self._task_feed_lock:
-            if self._task_feed_thread is not None and self._task_feed_thread.is_alive():
+            try:
+                alive_now = (
+                    self._task_feed_thread is not None
+                    and self._task_feed_thread.is_alive()
+                )
+            except Exception:
+                alive_now = False
+            if alive_now:
                 return {"started": False, "reason": "already_running", "hz": hz}
             self._task_feed_stop = threading.Event()
             stop_event = self._task_feed_stop
             period = 1.0 / max(float(hz), 1.0)
+
+            # 守护线程独立 ClintInterface,与业务 self.task_det 隔开
+            try:
+                feed_infer = ClintInterface("task")
+            except Exception as exc:
+                logger.warning("task_feed 创建独立 ClintInterface 失败: %s", exc)
+                feed_infer = self.task_det if hasattr(self, "task_det") else None
 
             def _task_feed_loop():
                 streamer = getattr(self, "streamer", None)
@@ -1546,67 +1788,51 @@ class MyCar(MecanumDriver):
                 # fallback 到 cap_side.read() (Camera.read 同步阻塞等 update 线程写 self.frame)
                 get_stream_frame = getattr(streamer, "get_frame", None) if streamer else None
                 get_fallback = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
-                # 2026-07-31: 与 lane_feed / arm_feed / ir_feed 同模式 —— 连续异常
-                # 不退出, backoff 封顶 1s, 收到一次正常 result 立刻复位。旧版本
-                # 累计 5 次异常就 break 退出, task_state 永久 idle, /v1/vision/task
-                # 失败 + 业务层"边走边看"失明, 必须手动 restart_task_feed 才能恢复。
+
+                # 心跳
+                health = {
+                    "alive": True,
+                    "started_at": time.time(),
+                    "last_iter_at": 0.0,
+                    "last_ok_at": 0.0,
+                    "iter_count": 0,
+                    "ok_count": 0,
+                    "err_count": 0,
+                    "last_err": None,
+                    "last_err_at": 0.0,
+                }
+                self._task_feed_health = health
+
                 backoff = 1
-                max_backoff = 20  # 20 * period = 1s @ period=50ms
+                max_backoff = 20  # 20 * period = 1s @ period~33ms
+                # 2026-08-01:最外层 while True + try/except 包住,守护线程绝不死
+                outer_crash = 0
                 while not stop_event.is_set():
-                    if self._stop_flag:
-                        break
                     try:
-                        img = None
-                        if get_stream_frame is not None:
-                            try:
-                                img = get_stream_frame("cam2")
-                            except Exception:
-                                img = None
-                        if img is None and get_fallback is not None:
-                            img = get_fallback()
-                        if img is None:
-                            stop_event.wait(period)
-                            continue
-                        # 直接调 self.task_det (PaddleDetection,无 sort/limit 过滤)
-                        # 排序/过滤留给上层业务按需调 /v1/vision/task (sync)
-                        raw = self.task_det(img) if hasattr(self, "task_det") else []
-                        # raw 形如 [[cls_id, det_id, label, score, x_c, y_c, w, h], ...]
-                        # 缓存到 streamer.task_state 供上层轮询/订阅
-                        backoff = 1  # 正常一次,退避复位
-                        if set_state is not None:
-                            set_state(
-                                active=True,
-                                mode="task_feed",
-                                detections=[
-                                    {
-                                        "cls_id": int(d[0]) if len(d) > 0 else None,
-                                        "det_id": int(d[1]) if len(d) > 1 else None,
-                                        "label": str(d[2]) if len(d) > 2 else "",
-                                        "score": float(d[3]) if len(d) > 3 else 0.0,
-                                        "bbox_norm": {
-                                            "x_center": float(d[4]) if len(d) > 4 else 0.0,
-                                            "y_center": float(d[5]) if len(d) > 5 else 0.0,
-                                            "width":    float(d[6]) if len(d) > 6 else 0.0,
-                                            "height":   float(d[7]) if len(d) > 7 else 0.0,
-                                        }
-                                    }
-                                    for d in (raw or []) if len(d) >= 8
-                                ],
-                                count=len(raw or []),
-                            )
-                    except Exception as exc:
-                        # ZMQ 暂时超时 / cv2 resize 临时失败 / EFSM:
-                        # 退避但不退出。clintInterface 内部已带锁, 这里的 EFSM
-                        # 通常来自 socket 已死等更底层故障, 让它有机会恢复。
-                        wait_s = min(period * backoff, period * max_backoff)
-                        logger.warning(
-                            "task feed transient err (backoff=%d, wait=%.2fs): %s",
-                            backoff, wait_s, exc,
+                        self._task_feed_inner_loop(
+                            stop_event=stop_event,
+                            period=period,
+                            get_stream_frame=get_stream_frame,
+                            get_fallback=get_fallback,
+                            feed_infer=feed_infer,
+                            set_state=set_state,
+                            health=health,
                         )
-                        backoff = min(backoff * 2, max_backoff)
-                        stop_event.wait(wait_s)
+                    except Exception as exc:
+                        outer_crash += 1
+                        health["err_count"] += 1
+                        health["last_err"] = "outer_crash#{}: {}".format(outer_crash, exc)
+                        health["last_err_at"] = time.time()
+                        if outer_crash <= 5 or outer_crash % 20 == 0:
+                            logger.warning(
+                                "task_feed outer_loop crashed (crash#%d), re-enter in %.2fs: %s",
+                                outer_crash, min(period * 20, 1.0), exc,
+                            )
+                        health["last_iter_at"] = time.time()
+                        stop_event.wait(min(period * 20, 1.0))
                         continue
-                    stop_event.wait(period)
+                # 显式 stop 路径
+                health["alive"] = False
                 if set_state is not None:
                     try:
                         set_state(active=False, mode="idle", detections=[], count=0)
@@ -1616,27 +1842,38 @@ class MyCar(MecanumDriver):
             self._task_feed_thread = threading.Thread(target=_task_feed_loop, name="task-feed")
             self._task_feed_thread.daemon = True
             self._task_feed_thread.start()
+            self._task_feed_infer = feed_infer
             return {"started": True, "hz": hz}
 
-    def stop_task_feed(self):
-        """停止 task_feed 守护线程,并把 task_state 复位成 idle。"""
+    def stop_task_feed(self, force: bool = False):
+        """停止 task_feed 守护线程,并把 task_state 复位成 idle。
+
+        默认 force=False → no-op；只有显式 force=True(运维/关闭) 才真停。
+        """
         if not hasattr(self, "_task_feed_lock"):
             return {"stopped": True, "reason": "never_started"}
+        if not force:
+            logger.warning("stop_task_feed called without force=True → NOOP")
+            return {"stopped": False, "reason": "noop_without_force"}
         with self._task_feed_lock:
             stop_event = self._task_feed_stop
             thread = self._task_feed_thread
         if stop_event is not None:
             stop_event.set()
+        joined = True
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=5.0)
+            joined = not thread.is_alive()
         with self._task_feed_lock:
-            self._task_feed_thread = None
-            self._task_feed_stop = None
-        return {"stopped": True}
+            if joined:
+                self._task_feed_thread = None
+                self._task_feed_stop = None
+        return {"stopped": True, "joined": joined}
 
-    def restart_task_feed(self, hz: float = 30.0):
-        """2026-08-01：stop+start 原子切档，给 ResourceProbeThread 调。"""
-        self.stop_task_feed()
+    def restart_task_feed(self, hz: float = 30.0, force: bool = False):
+        """force=True 才 stop+start；否则只是 start(幂等)。"""
+        if force:
+            self.stop_task_feed(force=True)
         return self.start_task_feed(hz=hz)
 
     # === 2026-07-31：左右 IR 距离缓存守护线程（实时 IR,给 /realtime/ir/state 轮询 / WS 订阅） ===
@@ -1696,38 +1933,71 @@ class MyCar(MecanumDriver):
             def _ir_feed_loop():
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_ir_state", None) if streamer else None
+                # 2026-08-01：心跳字段, feed watchdog 巡检用
+                health = {
+                    "alive": True,
+                    "started_at": time.time(),
+                    "last_iter_at": 0.0,
+                    "last_ok_at": 0.0,
+                    "iter_count": 0,
+                    "ok_count": 0,
+                    "err_count": 0,
+                    "last_err": None,
+                    "last_err_at": 0.0,
+                }
+                self._ir_feed_health = health
                 # 与 lane_feed / arm_feed 同模式：连续异常不退出,
                 # backoff 封顶 1s,正常一次立刻复位 period
                 backoff = 1
                 max_backoff = 20  # 20 * period = 1s @ period=50ms
+                # 2026-08-01：外层 while True + try/except,守护线程绝不死
+                outer_crash = 0
                 while not stop_event.is_set():
-                    if self._stop_flag:
-                        break
                     try:
-                        # 一次读两侧（底层 Infrared.read 串行字节往返两次）,
-                        # 比 main 业务层两次 execute 节省一次 HTTP + 一次 job_queue
-                        irs = self.get_all_ir_distance() if hasattr(self, "get_all_ir_distance") else {}
-                        left = irs.get("left") if isinstance(irs, dict) else None
-                        right = irs.get("right") if isinstance(irs, dict) else None
-                        backoff = 1
-                        if set_state is not None:
-                            set_state(
-                                active=True,
-                                mode="ir_feed",
-                                left=float(left) if left is not None else None,
-                                right=float(right) if right is not None else None,
-                            )
+                        health["last_iter_at"] = time.time()
+                        health["iter_count"] += 1
+                        try:
+                            irs = self.get_all_ir_distance() if hasattr(self, "get_all_ir_distance") else {}
+                            left = irs.get("left") if isinstance(irs, dict) else None
+                            right = irs.get("right") if isinstance(irs, dict) else None
+                            backoff = 1
+                            health["ok_count"] += 1
+                            health["last_ok_at"] = time.time()
+                            health["last_err"] = None
+                            if set_state is not None:
+                                set_state(
+                                    active=True,
+                                    mode="ir_feed",
+                                    left=float(left) if left is not None else None,
+                                    right=float(right) if right is not None else None,
+                                )
+                        except Exception as exc:
+                            health["err_count"] += 1
+                            health["last_err"] = str(exc)
+                            health["last_err_at"] = time.time()
+                            wait_s = min(period * backoff, period * max_backoff)
+                            if health["err_count"] <= 5 or health["err_count"] % 20 == 0:
+                                logger.warning(
+                                    "ir feed transient err (errs=%d, backoff=%d, wait=%.2fs): %s",
+                                    health["err_count"], backoff, wait_s, exc,
+                                )
+                            backoff = min(backoff * 2, max_backoff)
+                            if stop_event.wait(wait_s):
+                                break
+                            continue
+                        if stop_event.wait(period):
+                            break
                     except Exception as exc:
-                        wait_s = min(period * backoff, period * max_backoff)
-                        logger.warning(
-                            "ir feed transient err (backoff=%d, wait=%.2fs): %s",
-                            backoff, wait_s, exc,
-                        )
-                        backoff = min(backoff * 2, max_backoff)
-                        stop_event.wait(wait_s)
+                        outer_crash += 1
+                        health["err_count"] += 1
+                        health["last_err"] = "outer_crash#{}: {}".format(outer_crash, exc)
+                        health["last_err_at"] = time.time()
+                        if outer_crash <= 5 or outer_crash % 20 == 0:
+                            logger.warning("ir_feed outer_loop crashed#%d: %s", outer_crash, exc)
+                        health["last_iter_at"] = time.time()
+                        stop_event.wait(min(period * 20, 1.0))
                         continue
-                    stop_event.wait(period)
-                # 退出时 active=False,业务层能感知"feed 已停"
+                health["alive"] = False
                 if set_state is not None:
                     try:
                         set_state(active=False, mode="idle", left=None, right=None)
@@ -1739,35 +2009,38 @@ class MyCar(MecanumDriver):
             self._ir_feed_thread.start()
             return {"started": True, "hz": hz}
 
-    def stop_ir_feed(self):
+    def stop_ir_feed(self, force: bool = False):
         """停止 ir_feed 守护线程,并把 ir_state 复位成 idle。
 
-        join timeout 拉到 (1.5 * period + 0.5s 缓冲),IR 单次 SDK 字节往返
-        最坏 ~30ms,默认 50Hz 下 period=20ms,1.0s join 完全够；老逻辑 hard-code
-        2.0s 在低 hz（10Hz period=100ms）下也可能擦边,这里直接放宽+封顶。
+        默认 force=False → no-op；显式 force=True(运维/关闭) 才真停。
         """
         if not hasattr(self, "_ir_feed_lock"):
             return {"stopped": True, "reason": "never_started"}
+        if not force:
+            logger.warning("stop_ir_feed called without force=True → NOOP")
+            return {"stopped": False, "reason": "noop_without_force"}
         with self._ir_feed_lock:
             stop_event = self._ir_feed_stop
             thread = self._ir_feed_thread
         if stop_event is None and thread is None:
             return {"stopped": True, "reason": "never_started"}
-        # period 是上一次的 period,这里取最大 2.0s,任何 hz 都不会卡死
-        join_timeout = 2.0
+        join_timeout = 5.0
         if stop_event is not None:
             stop_event.set()
+        joined = True
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
+            joined = not thread.is_alive()
         with self._ir_feed_lock:
-            # 不论 join 成不成功,引用清掉——start 路径还会再次 stop
-            self._ir_feed_thread = None
-            self._ir_feed_stop = None
-        return {"stopped": True}
+            if joined:
+                self._ir_feed_thread = None
+                self._ir_feed_stop = None
+        return {"stopped": True, "joined": joined}
 
-    def restart_ir_feed(self, hz: float = 50.0):
-        """2026-07-31：stop 同步等待 + start(hz) 原子操作,给 main 业务层"切档"。"""
-        self.stop_ir_feed()
+    def restart_ir_feed(self, hz: float = 50.0, force: bool = False):
+        """force=True 才 stop+start；否则只是 start(幂等)。"""
+        if force:
+            self.stop_ir_feed(force=True)
         return self.start_ir_feed(hz=hz)
 
     # === 2026-07-31：底盘里程计缓存守护线程（实时 odom,给 /realtime/odom/state 轮询 / WS 订阅） ===
@@ -1824,28 +2097,64 @@ class MyCar(MecanumDriver):
             def _odom_feed_loop():
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_odom_state", None) if streamer else None
+                # 2026-08-01：心跳字段
+                health = {
+                    "alive": True,
+                    "started_at": time.time(),
+                    "last_iter_at": 0.0,
+                    "last_ok_at": 0.0,
+                    "iter_count": 0,
+                    "ok_count": 0,
+                    "err_count": 0,
+                    "last_err": None,
+                    "last_err_at": 0.0,
+                }
+                self._odom_feed_health = health
+                # 2026-08-01：外层 while True + try/except,绝不死
+                outer_crash = 0
                 while not stop_event.is_set():
-                    if self._stop_flag:
-                        break
                     try:
-                        pos = self.get_odometry() if hasattr(self, "get_odometry") else None
-                        x = float(pos[0]) if pos is not None and len(pos) > 0 else None
-                        y = float(pos[1]) if pos is not None and len(pos) > 1 else None
-                        theta = float(pos[2]) if pos is not None and len(pos) > 2 else None
-                        distance = (
-                            float(self.get_distance()) if hasattr(self, "get_distance") else None
-                        )
-                        if set_state is not None:
-                            set_state(
-                                active=True,
-                                mode="odom_feed",
-                                x=x, y=y, theta=theta, distance=distance,
+                        health["last_iter_at"] = time.time()
+                        health["iter_count"] += 1
+                        try:
+                            pos = self.get_odometry() if hasattr(self, "get_odometry") else None
+                            x = float(pos[0]) if pos is not None and len(pos) > 0 else None
+                            y = float(pos[1]) if pos is not None and len(pos) > 1 else None
+                            theta = float(pos[2]) if pos is not None and len(pos) > 2 else None
+                            distance = (
+                                float(self.get_distance()) if hasattr(self, "get_distance") else None
                             )
+                            health["ok_count"] += 1
+                            health["last_ok_at"] = time.time()
+                            health["last_err"] = None
+                            if set_state is not None:
+                                set_state(
+                                    active=True,
+                                    mode="odom_feed",
+                                    x=x, y=y, theta=theta, distance=distance,
+                                )
+                        except Exception as exc:
+                            health["err_count"] += 1
+                            health["last_err"] = str(exc)
+                            health["last_err_at"] = time.time()
+                            if health["err_count"] <= 5 or health["err_count"] % 20 == 0:
+                                logger.warning("odom feed transient err (errs=%d): %s", health["err_count"], exc)
+                            if stop_event.wait(period):
+                                break
+                            continue
+                        if stop_event.wait(period):
+                            break
                     except Exception as exc:
-                        logger.warning("odom feed transient err: {}".format(exc))
-                        stop_event.wait(period)
+                        outer_crash += 1
+                        health["err_count"] += 1
+                        health["last_err"] = "outer_crash#{}: {}".format(outer_crash, exc)
+                        health["last_err_at"] = time.time()
+                        if outer_crash <= 5 or outer_crash % 20 == 0:
+                            logger.warning("odom_feed outer_loop crashed#%d: %s", outer_crash, exc)
+                        health["last_iter_at"] = time.time()
+                        stop_event.wait(min(period * 20, 1.0))
                         continue
-                    stop_event.wait(period)
+                health["alive"] = False
                 if set_state is not None:
                     try:
                         set_state(active=False, mode="idle",
@@ -1858,31 +2167,38 @@ class MyCar(MecanumDriver):
             self._odom_feed_thread.start()
             return {"started": True, "hz": hz}
 
-    def stop_odom_feed(self):
+    def stop_odom_feed(self, force: bool = False):
         """停止 odom_feed 守护线程,并把 odom_state 复位成 idle。
 
-        join timeout 沿用 2.0s 封顶(odom 循环比 IR 更便宜,几十毫秒就退出)。
+        默认 force=False → no-op；显式 force=True(运维/关闭) 才真停。
         """
         if not hasattr(self, "_odom_feed_lock"):
             return {"stopped": True, "reason": "never_started"}
+        if not force:
+            logger.warning("stop_odom_feed called without force=True → NOOP")
+            return {"stopped": False, "reason": "noop_without_force"}
         with self._odom_feed_lock:
             stop_event = self._odom_feed_stop
             thread = self._odom_feed_thread
         if stop_event is None and thread is None:
             return {"stopped": True, "reason": "never_started"}
-        join_timeout = 2.0
+        join_timeout = 5.0
         if stop_event is not None:
             stop_event.set()
+        joined = True
         if thread is not None and thread.is_alive():
             thread.join(timeout=join_timeout)
+            joined = not thread.is_alive()
         with self._odom_feed_lock:
-            self._odom_feed_thread = None
-            self._odom_feed_stop = None
-        return {"stopped": True}
+            if joined:
+                self._odom_feed_thread = None
+                self._odom_feed_stop = None
+        return {"stopped": True, "joined": joined}
 
-    def restart_odom_feed(self, hz: float = 50.0):
-        """2026-07-31：stop 同步等待 + start(hz) 原子操作。"""
-        self.stop_odom_feed()
+    def restart_odom_feed(self, hz: float = 50.0, force: bool = False):
+        """force=True 才 stop+start；否则只是 start(幂等)。"""
+        if force:
+            self.stop_odom_feed(force=True)
         return self.start_odom_feed(hz=hz)
 
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):

@@ -160,6 +160,24 @@ class CarRuntimeService:
         )
         self._resource_probe_thread.start()
 
+        # 2026-08-01：feed watchdog。
+        # lane_feed / task_feed / arm_feed 等守护线程必须 24x7 跑（外环依赖
+        # lane_state 实时误差）；守护线程死后不会再自动起来，这条线程专门负责
+        # 探测 + 自动 restart。
+        # 策略：每 15s 检查一次，判定标准：
+        #   - car.<feed>_feed_thread 不存在或 is_alive()=False → 立即 restart
+        #   - car.<feed>_feed_health.alive=False 且 explicit stop（不可恢复）→ 不动
+        #   - health.last_iter_at 距今 > 5s（说明 feed 卡在推理 / ZMQ 永久 EAGAIN）
+        #     → restart（stop_event + 新线程）。这种情况通常意味着 ClintInterface
+        #     socket 永久死掉了，重建 client 是最干净的修复。
+        # env: RAK_CAR_FEED_WATCHDOG_INTERVAL_S（默认 15.0）
+        self._feed_watchdog_thread = threading.Thread(
+            target=self._feed_watchdog_loop,
+            name="rak-car-feed-watchdog",
+            daemon=True,
+        )
+        self._feed_watchdog_thread.start()
+
     @property
     def car_lock(self):
         """已废弃：长动作不应再全程持锁。
@@ -323,6 +341,118 @@ class CarRuntimeService:
         elif rss_mb < pressure_mb - 200:
             return self._restore_one_step()
         return None
+
+    # === 2026-08-01：feed watchdog 自动复活 ===
+    # 表驱动：feed_name → (thread_attr, health_attr, restart_method, default_hz)
+    # - thread_attr：MyCar 上的守护线程属性
+    # - health_attr：MyCar 上的心跳 dict 属性（可选）
+    # - restart_method：MyCar 上的 stop+start 方法
+    # - default_hz：默认频率
+    _FEED_WATCHDOG_TABLE = (
+        ("lane", "_lane_feed_thread", "_lane_feed_health", "restart_lane_feed", 50.0),
+        ("task", "_task_feed_thread", "_task_feed_health", "restart_task_feed", 30.0),
+        ("arm",  "_arm_feed_thread",  "_arm_feed_health",  "restart_arm_feed",  20.0),
+        ("ir",   "_ir_feed_thread",   "_ir_feed_health",   "restart_ir_feed",   50.0),
+        ("odom", "_odom_feed_thread", "_odom_feed_health", "restart_odom_feed", 50.0),
+    )
+
+    def _feed_watchdog_loop(self):
+        """定期巡检 feed 守护线程，死了/卡了自动 restart。"""
+        try:
+            interval = float(os.environ.get("RAK_CAR_FEED_WATCHDOG_INTERVAL_S", "15"))
+        except ValueError:
+            interval = 15.0
+        # 启动后给 30s 让 init 路径完成
+        time.sleep(30.0)
+        # stale 阈值：health.last_iter_at 距今超过这个秒数就算"卡了"
+        # lane 50Hz (period=20ms) → 1s 内至少 50 次 iter；
+        # 5s 阈值足够宽（容忍 init / 重连慢路径），又不会让车在路上失明太久。
+        stale_iter_seconds = 5.0
+        while True:
+            try:
+                self._feed_watchdog_tick(stale_iter_seconds)
+            except Exception as exc:
+                print("[CarRuntimeService] feed_watchdog tick err: {}".format(exc))
+            time.sleep(interval)
+
+    def _feed_watchdog_tick(self, stale_iter_seconds):
+        try:
+            car = self.car
+        except Exception:
+            car = None
+        if car is None:
+            return
+        # car 引用可能在 init / recover 切换瞬间变 None，
+        # 本 tick 直接跳过，不抛错。
+        car_ref = car
+        now = time.time()
+        for (
+            feed_name,
+            thread_attr,
+            health_attr,
+            restart_method,
+            default_hz,
+        ) in self._FEED_WATCHDOG_TABLE:
+            thread = getattr(car_ref, thread_attr, None)
+            health = getattr(car_ref, health_attr, None)
+            # 1) 线程不存在 / 已经死掉 → restart
+            dead = (
+                thread is None
+                or not thread.is_alive()
+            )
+            # 2) 线程活着但 health 报告自己 alive=False → 已经显式 stop 过，不动
+            # （业务调 stop_lane_feed 是用户的意图）
+            explicit_stop = (
+                isinstance(health, dict) and health.get("alive") is False
+            )
+            # 3) 线程活着 + health 报告 alive=True 但 last_iter_at 太久没动
+            # → 卡在 ZMQ 永久 EAGAIN / cv2 永久失败 → restart
+            stale = False
+            if not dead and not explicit_stop and isinstance(health, dict):
+                last_iter = health.get("last_iter_at") or 0.0
+                last_ok = health.get("last_ok_at") or 0.0
+                # (a) iter 完全不跑 → 卡死
+                if last_iter > 0 and (now - last_iter) > stale_iter_seconds:
+                    stale = True
+                # (b) 2026-08-01：iter 在跑但推理持续失败（守护空转）。
+                # lane_feed 50Hz 但推理一直 EAGAIN → ok_count 不涨 →
+                # 车在路上失明。last_ok 距今 > 30s 视为守护空转，重启 client。
+                elif (
+                    last_ok > 0
+                    and (now - last_ok) > stale_iter_seconds * 6
+                ):
+                    stale = True
+                # (c) 健康从来没成功过（init 期僵尸）→ 30s 后重启
+                elif last_ok == 0 and last_iter > 0 and (now - last_iter) > 30.0:
+                    stale = True
+            if not (dead or stale):
+                continue
+            reason = (
+                "dead" if dead
+                else ("stale_ok" if (
+                    isinstance(health, dict)
+                    and (health.get("last_ok_at") or 0) > 0
+                ) else "stale_iter")
+            )
+            logger.warning(
+                "feed watchdog: %s %s (thread=%s, alive_flag=%s, ok=%d, err=%d) → restart",
+                feed_name, reason,
+                "None" if thread is None else ("alive" if thread.is_alive() else "dead"),
+                health.get("alive") if isinstance(health, dict) else "n/a",
+                health.get("ok_count", 0) if isinstance(health, dict) else -1,
+                health.get("err_count", 0) if isinstance(health, dict) else -1,
+            )
+            try:
+                restart_fn = getattr(car_ref, restart_method, None)
+                if restart_fn is None:
+                    continue
+                # restart_* 内部 stop + start; start 会创建新 ClintInterface,
+                # 旧 socket 引用丢弃。EAGAIN 死 socket 的最干净修复。
+                restart_fn(hz=float(default_hz))
+            except Exception as exc:
+                logger.warning(
+                    "feed watchdog: restart %s failed: %s", feed_name, exc,
+                )
 
     def get_feeds_degraded(self):
         with self._resource_lock:
@@ -511,7 +641,7 @@ class CarRuntimeService:
         # 但**不**单独补 reset_x —— 复用路径下 x 由视觉闭环控制，避免 auto-init 反复撞墙
         # (commit fb24b1a 描述的 PM2 死循环)。
         try:
-            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.02"))
+            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.03"))
             reset_res = car.arm.reset_all(
                 arm_angle=90,        # 复位位 +90°
                 hand_angle=-90,      # UP
@@ -622,7 +752,7 @@ class CarRuntimeService:
                         # 反复撞墙触发 commit fb24b1a 描述的 PM2 死循环;只有真正创建新 car 的
                         # _create_car_locked 才默认 reset_x=True 撞墙定原点。
                         try:
-                            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.02"))
+                            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.03"))
                             reset_res = self.car.arm.reset_all(
                                 arm_angle=90,
                                 hand_angle=-90,
@@ -938,6 +1068,9 @@ class CarRuntimeService:
 
         返回:{lane_state, arm_state, task_state, ir_state, odom_state} 各自的 active / mode / updated_at。
         调试用,不抢任何锁,只读 streamer meta_lock 5 次。
+
+        2026-08-01：附加 feed health 心跳(线程 alive + last_iter_at + err_count),
+        watchdog 巡检后能在 /v1/health 里直接看 lane/task feed 是否被自动 restart 过。
         """
         if self.stream_service is None:
             return {"ir_state": {}, "odom_state": {}, "lane_state": {}, "arm_state": {}, "task_state": {}}
@@ -958,6 +1091,33 @@ class CarRuntimeService:
                 }
             except Exception:
                 out[name] = {"active": False, "mode": "idle", "updated_at": None}
+        # 2026-08-01：附加 health 心跳。car 引用可能在 init / recover 切换
+        # 瞬间变 None — getattr default 安全。
+        try:
+            car = self.car
+        except Exception:
+            car = None
+        if car is not None:
+            health_map = {
+                "lane_state": getattr(car, "_lane_feed_health", None),
+                "task_state": getattr(car, "_task_feed_health", None),
+                "arm_state":  getattr(car, "_arm_feed_health", None),
+                "ir_state":   getattr(car, "_ir_feed_health", None),
+                "odom_state": getattr(car, "_odom_feed_health", None),
+            }
+            for feed_name, health in health_map.items():
+                if health is None:
+                    continue
+                out[feed_name]["health"] = {
+                    "alive": health.get("alive"),
+                    "iter_count": health.get("iter_count"),
+                    "ok_count": health.get("ok_count"),
+                    "err_count": health.get("err_count"),
+                    "last_iter_at": health.get("last_iter_at"),
+                    "last_ok_at": health.get("last_ok_at"),
+                    "last_err": health.get("last_err"),
+                    "last_err_at": health.get("last_err_at"),
+                }
         return out
 
     def set_single_motor(self, port, speed, reverse=1):
