@@ -394,7 +394,6 @@ class ArmVisionClient:
                              mm_per_norm: float = 30.0,
                              settle_tol_norm: float = 0.05,
                              min_step_mm: float = 1.0,
-                             max_iter: int = 500,
                              timeout: float = 10.0,
                              on_missing_track: str = "abort",
                              move_fn: Optional[Callable[[float, float], dict]] = None,
@@ -413,7 +412,13 @@ class ArmVisionClient:
 
         Returns:
             ServoResult
+
+        2026-07-31 修正（security review）：
+        - 去 max_iter（误导；唯一兜底是 timeout）
+        - 收敛/abort 检查挪进 WS callback（threading.Event 即时唤醒主线程）
         """
+        import threading
+
         if ws is None:
             try:
                 from main.ws_client import RuntimeWsClient
@@ -421,20 +426,21 @@ class ArmVisionClient:
                 from ws_client import RuntimeWsClient  # type: ignore
             ws = RuntimeWsClient()
 
+        stop_event = threading.Event()
+        abort_reason: dict = {"reason": None}    # "converged" / "abort" / None
+
         state = {
-            "trace": [],
             "x_mm": x_mm, "y_mm": y_mm,
             "last_detection": None,
             "consecutive_misses": 0,
             "locked_track_id": None,
             "current_selector": selector,
-            "stop_flag": False,
             "last_updated_at": None,
         }
 
         def _on_push(raw: dict) -> None:
-            """WS 推送回调 —— 单帧处理"""
-            if state["stop_flag"]:
+            """WS 推送回调 —— 单帧处理；触发收敛/abort 时立即 set stop_event。"""
+            if stop_event.is_set():
                 return
             ts = raw.get("task_state") or {}
             updated_at = ts.get("updated_at")
@@ -455,6 +461,9 @@ class ArmVisionClient:
                     pick = cur_sel.apply_strategy(candidates)
                     if pick is None:
                         state["consecutive_misses"] += 1
+                        if on_missing_track == "abort" and state["consecutive_misses"] >= 5:
+                            abort_reason["reason"] = "miss_abort"
+                            stop_event.set()
                         return
                     state["locked_track_id"] = pick.track_id
                     cur_sel = dataclasses.replace(cur_sel, track_id=pick.track_id)
@@ -466,13 +475,17 @@ class ArmVisionClient:
             pick = cur_sel.apply_strategy(candidates) if candidates else None
             if pick is None:
                 state["consecutive_misses"] += 1
+                if on_missing_track == "abort" and state["consecutive_misses"] >= 5:
+                    abort_reason["reason"] = "miss_abort"
+                    stop_event.set()
                 return
             state["consecutive_misses"] = 0
             state["last_detection"] = pick
 
             dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
             if pick.bbox_norm.is_centered_at(settle_tol_norm):
-                state["stop_flag"] = True
+                abort_reason["reason"] = "converged"
+                stop_event.set()
                 return
 
             dx_mm = -dx_norm * mm_per_norm
@@ -498,37 +511,30 @@ class ArmVisionClient:
 
         t0 = time.time()
         try:
-            # 阻塞循环：定时检查收敛 / timeout / max_iter
-            # 注：subscribe_task_detection 的 on_state 在 client 内部线程异步调用，
-            # 这里只能轮询 state 标志位，无法精确计算 iterations。
-            # 用 timeout 兜底：到时间或 max_iter 秒就停。
-            while time.time() - t0 < timeout:
-                if state["stop_flag"]:
-                    break
-                time.sleep(0.01)
-            # 收尾：timeout 兜底
+            # 用 threading.Event.wait(timeout) 替代轮询：callback set 后立即唤醒
+            stop_event.wait(timeout=timeout)
             elapsed = time.time() - t0
         finally:
             try:
-                stop()    # RuntimeWsClient.subscribe_* 返回 callable（stop method）
+                stop()    # RuntimeWsClient.subscribe_* 返回 callable
             except Exception:
                 pass
 
-        # 构造 ServoResult
         last = state["last_detection"]
-        # iterations 估算：用 elapsed / 0.033（30Hz）做粗算
-        approx_iter = min(max_iter, max(1, int(elapsed * 30.0)))
-        if state["stop_flag"] and last is not None and last.bbox_norm.is_centered_at(settle_tol_norm):
+        # iterations 估算：用 elapsed / 0.033（30Hz）做粗算（仅供参考，非硬上限）
+        approx_iter = max(1, int(elapsed * 30.0))
+
+        if abort_reason["reason"] == "miss_abort":
+            raise RuntimeError(
+                f"find_target_realtime: 连续 {state['consecutive_misses']} 帧未检测到 {selector}"
+            )
+        if abort_reason["reason"] == "converged" and last is not None:
             return ServoResult(
                 converged=True, selector=selector,
                 x_mm=state["x_mm"], y_mm=state["y_mm"],
                 confidence=last.score, iterations=approx_iter,
                 elapsed_s=elapsed,
                 final_detection=last, trace=(),
-            )
-        if on_missing_track == "abort" and state["consecutive_misses"] >= 5:
-            raise RuntimeError(
-                f"find_target_realtime: 连续 {state['consecutive_misses']} 帧未检测到 {selector}"
             )
         return ServoResult(
             converged=False, selector=selector,

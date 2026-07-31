@@ -822,22 +822,30 @@ class ArmClient:
         return self._vision
 
     def _make_vision_with_move(self):
-        """返回一个 move_fn 已经被 _check_safe 包裹的 vision client（业务层用）。"""
+        """返回一个 move_fn 已经被 _check_safe 包裹的 vision client（业务层用）。
+
+        2026-07-31: 同时 wrap find_target 和 find_target_realtime —— realtime 路径
+        之前未走安全门（HIGH gate-bypass-sibling-path），现统一注入 safe_move_fn。
+        """
         ArmVisionClient = _import_vision()
         client = ArmVisionClient(self.http)
-        original = client.find_target
+        original_find = client.find_target
+        original_find_realtime = client.find_target_realtime
 
-        def safe_find(selector, *, x_mm, y_mm, **kwargs):
-            move_fn = kwargs.pop("move_fn", None)
-            if move_fn is None:
-                def _safe_move(nx: float, ny: float) -> dict:
-                    self._check_y_protected("find_target")
-                    self._check_safe(y_mm=ny)
-                    return self.move_xy(nx, ny, timeout=5.0)   # 2026-07-31: 5s（伺服高频）
-                move_fn = _safe_move
-            return original(selector, x_mm=x_mm, y_mm=y_mm, move_fn=move_fn, **kwargs)
+        def _safe_move(nx: float, ny: float) -> dict:
+            self._check_y_protected("find_target")
+            self._check_safe(y_mm=ny)
+            return self.move_xy(nx, ny, timeout=5.0)   # 2026-07-31: 5s（伺服高频）
 
-        client.find_target = safe_find  # type: ignore[method-assign]
+        def _safe_wrap(original, label: str):
+            def safe_fn(selector, *, x_mm, y_mm, **kwargs):
+                move_fn = kwargs.pop("move_fn", None) or _safe_move
+                return original(selector, x_mm=x_mm, y_mm=y_mm, move_fn=move_fn, **kwargs)
+            safe_fn.__name__ = label
+            return safe_fn
+
+        client.find_target = _safe_wrap(original_find, "safe_find_target")  # type: ignore[method-assign]
+        client.find_target_realtime = _safe_wrap(original_find_realtime, "safe_find_target_realtime")  # type: ignore[method-assign]
         return client
 
     def reset_origin(self, x_wall: str = "left", timeout: float = 60.0) -> dict:

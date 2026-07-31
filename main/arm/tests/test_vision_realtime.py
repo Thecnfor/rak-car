@@ -79,7 +79,7 @@ class TestFindTargetRealtime(unittest.TestCase):
             TargetSelector.for_label("cylinder_1"),
             x_mm=0.0, y_mm=-150.0,
             mm_per_norm=30.0, settle_tol_norm=0.05,
-            timeout=0.05, max_iter=20, ws=ws,
+            timeout=0.05, ws=ws,
             move_fn=lambda x, y: {},
         )
         self.assertFalse(result.converged)
@@ -93,7 +93,7 @@ class TestFindTargetRealtime(unittest.TestCase):
             vision.find_target_realtime(
                 TargetSelector.for_label("cylinder_1"),
                 x_mm=0.0, y_mm=-150.0,
-                on_missing_track="abort", max_iter=5,
+                on_missing_track="abort",
                 timeout=2.0,
                 ws=ws, move_fn=lambda x, y: {},
             )
