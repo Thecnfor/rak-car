@@ -1597,34 +1597,39 @@ class MyCar(MecanumDriver):
         业务场景: main/chassis/tasks/read_ir.py、orchestrator._wait_until_triggered
         不再每次都进 job_queue + car_lock + MC602 字节往返,直接读缓存。
         """
-        if not hasattr(self, "_ir_feed_lock"):
+        # 2026-07-31 修：init 后被 force-init 重建过 car 引用的 race —— car 实例对象
+        # 是新的,_ir_feed_hz 属性可能不存在,用 getattr 防御
+        cur_hz = getattr(self, "_ir_feed_hz", None)
+        cur_thread = getattr(self, "_ir_feed_thread", None)
+        cur_lock = getattr(self, "_ir_feed_lock", None)
+        cur_stop = getattr(self, "_ir_feed_stop", None)
+        if cur_lock is None:
             self._ir_feed_lock = threading.Lock()
             self._ir_feed_thread = None
             self._ir_feed_stop = None
             self._ir_feed_hz = None
+        else:
+            self._ir_feed_lock = cur_lock
+            self._ir_feed_thread = cur_thread
+            self._ir_feed_stop = cur_stop
+            self._ir_feed_hz = cur_hz
         with self._ir_feed_lock:
             # 同一 hz 已经在跑，直接 fast-path（即使别的并发 caller 刚 restart 完）。
+            # 属性为 None 用 getattr 防 force-init 把 car 替换成新对象但实例属性缺失
+            cur_thread = self._ir_feed_thread
+            cur_hz = self._ir_feed_hz
             if (
-                self._ir_feed_thread is not None
-                and self._ir_feed_thread.is_alive()
-                and self._ir_feed_hz is not None
-                and float(self._ir_feed_hz) == float(hz)
+                cur_thread is not None
+                and cur_thread.is_alive()
+                and cur_hz is not None
+                and float(cur_hz) == float(hz)
             ):
                 logger.info(
                     "ir_feed fast-path (alive hz=%s requested hz=%s)"
-                    % (self._ir_feed_hz, hz)
+                    % (cur_hz, hz)
                 )
                 return {"started": False, "reason": "already_running", "hz": hz}
             # 否则无论 alive 与否，都走"清旧建新"——也覆盖了"join 失败但活进程失去响应"边界
-            logger.info(
-                "ir_feed reset path: thread_alive=%s thread_is_None=%s hz_current=%s hz_request=%s"
-                % (
-                    self._ir_feed_thread.is_alive() if self._ir_feed_thread is not None else None,
-                    self._ir_feed_thread is None,
-                    self._ir_feed_hz,
-                    hz,
-                )
-            )
             if self._ir_feed_thread is not None:
                 if self._ir_feed_stop is not None:
                     self._ir_feed_stop.set()
@@ -1727,17 +1732,30 @@ class MyCar(MecanumDriver):
         业务场景: main/chassis/api.py.get_odometry、orchestrator 的 distance 轮询,
         不再每次都进 job_queue,主路径延迟接近 0。
         """
-        if not hasattr(self, "_odom_feed_lock"):
+        # 2026-07-31 修：init 后被 force-init 重建过 car 引用的 race —— car 实例对象
+        # 是新的,_odom_feed_hz 属性可能不存在,用 getattr 防御
+        cur_hz = getattr(self, "_odom_feed_hz", None)
+        cur_thread = getattr(self, "_odom_feed_thread", None)
+        cur_lock = getattr(self, "_odom_feed_lock", None)
+        cur_stop = getattr(self, "_odom_feed_stop", None)
+        if cur_lock is None:
             self._odom_feed_lock = threading.Lock()
             self._odom_feed_thread = None
             self._odom_feed_stop = None
             self._odom_feed_hz = None
+        else:
+            self._odom_feed_lock = cur_lock
+            self._odom_feed_thread = cur_thread
+            self._odom_feed_stop = cur_stop
+            self._odom_feed_hz = cur_hz
         with self._odom_feed_lock:
+            cur_thread = self._odom_feed_thread
+            cur_hz = self._odom_feed_hz
             if (
-                self._odom_feed_thread is not None
-                and self._odom_feed_thread.is_alive()
-                and self._odom_feed_hz is not None
-                and float(self._odom_feed_hz) == float(hz)
+                cur_thread is not None
+                and cur_thread.is_alive()
+                and cur_hz is not None
+                and float(cur_hz) == float(hz)
             ):
                 return {"started": False, "reason": "already_running", "hz": hz}
             if self._odom_feed_thread is not None:
