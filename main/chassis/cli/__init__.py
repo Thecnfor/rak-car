@@ -1,1 +1,3 @@
-"""main/chassis/cli — 底盘组的可执行入口（argparse + __main__）。"""
+"""main/chassis/cli — 巡线外环的命令行入口。
+参数值统一走控制器默认值，CLI 只负责控制器选型和运行节律。
+"""
