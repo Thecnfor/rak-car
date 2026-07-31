@@ -19,7 +19,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 # 让 main.start.orchestrator 可被仓库根目录的 run.py 直接 import
 _ROOT = Path(__file__).resolve().parents[2]
@@ -130,19 +130,35 @@ class Orchestrator:
                                  "on_tick": lambda v: dis_buf.__setitem__(0, v)},
                          daemon=True, name="distance").start()
 
+        # 后台 C：TUI 状态栏（200ms 刷新）
+        tui_running = threading.Event()
+        tui_running.set()
+        tui_buf: List[Dict[str, Any]] = [{"wp": "", "dis": 0.0,
+                                          "ir_left": None, "ir_right": None,
+                                          "state": "init"}]
+        threading.Thread(target=self._tui_loop,
+                         args=(tui_buf, tui_running),
+                         daemon=True, name="tui").start()
+
         completed: List[str] = []
         try:
             for wp in self.waypoints:
                 logger.info("=== navigating to %s ===", wp.name)
-                self._wait_until_triggered(wp, api, dis_buf)
+                self._wait_until_triggered(wp, api, dis_buf, tui_buf)
                 if wp.is_finish:
                     logger.info("finish waypoint reached (dis=%.2fm), mission done",
                                 dis_buf[0])
+                    tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
+                                  "ir_left": None, "ir_right": None,
+                                  "state": "done"}
                     completed.append(wp.name)
                     break
                 self._pause_lane(api, running)
                 time.sleep(wp.pause_before_s)
                 if wp.task_module:
+                    tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
+                                  "ir_left": None, "ir_right": None,
+                                  "state": "task"}
                     ok = self._run_task(client, wp)
                     if not ok:
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
@@ -153,6 +169,7 @@ class Orchestrator:
             logger.info("interrupted by user")
         finally:
             running.clear()
+            tui_running.clear()
             try:
                 api.stop_wheel_speeds()
             except Exception:
@@ -165,6 +182,27 @@ class Orchestrator:
             logger.info("mission completed: %s", completed)
 
     # ── 后台线程 ────────────────────────────────────────────
+
+    @staticmethod
+    def _tui_loop(tui_buf: List[Dict[str, Any]],
+                  tui_running: threading.Event) -> None:
+        """每 200ms 刷一行 TUI 状态栏到终端。"""
+        while tui_running.wait():
+            info = tui_buf[0]
+            state = info.get("state", "?")
+            wp = info.get("wp", "")
+            dis = info.get("dis", 0.0)
+            il = info.get("ir_left")
+            ir = info.get("ir_right")
+            il_s = f"{il:.2f}" if il is not None else "---"
+            ir_s = f"{ir:.2f}" if ir is not None else "---"
+            line = f"\r[{state}] wp={wp:<14s} | dis={dis:6.2f}m | IR L:{il_s} R:{ir_s}   "
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            time.sleep(0.2)
+        # 退出时换行
+        sys.stdout.write("\n")
+        sys.stdout.flush()
 
     def _lane_loop(self, api: ChassisClient, running: threading.Event) -> None:
         """50Hz 巡线：读 lane → 控制律 → smoother → 下发。running.clear() 暂停。"""
@@ -212,11 +250,13 @@ class Orchestrator:
 
     @staticmethod
     def _wait_until_triggered(wp: Waypoint, api: ChassisClient,
-                              dis_buf: list, interval_s: float = 0.1) -> None:
+                              dis_buf: list, tui_buf: List[Dict[str, Any]],
+                              interval_s: float = 0.1) -> None:
         """轮询 IR + 里程计，直到 wp 的触发条件满足（默认 AND）。
 
         任一条件字段为 None 时视为「已满足」，避免任务永不触发。
         IR 分左右：wp.ir_side 取 left / right，"any" 表示两侧任一触发即可。
+        每轮更新 tui_buf 供 TUI 线程读取。
         """
         while True:
             ir: dict = {}
@@ -227,6 +267,11 @@ class Orchestrator:
             right = ir.get("right") if isinstance(ir, dict) else None
             left = ir.get("left") if isinstance(ir, dict) else None
             dis = dis_buf[0]
+
+            # 更新 TUI
+            tui_buf[0] = {"wp": wp.name, "dis": dis,
+                          "ir_left": left, "ir_right": right,
+                          "state": "nav"}
 
             if wp.ir_threshold_m is None:
                 ir_ok = True
