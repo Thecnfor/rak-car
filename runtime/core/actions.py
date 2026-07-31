@@ -26,8 +26,10 @@ CAR_ACTIONS = {
     # 与 start_lane_feed / start_arm_feed / start_task_feed 同构。
     "start_ir_feed": lambda car, *args, **kwargs: car.start_ir_feed(*args, **kwargs),
     "stop_ir_feed": lambda car, *args, **kwargs: car.stop_ir_feed(**kwargs) if kwargs else car.stop_ir_feed(),
+    "restart_ir_feed": lambda car, *args, **kwargs: car.restart_ir_feed(*args, **kwargs),
     "start_odom_feed": lambda car, *args, **kwargs: car.start_odom_feed(*args, **kwargs),
     "stop_odom_feed": lambda car, *args, **kwargs: car.stop_odom_feed(**kwargs) if kwargs else car.stop_odom_feed(),
+    "restart_odom_feed": lambda car, *args, **kwargs: car.restart_odom_feed(*args, **kwargs),
     "move_to_detection_target": lambda car, *args, **kwargs: car.move_to_detection_target(*args, **kwargs),
     "adjust_arm_position": lambda car, *args, **kwargs: car.adjust_arm_position(*args, **kwargs),
     "get_detection_results": lambda car, *args, **kwargs: car.get_detection_results(*args, **kwargs),

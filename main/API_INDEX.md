@@ -114,6 +114,11 @@ client.execute_car_action("get_detection_results", sync=True, timeout=20,
 
 - `sync=false`（默认）：立即返回 `job_id`，调用方轮询 `/v1/jobs/{id}`。
 - `sync=true`：阻塞轮询到 `succeeded` / `failed`。
+- 响应包装：
+  ```json
+  {"ok": true, "async": true, "job": {"id":"...", "target":"...", "name":"...", "status":"queued|running|succeeded|failed", "result":..., "error":...}}
+  ```
+  job_id 从 `response.job.id` 取（不是顶层 `id`）。`async` 字段仅 `sync=false` 时出现。
 - `target=car` → 进 `car_queue` worker；`target=arm` → 进 `arm_queue` worker；两者物理串口锁仍是公共瓶颈。
 
 **Python**：
@@ -218,8 +223,8 @@ client.get_odom_state()           # 里程计
 | `set_chassis_velocity` | (vx, vy, wz) 闭环 |
 | `lane_time` / `lane_dis` / `lane_dis_offset` | 巡线 + 距离补偿 |
 | `start_lane_feed` / `stop_lane_feed` | lane_feed 守护线程开关 |
-| `start_ir_feed` / `stop_ir_feed` | ir_feed 守护线程开关 |
-| `start_odom_feed` / `stop_odom_feed` | odom_feed 守护线程开关 |
+| `start_ir_feed` / `stop_ir_feed` / `restart_ir_feed` | ir_feed 守护线程开关 / 强制 restart 切档（hz 不同自动 stop → start） |
+| `start_odom_feed` / `stop_odom_feed` / `restart_odom_feed` | odom_feed 守护线程开关 / 强制 restart 切档 |
 | `move_to_detection_target` | 视觉对齐到目标点 |
 | `adjust_arm_position` | 调臂位姿 |
 | `get_detection_results` | cam2 目标检测（带 sort/limit） |
@@ -234,7 +239,7 @@ client.get_odom_state()           # 里程计
 | `show_text` | 屏幕显示 |
 | `set_pwm_servo_angle` | PWM 舵机 |
 | `set_digital_output` | 数字输出口 |
-| `get_arm_state` | 机械臂 y/x 位置（与 arm_feed 同源） |
+| `get_arm_state` | 机械臂 y/x 位置（`{x, y, side, arm_angle, hand_angle, y_limit}`，与 arm_feed 同源走 SDK 直读，不带 `ref_encoder` / `active` 字段；如需守护线程缓存请用 `/v1/realtime/arm/state`） |
 
 ### 6.2 机械臂 ARM_ACTIONS（`target="arm"`）
 
@@ -337,6 +342,7 @@ stop()  # 断开订阅连接
 | `realtime_motor_speed(port, speed, reverse)` | `POST /v1/realtime/motor/speed` |
 | `realtime_encoder(port, reverse)` | `GET /v1/realtime/encoder` |
 | `realtime_stepper_rad(...)` | `POST /v1/realtime/stepper/rad` |
+| `restart_ir_feed()` / `restart_odom_feed()` | `execute_car_action("restart_ir_feed" / "restart_odom_feed")` |
 | `realtime_bus_servo_angle(...)` / `realtime_bus_servo_read(port)` | `/v1/realtime/bus-servo/angle` |
 | `realtime_analog(port)` / `realtime_analog2(port)` | `/v1/realtime/analog*` |
 | `realtime_lane_state()` | `GET /v1/realtime/lane/state` |

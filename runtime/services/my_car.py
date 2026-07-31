@@ -1601,11 +1601,28 @@ class MyCar(MecanumDriver):
             self._ir_feed_lock = threading.Lock()
             self._ir_feed_thread = None
             self._ir_feed_stop = None
+            self._ir_feed_hz = 50.0
         with self._ir_feed_lock:
             if self._ir_feed_thread is not None and self._ir_feed_thread.is_alive():
-                return {"started": False, "reason": "already_running", "hz": hz}
+                # 2026-07-31：如果当前已经在跑但 hz 不同,自动 stop → restart
+                # 让业务层用同一个 action 就能"切档",不必先手动 stop。
+                if float(self._ir_feed_hz) == float(hz):
+                    return {"started": False, "reason": "already_running", "hz": hz}
+                logger.info(
+                    "ir_feed alive with hz=%s, restart to hz=%s"
+                    % (self._ir_feed_hz, hz)
+                )
+                stop_event = self._ir_feed_stop
+                thread = self._ir_feed_thread
+                if stop_event is not None:
+                    stop_event.set()
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=2.0)
+                self._ir_feed_thread = None
+                self._ir_feed_stop = None
             self._ir_feed_stop = threading.Event()
             stop_event = self._ir_feed_stop
+            self._ir_feed_hz = float(hz)
             period = 1.0 / max(float(hz), 1.0)
 
             def _ir_feed_loop():
@@ -1655,20 +1672,35 @@ class MyCar(MecanumDriver):
             return {"started": True, "hz": hz}
 
     def stop_ir_feed(self):
-        """停止 ir_feed 守护线程,并把 ir_state 复位成 idle。"""
+        """停止 ir_feed 守护线程,并把 ir_state 复位成 idle。
+
+        join timeout 拉到 (1.5 * period + 0.5s 缓冲),IR 单次 SDK 字节往返
+        最坏 ~30ms,默认 50Hz 下 period=20ms,1.0s join 完全够；老逻辑 hard-code
+        2.0s 在低 hz（10Hz period=100ms）下也可能擦边,这里直接放宽+封顶。
+        """
         if not hasattr(self, "_ir_feed_lock"):
             return {"stopped": True, "reason": "never_started"}
         with self._ir_feed_lock:
             stop_event = self._ir_feed_stop
             thread = self._ir_feed_thread
+        if stop_event is None and thread is None:
+            return {"stopped": True, "reason": "never_started"}
+        # period 是上一次的 period,这里取最大 2.0s,任何 hz 都不会卡死
+        join_timeout = 2.0
         if stop_event is not None:
             stop_event.set()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=join_timeout)
         with self._ir_feed_lock:
+            # 不论 join 成不成功,引用清掉——start 路径还会再次 stop
             self._ir_feed_thread = None
             self._ir_feed_stop = None
         return {"stopped": True}
+
+    def restart_ir_feed(self, hz: float = 50.0):
+        """2026-07-31：stop 同步等待 + start(hz) 原子操作,给 main 业务层"切档"。"""
+        self.stop_ir_feed()
+        return self.start_ir_feed(hz=hz)
 
     # === 2026-07-31：底盘里程计缓存守护线程（实时 odom,给 /realtime/odom/state 轮询 / WS 订阅） ===
     def start_odom_feed(self, hz: float = 50.0):
@@ -1687,11 +1719,27 @@ class MyCar(MecanumDriver):
             self._odom_feed_lock = threading.Lock()
             self._odom_feed_thread = None
             self._odom_feed_stop = None
+            self._odom_feed_hz = 50.0
         with self._odom_feed_lock:
             if self._odom_feed_thread is not None and self._odom_feed_thread.is_alive():
-                return {"started": False, "reason": "already_running", "hz": hz}
+                # 2026-07-31：hz 不同 → 自动 stop → restart（与 ir_feed 同模式）
+                if float(self._odom_feed_hz) == float(hz):
+                    return {"started": False, "reason": "already_running", "hz": hz}
+                logger.info(
+                    "odom_feed alive with hz=%s, restart to hz=%s"
+                    % (self._odom_feed_hz, hz)
+                )
+                stop_event = self._odom_feed_stop
+                thread = self._odom_feed_thread
+                if stop_event is not None:
+                    stop_event.set()
+                if thread is not None and thread.is_alive():
+                    thread.join(timeout=2.0)
+                self._odom_feed_thread = None
+                self._odom_feed_stop = None
             self._odom_feed_stop = threading.Event()
             stop_event = self._odom_feed_stop
+            self._odom_feed_hz = float(hz)
             period = 1.0 / max(float(hz), 1.0)
 
             def _odom_feed_loop():
@@ -1732,20 +1780,31 @@ class MyCar(MecanumDriver):
             return {"started": True, "hz": hz}
 
     def stop_odom_feed(self):
-        """停止 odom_feed 守护线程,并把 odom_state 复位成 idle。"""
+        """停止 odom_feed 守护线程,并把 odom_state 复位成 idle。
+
+        join timeout 沿用 2.0s 封顶(odom 循环比 IR 更便宜,几十毫秒就退出)。
+        """
         if not hasattr(self, "_odom_feed_lock"):
             return {"stopped": True, "reason": "never_started"}
         with self._odom_feed_lock:
             stop_event = self._odom_feed_stop
             thread = self._odom_feed_thread
+        if stop_event is None and thread is None:
+            return {"stopped": True, "reason": "never_started"}
+        join_timeout = 2.0
         if stop_event is not None:
             stop_event.set()
         if thread is not None and thread.is_alive():
-            thread.join(timeout=2.0)
+            thread.join(timeout=join_timeout)
         with self._odom_feed_lock:
             self._odom_feed_thread = None
             self._odom_feed_stop = None
         return {"stopped": True}
+
+    def restart_odom_feed(self, hz: float = 50.0):
+        """2026-07-31：stop 同步等待 + start(hz) 原子操作。"""
+        self.stop_odom_feed()
+        return self.start_odom_feed(hz=hz)
 
     # def lane_det_base(self, speed, end_fuction, stop=STOP_PARAM):
     #     """
