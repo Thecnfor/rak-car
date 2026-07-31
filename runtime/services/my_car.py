@@ -1601,25 +1601,24 @@ class MyCar(MecanumDriver):
             self._ir_feed_lock = threading.Lock()
             self._ir_feed_thread = None
             self._ir_feed_stop = None
-            self._ir_feed_hz = 50.0
+            self._ir_feed_hz = None
         with self._ir_feed_lock:
-            if self._ir_feed_thread is not None and self._ir_feed_thread.is_alive():
-                # 2026-07-31：如果当前已经在跑但 hz 不同,自动 stop → restart
-                # 让业务层用同一个 action 就能"切档",不必先手动 stop。
-                if float(self._ir_feed_hz) == float(hz):
-                    return {"started": False, "reason": "already_running", "hz": hz}
-                logger.info(
-                    "ir_feed alive with hz=%s, restart to hz=%s"
-                    % (self._ir_feed_hz, hz)
-                )
-                stop_event = self._ir_feed_stop
-                thread = self._ir_feed_thread
-                if stop_event is not None:
-                    stop_event.set()
-                if thread is not None and thread.is_alive():
-                    thread.join(timeout=2.0)
-                self._ir_feed_thread = None
-                self._ir_feed_stop = None
+            # 同一 hz 已经在跑，直接 fast-path（即使别的并发 caller 刚 restart 完）。
+            if (
+                self._ir_feed_thread is not None
+                and self._ir_feed_thread.is_alive()
+                and self._ir_feed_hz is not None
+                and float(self._ir_feed_hz) == float(hz)
+            ):
+                return {"started": False, "reason": "already_running", "hz": hz}
+            # 否则无论 alive 与否，都走"清旧建新"——也覆盖了"join 失败但活进程失去响应"边界
+            if self._ir_feed_thread is not None:
+                if self._ir_feed_stop is not None:
+                    self._ir_feed_stop.set()
+                if self._ir_feed_thread.is_alive():
+                    self._ir_feed_thread.join(timeout=2.0)
+            self._ir_feed_thread = None
+            self._ir_feed_stop = None
             self._ir_feed_stop = threading.Event()
             stop_event = self._ir_feed_stop
             self._ir_feed_hz = float(hz)
@@ -1719,24 +1718,22 @@ class MyCar(MecanumDriver):
             self._odom_feed_lock = threading.Lock()
             self._odom_feed_thread = None
             self._odom_feed_stop = None
-            self._odom_feed_hz = 50.0
+            self._odom_feed_hz = None
         with self._odom_feed_lock:
-            if self._odom_feed_thread is not None and self._odom_feed_thread.is_alive():
-                # 2026-07-31：hz 不同 → 自动 stop → restart（与 ir_feed 同模式）
-                if float(self._odom_feed_hz) == float(hz):
-                    return {"started": False, "reason": "already_running", "hz": hz}
-                logger.info(
-                    "odom_feed alive with hz=%s, restart to hz=%s"
-                    % (self._odom_feed_hz, hz)
-                )
-                stop_event = self._odom_feed_stop
-                thread = self._odom_feed_thread
-                if stop_event is not None:
-                    stop_event.set()
-                if thread is not None and thread.is_alive():
-                    thread.join(timeout=2.0)
-                self._odom_feed_thread = None
-                self._odom_feed_stop = None
+            if (
+                self._odom_feed_thread is not None
+                and self._odom_feed_thread.is_alive()
+                and self._odom_feed_hz is not None
+                and float(self._odom_feed_hz) == float(hz)
+            ):
+                return {"started": False, "reason": "already_running", "hz": hz}
+            if self._odom_feed_thread is not None:
+                if self._odom_feed_stop is not None:
+                    self._odom_feed_stop.set()
+                if self._odom_feed_thread.is_alive():
+                    self._odom_feed_thread.join(timeout=2.0)
+            self._odom_feed_thread = None
+            self._odom_feed_stop = None
             self._odom_feed_stop = threading.Event()
             stop_event = self._odom_feed_stop
             self._odom_feed_hz = float(hz)
