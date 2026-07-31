@@ -32,6 +32,11 @@ from .state import (
 )
 from .trajectory import TrajectoryGenerator, TrajectoryPlan
 
+# 2026-07-31 视觉伺服：延迟到方法体内 import 避免循环依赖
+def _import_vision():
+    from .vision import ArmVisionClient
+    return ArmVisionClient
+
 
 def _mm_to_m(v_mm: float) -> float:
     return float(v_mm) / 1000.0
@@ -69,6 +74,8 @@ class ArmClient:
         self.ws_ready = False
         self.origin = origin or ArmOrigin()
         self.traj = traj or TrajectoryGenerator()
+        # 2026-07-31：vision 懒构造
+        self._vision: Optional[object] = None
 
     @classmethod
     def connect(cls, load_origin: bool = True) -> "ArmClient":
@@ -761,6 +768,85 @@ class ArmClient:
             action, timeout=timeout,
             hand=hand, arm=arm, speed=speed,
         )
+
+    # ---- 2026-07-31: composite_run / composite_run_reset / vision ----
+
+    def composite_run(
+        self,
+        *,
+        arm: Optional[float] = None,
+        x_mm: Optional[float] = None,
+        y_mm: Optional[float] = None,
+        hand: Optional[float] = None,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """薄封装 arm.composite_run(arm, x, y, hand)，任一 None 跳过。
+
+        业务前置：所有非 None 参数必须先过 _check_y_protected / _check_safe。
+        """
+        if y_mm is not None:
+            self._check_y_protected("composite_run")
+            self._check_safe(y_mm=y_mm)
+        return self._call_arm(
+            "composite_run", timeout=timeout,
+            arm=arm,
+            x=_mm_to_m(x_mm) if x_mm is not None else None,
+            y=_mm_to_m(y_mm) if y_mm is not None else None,
+            hand=hand, speed=speed,
+        )
+
+    def composite_run_reset(
+        self,
+        *,
+        arm_angle: float = 90.0,
+        hand_angle: float = -90.0,
+        x_direction: str = "right",
+        reset_x_velocity_mms: float = 20.0,
+        timeout: float = 60.0,
+    ) -> dict:
+        """薄封装 arm.composite_run_reset() —— x 撞墙 + arm + hand 并行 + y 触底收尾"""
+        return self._call_arm(
+            "composite_run_reset", timeout=timeout,
+            arm_angle=arm_angle, hand_angle=hand_angle,
+            x_direction=x_direction,
+            reset_x_velocity=reset_x_velocity_mms / 1000.0,
+        )
+
+    @property
+    def vision(self):
+        """懒构造：首次访问时建 ArmVisionClient"""
+        if self._vision is None:
+            ArmVisionClient = _import_vision()
+            self._vision = ArmVisionClient(self.http)
+        return self._vision
+
+    def _make_vision_with_move(self):
+        """返回一个 move_fn 已经被 _check_safe 包裹的 vision client（业务层用）。
+
+        2026-07-31: 同时 wrap find_target 和 find_target_realtime —— realtime 路径
+        之前未走安全门（HIGH gate-bypass-sibling-path），现统一注入 safe_move_fn。
+        """
+        ArmVisionClient = _import_vision()
+        client = ArmVisionClient(self.http)
+        original_find = client.find_target
+        original_find_realtime = client.find_target_realtime
+
+        def _safe_move(nx: float, ny: float) -> dict:
+            self._check_y_protected("find_target")
+            self._check_safe(y_mm=ny)
+            return self.move_xy(nx, ny, timeout=5.0)   # 2026-07-31: 5s（伺服高频）
+
+        def _safe_wrap(original, label: str):
+            def safe_fn(selector, *, x_mm, y_mm, **kwargs):
+                move_fn = kwargs.pop("move_fn", None) or _safe_move
+                return original(selector, x_mm=x_mm, y_mm=y_mm, move_fn=move_fn, **kwargs)
+            safe_fn.__name__ = label
+            return safe_fn
+
+        client.find_target = _safe_wrap(original_find, "safe_find_target")  # type: ignore[method-assign]
+        client.find_target_realtime = _safe_wrap(original_find_realtime, "safe_find_target_realtime")  # type: ignore[method-assign]
+        return client
 
     def reset_origin(self, x_wall: str = "left", timeout: float = 60.0) -> dict:
         """主动触发车端 reset_position（仅 y 触底），作为业务坐标系新原点。

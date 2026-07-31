@@ -44,6 +44,37 @@ class RuntimeApiClient:
     def get(self, path, timeout=None):
         return self._request("GET", path, timeout=timeout)
 
+    # 2026-07-31: 视觉伺服封装需要的 vision 调用方法（VISION_SERVO_DESIGN.md §3）。
+    # - request_vision_task: 单次同步推理（带 bbox_pixels + filter）
+    # - get_vision_task_cache: 读 task_feed 30Hz 缓存（视觉伺服主路径）
+    def request_vision_task(
+        self,
+        *,
+        sort_pos=(0.0, 0.0),
+        limit_x: float = 1.0,
+        limit_y: float = 1.0,
+        timeout: float = 20.0,
+    ):
+        """POST /v1/vision/task — 同步单次推理（含 bbox_pixels）。
+
+        返回 runtime JSON 原样 dict，由 vision.py 层负责解析。
+        """
+        return self._request(
+            "POST",
+            f"{self.api_prefix}/vision/task",
+            payload={
+                "sort_pos": [float(sort_pos[0]), float(sort_pos[1])],
+                "limit_x": float(limit_x),
+                "limit_y": float(limit_y),
+                "timeout": float(timeout),
+            },
+            timeout=timeout + 5.0,
+        )
+
+    def get_vision_task_cache(self):
+        """GET /v1/realtime/vision/task — 读 task_feed 30Hz 缓存。"""
+        return self._request("GET", f"{self.api_prefix}/realtime/vision/task")
+
     def post(self, path, payload=None, timeout=None):
         return self._request("POST", path, payload=payload, timeout=timeout)
 
