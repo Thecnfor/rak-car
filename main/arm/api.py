@@ -633,7 +633,7 @@ class ArmClient:
 
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
-                  reset_x_velocity_mms: float = 30.0,
+                  reset_x_velocity_mms: float = 40.0,
                   timeout: float = 120.0) -> dict:
         """2026-07-16 新加：复合复位 (x + 大臂 + 手爪 并行 → y 串行)。
 
@@ -802,7 +802,7 @@ class ArmClient:
         arm_angle: float = 90.0,
         hand_angle: float = -90.0,
         x_direction: str = "right",
-        reset_x_velocity_mms: float = 20.0,
+        reset_x_velocity_mms: float = 40.0,
         timeout: float = 60.0,
     ) -> dict:
         """薄封装 arm.composite_run_reset() —— x 撞墙 + arm + hand 并行 + y 触底收尾"""
