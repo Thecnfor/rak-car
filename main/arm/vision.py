@@ -510,7 +510,7 @@ class ArmVisionClient:
             elapsed = time.time() - t0
         finally:
             try:
-                stop.stop()
+                stop()    # RuntimeWsClient.subscribe_* 返回 callable（stop method）
             except Exception:
                 pass
 
