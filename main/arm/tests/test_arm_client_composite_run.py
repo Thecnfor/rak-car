@@ -72,7 +72,7 @@ class TestCompositeRun(unittest.TestCase):
         self.assertEqual(kw["arm_angle"], 90.0)
         self.assertEqual(kw["hand_angle"], -90.0)
         self.assertEqual(kw["x_direction"], "right")
-        self.assertEqual(kw["reset_x_velocity"], 0.02)
+        self.assertEqual(kw["reset_x_velocity"], 0.03)
 
     def test_vision_property_lazy(self):
         v1 = self.client.vision

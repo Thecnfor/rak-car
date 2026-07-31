@@ -531,7 +531,7 @@ class ArmController:
         self._x_expected_total_delta += abs(final - prev_pos) - abs(target - prev_pos)
 
 
-    def reset_x(self, direction: str = "right", reset_velocity: float = 0.02,
+    def reset_x(self, direction: str = "right", reset_velocity: float = 0.03,
                 seek_timeout: float = 15.0, no_move_hard_timeout: float = 2.0,
                 min_pre_trigger_disp_m: float = 0.05,
                 probe_time: float = 0.3):
@@ -542,7 +542,7 @@ class ArmController:
           - commit fb24b1a: 旧版撞墙瞬间即判 stall(电机还没动就触发),导致 calibrate 漂移;
             这里用 min_pre_trigger_disp 闸要求电机先走过 ≥50mm 才允许触发,根除该 bug。
           - commit 2cc48ac: 撞墙后用 motor_x.set_linear(0) hard-stop,绕开 PID 惯性,电机立即停。
-          - commit 1d5990e: reset_velocity=0.02 m/s(20mm/s)经实测是撞墙最稳定档位。
+          - commit 1d5990e: reset_velocity=0.03 m/s(30mm/s)经实测是撞墙最稳定档位。
           - 2026-07-16 bug fix: 增加反向探针 (probe_time)。原逻辑当 X 机械已经在 selected
             direction 墙上时,正向前进完全不动 → 等 2s 走 no_move_hard_timeout → 报
             "失步/卡死" 错。现在先反向驱动 probe_time 秒:
@@ -553,7 +553,7 @@ class ArmController:
 
         Args:
             direction: "right" (正方向,target 增大方向) 或 "left"
-            reset_velocity: 撞墙速度 (m/s),默认 0.02
+            reset_velocity: 撞墙速度 (m/s),默认 0.03
             seek_timeout: 总找墙超时 (s),默认 15s
             no_move_hard_timeout: 编码器持续不动硬停 (s),默认 2s
             min_pre_trigger_disp_m: 撞墙判据生效前电机必须先走过这段距离 (m);
@@ -677,7 +677,7 @@ class ArmController:
 
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
-                  reset_x_velocity: float = 0.02,
+                  reset_x_velocity: float = 0.06,
                   timeout: float = 60.0,
                   reset_x: bool = True):
         """
@@ -707,7 +707,7 @@ class ArmController:
             arm_angle: 大臂目标角度 (°),默认 0=MID
             hand_angle: 手爪目标角度 (°),默认 -90=UP
             x_direction: x 撞墙方向,默认 "right"
-            reset_x_velocity: x 撞墙速度 (m/s),默认 0.02
+            reset_x_velocity: x 撞墙速度 (m/s),默认 0.03
             timeout: 并行阶段总超时 (s)
             reset_x: 是否包含 x 撞墙 (默认 True)
 
@@ -1028,7 +1028,7 @@ class ArmController:
         arm_angle: float = 90,
         hand_angle: float = -90,
         x_direction: str = "right",
-        reset_x_velocity: float = 0.02,
+        reset_x_velocity: float = 0.06,
         timeout: float = 60.0,
         reset_x: bool = True,
     ) -> dict:

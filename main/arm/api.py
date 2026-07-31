@@ -606,21 +606,21 @@ class ArmClient:
         """
         return self._call_arm("reset_y", timeout=timeout)
 
-    def reset_x(self, direction: str = "right", reset_velocity_mms: float = 20.0,
+    def reset_x(self, direction: str = "right", reset_velocity_mms: float = 30.0,
                 timeout: float = 30.0) -> dict:
         """2026-07-16 新加：x 撞墙定原点。
 
-        单档极慢速度撞物理墙,编码器 stall 判定。默认 20 mm/s 撞右墙(direction='right')。
+        单档极慢速度撞物理墙,编码器 stall 判定。默认 30 mm/s 撞右墙(direction='right')。
         撞墙后 calibrate,x_pose_now 归零,_x_ref_encoder_at_zero 写入新 ref。
 
         注意:
           - 仅 opt-in 触发,不进 auto-init(避免 fb24b1a 描述的 pm2 反复重建)。
           - 机械臂当前已经在墙边(<50mm)时不会 calibrate,需先 move_x 反向拉回中段。
-          - 撞墙速度不要改太快(参考 commit 1d5990e 实测 0.02 m/s 最稳定)。
+          - 撞墙速度不要改太快(参考 commit 1d5990e 实测 0.03 m/s 最稳定)。
 
         Args:
             direction: 'right' 或 'left'
-            reset_velocity_mms: 撞墙速度 (mm/s),默认 20
+            reset_velocity_mms: 撞墙速度 (mm/s),默认 30
             timeout: HTTP 同步超时 (s),车端实际可能 15-20s,留余量
         """
         if direction not in ("right", "left"):
@@ -633,7 +633,7 @@ class ArmClient:
 
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,
                   x_direction: str = "right",
-                  reset_x_velocity_mms: float = 20.0,
+                  reset_x_velocity_mms: float = 30.0,
                   timeout: float = 120.0) -> dict:
         """2026-07-16 新加：复合复位 (x + 大臂 + 手爪 并行 → y 串行)。
 
