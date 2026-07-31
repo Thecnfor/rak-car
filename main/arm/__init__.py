@@ -19,20 +19,29 @@ from .trajectory import (
     TrajectorySample,
 )
 from .loops.runner import ArmRunner
+# 2026-07-31 视觉伺服封装（VISION_SERVO_DESIGN.md）：
+from .labels import (
+    Label, LabelInfo, LABELS, LABEL_GROUPS,
+    get_label_info, is_in_group,
+)
+from .vision import (
+    ArmVisionClient,
+    Detection, BBoxNorm, BBoxPixels,
+    TargetSelector, SelectionStrategy,
+    ServoTrace, ServoResult,
+)
 
 __all__ = [
-    "ArmClient",
-    "ArmState",
-    "ArmOrigin",
-    "SIDES",
-    "HANDS",
-    "STORAGE_SIDES",
-    "STORAGE_DEFAULT_LEFT_ANGLE",
-    "STORAGE_DEFAULT_RIGHT_ANGLE",
-    "OriginCalibrator",
-    "run_calibrator",
-    "TrajectoryGenerator",
-    "TrajectoryPlan",
-    "TrajectorySample",
-    "ArmRunner",
+    "ArmClient", "ArmRunner", "ArmState", "ArmOrigin",
+    "SIDES", "HANDS", "STORAGE_SIDES",
+    "STORAGE_DEFAULT_LEFT_ANGLE", "STORAGE_DEFAULT_RIGHT_ANGLE",
+    "OriginCalibrator", "run_calibrator",
+    "TrajectoryGenerator", "TrajectoryPlan", "TrajectorySample",
+    # 视觉伺服
+    "Label", "LabelInfo", "LABELS", "LABEL_GROUPS",
+    "get_label_info", "is_in_group",
+    "ArmVisionClient",
+    "Detection", "BBoxNorm", "BBoxPixels",
+    "TargetSelector", "SelectionStrategy",
+    "ServoTrace", "ServoResult",
 ]
