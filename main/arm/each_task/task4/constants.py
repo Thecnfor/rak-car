@@ -101,52 +101,7 @@ TARGET_AREA_MAX: float = 0.50
 - 2026-07-29 之前 0.50 → 2026-07-30 退到 0.30 → 现场拒大球 → 改回 0.50
 """
 
-# ---------- Ball 验证基线 (target1.py 位姿下) ----------
-# 2026-07-30 加测 (现场跑出**新最佳**黄球): cx=+0.026  cy=-0.748  w=0.534  h=0.505
-#   score=0.939  area=0.270  aspect=1.057。
-#   跟 2026-07-29 run 8 (cx=0.120, aspect=0.923) 差很多:
-#   **cx 显著更居中** (0.026 vs 0.120, 差 0.094)
-#   **aspect 跨过 1.0** (1.057 vs 0.923) — 球从"纵高>横宽"翻到"横宽>纵高"
-#   **h 略矮** (0.505 vs 0.562) — 球被压成扁圆
-#   可能 (a) 摄像头角度/位置变了 (b) 球场上球位置不同 (c) 球本身姿态变化。
-#   **取 UNION 校准** (历史 + 7-29 + 7-30 + buffer), 噪声框仍会被 aspect_max/area_min 拦掉。
-# 2026-07-29 加测 (历史新最佳): cx=+0.120  cy=-0.719  w=0.519  h=0.562
-#   score=0.953  area=0.292  aspect=0.923。target1.py (y=-133, arm=+90°, hand=0°, x=-260) 已跑。
-#   跟 2026-07-28 run 7 (cx=0.050, cy=-0.620, w=0.418, h=0.596, area=0.249, score=0.935, aspect=0.701)
-#   差非常多: cy 更负 (球更远) + aspect 近正方 (历史 0.70 → 新 0.92) + w 更大 + h 略小。
-# 2026-07-28 校准 (历史): target1.py (y=-133 现场实测, arm=+90°, hand=0°, x=-260)
-#   跑完后, 侧摄识别球的**期望范围** (蓝黄共用, 几何一致, 仅 color 字段不同)。
-#   给 target4 / 单元测试用 —— 跑完 target1 后立刻 target2, 球的检测应该
-#   落在这些区间内; 不在就说明 target1 位姿偏移或侧摄装错。
-# 9 次黄色球实测 (蓝球几何与黄球一致, 2026-07-28 user 确认):
-#   [历史 y=-150, 1-6 次]  cx 0.058~0.173 (mean=0.124)  cy -0.675~-0.584 (mean=-0.636)
-#     几何 w/h/aspect/area 全在 [0.40, 0.44] / [0.59, 0.62] / [0.24, 0.27] / [0.60, 0.80] 区间。
-#   [历史 y=-133, 第 7 次]  cx=+0.050  cy=-0.620  w=0.418  h=0.596  score=0.935  aspect=0.701
-#     ↑ cx 0.050 撑爆旧 CX_MIN=0.05, 加宽到 0.04 留 buffer
-#   [7-29 新最佳 y=-133, 第 8 次]  cx=+0.120  cy=-0.719  w=0.519  h=0.562  score=0.953  area=0.292  aspect=0.923
-#     ↑ cx/cy/w/h/area/aspect 全部超出 7 次基线区间, 取 UNION + buffer
-#   [7-30 新最佳 y=-133, 第 9 次]  cx=+0.026  cy=-0.748  w=0.534  h=0.505  score=0.939  area=0.270  aspect=1.057
-#     ↑ cx 显著更居中 + aspect 跨 1.0 (横宽>纵高) + h 略矮, 取 UNION + buffer
-# 用 min/max + buffer 表达, 比 mean ± 1σ 更贴近实测两端 (1σ 太紧, 5 次里
-# 2 次 (r1/r4) 落在边界外)。
-# ⚠️ 2026-07-30 范围放宽警告: h_min=0.48 / aspect_max=1.10 已接近噪声框阈值
-#   (h≤0.5 已是噪声范围, aspect>1.0 几何上不太圆), 现场如有误检请用
-#   `--aspect-tol` / `--score-min` 临时收紧, 而非动 constants。
-BALL_VERIFIED_CX_MIN: float = 0.02        # 2026-07-29: 新最佳 cx=0.120 + 历史 cx=0.050 → UNION 加 buffer [0.04→0.02, 0.18→0.20]
-BALL_VERIFIED_CX_MAX: float = 0.20
-BALL_VERIFIED_CY_MIN: float = -0.78       # 2026-07-29: 新最佳 cy=-0.719 → 加宽 [-0.68→-0.78, -0.58→-0.55]
-BALL_VERIFIED_CY_MAX: float = -0.55
-BALL_VERIFIED_W_MIN: float = 0.35         # 2026-07-29: 新最佳 w=0.519 → 加宽 [0.40→0.35, 0.44→0.56]
-BALL_VERIFIED_W_MAX: float = 0.56
-BALL_VERIFIED_H_MIN: float = 0.48         # 2026-07-30: 新最佳 h=0.505 (aspect=1.057 横宽>纵高) → 加宽 [0.55→0.48]; 0.48 已是噪声框边界
-BALL_VERIFIED_H_MAX: float = 0.65
-BALL_VERIFIED_AREA_MIN_VERIFY: float = 0.20       # 2026-07-29: 新最佳 area=0.292 → 加宽 [0.24→0.20, 0.27→0.35]
-BALL_VERIFIED_AREA_MAX_VERIFY: float = 0.35
-BALL_VERIFIED_SCORE_MIN_VERIFY: float = 0.80       # 2026-07-28: 旧 0.92 临界擦线 (实测 0.924), 放宽到 0.80; 2026-07-29/30 不动
-BALL_VERIFIED_ASPECT_MIN: float = 0.55
-"""2026-07-30: 新加测 aspect=1.057 (横宽>纵高, 反 7-29 0.923 趋势) → 加宽 [0.95→1.10]。
-实测 7 历史 + 7-29 + 7-30 共 9 次都覆盖, 蓝黄共用。"""
-BALL_VERIFIED_ASPECT_MAX: float = 1.10
+# ---------- 检测 / 选择策略 ----------
 
 # ---------- 检测 / 选择策略 ----------
 TARGET_DEDUP_NORM_MIN: float = 0.05

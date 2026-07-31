@@ -15,10 +15,15 @@
   - label       : 模型原始 label 字符串 (小写)
 
 过滤阈值 (复用 constants.py, ARM_API.md §ARM业务约定):
-  - TARGET_SCORE_MIN   : 0.5   score 低于此值丢弃
-  - TARGET_ASPECT_TOL  : 0.4   |w/h - 1| 高于此值丢弃 (球要圆)
-  - TARGET_AREA_MIN    : 0.003 bbox 面积归一化下界 (太小的不要)
-  - TARGET_AREA_MAX    : 0.20  bbox 面积归一化上界 (太大的不要)
+  - TARGET_SCORE_MIN   : 0.85  score 低于此值丢弃 (实测 0.927-0.941, 留 0.08 余量)
+  - TARGET_ASPECT_TOL  : 0.8   |w/h - 1| 高于此值丢弃 (球要圆)
+  - TARGET_AREA_MIN    : 0.15  bbox 面积归一化下界 (太小的不要)
+  - TARGET_AREA_MAX    : 0.50  bbox 面积归一化上界 (太大的不要)
+
+⚠️ 2026-08-01: 删除 BALL_VERIFIED_* 位姿期望验证 (cx/cy/w/h/area/aspect 7 项)。
+   用户实测 target1 位姿偏移时 BALL_VERIFIED_* 误伤过滤 (round 4 唯一检出的
+   球被 reject)。fetch_balls 现在只过 score + aspect + area 三层基线过滤,
+   cx/cy 不再卡范围。
 
 ⚠️ 本文件**自包含**: 只依赖 main.api_client / constants, 不 import task4 包内其它模块。
    原因: task5 目录里的辅助文件曾被外部动作清空过, 自包含保证 `python target2.py` 直接跑。
@@ -28,6 +33,7 @@
     python main/arm/each_task/task4/target2.py --once --save      # 单次 + 写 TASK4_TARGET_CACHE
     python main/arm/each_task/task4/target2.py --loop --hz 5     # 5Hz 轮询
     python main/arm/each_task/task4/target2.py --once --color blue  # 只看蓝色球
+    python main/arm/each_task/task4/target2.py --once --debug     # 打印 raw detections 诊断
 """
 from __future__ import annotations
 
@@ -49,16 +55,6 @@ try:
         COLOR_BLUE, COLOR_YELLOW, COLOR_UNKNOWN,
         TARGET_SCORE_MIN, TARGET_ASPECT_TOL,
         TARGET_AREA_MIN, TARGET_AREA_MAX,
-        # 2026-07-28: BALL_VERIFIED_* 13 个常量 (target1.py 位姿下球检测
-        # 期望范围, 蓝黄共用)。每球经过 fetch_balls 都会再过一遍这个
-        # 验证 (除非传 verify_target1_pose=False)。
-        BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX,
-        BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX,
-        BALL_VERIFIED_W_MIN, BALL_VERIFIED_W_MAX,
-        BALL_VERIFIED_H_MIN, BALL_VERIFIED_H_MAX,
-        BALL_VERIFIED_AREA_MIN_VERIFY, BALL_VERIFIED_AREA_MAX_VERIFY,
-        BALL_VERIFIED_SCORE_MIN_VERIFY,
-        BALL_VERIFIED_ASPECT_MIN, BALL_VERIFIED_ASPECT_MAX,
         TASK4_TARGET_CACHE,
     )
 except ImportError:  # pragma: no cover — 直接 python target2.py 时无包上下文
@@ -67,13 +63,6 @@ except ImportError:  # pragma: no cover — 直接 python target2.py 时无包�
         COLOR_BLUE, COLOR_YELLOW, COLOR_UNKNOWN,
         TARGET_SCORE_MIN, TARGET_ASPECT_TOL,
         TARGET_AREA_MIN, TARGET_AREA_MAX,
-        BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX,
-        BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX,
-        BALL_VERIFIED_W_MIN, BALL_VERIFIED_W_MAX,
-        BALL_VERIFIED_H_MIN, BALL_VERIFIED_H_MAX,
-        BALL_VERIFIED_AREA_MIN_VERIFY, BALL_VERIFIED_AREA_MAX_VERIFY,
-        BALL_VERIFIED_SCORE_MIN_VERIFY,
-        BALL_VERIFIED_ASPECT_MIN, BALL_VERIFIED_ASPECT_MAX,
         TASK4_TARGET_CACHE,
     )
 
@@ -174,54 +163,6 @@ def _is_ball_like(
     return True
 
 
-def _verify_ball_in_target1_pose(ball: dict) -> bool:
-    """验证 ball 落在 target1.py 位姿下的期望范围内 (BALL_VERIFIED_*)。
-
-    2026-07-28: 加在 fetch_balls 末尾, 蓝黄共用基线。**仅适用于 target1.py
-    位姿** (y=-150, arm=+90°, hand=0°, x=-260)。其他位姿下 (搜索/扫描中)
-    球的 cx/cy 不在此区间, 会被这个过滤误伤 —— 调用方传
-    `verify_target1_pose=False` 关掉。
-
-    验证项 (全部同时通过才算合格):
-      - cx_norm ∈ [BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX]
-      - cy_norm ∈ [BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX]
-      - w_norm   ∈ [BALL_VERIFIED_W_MIN, BALL_VERIFIED_W_MAX]
-      - h_norm   ∈ [BALL_VERIFIED_H_MIN, BALL_VERIFIED_H_MAX]
-      - area     ∈ [BALL_VERIFIED_AREA_MIN_VERIFY, BALL_VERIFIED_AREA_MAX_VERIFY]
-      - score    ≥ BALL_VERIFIED_SCORE_MIN_VERIFY
-      - aspect   ∈ [BALL_VERIFIED_ASPECT_MIN, BALL_VERIFIED_ASPECT_MAX]
-
-    字段缺失 / 类型错 → 不通过 (静默 False)。
-    """
-    try:
-        cx = float(ball.get("cx_norm", 0.0))
-        cy = float(ball.get("cy_norm", 0.0))
-        w = float(ball.get("w_norm", 0.0))
-        h = float(ball.get("h_norm", 0.0))
-        score = float(ball.get("score", 0.0))
-    except (TypeError, ValueError):
-        return False
-    if w <= 0 or h <= 0:
-        return False
-    area = w * h
-    aspect = w / h
-    if not (BALL_VERIFIED_CX_MIN <= cx <= BALL_VERIFIED_CX_MAX):
-        return False
-    if not (BALL_VERIFIED_CY_MIN <= cy <= BALL_VERIFIED_CY_MAX):
-        return False
-    if not (BALL_VERIFIED_W_MIN <= w <= BALL_VERIFIED_W_MAX):
-        return False
-    if not (BALL_VERIFIED_H_MIN <= h <= BALL_VERIFIED_H_MAX):
-        return False
-    if not (BALL_VERIFIED_AREA_MIN_VERIFY <= area <= BALL_VERIFIED_AREA_MAX_VERIFY):
-        return False
-    if score < BALL_VERIFIED_SCORE_MIN_VERIFY:
-        return False
-    if not (BALL_VERIFIED_ASPECT_MIN <= aspect <= BALL_VERIFIED_ASPECT_MAX):
-        return False
-    return True
-
-
 # ---------- 核心 API ----------
 
 def fetch_balls(
@@ -232,7 +173,6 @@ def fetch_balls(
     aspect_tol: Optional[float] = None,
     area_min: Optional[float] = None,
     area_max: Optional[float] = None,
-    verify_target1_pose: bool = False,
 ) -> list[dict]:
     """调 task_feed 拿当前帧的球类识别结果 + 按阈值过滤 + 颜色映射。
 
@@ -241,13 +181,6 @@ def fetch_balls(
         score_min: score 阈值 (None → 用 constants.TARGET_SCORE_MIN)
         color_filter: "blue" / "yellow" / None (None=不按颜色过滤)
         aspect_tol / area_min / area_max: 几何阈值 (None → 用 constants)
-        verify_target1_pose: True 时, 每球最后过一遍
-                              _verify_ball_in_target1_pose (BALL_VERIFIED_*
-                              7 项检查, 蓝黄共用)。**仅适用于 target1.py 位姿
-                              下的检测**; 搜索/扫描场景下请传 False 关闭,
-                              否则球的 cx/cy 不在 BALL_VERIFIED_* 区间会被
-                              误伤。
-        timeout: HTTP 异常时返回 [] (静默兜底)
 
     Returns:
         list[dict]: 每球一个 dict, 字段见模块 docstring。
@@ -274,7 +207,6 @@ def fetch_balls(
         return []
 
     out: list[dict] = []
-    n_filtered_verify = 0  # 2026-07-28: BALL_VERIFIED_* 过滤掉的球数
     for det in detections:
         if not isinstance(det, dict):
             continue
@@ -307,18 +239,8 @@ def fetch_balls(
             "cls_id": cls_id,
             "label": label,
         }
-        # 2026-07-28: BALL_VERIFIED_* 验证 (target1.py 位姿下, 蓝黄共用)。
-        # 不在期望范围 → 视作噪声框/错位姿, 丢弃。
-        if verify_target1_pose and not _verify_ball_in_target1_pose(ball):
-            n_filtered_verify += 1
-            continue
         out.append(ball)
 
-    if verify_target1_pose and n_filtered_verify:
-        # 仅在确实过滤掉东西时打日志, 避免刷屏
-        print(f"  [{LOG_PREFIX}] BALL_VERIFIED_* 过滤: {n_filtered_verify} "
-              f"个检测不在 target1 位姿期望范围 (可能位姿偏移或噪声框)",
-              file=sys.stderr)
     return out
 
 
@@ -374,14 +296,12 @@ def step_target2_once(
     save: bool = False,
     show_raw: bool = False,
     debug: bool = False,
-    verify_target1_pose: bool = False,
 ) -> dict:
     """单次识别 + (可选) 写盘。
 
     Args:
         debug: True 时打印 raw detections 全部字段 (前 3 条) + active/count/updated_at;
                用于现场诊断 task_feed 输出结构跟 fetch_balls 假设不一致的问题。
-        verify_target1_pose: 透传给 fetch_balls (默认 False, 仅已确认 target1 位姿时开)。
 
     Returns:
         {"ok": bool, "balls": list[dict], "raw_task_state": dict|None, "saved_path": str|None}
@@ -409,7 +329,6 @@ def step_target2_once(
         http_client,
         score_min=score_min,
         color_filter=color_filter,
-        verify_target1_pose=verify_target1_pose,
     )
     saved_path = save_latest(balls) if save else None
     _print_balls(balls, raw=raw_task_state if show_raw else None)
@@ -432,7 +351,6 @@ def step_target2_loop(
     color_filter: Optional[str] = None,
     save_each: bool = False,
     duration_s: Optional[float] = None,
-    verify_target1_pose: bool = False,
 ) -> dict:
     """轮询识别 + 持续打印。Ctrl-C 中止。
 
@@ -440,7 +358,6 @@ def step_target2_loop(
         hz: 轮询频率 (Hz); 默认 5Hz。
         duration_s: 跑多少秒后自动退出 (None=无限, Ctrl-C 中止)。
         save_each: 每帧写盘 (TASK4_TARGET_CACHE)。
-        verify_target1_pose: 透传给 fetch_balls (默认 False, opt-in)。
     """
     interval = 1.0 / max(hz, 0.1)
     print(f"========== {LOG_PREFIX} step_target2_loop (hz={hz}) ==========")
@@ -456,7 +373,6 @@ def step_target2_loop(
                 http_client,
                 score_min=score_min,
                 color_filter=color_filter,
-                verify_target1_pose=verify_target1_pose,
             )
             ts = time.strftime("%H:%M:%S")
             print(f"  [{LOG_PREFIX}] {ts} 识别到 {len(balls)} 个球")
@@ -494,10 +410,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="按颜色过滤 (默认不过滤)")
     p.add_argument("--score-min", type=float, default=None,
                    help=f"score 阈值 (默认 {TARGET_SCORE_MIN})")
-    p.add_argument("--verify-target1-pose", dest="verify_target1_pose",
-                   action="store_true", default=False,
-                   help=f"开 BALL_VERIFIED_* 验证 (默认 False, 仅在已确认 target1 位姿下开;"
-                        f"其他位姿开会被误伤过滤)")
     p.add_argument("--save", action="store_true",
                    help="写盘到 TASK4_TARGET_CACHE (供 b2/b3 复用)")
     p.add_argument("--show-raw", action="store_true",
@@ -519,7 +431,6 @@ def main(argv=None) -> int:
             color_filter=args.color,
             save_each=args.save,
             duration_s=args.duration,
-            verify_target1_pose=args.verify_target1_pose,
         )
     else:
         step_target2_once(
@@ -529,7 +440,6 @@ def main(argv=None) -> int:
             save=args.save,
             show_raw=args.show_raw,
             debug=args.debug,
-            verify_target1_pose=args.verify_target1_pose,
         )
     return 0
 

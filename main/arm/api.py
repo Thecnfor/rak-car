@@ -24,38 +24,9 @@ except ImportError:  # pragma: no cover
     from api_client import RuntimeApiClient  # type: ignore
     from ws_client import RuntimeWsClient  # type: ignore
 
-# 2026-07-28: 球检测验证基线 + 助手。task4 业务层有 BALL_VERIFIED_*
-# (target1 位姿下球检测期望范围, 蓝黄共用), api.py 这里**再导出 + 暴露
-# verify_ball()** 让一般 arm 客户端代码也能做"球是不是在期望范围"的检查
-# (不直接依赖 task4 常量文件)。`ArmClient.verify_ball()` 方法是常用入口。
-try:
-    from main.arm.each_task.task4.constants import (  # type: ignore
-        BALL_VERIFIED_CX_MIN, BALL_VERIFIED_CX_MAX,
-        BALL_VERIFIED_CY_MIN, BALL_VERIFIED_CY_MAX,
-        BALL_VERIFIED_W_MIN, BALL_VERIFIED_W_MAX,
-        BALL_VERIFIED_H_MIN, BALL_VERIFIED_H_MAX,
-        BALL_VERIFIED_AREA_MIN_VERIFY, BALL_VERIFIED_AREA_MAX_VERIFY,
-        BALL_VERIFIED_SCORE_MIN_VERIFY,
-        BALL_VERIFIED_ASPECT_MIN, BALL_VERIFIED_ASPECT_MAX,
-    )
-except ImportError:  # pragma: no cover — 业务层未就绪时给空缺省值, 不阻断 import
-    # 2026-07-30: fallback 同步 constants.py 第 9 次 (新最佳) 加测后的 UNION 区间。
-    # 2026-07-29 第 8 次 (cx=0.120, aspect=0.923) → 2026-07-30 第 9 次 (cx=0.026, aspect=1.057) 加测,
-    # 新球 aspect 跨 1.0 (横宽>纵高), 放宽 H_MIN/ASPECT_MAX。
-    # 业务层导入成功时**不会**用这里, 只在 task4 constants.py 缺失时兜底。
-    BALL_VERIFIED_CX_MIN = 0.02
-    BALL_VERIFIED_CX_MAX = 0.20
-    BALL_VERIFIED_CY_MIN = -0.78
-    BALL_VERIFIED_CY_MAX = -0.55
-    BALL_VERIFIED_W_MIN = 0.35
-    BALL_VERIFIED_W_MAX = 0.56
-    BALL_VERIFIED_H_MIN = 0.48
-    BALL_VERIFIED_H_MAX = 0.65
-    BALL_VERIFIED_AREA_MIN_VERIFY = 0.20
-    BALL_VERIFIED_AREA_MAX_VERIFY = 0.35
-    BALL_VERIFIED_SCORE_MIN_VERIFY = 0.80
-    BALL_VERIFIED_ASPECT_MIN = 0.55
-    BALL_VERIFIED_ASPECT_MAX = 1.10
+# 2026-08-01: 删除 BALL_VERIFIED_* 位姿期望验证 (target1 位姿下 cx/cy/w/h/area/aspect
+# 期望范围)。target4 实测位姿偏移时该验证误伤过滤 (round 4 唯一检出的球被 reject)。
+# verify_ball() / ArmClient.verify_ball() 也一并删除 (基线常量已无)。
 
 from .state import (
     ArmState,
@@ -133,78 +104,6 @@ def pre_init_close_storage(
         timeout=timeout,
         sync=True,
     )
-
-
-def verify_ball(
-    ball: dict,
-    *,
-    cx_min: float = BALL_VERIFIED_CX_MIN,
-    cx_max: float = BALL_VERIFIED_CX_MAX,
-    cy_min: float = BALL_VERIFIED_CY_MIN,
-    cy_max: float = BALL_VERIFIED_CY_MAX,
-    w_min: float = BALL_VERIFIED_W_MIN,
-    w_max: float = BALL_VERIFIED_W_MAX,
-    h_min: float = BALL_VERIFIED_H_MIN,
-    h_max: float = BALL_VERIFIED_H_MAX,
-    area_min: float = BALL_VERIFIED_AREA_MIN_VERIFY,
-    area_max: float = BALL_VERIFIED_AREA_MAX_VERIFY,
-    score_min: float = BALL_VERIFIED_SCORE_MIN_VERIFY,
-    aspect_min: float = BALL_VERIFIED_ASPECT_MIN,
-    aspect_max: float = BALL_VERIFIED_ASPECT_MAX,
-) -> bool:
-    """验证 ball dict 是否落在 BALL_VERIFIED_* 期望范围 (target1 位姿下)。
-
-    2026-07-28 加进 api.py: 业务层 (target2 / test_* / step_*) 之外的其他
-    代码也能用 arm 客户端做球验证, 不必 import task4.constants。
-
-    默认值取自 `BALL_VERIFIED_*` (target1.py 位姿下 5 次实测基线, 蓝黄共用)。
-    全部 7 项**同时**通过才返 True; 任一不通过 → False (静默, 不抛)。
-
-    字段缺失 / 类型错 → 不通过。
-
-    验证项:
-      - cx_norm  ∈ [cx_min, cx_max]
-      - cy_norm  ∈ [cy_min, cy_max]
-      - w_norm   ∈ [w_min, w_max]
-      - h_norm   ∈ [h_min, h_max]
-      - area     = w*h ∈ [area_min, area_max]
-      - score    ≥ score_min
-      - aspect   = w/h ∈ [aspect_min, aspect_max]
-
-    Args:
-        ball: dict, 期望含 cx_norm / cy_norm / w_norm / h_norm / score 字段。
-        其他参数: 阈值覆盖, 默认值 = BALL_VERIFIED_*, 调用方可临时调。
-
-    Returns:
-        True = 在范围内 (球检测合理); False = 越界 (噪声框或位姿偏移)。
-    """
-    try:
-        cx = float(ball.get("cx_norm", 0.0))
-        cy = float(ball.get("cy_norm", 0.0))
-        w = float(ball.get("w_norm", 0.0))
-        h = float(ball.get("h_norm", 0.0))
-        score = float(ball.get("score", 0.0))
-    except (TypeError, ValueError):
-        return False
-    if w <= 0 or h <= 0:
-        return False
-    area = w * h
-    aspect = w / h
-    if not (cx_min <= cx <= cx_max):
-        return False
-    if not (cy_min <= cy <= cy_max):
-        return False
-    if not (w_min <= w <= w_max):
-        return False
-    if not (h_min <= h <= h_max):
-        return False
-    if not (area_min <= area <= area_max):
-        return False
-    if score < score_min:
-        return False
-    if not (aspect_min <= aspect <= aspect_max):
-        return False
-    return True
 
 
 @dataclass
@@ -1171,53 +1070,6 @@ class ArmClient:
         except (TypeError, ValueError):
             self._last_realtime_error = f"arm_state.y_mm 不是数字: {y!r}"
             return None
-
-    # ---- 球检测验证 (BALL_VERIFIED_*, target1 位姿下) ----
-    #
-    # 2026-07-28 加: 业务层 (target2.fetch_balls 等等) 之外的一般 arm 客户端
-    # 调用方也能用 ArmClient.verify_ball(ball) 验证检测结果。默认阈值 = 顶层
-    # verify_ball() 的 BALL_VERIFIED_* (target1 位姿下 5 次实测基线, 蓝黄共用)。
-    # 阈值可临时覆盖 (例如换位姿校准)。
-
-    def verify_ball(
-        self,
-        ball: dict,
-        *,
-        cx_min: float = BALL_VERIFIED_CX_MIN,
-        cx_max: float = BALL_VERIFIED_CX_MAX,
-        cy_min: float = BALL_VERIFIED_CY_MIN,
-        cy_max: float = BALL_VERIFIED_CY_MAX,
-        w_min: float = BALL_VERIFIED_W_MIN,
-        w_max: float = BALL_VERIFIED_W_MAX,
-        h_min: float = BALL_VERIFIED_H_MIN,
-        h_max: float = BALL_VERIFIED_H_MAX,
-        area_min: float = BALL_VERIFIED_AREA_MIN_VERIFY,
-        area_max: float = BALL_VERIFIED_AREA_MAX_VERIFY,
-        score_min: float = BALL_VERIFIED_SCORE_MIN_VERIFY,
-        aspect_min: float = BALL_VERIFIED_ASPECT_MIN,
-        aspect_max: float = BALL_VERIFIED_ASPECT_MAX,
-    ) -> bool:
-        """验证 ball dict 是否在 BALL_VERIFIED_* 期望范围 (target1 位姿下)。
-
-        委托给模块级 ``verify_ball()`` 函数。详细语义见该函数 docstring。
-
-        Args:
-            ball: dict, 期望含 cx_norm / cy_norm / w_norm / h_norm / score 字段。
-            其他参数: 阈值覆盖, 默认值 = BALL_VERIFIED_*, 调用方可临时调。
-
-        Returns:
-            True = 在范围内 (球检测合理); False = 越界 (噪声框或位姿偏移)。
-        """
-        return verify_ball(
-            ball,
-            cx_min=cx_min, cx_max=cx_max,
-            cy_min=cy_min, cy_max=cy_max,
-            w_min=w_min, w_max=w_max,
-            h_min=h_min, h_max=h_max,
-            area_min=area_min, area_max=area_max,
-            score_min=score_min,
-            aspect_min=aspect_min, aspect_max=aspect_max,
-        )
 
     # ---- x_speed safety watchdog（belt-slip 兜底）----
     #

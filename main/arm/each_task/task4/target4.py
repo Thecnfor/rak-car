@@ -130,7 +130,6 @@ def _identify_and_pick(
     round_idx: int,
     *,
     return_x_mm: Optional[float],
-    verify_target1_pose: bool,
     pick_timeout_s: float,
     dry_run: bool,
     pre_recognition_settle_s: float = DEFAULT_PRE_RECOGNITION_SETTLE_S,
@@ -177,7 +176,6 @@ def _identify_and_pick(
         balls = target2.fetch_balls(
             http_client,
             color_filter=None,                # 不按颜色过滤, 选 score 最高时再判
-            verify_target1_pose=verify_target1_pose,
         )
     except Exception as e:
         print(f"  [{LOG_PREFIX}] ⚠️ fetch_balls 异常: "
@@ -285,7 +283,6 @@ def step_target4(
     rounds: int = DEFAULT_ROUNDS,
     chassis_step_mm: float = DEFAULT_CHASSIS_STEP_MM,
     return_x_mm: Optional[float] = DEFAULT_RETURN_X_MM,
-    verify_target1_pose: bool = True,
     pick_timeout_s: float = DEFAULT_PICK_TIMEOUT_S,
     pick_error_tolerance: int = DEFAULT_PICK_ERROR_TOLERANCE,
     do_prep: bool = True,
@@ -302,8 +299,6 @@ def step_target4(
         chassis_step_mm: 底盘前移距离 (mm, 正数 = 前进), 默认 80 (用户指定)。
         return_x_mm: 抓球后 x 回的目标位置 (mm), 走 trust 模式。默认 -260。
                      None = 不回 (v5 兼容)。
-        verify_target1_pose: fetch_balls 是否用 BALL_VERIFIED_* 7 项验证 (target1 位姿下)。
-                            本流程始终在 target1 位姿上 (抓球后 y/x 自动回), 建议 True。
         pick_timeout_s: 单次 pick_up 序列超时 (秒, 兜底用, 当前未透传)。
         pick_error_tolerance: 连续 pick 失败超过此数 → break (默认 99 = 不强制停)。
         do_prep: True (默认) 开头跑 target1.step_target1; False 跳过 (假设已在 target1 位姿)。
@@ -364,7 +359,6 @@ def step_target4(
             arm_client, http_client, runner,
             round_idx=0,
             return_x_mm=return_x_mm,
-            verify_target1_pose=verify_target1_pose,
             pick_timeout_s=pick_timeout_s,
             dry_run=dry_run,
             pre_recognition_settle_s=pre_recognition_settle_s,
@@ -409,7 +403,6 @@ def step_target4(
                 arm_client, http_client, runner,
                 round_idx=r,
                 return_x_mm=return_x_mm,
-                verify_target1_pose=verify_target1_pose,
                 pick_timeout_s=pick_timeout_s,
                 dry_run=dry_run,
                 pre_recognition_settle_s=pre_recognition_settle_s,
@@ -487,9 +480,6 @@ def build_parser() -> argparse.ArgumentParser:
                         f" 设 0=撞墙; 跟 --no-return 互斥。")
     p.add_argument("--no-return", dest="no_return", action="store_true",
                    help="抓球后不回 x (v5 行为兼容)")
-    p.add_argument("--no-verify-pose", dest="verify_target1_pose",
-                   action="store_false", default=True,
-                   help="fetch_balls 不做 BALL_VERIFIED_* 验证 (调试噪声框用)")
     p.add_argument("--no-prep", dest="no_prep", action="store_true",
                    help="跳过开头 target1.step_target1 (假设已在 target1 位姿)")
     p.add_argument("--pick-error-tolerance", type=int,
@@ -526,7 +516,6 @@ def main(argv=None) -> int:
         rounds=args.rounds,
         chassis_step_mm=args.chassis_step_mm,
         return_x_mm=return_x_mm,
-        verify_target1_pose=args.verify_target1_pose,
         pick_error_tolerance=args.pick_error_tolerance,
         do_prep=not args.no_prep,
         dry_run=args.dry_run,

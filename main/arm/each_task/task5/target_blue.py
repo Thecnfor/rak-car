@@ -238,8 +238,6 @@ def detect_balls(client: ArmClient,
                 area_min=area_min,
                 area_max=area_max,
                 aspect_tol=aspect_tol,
-                # ⚠️ 必须 False, 见上文 docstring —— 那是 task4 位姿的基线
-                verify_target1_pose=False,
             )
         except Exception as e:
             print(f"  {LOG_PREFIX} [WARN] fetch_balls 异常: "
