@@ -4,7 +4,7 @@
 
 任务层共用的 motion helpers: 把原来散在 auto_seeding.py / water_tower_task.py
 以及 task6 (get_order.py) 里的私有函数统一抽到这里, 避免 3 份重复实现和
-"import 不存在的 main.tasks.auto_seeding_safe" 死代码。
+"import 不存在的 main.task.auto_seeding_safe" 死代码。
 
 业务层只走 /v1/execute HTTP client (= RuntimeApiClient), 跟运行时端保持薄封装。
 所有函数失败语义 = raise RuntimeError, 调用方在 task 顶层 try/except 包。

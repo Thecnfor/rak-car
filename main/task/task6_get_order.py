@@ -22,7 +22,7 @@ Phases:
   Phase 4: pick goods — veggie detect + vacuum pick ×2
   Phase 5: carry pose for Task 7 (stub)
 
-Motion helpers: 统一从 main.tasks._helpers 取 (与 task1/task2 共用)。
+Motion helpers: 统一从 main.task._helpers 取 (与 task1/task2 共用)。
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from main.api_client import RuntimeApiClient
-from main.tasks._helpers import (
+from main.task._helpers import (
     _ensure_runtime,
     _wait_infer_ready,
     _move_x,

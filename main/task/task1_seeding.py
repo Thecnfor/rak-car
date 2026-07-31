@@ -37,7 +37,7 @@ from main.api_client import RuntimeApiClient
 from main.arm.api import ArmClient
 from main.arm.loops.runner import ArmRunner
 
-from main.tasks._helpers import (
+from main.task._helpers import (
     _ensure_runtime,
     _wait_infer_ready,
     _move_x as _helpers_move_x,
@@ -46,7 +46,7 @@ from main.tasks._helpers import (
     _grasp,
     _chassis_move_for,
 )
-from main.tasks._config import load_task_config
+from main.task._config import load_task_config
 
 logger = logging.getLogger("task.auto_seeding")
 
@@ -123,12 +123,12 @@ def _scan_labels(
 # 通过 _arm_move_x / _arm_move_y 调用(保留命名一致性)
 def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0,
                 out_time: float = 15.0, timeout: float = 30.0) -> None:
-    """业务层 alias: 委托 main.tasks._helpers._move_x (含完整错误处理)."""
+    """业务层 alias: 委托 main.task._helpers._move_x (含完整错误处理)."""
     _helpers_move_x(client, x_mm, v_max_mms=v_max_mms, out_time=out_time, timeout=timeout)
 
 
 def _arm_move_y(client: RuntimeApiClient, y_mm: float, timeout: float = 25.0) -> None:
-    """业务层 alias: 委托 main.tasks._helpers._move_y."""
+    """业务层 alias: 委托 main.task._helpers._move_y."""
     _helpers_move_y(client, y_mm, timeout=timeout)
 
 

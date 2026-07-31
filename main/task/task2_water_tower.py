@@ -41,7 +41,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from main.api_client import RuntimeApiClient
-from main.tasks._helpers import (
+from main.task._helpers import (
     _ensure_runtime,
     _wait_infer_ready,
     _move_x,
@@ -51,7 +51,7 @@ from main.tasks._helpers import (
     _grasp,
     _chassis_move_for,
 )
-from main.tasks._config import load_task_config
+from main.task._config import load_task_config
 
 logger = logging.getLogger("task.water_tower")
 
@@ -186,7 +186,7 @@ def _ensure_x_for_y_lift(client: RuntimeApiClient) -> None:
 
 def _set_hand_angle(client: RuntimeApiClient, angle_deg: float, speed: int = 80,
                    timeout: float = 10.0) -> None:
-    # 委托到 main.tasks._helpers._set_hand_angle (含 retry)
+    # 委托到 main.task._helpers._set_hand_angle (含 retry)
     return _helpers_set_hand_angle(client, angle_deg, speed=speed, timeout=timeout)
 
 
