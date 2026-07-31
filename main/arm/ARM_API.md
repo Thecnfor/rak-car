@@ -782,3 +782,34 @@ origin = ArmOrigin(step_loss_y_mm=2.0, step_loss_x_mm=5.0)  # 默认
 - runtime 端点：[../../runtime/README.md](../../runtime/README.md) · [../../runtime/VISION_API.md](../../runtime/VISION_API.md)
 - SDK 注释：[../../smartcar/whalesbot/vehicle/arm/arm_base.py](../../smartcar/whalesbot/vehicle/arm/arm_base.py)
 - 软件急停 / `reset_y` 找底方向 / HTTP 急停端点：[SOFTWARE_ESTOP.md](./SOFTWARE_ESTOP.md)
+
+### 10.7 实时版本（WS push，2026-07-31）
+
+> 替代 HTTP cache 轮询，用 WS 推送做实时检测。配合 `task_push_hz` 10→30（runtime commit `9d4aa50`），单帧闭环可降到 ~25-60ms。
+
+| 方法 | 说明 |
+| --- | --- |
+| `ArmVisionClient.find_target_realtime(selector, *, x_mm, y_mm, hz=30.0, ...)` | 单目标伺服（WS 推流） |
+| `ArmRunner.move_to_vision_target_realtime(selector, *, x_mm, y_mm, arm_angle=0, ...)` | composite_run + WS 伺服 |
+| `ArmRunner.pick_by_vision_realtime(selector, *, x_mm, y_mm, arm_angle=-90, ...)` | 一键抓取（WS 版） |
+
+```python
+from main.arm import ArmClient, ArmRunner, TargetSelector, Label
+
+runner = ArmRunner(ArmClient.connect())
+result = runner.move_to_vision_target_realtime(
+    TargetSelector.for_label(Label.H_DOU_JIAO),
+    x_mm=100, y_mm=-150, arm_angle=-90, hz=30.0, timeout=10,
+)
+# 或一键：
+job = runner.pick_by_vision_realtime(
+    TargetSelector.for_group("vegetable"),
+    x_mm=100, y_mm=-150, arm_angle=-90,
+)
+```
+
+**与 HTTP 版关系**：HTTP 路径（`find_target` / `move_to_vision_target` / `pick_by_vision`）全部保留，行为完全一致，仅检测来源不同：
+- HTTP：主动 GET 30Hz 轮询（适合简单场景、调试）
+- WS：服务端推送 30Hz（适合实时伺服、生产）
+
+详见 [VISION_REALTIME_DESIGN.md](./VISION_REALTIME_DESIGN.md)。
