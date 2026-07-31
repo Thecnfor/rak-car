@@ -1282,7 +1282,16 @@ class MyCar(MecanumDriver):
                     if (streamer is not None and hasattr(streamer, "normalize_cam_id"))
                     else "cam1"
                 )
-                consecutive_err = 0
+                # 2026-07-31 lane 推理断连修复:
+                # 旧逻辑连续 5 次异常就 break, 守护线程永久退出, lane_state 永远停在
+                # idle, 外环拿不到误差信号 -> 车在路上突然失明。
+                # 新逻辑:
+                #   - 连续异常不退出, 只递增 backoff(period*2^n, 封顶 1s)
+                #   - 每收到一次正常 result, 计数清零并恢复原 period
+                #   - 仍然走 stop_event / _stop_flag 优雅退出
+                # backoff 状态
+                backoff = 1
+                max_backoff = 20  # 20 * period = 1s @ period=50ms
                 while not stop_event.is_set():
                     if self._stop_flag:
                         break
@@ -1302,7 +1311,7 @@ class MyCar(MecanumDriver):
                             continue
                         error_y = float(result[0])
                         error_angle = float(result[1])
-                        consecutive_err = 0
+                        backoff = 1  # 恢复正常, 退避复位
                         if set_state is not None:
                             set_state(
                                 active=True,
@@ -1315,18 +1324,18 @@ class MyCar(MecanumDriver):
                                 distance=self.get_distance(),
                             )
                     except Exception as exc:
-                        consecutive_err += 1
-                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出，
-                        # 否则外环会丢一份新鲜的 lane_state。
+                        # ZMQ 暂时超时 / cv2 resize 临时失败：退避但不退出。
+                        # 旧版本累计 5 次直接 break, 导致 lane_feed 永久死掉,
+                        # 必须手动重启 lane_feed, 这是 issue "前置推理突然断掉"
+                        # 的根因。改为连续异常也不退出, 用 backoff 拉长间隔,
+                        # 一旦 ZMQ 恢复立刻复位 backoff=1 续跑。
+                        wait_s = min(period * backoff, period * max_backoff)
                         logger.warning(
-                            "lane feed transient err ({}): {}".format(
-                                consecutive_err, exc
-                            )
+                            "lane feed transient err (backoff=%d, wait=%.2fs): %s",
+                            backoff, wait_s, exc,
                         )
-                        if consecutive_err >= 5:
-                            logger.warning("lane feed loop exit after {} errs".format(consecutive_err))
-                            break
-                        stop_event.wait(period)
+                        backoff = min(backoff * 2, max_backoff)
+                        stop_event.wait(wait_s)
                         continue
                     stop_event.wait(period)
                 if set_state is not None:

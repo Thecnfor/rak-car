@@ -260,26 +260,46 @@ class InferServer:
         while True:
             if self.flag_end:
                 return
-            response = server.recv()
+            try:
+                response = server.recv()
+            except Exception as exc:
+                # recv 阶段异常（少见，但 ZMQ socket 状态可能被外部打断）
+                print("{} recv err: {}".format(name, exc))
+                time.sleep(0.01)
+                continue
 
             head = response[:5]
             res = []
-            if head == b"ATATA":
-                if self.flag_infer_initok:
-                    res = True
-                else:
-                    res = False
-            elif head == b"image":
-                # 把bytes转为jpg格式
-                img = cv2.imdecode(np.frombuffer(response[5:], dtype=np.uint8), 1)
-                if self.flag_infer_initok:
-                    # res = self.lane_infer(img).tolist()
-                    # lambda函数
-                    res = func(img)
-                    
-            json_data = json.dumps(res)
-            json_data = bytes(json_data, encoding='utf-8')
-            server.send(json_data)
+            try:
+                if head == b"ATATA":
+                    if self.flag_infer_initok:
+                        res = True
+                    else:
+                        res = False
+                elif head == b"image":
+                    # 把bytes转为jpg格式
+                    img = cv2.imdecode(np.frombuffer(response[5:], dtype=np.uint8), 1)
+                    if self.flag_infer_initok:
+                        # 2026-07-31 加固:
+                        # 推理异常不能杀死 REP 线程, 否则 lane/task/ocr 任一模型抛错
+                        # 整个端口没人 recv, 前端 ClintInterface.get_infer 一直
+                        # zmq.Again, lane_feed 守护线程会卡住 / 触发前端 backoff 风暴.
+                        try:
+                            res = func(img)
+                        except Exception as infer_exc:
+                            print("{} infer err: {}".format(name, infer_exc))
+                            # 返回 [] 让前端知道本次推理失败但不阻塞,
+                            # 不要让异常向上抛出杀掉这个 REP 线程.
+                            res = []
+                # 任何分支都到这里, send 响应保证 ZMQ REQ/REP 同步不被打乱.
+                json_data = json.dumps(res)
+                json_data = bytes(json_data, encoding="utf-8")
+                server.send(json_data)
+            except Exception as exc:
+                # send 失败 / json 编码失败 / 其他: 这次响应丢了, REQ 端会超时.
+                # 但 REP 状态已对齐(没 send 也算消耗了一帧), 下次循环能继续.
+                print("{} process err: {}".format(name, exc))
+                time.sleep(0.01)
 
     def close(self):
         print("closing...")

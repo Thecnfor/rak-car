@@ -346,7 +346,7 @@ class CarRuntimeService:
             logger.warning("init 时 reset_position 失败: %s" % exc)
         if settings.get_reset_x_on_init() and car.arm is not None:
             try:
-                init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.04"))
+                init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.06"))
                 car.arm.reset_x(reset_velocity=init_x_v)
                 self._last_init_reset_x_at = time.time()
                 logger.warning(
@@ -357,7 +357,19 @@ class CarRuntimeService:
                     "[init reset_x create path] failed: {}".format(exc)
                 )
         if reset_position:
-            car.reset_position()
+            # 机械臂归位 + 里程计清零 打包在 car.init_car_position() 里,
+            # 一个调用同时完成两件事, 避免分开调时一个异常导致另一个遗漏。
+            # reset_arm=True (默认): 包含 arm.reset_position(); 复用 car 路径
+            # 仍会单独走 ensure_initialized 的 reset_arm 分支, 不重复归位 arm。
+            try:
+                init_res = car.init_car_position(reset_arm=False)
+                logger.info(
+                    "init_car_position 完成 (arm_reset=%s, odometry_reset=%s)",
+                    init_res.get("arm_reset"), init_res.get("odometry_reset"),
+                )
+            except Exception as exc:
+                self.last_error = "init_car_position 失败: {}".format(exc)
+                logger.warning("init_car_position 失败: %s" % exc)
         # 2026-07-30 init 时把存储仓舵机转到 close 物理位（98°），与 reset 同步。
         # 参照 test/test_storage_close.py：先抬 y 到 -150mm 离开保护区，再发舵机。
         # 走下层同步方法（car.arm.move_y_position / car.set_storage_angle），
