@@ -15,8 +15,9 @@ class FakeWsClient:
     def subscribe_task_detection(self, on_state, hz=30.0):
         self.captured_cb = on_state
         # 同步推完所有帧（替代 asyncio loop 的异步行为）
+        # WS 推送实际用 "data" 键（routes.py:1437）
         for i, frame in enumerate(self.frames):
-            on_state({"task_state": {
+            on_state({"data": {
                 "active": True,
                 "detections": [FakeWsClient._det_to_dict(d) for d in frame],
                 "updated_at": float(i + 1),    # 每个帧唯一，绕过 dedup
@@ -103,9 +104,9 @@ class TestFindTargetRealtime(unittest.TestCase):
         with patch("main.ws_client.RuntimeWsClient") as mock_ws_cls:
             mock_ws = MagicMock()
             mock_ws_cls.return_value = mock_ws
-            # 模拟 WS 推 1 帧就收敛
+            # 模拟 WS 推 1 帧就收敛（routes.py:1437 实际用 'data' 键）
             def fake_subscribe(on_state, hz=30.0):
-                on_state({"task_state": {
+                on_state({"data": {
                     "detections": [{
                         "label": "cylinder_1", "score": 0.9,
                         "track_id": 0, "cls_id": 4,

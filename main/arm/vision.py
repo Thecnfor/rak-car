@@ -60,13 +60,16 @@ class Detection:
 
 
 def _parse_cache(raw: Dict[str, Any]) -> List[Detection]:
-    """GET /v1/realtime/vision/task → List[Detection]（无 bbox_pixels）
+    """GET /v1/realtime/vision/task 或 WS subscribe_task_detection → List[Detection]（无 bbox_pixels）
 
-    缓存字段命名约定（runtime 实际返回）：
+    兼容两种 wrapper key：
+      - HTTP cache 用 "task_state"
+      - WS push 用 "data"（routes.py:1437）
+    字段命名约定（runtime 实际返回）：
       - det_id（cache 字段） / track_id（sync 字段） 都视作 track_id
       - cls_id / class_id 都视作 class_id
     """
-    state = raw.get("task_state") or {}
+    state = raw.get("task_state") or raw.get("data") or {}
     dets = state.get("detections") or []
     now = float(state.get("updated_at") or time.time())
     out: List[Detection] = []
