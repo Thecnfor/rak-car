@@ -495,13 +495,16 @@ class ArmVisionClient:
 
             new_x = state["x_mm"] + dx_mm
             new_y = state["y_mm"] + dy_mm
+            # realtime servo: sync=False 避免阻塞 ws-subscriber 线程
+            # arm_queue worker 在后台执行；HTTP 下发即返回（job_id）
+            # ValueError（_safe_move 越界 / y 保护区）必须向上传播，不静默吞
             if move_fn is not None:
-                move_fn(new_x, new_y)
+                move_fn(new_x, new_y)    # ValueError 由 move_fn raise
             else:
                 self.http.execute_arm_action(
                     "goto_position",
                     x=new_x / 1000.0, y=new_y / 1000.0,
-                    timeout=5.0, sync=True,
+                    timeout=5.0, sync=False,
                 )
             state["x_mm"], state["y_mm"] = new_x, new_y
 
@@ -549,7 +552,7 @@ class ArmVisionClient:
                              timeout: float = 10.0,
                              on_missing_track: str = "abort",
                              move_fn: Optional[Callable[[float, float], dict]] = None,
-                             ws=None) -> ServoResult:
+                             ws=None) -> ServoResult:  # noqa: E501
         """视觉伺服实时版本：用 WS subscribe_task_detection 推流（替代 HTTP 轮询）。
 
         与 find_target 行为一致，但检测来源是 WS 推送（task_feed 30Hz），
@@ -649,13 +652,16 @@ class ArmVisionClient:
 
             new_x = state["x_mm"] + dx_mm
             new_y = state["y_mm"] + dy_mm
+            # realtime servo: sync=False 避免阻塞 ws-subscriber 线程
+            # arm_queue worker 在后台执行；HTTP 下发即返回（job_id）
+            # ValueError（_safe_move 越界 / y 保护区）必须向上传播，不静默吞
             if move_fn is not None:
-                move_fn(new_x, new_y)
+                move_fn(new_x, new_y)    # ValueError 由 move_fn raise
             else:
                 self.http.execute_arm_action(
                     "goto_position",
                     x=new_x / 1000.0, y=new_y / 1000.0,
-                    timeout=5.0, sync=True,
+                    timeout=5.0, sync=False,
                 )
             state["x_mm"], state["y_mm"] = new_x, new_y
 
