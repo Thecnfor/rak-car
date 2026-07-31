@@ -125,3 +125,78 @@ task_cfg:
 
     vacuum_settle_s: 0.5
     chassis_move_timeout_s: 30
+
+# 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
+# 触发条件: IR (红外接近) + dis_at_least_m (累计里程计) AND/OR.
+# 换场地改这里, 业务代码不动.
+waypoints:
+
+  # ----- task1 -----
+  - name: task1_seeding
+    task_id: 1
+    task_module: main.task.task1_seeding
+    ir_threshold_m: 0.6
+    ir_side: right
+    dis_at_least_m: 1.00
+    trigger_op: AND
+
+  # ----- task2 -----
+  - name: task2_water_tower
+    task_id: 2
+    task_module: main.task.task2_water_tower
+    ir_threshold_m: 0.50
+    ir_side: right
+    dis_at_least_m: 5.20
+    trigger_op: AND
+
+  # ----- task3 (TODO) -----
+  - name: task3_pest_scout
+    task_id: 3
+    task_module: main.task.task3_pest_scout
+    ir_threshold_m: 0.50
+    ir_side: right
+    dis_at_least_m: 7.00
+    trigger_op: AND
+
+  # ----- task4 -----
+  - name: task4_harvest
+    task_id: 4
+    task_module: main.task.task4_harvest
+    ir_threshold_m: 0.50
+    ir_side: right
+    dis_at_least_m: 9.00
+    trigger_op: AND
+
+  # ----- task5 -----
+  - name: task5_sort
+    task_id: 5
+    task_module: main.task.task5_sort
+    ir_threshold_m: 0.50
+    ir_side: right
+    dis_at_least_m: 11.0
+    trigger_op: AND
+
+  # ----- task6 -----
+  - name: task6_get_order
+    task_id: 6
+    task_module: main.task.task6_get_order
+    ir_threshold_m: 0.50
+    ir_side: left
+    dis_at_least_m: 13.0
+    trigger_op: AND
+
+  # ----- task7 (TODO) -----
+  - name: task7_deliver
+    task_id: 7
+    task_module: main.task.task7_deliver
+    ir_threshold_m: 0.50
+    ir_side: right
+    dis_at_least_m: 14.5
+    trigger_op: AND
+
+  # ----- finish -----
+  - name: cruise_done
+    task_module: null
+    ir_threshold_m: null
+    dis_at_least_m: 16.5
+    is_finish: true

@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 try:
     import yaml
@@ -63,4 +63,28 @@ def require(cfg: Dict[str, Any], key: str, kind: type) -> Any:
     v = cfg[key]
     if not isinstance(v, kind):
         raise TypeError(f"配置字段 {key!r} 类型应为 {kind.__name__},实际 {type(v).__name__}")
-    return v
+    return v
+
+
+def load_waypoints() -> List[Dict[str, Any]]:
+    """读取 task_config.yml 中 waypoints 段 (8 task + 1 finish).
+
+    Returns:
+        List[Dict]: 每个 dict 含 name, task_id (可选), task_module, ir_threshold_m,
+                    ir_side, dis_at_least_m, trigger_op, is_finish 等字段.
+                    orchestrator 据此构造 Waypoint 列表.
+    """
+    path = _config_path()
+    if not path.is_file():
+        raise FileNotFoundError(f"任务配置文件不存在: {path}")
+    with path.open("r", encoding="utf-8") as f:
+        all_cfg = yaml.safe_load(f)
+    if not isinstance(all_cfg, dict):
+        raise ValueError(f"{path} 顶层必须是 mapping")
+    wp = all_cfg.get("waypoints")
+    if not isinstance(wp, list):
+        raise KeyError(
+            f"task_config.yml 里没有 waypoints 段 (或不是 list), "
+            f"现有顶层 keys: {list(all_cfg.keys())}"
+        )
+    return wp
