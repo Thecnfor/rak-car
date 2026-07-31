@@ -230,6 +230,10 @@ def move_x_with_split(
     x_final = x0
     wall_hit = False
     max_overshoot_mm = 0.0
+    # 振荡检测 (2026-08-01): x_get_position 在 calibrate 后跳回 ~0,realtime 报"远"
+    # 但 motor 实际已在 target。特征:best_err 很小之后 abs(err) 突然放大 ≥3x。
+    # 命中就 break,信任 move_x PID 内部已经收住。
+    best_err_seen = initial_delta_abs
 
     for rnd in range(1, max_rounds + 1):
         try:
@@ -258,6 +262,18 @@ def move_x_with_split(
 
         if abs(err) < tol_mm:
             reached = True
+            break
+
+        # 更新 best_err_seen (本轮 err 比历史 best 小才更新)
+        if abs(err) < best_err_seen:
+            best_err_seen = abs(err)
+
+        # 振荡检测: 已经接近过 (best_err_seen < tol*3 ≈ 30mm), 但现在 err 又放大 ≥3x
+        # → x_get_position 漂移 (calibrate 后跳回 0), motor 实际已在 target, 别再调
+        if best_err_seen < tol_mm * 3 and abs(err) > best_err_seen * 3 and rnd > 1:
+            print(f"  {log_prefix} [OSCILLATION] x 在 target 附近振荡 "
+                  f"(best_err={best_err_seen:.1f}mm → 当前 err={err:+.1f}mm), "
+                  f"break (x_get_position 漂移兜底, 信任 move_x PID 已收住)")
             break
 
         # wall_hit 检测: 距墙 < TOL → 立即 break (不等 stall)
@@ -452,6 +468,25 @@ def move_x_hard_reach(
             raise RuntimeError(msg) from rescue_exc
 
     if res1["reached"]:
+        res1["reset_count"] = 0
+        return res1
+
+    # 接近到位 (2026-08-01): x_get_position 漂移让 strict reached 抓不到, 但
+    # motor 实际已经贴近 target (residual < tol * CLOSE_ENOUGH_RATIO)。
+    # belt-slip 修复初期或物理墙挡住时常见。**直接当 success 返回,不调 reset_x**
+    # ——reset_x 会撞 +300 那侧墙,motor 又跑一整段 (用户反馈 "已经跑到 -260
+    # 然后静止一段时间后还继续跑" 就是这个)。
+    CLOSE_ENOUGH_RATIO = 2.0
+    residual_abs = abs(res1["residual_mm"])
+    if residual_abs < tol_mm * CLOSE_ENOUGH_RATIO:
+        print(f"  {log_prefix} [CLOSE_ENOUGH] split 接近到位 "
+              f"(residual={res1['residual_mm']:+.1f}mm, 容差 tol×{CLOSE_ENOUGH_RATIO:.0f}="
+              f"{tol_mm * CLOSE_ENOUGH_RATIO:.0f}mm), 标记 reached=True, 不 reset_x")
+        res1["reached"] = True
+        if res1["result"] in ("success",):
+            res1["result"] = "close_enough"
+        else:
+            res1["result"] = f"close_enough_after_{res1['result']}"
         res1["reset_count"] = 0
         return res1
 
