@@ -556,7 +556,7 @@ class ArmClient:
         返回:
             {"ok": bool, "angle": float, "raw_job": dict}
         """
-        self._call_car(
+        job = self._call_car(
             "set_storage_angle", timeout=timeout,
             angle=angle, speed=speed, sync=True,
         )

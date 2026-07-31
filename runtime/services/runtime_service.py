@@ -358,6 +358,16 @@ class CarRuntimeService:
                 )
         if reset_position:
             car.reset_position()
+        # 2026-07-30 init 时把存储仓舵机转到 close 物理位（98°），与 reset 同步。
+        # 参照 test/test_storage_close.py：先抬 y 到 -150mm 离开保护区，再发舵机。
+        # 走下层同步方法（car.arm.move_y_position / car.set_storage_angle），
+        # 不绕 HTTP / ArmClient 业务 wrapper，失败仅 log warn，不阻断 init。
+        try:
+            car.arm.move_y_position(-0.150)
+            car.set_storage_angle(98, speed=5)
+            logger.info("init storage close (98°) 完成")
+        except Exception as exc:  # pragma: no cover - 不让 init 失败
+            logger.warning("init storage close 失败: %s" % exc)
         self.car = car
         self.controller_generation = session.get("generation")
         self.last_init_at = time.time()
