@@ -98,6 +98,13 @@ DEFAULT_PICK_ERROR_TOLERANCE: int = 99
 """连续 pick 失败超过此数 → break (默认 99 = 不强制 stop, 让业务层自己决定何时停)。
    7 轮中失败 1-2 次正常 (现场 stall / 噪声), 不应让 1 次失败打掉整轮。"""
 
+DEFAULT_PRE_RECOGNITION_SETTLE_S: float = 3.0
+"""识别前静置秒数 (2026-08-01): 用户实测 arm 在目标位姿微抖 (x PID 振荡 / y 抖动
+   / chassis 80mm 前移后回弹), fetch_balls 立刻抓拍会把抖动当噪声框。
+   静置 N 秒让所有零件稳定后再识别, 准确率显著提升。
+   默认 3.0s (平衡识别准确率 vs 总耗时; 7 轮 × 3s = 21s 加到整轮)。
+   设 0 = 跳过静置 (老行为, 给现场快速调试用)。"""
+
 
 # ---------- 内部 helper ----------
 
@@ -126,16 +133,21 @@ def _identify_and_pick(
     verify_target1_pose: bool,
     pick_timeout_s: float,
     dry_run: bool,
+    pre_recognition_settle_s: float = DEFAULT_PRE_RECOGNITION_SETTLE_S,
 ) -> dict:
     """单轮 "识别 + 抓球" 序列。
 
-    1. fetch_balls (调 task_feed 守护线程, 走 realtime 不抢 car_lock)
-    2. 选 score 最高的 1 球 (蓝/黄)
-    3. 蓝色 → pick_up_blue; 黄色 → pick_up_yellow; 无球 → skip
-    4. 抓球失败 → log + 返 result["ok"]=False, **不抛** (让外层循环继续)
+    1. (2026-08-01) **静置 N 秒让臂稳定** (pre_recognition_settle_s)
+       arm 在目标位姿微抖 (x PID 振荡 / y 抖动 / chassis 前移回弹),
+       fetch_balls 立刻抓拍会把抖动当噪声框 → 静置后识别准确率显著提升。
+    2. fetch_balls (调 task_feed 守护线程, 走 realtime 不抢 car_lock)
+    3. 选 score 最高的 1 球 (蓝/黄)
+    4. 蓝色 → pick_up_blue; 黄色 → pick_up_yellow; 无球 → skip
+    5. 抓球失败 → log + 返 result["ok"]=False, **不抛** (让外层循环继续)
 
     Args:
         round_idx: 当前轮次 (用于日志, 0 = 初始轮)
+        pre_recognition_settle_s: 识别前静置秒数 (默认 3.0s, 设 0 跳过)
         其他: 见 step_target4 docstring
 
     Returns:
@@ -150,6 +162,15 @@ def _identify_and_pick(
     """
     phase = "初始" if round_idx == 0 else f"第{round_idx}轮"
     print(f"\n--- [{LOG_PREFIX}] {phase}: 识别 + 抓球 ---")
+
+    # 0. (2026-08-01) 识别前静置, 让臂稳定 (y / arm / hand / x 微抖收敛)
+    #    dry-run 也照睡 (让 dry-run 总时长跟真跑对齐, 方便比对日志)
+    if pre_recognition_settle_s > 0:
+        print(f"  [{LOG_PREFIX}] ⏸  静置 {pre_recognition_settle_s:.1f}s "
+              f"(识别前稳定臂位姿, 抑制 PID 振荡/底盘回弹噪声)")
+        time.sleep(pre_recognition_settle_s)
+    else:
+        print(f"  [{LOG_PREFIX}] ⏩ 跳过静置 (pre_recognition_settle_s=0)")
 
     # 1. 视觉检测
     try:
@@ -269,6 +290,7 @@ def step_target4(
     pick_error_tolerance: int = DEFAULT_PICK_ERROR_TOLERANCE,
     do_prep: bool = True,
     dry_run: bool = False,
+    pre_recognition_settle_s: float = DEFAULT_PRE_RECOGNITION_SETTLE_S,
 ) -> dict:
     """target1 起手 + 循环 (前移 + 识别 + 抓球)。
 
@@ -286,6 +308,8 @@ def step_target4(
         pick_error_tolerance: 连续 pick 失败超过此数 → break (默认 99 = 不强制停)。
         do_prep: True (默认) 开头跑 target1.step_target1; False 跳过 (假设已在 target1 位姿)。
         dry_run: True 只 print 不动硬件。
+        pre_recognition_settle_s: 识别前静置秒数 (2026-08-01, 默认 3.0s)。
+            设 0 = 跳过静置 (老行为)。识别更准, 总耗时增加 rounds * settle_s。
 
     Returns:
         dict:
@@ -305,6 +329,9 @@ def step_target4(
           f"+ 1 初始识别/抓球 (在 target1 位姿上)")
     print(f"  抓球后 x 回: {return_x_mm} mm (None = 不回)")
     print(f"  准备位姿: {'跑 target1' if do_prep and not dry_run else '跳过'}")
+    print(f"  识别前静置: {pre_recognition_settle_s:.1f}s "
+          f"(0=跳过, 让臂稳定后 fetch_balls 抓拍; "
+          f"每轮增加 {(rounds + 1) * pre_recognition_settle_s:.1f}s)")
 
     if rounds < 0:
         raise ValueError(f"rounds 必须 ≥ 0, 收到: {rounds}")
@@ -340,6 +367,7 @@ def step_target4(
             verify_target1_pose=verify_target1_pose,
             pick_timeout_s=pick_timeout_s,
             dry_run=dry_run,
+            pre_recognition_settle_s=pre_recognition_settle_s,
         )
         history.append(init_res)
         if init_res["action"] == "picked":
@@ -384,6 +412,7 @@ def step_target4(
                 verify_target1_pose=verify_target1_pose,
                 pick_timeout_s=pick_timeout_s,
                 dry_run=dry_run,
+                pre_recognition_settle_s=pre_recognition_settle_s,
             )
             history.append(round_res)
             if round_res["action"] == "picked":
@@ -467,6 +496,11 @@ def build_parser() -> argparse.ArgumentParser:
                    default=DEFAULT_PICK_ERROR_TOLERANCE,
                    help=f"连续 pick 失败超过此数 → 退出循环 (默认 "
                         f"{DEFAULT_PICK_ERROR_TOLERANCE} = 不强制停)")
+    p.add_argument("--pre-recognition-settle-s", dest="pre_recognition_settle_s",
+                   type=float, default=DEFAULT_PRE_RECOGNITION_SETTLE_S,
+                   help=f"识别前静置秒数 (默认 {DEFAULT_PRE_RECOGNITION_SETTLE_S}s)。"
+                        f" 设 0 = 跳过 (老行为)。每轮增加 rounds × 该值 秒, "
+                        f"但 fetch_balls 抓拍准确率显著提升。")
     return p
 
 
@@ -496,6 +530,7 @@ def main(argv=None) -> int:
         pick_error_tolerance=args.pick_error_tolerance,
         do_prep=not args.no_prep,
         dry_run=args.dry_run,
+        pre_recognition_settle_s=args.pre_recognition_settle_s,
     )
 
     print(f"\n[{LOG_PREFIX}] 最终结果: {result}")
