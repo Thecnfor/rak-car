@@ -1613,18 +1613,8 @@ class MyCar(MecanumDriver):
             self._ir_feed_thread = cur_thread
             self._ir_feed_stop = cur_stop
             self._ir_feed_hz = cur_hz
-        logger.info(
-            "ir_feed start(hz=%s) pre-state: thread_is_None=%s thread_alive=%s cur_hz=%s"
-            % (
-                hz,
-                self._ir_feed_thread is None,
-                self._ir_feed_thread.is_alive() if self._ir_feed_thread is not None else None,
-                self._ir_feed_hz,
-            )
-        )
         with self._ir_feed_lock:
             # 同一 hz 已经在跑，直接 fast-path（即使别的并发 caller 刚 restart 完）。
-            # 属性为 None 用 getattr 防 force-init 把 car 替换成新对象但实例属性缺失
             cur_thread = self._ir_feed_thread
             cur_hz = self._ir_feed_hz
             if (
@@ -1633,10 +1623,6 @@ class MyCar(MecanumDriver):
                 and cur_hz is not None
                 and float(cur_hz) == float(hz)
             ):
-                logger.info(
-                    "ir_feed fast-path (alive hz=%s requested hz=%s)"
-                    % (cur_hz, hz)
-                )
                 return {"started": False, "reason": "already_running", "hz": hz}
             # 否则无论 alive 与否，都走"清旧建新"——也覆盖了"join 失败但活进程失去响应"边界
             if self._ir_feed_thread is not None:
