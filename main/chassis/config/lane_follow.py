@@ -2,11 +2,12 @@
 巡线外环的**参数值**集中地。examples / tasks 里不再写默认值，只引用这里的 profile。
 
 一个 profile = 一套现场标定好的参数 + 从参数造控制律/软化器的工厂方法。
-换场地只改这个文件（或传一个 replace() 出来的变体），控制律与循环代码不动。
+换场地只改这个文件（或传一个 tuned() 出来的变体），控制律与循环代码不动。
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from enum import Enum
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -16,9 +17,39 @@ if TYPE_CHECKING:  # 避免 config 反向依赖控制律实现
     from ..controllers.base import OuterLoop, WheelSmoother
 
 
+class ControllerType(str, Enum):
+    """profile 支持的控制律。``build_outer()`` 按这个字段分发。"""
+
+    CURVATURE_ADAPTIVE = "curvature_adaptive"
+    STANLEY = "stanley"
+    P = "p"
+
+
+# ─── Magic-number 集中点（#8）─────────────────────────────────
+# 这些值以前散落在 curvature_adaptive / stanley / safety 里，
+# 现在统一到这里，方便跨控制器统一调。
+# 含义见 controllers/ 下各文件。
+
+# _update_curvature 中过滤 lane_feed 异常间隔（秒）
+DT_VALID_MIN_S: float = 0.005
+DT_VALID_MAX_S: float = 0.5
+
+# omega_raw 的硬截上限（弧度变化率）—— curvature_adaptive 的 min(kappa, 1.5) 等价物
+KAPPA_HARD_CAP: float = 1.5
+
+# Stanley 的 vx 防除零下限
+STANLEY_VX_FLOOR: float = 0.05
+
+# LostLineDetector 的零误差阈值（m / rad）
+LOST_LINE_ZERO_EPS: float = 1e-3
+
+
 @dataclass(frozen=True)
 class LaneFollowProfile:
-    """curvature-adaptive 巡线的全部可调量。字段语义见 controllers/curvature_adaptive.py。"""
+    """巡线外环全部可调量。字段语义见 controllers/curvature_adaptive.py 等。"""
+
+    # --- 控制律选择（#6） ---
+    controller_type: ControllerType = ControllerType.CURVATURE_ADAPTIVE
 
     # --- 循环节律 ---
     hz: float = 50.0
@@ -27,8 +58,10 @@ class LaneFollowProfile:
     watchdog_ms: Optional[float] = 500.0
     lost_line_ms: Optional[float] = None  # 笔直居中路段误差本来就会齐 0，默认不按丢线处理
 
-    # --- 速度曲线（v_min / kappa_full 由 curvature_adaptive.py 默认值接管）---
+    # --- 速度曲线（#2 补齐） ---
     v_max: float = 0.24
+    v_min: float = 0.12
+    kappa_full: float = 0.9
     dkappa_full: float = 1.5
 
     # --- P 项 ---
@@ -40,9 +73,16 @@ class LaneFollowProfile:
     ey_int_cap: float = 0.10
     ey_int_decay: float = 0.80
 
-    # --- 弧度变化驱动的 omega 增益（omega_cap 由 curvature_adaptive.py 默认值接管）---
+    # --- 角度 I 项（#2 补齐）---
+    ki_theta: float = 0.30
+    ea_int_cap: float = 0.40
+    ea_int_decay: float = 0.50
+
+    # --- 弧度变化驱动的 omega 增益（#2 补齐 omega_cap / ema_alpha）---
     omega_gain: float = 0.35
     k_curvature: float = 0.25
+    omega_cap: float = 2.8
+    ema_alpha: float = 0.35
 
     # --- 恢复门控 ---
     ey_release: float = 0.02
@@ -57,23 +97,48 @@ class LaneFollowProfile:
     # --- 麦轮几何 ---
     r_eff: float = 0.30
 
-    # --- 下发软化（饱和 + slew rate）（max_abs 由 base.py 默认值接管）---
+    # --- 下发软化（饱和 + slew rate）（#4 补齐 max_abs）---
+    wheel_max_abs: float = 0.70
     wheel_max_accel: float = 0.4
     wheel_max_decel: float = 0.6
 
     def build_outer(self) -> "OuterLoop":
-        from ..controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
+        # 按 controller_type 分发（#6）。CurvatureAdaptiveOuterLoop 透传全部 19 个参数；
+        # Stanley / P 只接受它们自己的字段，其余用 profile 默认值即可。
+        if self.controller_type == ControllerType.STANLEY:
+            from ..controllers.stanley import StanleyOuterLoop
+            return StanleyOuterLoop(
+                vx=self.v_max,
+                r_eff=self.r_eff,
+            )
+        if self.controller_type == ControllerType.P:
+            from ..controllers.p_controller import POuterLoop
+            return POuterLoop(
+                kp_y=self.kp_y,
+                kp_theta=self.kp_theta,
+                vx=self.v_max,
+                r_eff=self.r_eff,
+            )
 
+        # 默认：curvature_adaptive
+        from ..controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
         return CurvatureAdaptiveOuterLoop(
             v_max=self.v_max,
+            v_min=self.v_min,
+            kappa_full=self.kappa_full,
             dkappa_full=self.dkappa_full,
             kp_y=self.kp_y,
             kp_theta=self.kp_theta,
             ki_y=self.ki_y,
             ey_int_cap=self.ey_int_cap,
             ey_int_decay=self.ey_int_decay,
+            ki_theta=self.ki_theta,
+            ea_int_cap=self.ea_int_cap,
+            ea_int_decay=self.ea_int_decay,
             omega_gain=self.omega_gain,
             k_curvature=self.k_curvature,
+            omega_cap=self.omega_cap,
+            ema_alpha=self.ema_alpha,
             ey_release=self.ey_release,
             ea_release=self.ea_release,
             hold_ms=self.hold_ms,
@@ -87,6 +152,7 @@ class LaneFollowProfile:
         from ..controllers.base import WheelSmoother
 
         return WheelSmoother(
+            max_abs=self.wheel_max_abs,
             max_accel=self.wheel_max_accel,
             max_decel=self.wheel_max_decel,
         )

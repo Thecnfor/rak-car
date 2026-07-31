@@ -2,8 +2,16 @@ from __future__ import annotations
 import math
 import time
 from typing import List, Optional
+
 from ..state import LaneState
+from ..config.lane_follow import (
+    DT_VALID_MIN_S,
+    DT_VALID_MAX_S,
+    KAPPA_HARD_CAP,
+)
 from .base import OuterLoop, mecanum_inverse
+
+
 class CurvatureAdaptiveOuterLoop(OuterLoop):
     def __init__(
         self,
@@ -61,6 +69,9 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self._kappa_ema: float = 0.0
         self._prev_ea: Optional[float] = None
         self._prev_ea_t: Optional[float] = None
+        # _prev_sign 单独存：丢线时 decay 而不是硬复位（#9），
+        # 避免下一帧进入弯道符号默认变 +1，引入横跳。
+        self._prev_sign: float = 1.0
         self._dkappa_ema: float = 0.0
         self._straight_streak_ms: float = 0.0
 
@@ -76,7 +87,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             and now > self._prev_ea_t
         ):
             dt = now - self._prev_ea_t
-            if 0.005 <= dt <= 0.5:
+            if DT_VALID_MIN_S <= dt <= DT_VALID_MAX_S:
                 dkappa_inst = abs((ea - self._prev_ea) / dt)
         self._prev_ea = ea
         self._prev_ea_t = now
@@ -142,6 +153,9 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             self._straight_streak_ms = 0.0
             self._prev_ea = None
             self._prev_ea_t = None
+            # _prev_sign 不复位，只 decay（#9）—— 短暂丢线后能记住上次弯向，
+            # 重新获线时前馈项符号不会从 +1 跳到 -1（产生横跳）。
+            self._prev_sign *= math.exp(-1.0 * dt)
             self._ey_integral = 0.0
             self._ea_integral = 0.0
             return self._safe_zero()
@@ -159,14 +173,15 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
 
         vy_raw = -self.kp_y * float(state.error_y) - self.ki_y * self._ey_integral
 
-        boost = 1.0 + self.omega_gain * min(kappa, 1.5)
-        # 前馈符号用 _prev_ea 保留方向记忆，避免 error_angle 归零后 copysign(0) 默认 +1
-        _prev_sign = 1.0
-        if self._prev_ea is not None and self._prev_ea != 0.0:
-            _prev_sign = math.copysign(1.0, self._prev_ea)
+        boost = 1.0 + self.omega_gain * min(kappa, KAPPA_HARD_CAP)
+        # 前馈符号：用 state.error_angle 实时方向更新 _prev_sign，
+        # 而不是用 _prev_ea 兜底（_prev_ea 在 has_error=False 时被复位会丢符号）。
+        ea_now = float(state.error_angle)
+        if ea_now != 0.0:
+            self._prev_sign = math.copysign(1.0, ea_now)
         omega_raw = (
-            +self.kp_theta * float(state.error_angle) * boost
-            + self.k_curvature * self._dkappa_ema * _prev_sign
+            +self.kp_theta * ea_now * boost
+            + self.k_curvature * self._dkappa_ema * self._prev_sign
             + self.ki_theta * self._ea_integral * boost
         )
         if omega_raw > self.omega_cap:

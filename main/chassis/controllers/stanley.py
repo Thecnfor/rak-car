@@ -6,6 +6,7 @@ import math
 from typing import List
 
 from ..state import LaneState
+from ..config.lane_follow import STANLEY_VX_FLOOR
 from .base import OuterLoop
 
 
@@ -22,7 +23,7 @@ class StanleyOuterLoop(OuterLoop):
             return self._safe_zero()
         vy = -float(state.error_y)  # 视觉误差直接当横向修正（米）
         # Stanley 转向
-        v = max(self.vx, 0.05)
+        v = max(self.vx, STANLEY_VX_FLOOR)
         delta = float(state.error_angle) + math.atan(self.k * float(state.error_y) / v)
         omega = -delta
         # Stanley 是单舵机思路；麦轮上把 delta 视作 omega、vy 视作横移
