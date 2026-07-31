@@ -13,6 +13,7 @@ import yaml
 import os
 import sys
 from typing import Union
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # 添加上本地目录
 dir_this = os.path.abspath(os.path.dirname(__file__))
@@ -752,6 +753,180 @@ class ArmController:
         return results
 
 
+    # ============== 复合动作 (业务层 pick / release / go_home 用) ==============
+    #
+    # 与 reset_all 同样的设计：
+    #   - ThreadPoolExecutor 在一个 runtime job 内部并行驱动多个电机
+    #   - arm_queue 单 worker,串行的是 JOB 之间,JOB 内的并发是安全的
+    #   - 任何子步骤异常 logger.warning 不抛,避免 runtime 走 _should_probe_controller 自愈路径
+    #   - 返回 {"ok": bool, "steps": {...}} 让上层 ArmRunner 自决定后续动作
+    #
+    # 业务侧说明 (main/arm/README.md §坐标系约定 + 软限位)：
+    #   - x 单位米,y 单位米 (与 goto_position 一致)
+    #   - arm_angle 单位度,set_arm_angle 直传
+    #   - hand 单位度,set_hand_angle 直传
+    #   - grasp 是 vacuum 开关
+
+    def composite_pick(
+        self,
+        arm_angle: float,
+        x: float,
+        y: float,
+        hand: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合抓取：并行 set_arm_angle + goto_position,再串行 set_hand_angle + grasp(True)。
+
+        设计：
+          ① ThreadPoolExecutor(2) 并行 set_arm_angle(arm_angle) + goto_position(x, y)
+            (大臂舵机 + x/y 电机物理独立)
+          ② 等两者都到位
+          ③ 串行 set_hand_angle(hand) — 手爪独立,放最后避免与旋转中的大臂撞车
+          ④ grasp(True) 开真空泵
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool, "grasp": bool}}
+        """
+        results = {"arm": False, "position": False, "hand": False, "grasp": False}
+
+        # ① 并行：大臂角度 + xy 位置
+        def _do_arm():
+            self.set_arm_angle(arm_angle, speed=speed)
+            return ("arm", True)
+
+        def _do_position():
+            self.goto_position(x, y)
+            return ("position", True)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="composite_pick") as ex:
+                futs = [ex.submit(_do_arm), ex.submit(_do_position)]
+                for fut in as_completed(futs, timeout=timeout):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("composite_pick 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("composite_pick 并行阶段异常: %s" % exc)
+
+        # ② 仅当 position 成功才继续 hand + grasp (避免抓在错误位置)
+        if results["position"]:
+            try:
+                self.set_hand_angle(hand, speed=speed)
+                results["hand"] = True
+            except Exception as exc:
+                logger.warning("composite_pick: set_hand_angle 异常: %s" % exc)
+            try:
+                self.grasp(True)
+                results["grasp"] = True
+            except Exception as exc:
+                logger.warning("composite_pick: grasp 异常: %s" % exc)
+        else:
+            logger.warning("composite_pick: position 未到位,跳过 hand + grasp")
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+
+    def composite_release(
+        self,
+        drop_x: float = 0.0,
+        drop_y: float = 0.03,
+        hand: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合释放：保守序列 — 先 set_hand_angle,再 goto_position,再 grasp(False)。
+
+        为什么 release 不用并发：
+          - hand 放料姿态是 DOWN (0°),与 set_hand_angle 直传;
+            同时 set_hand_angle 在大臂展开带 [-30, +30] 时拒绝非 UP,
+            因此保守起见 hand 串行在 position 之前(避开"手爪先下但位置未到"的中间态)
+          - position 单轴并发节省有限,主要时间花在舵机 wait,不值得加并发复杂度
+
+        Returns:
+            {"ok": bool, "steps": {"hand": bool, "position": bool, "grasp": bool}}
+        """
+        results = {"hand": False, "position": False, "grasp": False}
+
+        # ① hand 串行 (业务侧 _check_y_protected 在 client wrapper 已做)
+        try:
+            self.set_hand_angle(hand, speed=speed)
+            results["hand"] = True
+        except Exception as exc:
+            logger.warning("composite_release: set_hand_angle 异常: %s" % exc)
+            # hand 失败仍继续 — 可能已经在 DOWN
+
+        # ② position 单线程,够用
+        try:
+            self.goto_position(drop_x, drop_y)
+            results["position"] = True
+        except Exception as exc:
+            logger.warning("composite_release: goto_position 异常: %s" % exc)
+
+        # ③ grasp 关真空
+        try:
+            self.grasp(False)
+            results["grasp"] = True
+        except Exception as exc:
+            logger.warning("composite_release: grasp 异常: %s" % exc)
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+
+    def composite_go_home(
+        self,
+        hand: float = -90.0,
+        arm: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合回原点：并行 set_arm_angle + goto_position,再串行 set_hand_angle(hand)。
+
+        hand 放最后：
+          - hand=-90 (UP) 是安全姿态,即便大臂在 [-30,+30] 也不会撞车
+          - 与 reset_all 末尾 hand 串行的设计一致
+
+        Returns:
+            {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool}}
+        """
+        results = {"arm": False, "position": False, "hand": False}
+
+        # ① 并行：大臂角度 + xy 位置
+        def _do_arm():
+            self.set_arm_angle(arm, speed=speed)
+            return ("arm", True)
+
+        def _do_position():
+            self.goto_position(0.0, 0.0)
+            return ("position", True)
+
+        try:
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="composite_go_home") as ex:
+                futs = [ex.submit(_do_arm), ex.submit(_do_position)]
+                for fut in as_completed(futs, timeout=timeout):
+                    try:
+                        name, ok = fut.result()
+                        results[name] = bool(ok)
+                    except Exception as exc:
+                        logger.warning("composite_go_home 子步骤异常: %s" % exc)
+        except Exception as exc:
+            logger.warning("composite_go_home 并行阶段异常: %s" % exc)
+
+        # ② hand 串行,放最后(参考 reset_all 模式)
+        try:
+            self.set_hand_angle(hand, speed=speed)
+            results["hand"] = True
+        except Exception as exc:
+            logger.warning("composite_go_home: set_hand_angle 异常: %s" % exc)
+
+        ok = all(results.values())
+        return {"ok": ok, "steps": results}
+
+
     def hand_params_init(self, hand, hand2, grap):
         """
         初始化手部参数
@@ -1090,10 +1265,10 @@ class ArmController:
         
         '''
         self.goto_position(x, y)
-        # time.sleep(0.2)
+        # 注：原先此处 arm -> hand 之间有 time.sleep(1) 死等,
+        # 与 PID 闭环无关,纯空转。已删除(2026-07-31 PR#13)。
         if arm is not None:
             self.set_arm_angle(arm)
-            time.sleep(1)
         if hand is not None:
             self.set_hand_angle(hand)
 

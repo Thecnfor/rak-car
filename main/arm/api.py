@@ -147,7 +147,10 @@ class ArmClient:
         D 改造后默认 sync=True：
           - 长动作（move_xy / reset_y 等）业务语义就是「等完成才能走下一步」，
             改 sync=False 会破坏现有链式编排。
-          - 想 fire-and-forget（例如并发抓多个目标）显式传 sync=False。
+          - sync=False 让 HTTP 调用方立即返回,适合「自己开线程监控」
+            或「后台持续动作」。**注意**:runtime 的 arm_queue 单 worker,
+            多个 sync=False 调用仍按提交顺序串行执行,**不会真并发**。
+            真并发见 composite_pick / composite_release / composite_go_home。
         """
         return self.http.execute_arm_action(
             name, *args, timeout=timeout, sync=sync, **kwargs
@@ -309,9 +312,18 @@ class ArmClient:
         try:
             st = self.get_state()
             y_mm = float(st.y_mm)
-        except Exception:
-            # 读不到 y（init 阶段或底层异常）不阻断，避免死锁
-            return
+        except Exception as exc:
+            # 2026-07-31 PR#13: 改 fail-closed。原来这里"读不到就放行"
+            # 在硬件失控时会放过撞车指令。改为保守拒绝：
+            #   - log warning 留现场
+            #   - raise ValueError 让 caller 显式选择"跳过保护再下发"
+            logger.warning(
+                "_check_y_protected: 读不到 state,保守拒绝 (action=%s, err=%s)",
+                action, exc,
+            )
+            raise ValueError(
+                f"[{action}] 无法读取 y 状态,保守拒绝。runtime 是否在线?"
+            ) from exc
         if y_mm > self._Y_PROTECTED_THRESHOLD_MM:
             if allow_init_position:
                 return
@@ -629,6 +641,125 @@ class ArmClient:
             arm_angle=arm_angle, hand_angle=hand_angle,
             x_direction=x_direction,
             reset_x_velocity=reset_x_velocity_mms / 1000.0,
+        )
+
+    # ---- composite (2026-07-31 PR#13) ----
+    #
+    # 业务层 pick / release / go_home 用这三个方法替换原来的"三步串行"。
+    # 设计原则:
+    #   - entry-only validation (一次性 _check_y_protected + _check_safe + arm/hand 限位)
+    #   - 单次 _call_arm,内部一个 runtime job 内 ThreadPoolExecutor 真并发
+    #   - 不要在本 wrapper 调 set_arm_angle / set_hand_angle (它们有 live-state 检查,会与并发冲突)
+
+    def _validate_arm_angle_client(self, angle: float, action: str) -> None:
+        """业务层大臂角度硬限 [+90, -150]° 校验。"""
+        try:
+            a = float(angle)
+        except (TypeError, ValueError):
+            raise ValueError(f"{action} arm_angle 必须是数字，收到: {angle!r}")
+        if a > self._ARM_ANGLE_MAX or a < self._ARM_ANGLE_MIN:
+            raise ValueError(
+                f"{action} arm_angle({a}) 超出业务硬限 [{self._ARM_ANGLE_MIN}, "
+                f"{self._ARM_ANGLE_MAX}]°。\n"
+                f"  规则: 大臂角度 ∈ [+90, -150]°（+90 是复位位，-150 是结构极限）\n"
+                f"  解决: 选 +90 (复位) / 0 (MID) / -90 / -150 等。"
+            )
+
+    def _validate_hand_angle_client(self, angle: float, action: str) -> None:
+        """业务层手爪角度硬限 [-90, 0]° 校验。"""
+        try:
+            a = float(angle)
+        except (TypeError, ValueError):
+            raise ValueError(f"{action} hand 必须是数字，收到: {angle!r}")
+        if a > self._HAND_ANGLE_MAX or a < self._HAND_ANGLE_MIN:
+            raise ValueError(
+                f"{action} hand({a}) 超出业务硬限 [{self._HAND_ANGLE_MIN}, "
+                f"{self._HAND_ANGLE_MAX}]°。\n"
+                f"  规则: 手爪角度 ∈ [-90, 0]°（DOWN=0, UP=-90）\n"
+                f"  解决: 选 0 (DOWN) / -90 (UP) / 中间值。"
+            )
+
+    def composite_pick(
+        self,
+        arm_angle: float,
+        x_mm: float,
+        y_mm: float,
+        hand: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合抓取（2026-07-31 PR#13）：底层并行 set_arm_angle + goto_position,再串行 hand + grasp。
+
+        业务前置：必须先 move_y(<-30) 出保护区，再调本方法。
+        入口校验：arm_angle ∈ [+90, -150]°、hand ∈ [-90, 0]°、y ∈ 软限位。
+        返回 {"ok": bool, "steps": {...}} — ok=False 时由 caller 决定后续动作。
+
+        Args:
+            arm_angle: 大臂目标角度（°）。
+            x_mm / y_mm: xy 目标（mm,业务单位）。
+            hand: 手爪角度（°），默认 0=DOWN。
+            speed: 舵机速度，默认 80。
+            timeout: HTTP 同步超时（秒），默认 30。
+        """
+        action = "composite_pick"
+        self._validate_arm_angle_client(arm_angle, action)
+        self._validate_hand_angle_client(hand, action)
+        self._check_y_protected(action)
+        self._check_safe(y_mm=y_mm)
+        return self._call_arm(
+            action, timeout=timeout,
+            arm_angle=arm_angle, x=_mm_to_m(x_mm), y=_mm_to_m(y_mm),
+            hand=hand, speed=speed,
+        )
+
+    def composite_release(
+        self,
+        drop_x_mm: float = 0.0,
+        drop_y_mm: float = 30.0,
+        hand: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合释放（2026-07-31 PR#13）：保守序列 hand → goto_position → grasp(False)。
+
+        释放场景 hand=DOWN 在大臂展开带时安全门会拒绝,因此串行手爪在前。
+        业务前置：必须先 move_y(<-30) 出保护区。
+
+        Returns:
+            {"ok": bool, "steps": {"hand": bool, "position": bool, "grasp": bool}}
+        """
+        action = "composite_release"
+        self._validate_hand_angle_client(hand, action)
+        self._check_y_protected(action)
+        self._check_safe(y_mm=drop_y_mm)
+        return self._call_arm(
+            action, timeout=timeout,
+            drop_x=_mm_to_m(drop_x_mm), drop_y=_mm_to_m(drop_y_mm),
+            hand=hand, speed=speed,
+        )
+
+    def composite_go_home(
+        self,
+        hand: float = -90.0,
+        arm: float = 0.0,
+        speed: int = 80,
+        timeout: float = 30.0,
+    ) -> dict:
+        """复合回原点（2026-07-31 PR#13）：底层并行 set_arm_angle + goto_position,再串行 hand=UP。
+
+        hand=-90 (UP) 是 init 位置,允许在保护区内调,故无需预出保护区。
+        返回 {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool}}。
+        """
+        action = "composite_go_home"
+        self._validate_arm_angle_client(arm, action)
+        self._validate_hand_angle_client(hand, action)
+        # hand=UP / arm=0 是 init 位置,_check_y_protected 内置 allow_init_position 处理
+        # 但 composite_go_home 是单次 HTTP,job 内顺序是 arm+position 并行 → hand,
+        # arm=0 / hand=-90 都在 init,保护区对它们直接放行
+        self._check_y_protected(action)
+        return self._call_arm(
+            action, timeout=timeout,
+            hand=hand, arm=arm, speed=speed,
         )
 
     def reset_origin(self, x_wall: str = "left", timeout: float = 60.0) -> dict:
