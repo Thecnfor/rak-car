@@ -21,6 +21,55 @@ from smartcar import logger
 from smartcar.paddlebaidu.infer_cs import ClintInterface
 
 
+def _new_health():
+    """守护线程心跳模板（lane / arm / task / ir / odom 共用）。
+
+    字段被 runtime 的 feed watchdog 巡检：alive=False 表示显式 stop；
+    last_iter_at / last_ok_at 距今超阈值视为"卡死"要 restart。
+    """
+    return {
+        "alive": True,
+        "started_at": time.time(),
+        "last_iter_at": 0.0,
+        "last_ok_at": 0.0,
+        "iter_count": 0,
+        "ok_count": 0,
+        "err_count": 0,
+        "last_err": None,
+        "last_err_at": 0.0,
+    }
+
+
+def _stop_feed(self, attr_base, force):
+    """通用 feed 停止骨架：force=False 一律 no-op（消费者生命周期不该杀生产者）。
+
+    attr_base: "lane_feed" / "arm_feed" / "task_feed" / "ir_feed" / "odom_feed"。
+    stop 的 5 份重复实现收敛成这一个；各 feed 的 start 因 loop 差异保留显式。
+    """
+    lock = getattr(self, "_{}_lock".format(attr_base), None)
+    if lock is None:
+        return {"stopped": True, "reason": "never_started"}
+    if not force:
+        logger.warning("stop_{} called without force=True → NOOP".format(attr_base))
+        return {"stopped": False, "reason": "noop_without_force"}
+    with lock:
+        stop_event = getattr(self, "_{}_stop".format(attr_base), None)
+        thread = getattr(self, "_{}_thread".format(attr_base), None)
+    if stop_event is None and thread is None:
+        return {"stopped": True, "reason": "never_started"}
+    if stop_event is not None:
+        stop_event.set()
+    joined = True
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=5.0)
+        joined = not thread.is_alive()
+    with lock:
+        if joined:
+            setattr(self, "_{}_thread".format(attr_base), None)
+            setattr(self, "_{}_stop".format(attr_base), None)
+    return {"stopped": True, "joined": joined}
+
+
 class FeedsMixin:
     """MyCar 的守护线程缓存刷新行为。"""
 
@@ -151,17 +200,7 @@ class FeedsMixin:
                 )
 
                 # 心跳字段:watchdog 用它判断"守护线程是否还在喂数据"
-                health = {
-                    "alive": True,
-                    "started_at": time.time(),
-                    "last_iter_at": 0.0,
-                    "last_ok_at": 0.0,
-                    "iter_count": 0,
-                    "ok_count": 0,
-                    "err_count": 0,
-                    "last_err": None,
-                    "last_err_at": 0.0,
-                }
+                health = _new_health()
                 self._lane_feed_health = health
 
                 # backoff 状态:连续异常不退出,只拉长间隔
@@ -227,23 +266,7 @@ class FeedsMixin:
         设计原则: **消费者脚本的生命周期绝不应该杀掉生产者守护线程。**
         默认 force=False → no-op, 只有显式 force=True(运维 / runtime 关闭路径) 才真的停。
         """
-        if not force:
-            logger.warning("stop_lane_feed called without force=True → NOOP (守护线程不关)")
-            return {"stopped": False, "reason": "noop_without_force"}
-        with self._lane_feed_lock:
-            stop_event = self._lane_feed_stop
-            thread = self._lane_feed_thread
-        if stop_event is not None:
-            stop_event.set()
-        joined = True
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=5.0)
-            joined = not thread.is_alive()
-        with self._lane_feed_lock:
-            if joined:
-                self._lane_feed_thread = None
-                self._lane_feed_stop = None
-        return {"stopped": True, "joined": joined}
+        return _stop_feed(self, "lane_feed", force)
 
     def restart_lane_feed(self, hz: float = 50.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等,不丢状态)。"""
@@ -282,17 +305,7 @@ class FeedsMixin:
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_arm_state", None) if streamer else None
                 # 2026-08-01：心跳字段, runtime_service 的 feed watchdog 巡检用
-                health = {
-                    "alive": True,
-                    "started_at": time.time(),
-                    "last_iter_at": 0.0,
-                    "last_ok_at": 0.0,
-                    "iter_count": 0,
-                    "ok_count": 0,
-                    "err_count": 0,
-                    "last_err": None,
-                    "last_err_at": 0.0,
-                }
+                health = _new_health()
                 self._arm_feed_health = health
                 # 2026-08-01：外层绝不死 while True + try/except
                 outer_crash = 0
@@ -348,25 +361,7 @@ class FeedsMixin:
             return {"started": True, "hz": hz}
 
     def stop_arm_feed(self, force: bool = False):
-        if not hasattr(self, "_arm_feed_lock"):
-            return {"stopped": True, "reason": "never_started"}
-        if not force:
-            logger.warning("stop_arm_feed called without force=True → NOOP")
-            return {"stopped": False, "reason": "noop_without_force"}
-        with self._arm_feed_lock:
-            stop_event = self._arm_feed_stop
-            thread = self._arm_feed_thread
-        if stop_event is not None:
-            stop_event.set()
-        joined = True
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=5.0)
-            joined = not thread.is_alive()
-        with self._arm_feed_lock:
-            if joined:
-                self._arm_feed_thread = None
-                self._arm_feed_stop = None
-        return {"stopped": True, "joined": joined}
+        return _stop_feed(self, "arm_feed", force)
 
     def restart_arm_feed(self, hz: float = 20.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
@@ -513,17 +508,7 @@ class FeedsMixin:
                 get_fallback = getattr(self.cap_side, "read", None) if hasattr(self, "cap_side") else None
 
                 # 心跳
-                health = {
-                    "alive": True,
-                    "started_at": time.time(),
-                    "last_iter_at": 0.0,
-                    "last_ok_at": 0.0,
-                    "iter_count": 0,
-                    "ok_count": 0,
-                    "err_count": 0,
-                    "last_err": None,
-                    "last_err_at": 0.0,
-                }
+                health = _new_health()
                 self._task_feed_health = health
 
                 backoff = 1
@@ -573,25 +558,7 @@ class FeedsMixin:
 
         默认 force=False → no-op；只有显式 force=True(运维/关闭) 才真停。
         """
-        if not hasattr(self, "_task_feed_lock"):
-            return {"stopped": True, "reason": "never_started"}
-        if not force:
-            logger.warning("stop_task_feed called without force=True → NOOP")
-            return {"stopped": False, "reason": "noop_without_force"}
-        with self._task_feed_lock:
-            stop_event = self._task_feed_stop
-            thread = self._task_feed_thread
-        if stop_event is not None:
-            stop_event.set()
-        joined = True
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=5.0)
-            joined = not thread.is_alive()
-        with self._task_feed_lock:
-            if joined:
-                self._task_feed_thread = None
-                self._task_feed_stop = None
-        return {"stopped": True, "joined": joined}
+        return _stop_feed(self, "task_feed", force)
 
     def restart_task_feed(self, hz: float = 30.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
@@ -657,17 +624,7 @@ class FeedsMixin:
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_ir_state", None) if streamer else None
                 # 2026-08-01：心跳字段, feed watchdog 巡检用
-                health = {
-                    "alive": True,
-                    "started_at": time.time(),
-                    "last_iter_at": 0.0,
-                    "last_ok_at": 0.0,
-                    "iter_count": 0,
-                    "ok_count": 0,
-                    "err_count": 0,
-                    "last_err": None,
-                    "last_err_at": 0.0,
-                }
+                health = _new_health()
                 self._ir_feed_health = health
                 # 与 lane_feed / arm_feed 同模式：连续异常不退出,
                 # backoff 封顶 1s,正常一次立刻复位 period
@@ -737,28 +694,7 @@ class FeedsMixin:
 
         默认 force=False → no-op；显式 force=True(运维/关闭) 才真停。
         """
-        if not hasattr(self, "_ir_feed_lock"):
-            return {"stopped": True, "reason": "never_started"}
-        if not force:
-            logger.warning("stop_ir_feed called without force=True → NOOP")
-            return {"stopped": False, "reason": "noop_without_force"}
-        with self._ir_feed_lock:
-            stop_event = self._ir_feed_stop
-            thread = self._ir_feed_thread
-        if stop_event is None and thread is None:
-            return {"stopped": True, "reason": "never_started"}
-        join_timeout = 5.0
-        if stop_event is not None:
-            stop_event.set()
-        joined = True
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout)
-            joined = not thread.is_alive()
-        with self._ir_feed_lock:
-            if joined:
-                self._ir_feed_thread = None
-                self._ir_feed_stop = None
-        return {"stopped": True, "joined": joined}
+        return _stop_feed(self, "ir_feed", force)
 
     def restart_ir_feed(self, hz: float = 50.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
@@ -821,17 +757,7 @@ class FeedsMixin:
                 streamer = getattr(self, "streamer", None)
                 set_state = getattr(streamer, "set_odom_state", None) if streamer else None
                 # 2026-08-01：心跳字段
-                health = {
-                    "alive": True,
-                    "started_at": time.time(),
-                    "last_iter_at": 0.0,
-                    "last_ok_at": 0.0,
-                    "iter_count": 0,
-                    "ok_count": 0,
-                    "err_count": 0,
-                    "last_err": None,
-                    "last_err_at": 0.0,
-                }
+                health = _new_health()
                 self._odom_feed_health = health
                 # 2026-08-01：外层 while True + try/except,绝不死
                 outer_crash = 0
@@ -895,28 +821,7 @@ class FeedsMixin:
 
         默认 force=False → no-op；显式 force=True(运维/关闭) 才真停。
         """
-        if not hasattr(self, "_odom_feed_lock"):
-            return {"stopped": True, "reason": "never_started"}
-        if not force:
-            logger.warning("stop_odom_feed called without force=True → NOOP")
-            return {"stopped": False, "reason": "noop_without_force"}
-        with self._odom_feed_lock:
-            stop_event = self._odom_feed_stop
-            thread = self._odom_feed_thread
-        if stop_event is None and thread is None:
-            return {"stopped": True, "reason": "never_started"}
-        join_timeout = 5.0
-        if stop_event is not None:
-            stop_event.set()
-        joined = True
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=join_timeout)
-            joined = not thread.is_alive()
-        with self._odom_feed_lock:
-            if joined:
-                self._odom_feed_thread = None
-                self._odom_feed_stop = None
-        return {"stopped": True, "joined": joined}
+        return _stop_feed(self, "odom_feed", force)
 
     def restart_odom_feed(self, hz: float = 50.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""

@@ -33,6 +33,38 @@ _PLACEHOLDER_JPEG = bytes.fromhex(
 )
 
 
+class _StateCache:
+    """带独立锁 + updated_at 的缓存槽（lane / arm / task / ir / odom 共用）。
+
+    原 5 个 *_state 各是一组 `set_*_state` / `get_*_state` / `_default_*_state`
+    三元组，模式完全相同（meta_lock + dict 副本 + updated_at）。收敛成单个
+    槽类后，公开方法名保留（MyCar feeds / WS op 调用点零改动），内部只做
+    一行转发。每槽独立锁，比原来共享一把 meta_lock 竞争更少。
+    """
+
+    def __init__(self, default_factory):
+        self._lock = threading.Lock()
+        self._default_factory = default_factory
+        self._state = default_factory()
+
+    def set(self, **updates):
+        with self._lock:
+            state = dict(self._state)
+            state.update(updates)
+            state["updated_at"] = time.time()
+            self._state = state
+            return dict(state)
+
+    def get(self):
+        with self._lock:
+            return dict(self._state)
+
+    def reset(self):
+        with self._lock:
+            self._state = self._default_factory()
+            return dict(self._state)
+
+
 class CameraStreamService:
     """
     runtime 内置双摄像头流服务。
@@ -67,28 +99,25 @@ class CameraStreamService:
         self._encoder_thread = None
         self.frame_lock = threading.Lock()
         self.key_lock = threading.Lock()
-        self.meta_lock = threading.Lock()
         self.frames = {}
         self.frame_meta = {}
         # JPEG 编码缓存：{cam_id: (source_updated_at: float, jpeg_bytes: bytes)}
         # 一次编码喂所有 MJPEG 连接 + 所有 HTTP /stream/frame/*.jpg 客户端，
         # 避免每个连接独立 cv2.imencode 抢占 CPU。
         self._jpeg_cache = {}
-        self.lane_state = self._default_lane_state()
-        # 机械臂 y/x 位置缓存：与 lane_state 同生命周期(meta_lock 保护),
-        # 由 car.start_arm_feed 守护线程持续刷新,subscribe_arm_state WS op 推送。
-        self.arm_state = self._default_arm_state()
-        # 侧摄目标检测缓存：与 arm_state 同模式，由 car.start_task_feed 守护线程
-        # 持续刷新,subscribe_task_detection WS op 推送。
-        self.task_state = self._default_task_state()
-        # 2026-07-31：左右 IR 距离缓存（meta_lock 保护），
-        # 由 car.start_ir_feed 守护线程持续刷新（默认 50Hz，与 lane_feed 同档）。
-        # main/chassis/tasks/read_ir.py 不再每次走 job_queue + MC602 字节往返。
-        self.ir_state = self._default_ir_state()
-        # 2026-07-31：底盘里程计缓存（meta_lock 保护），
-        # 由 car.start_odom_feed 守护线程持续刷新（默认 50Hz，与 lane_feed 同档）。
-        # main/chassis/api.py.get_odometry 不再每次抢 _ref_lock + job_queue。
-        self.odom_state = self._default_odom_state()
+        # 5 个 *_state 缓存统一由 _StateCache 槽管理（独立锁 + updated_at）。
+        # 公开方法 set_*_state / get_*_state 保留原名（MyCar feeds / WS op
+        # 调用点零改动）；_default_*_state 作为槽的 default_factory 保留。
+        # - lane_state：lane_feed 守护线程（50Hz）刷新，外环消费
+        # - arm_state：  arm_feed（20Hz）刷新，subscribe_arm_state 推送
+        # - task_state： task_feed（30Hz）刷新，subscribe_task_detection 推送
+        # - ir_state：   ir_feed（50Hz）刷新，/realtime/ir/state 轮询
+        # - odom_state： odom_feed（50Hz）刷新，/realtime/odom/state 轮询
+        self._cache_lane = _StateCache(self._default_lane_state)
+        self._cache_arm = _StateCache(self._default_arm_state)
+        self._cache_task = _StateCache(self._default_task_state)
+        self._cache_ir = _StateCache(self._default_ir_state)
+        self._cache_odom = _StateCache(self._default_odom_state)
 
     def start(self):
         if self.running:
@@ -109,12 +138,11 @@ class CameraStreamService:
             self.frames.clear()
             self.frame_meta.clear()
             self._jpeg_cache.clear()
-        with self.meta_lock:
-            self.lane_state = self._default_lane_state()
-            self.arm_state = self._default_arm_state()
-            self.task_state = self._default_task_state()
-            self.ir_state = self._default_ir_state()
-            self.odom_state = self._default_odom_state()
+        self._cache_lane.reset()
+        self._cache_arm.reset()
+        self._cache_task.reset()
+        self._cache_ir.reset()
+        self._cache_odom.reset()
 
     def get_key(self, clear=True):
         with self.key_lock:
@@ -233,22 +261,13 @@ class CameraStreamService:
         }
 
     def set_lane_state(self, **updates):
-        with self.meta_lock:
-            state = dict(self.lane_state)
-            for key, value in updates.items():
-                state[key] = value
-            state["updated_at"] = time.time()
-            self.lane_state = state
-            return dict(state)
+        return self._cache_lane.set(**updates)
 
     def clear_lane_state(self):
-        with self.meta_lock:
-            self.lane_state = self._default_lane_state()
-            return dict(self.lane_state)
+        return self._cache_lane.reset()
 
     def get_lane_state(self):
-        with self.meta_lock:
-            state = dict(self.lane_state)
+        state = self._cache_lane.get()
         state["frame_url"] = "/stream/frame/cam1.jpg"
         state["preview_url"] = "/stream/"
         return state
@@ -976,20 +995,12 @@ class CameraStreamService:
         }
 
     def set_task_state(self, **updates):
-        """task_feed 守护线程持续刷新的目标检测缓存（meta_lock 路径，不抢 car_lock）。"""
-        with self.meta_lock:
-            state = dict(self.task_state)
-            for key, value in updates.items():
-                state[key] = value
-            state["updated_at"] = time.time()
-            self.task_state = state
-            return dict(state)
+        """task_feed 守护线程持续刷新的目标检测缓存（不抢 car_lock）。"""
+        return self._cache_task.set(**updates)
 
     def get_task_state(self):
         """读 task_feed 守护线程缓存。"""
-        with self.meta_lock:
-            state = dict(self.task_state)
-        return state
+        return self._cache_task.get()
 
     def _default_lane_state(self):
         return {
@@ -1013,18 +1024,10 @@ class CameraStreamService:
         y_m/x_m:   SDK 原始坐标(m),精度更高。
         ref_encoder: 最近一次 reset_y 后的编码器零点,丢步核对用。
         """
-        with self.meta_lock:
-            state = dict(self.arm_state)
-            for key, value in updates.items():
-                state[key] = value
-            state["updated_at"] = time.time()
-            self.arm_state = state
-            return dict(state)
+        return self._cache_arm.set(**updates)
 
     def get_arm_state(self):
-        with self.meta_lock:
-            state = dict(self.arm_state)
-        return state
+        return self._cache_arm.get()
 
     def _default_arm_state(self):
         return {
@@ -1048,24 +1051,16 @@ class CameraStreamService:
         }
 
     def set_ir_state(self, **updates):
-        """ir_feed 守护线程持续刷新的左右 IR 距离缓存（meta_lock 路径，不抢 car_lock）。
+        """ir_feed 守护线程持续刷新的左右 IR 距离缓存（不抢 car_lock）。
 
         left/right: 用户视角（与 main/chassis/tasks/read_ir.py 语义一致：
                     底层 left_sensor/right_sensor 已对应物理端口，业务层
                     若发现方向反了由调用方调换，本缓存按底层取到的值原样记录）。
         """
-        with self.meta_lock:
-            state = dict(self.ir_state)
-            for key, value in updates.items():
-                state[key] = value
-            state["updated_at"] = time.time()
-            self.ir_state = state
-            return dict(state)
+        return self._cache_ir.set(**updates)
 
     def get_ir_state(self):
-        with self.meta_lock:
-            state = dict(self.ir_state)
-        return state
+        return self._cache_ir.get()
 
     # === 底盘里程计缓存（供 /v1/realtime/odom/state 与 WS subscribe_odom 推送） ===
     def _default_odom_state(self):
@@ -1080,20 +1075,12 @@ class CameraStreamService:
         }
 
     def set_odom_state(self, **updates):
-        """odom_feed 守护线程持续刷新的底盘里程计缓存（meta_lock 路径，不抢 car_lock）。
+        """odom_feed 守护线程持续刷新的底盘里程计缓存（不抢 car_lock）。
 
         数据源：MyCar.get_odometry() + get_distance() —— 锁内是 numpy.copy()
         与 float 取数，比 IR 廉价很多。50Hz 持续刷新主路径延迟接近 0。
         """
-        with self.meta_lock:
-            state = dict(self.odom_state)
-            for key, value in updates.items():
-                state[key] = value
-            state["updated_at"] = time.time()
-            self.odom_state = state
-            return dict(state)
+        return self._cache_odom.set(**updates)
 
     def get_odom_state(self):
-        with self.meta_lock:
-            state = dict(self.odom_state)
-        return state
+        return self._cache_odom.get()
