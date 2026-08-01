@@ -36,27 +36,27 @@ task_cfg:
     spacing_along_row_m: 0.15
 
     arm_pick_pose:
-      x_mm: -60
-      arm_angle_deg: -150
-      y_mm: -25            # 下放高度(吸取)
-      hand_angle_deg: -10  # 吸取时末端向下
+      x_mm: -100
+      arm_angle_deg: -90
+      y_mm: -10            # 下放高度(吸取)
+      hand_angle_deg: 0    # 吸取时末端向下
 
     arm_carry_pose:
-      x_mm: -60
-      arm_angle_deg: -150
+      x_mm: -100
+      arm_angle_deg: -90
       y_mm: -150           # 安全高度
       hand_angle_deg: -10
 
     arm_place_pose_T2:
-      x_mm: -260
-      arm_angle_deg: 0     # 大臂指向左侧
-      y_mm: -25            # 下放高度(释放)
+      x_mm: -270
+      arm_angle_deg: 90    # 大臂指向左侧
+      y_mm: -30            # 下放高度(释放)
       hand_angle_deg: -10
 
     arm_return_S1_pose:
-      x_mm: -60
-      arm_angle_deg: -150
-      y_mm: -150           # 放置后抬到检测高度
+      x_mm: -100
+      arm_angle_deg: -90
+      y_mm: -100           # 放置后抬到检测高度，直接可下一轮检测
       hand_angle_deg: -10
 
     init_y_mm: -100        # 初始化抬升高度(进入任务时)
