@@ -126,15 +126,6 @@ waypoints:
     dis_at_least_m: 0.90
     trigger_op: AND
 
-  # ----- task2 -----
-  - name: task2_water_tower
-    task_id: 2
-    task_module: main.task.task2_water_tower
-    ir_threshold_m: 0.50
-    ir_side: left
-    dis_at_least_m: 7
-    trigger_op: AND
-
   # ----- task3 (TODO) -----
   - name: task3_pest_scout
     task_id: 3
@@ -142,6 +133,15 @@ waypoints:
     ir_threshold_m: 1.50
     ir_side: right
     dis_at_least_m: 2.33
+    trigger_op: AND
+
+  # ----- task2 -----
+  - name: task2_water_tower
+    task_id: 2
+    task_module: main.task.task2_water_tower
+    ir_threshold_m: 0.50
+    ir_side: left
+    dis_at_least_m: 7
     trigger_op: AND
 
   # ----- task4 -----
