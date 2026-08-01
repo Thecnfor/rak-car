@@ -1448,13 +1448,16 @@ class ArmController:
                     self.y_speed(0)
                     y_flag = True
 
-                # 重置初始化位置
+                # 触底到位: 目标在上方且磁感触发 → 提前到位退出 + 校准基准。
+                # 2026-08-01 修复: 原逻辑磁感一触发(含移动中噪声)就无条件重写
+                # y_pose_start/y_pose_now, 视觉伺服 goto_position 持续跟踪时磁感噪声
+                # 让位置基准每帧归零 → y 来回走。仅"目标在上方且已触底"才校准。
                 if self.y_reset_check():
                     if self.y_pid.setpoint <= self.y_pose_now:
                         y_flag = True
                         self.y_speed(0)
-                    self.y_pose_start = self.motor_y.get_dis()
-                    self.y_pose_now = 0
+                        self.y_pose_start = self.motor_y.get_dis()
+                        self.y_pose_now = 0
 
             if not x_flag:
                 if self.x_pid_moveto(x_pos):
