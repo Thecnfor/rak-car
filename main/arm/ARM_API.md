@@ -16,7 +16,7 @@
 
 | 量 | 单位 | 语义 |
 | --- | --- | --- |
-| `x_mm` | mm | 水平位移，**初始化位置=0**，远离为正。**x 轴无软件软限位**（用户原话"灵活使用就好"），业务层 `_check_safe` 不再校验 x；物理墙 ≈ 0.34m 由 `move_x_position` 的 `x_stop_check` 触发 calibrate 兜底 |
+| `x_mm` | mm | 水平位移，**reset_x 撞墙=0**，远离为正。**x 轴软限位 [x_min_m, x_max_m]** 由 `arm_cfg.yaml` 配置（2026-08-01：`x_min_m=-0.32` / `x_max_m=0.22`，即 0~-320mm + 0~+220mm）；业务层 `_check_safe` 不校验 x；物理墙 ≈ 0.34m 由 `reset_x` 撞墙 calibrate 兜底 |
 | `y_mm` | mm | 垂直位移，**触底=0**。`y<0` 向上（远离触底），`y>0` 向下（被安全门拦） |
 | `side` | enum | `LEFT` / `MID` / `RIGHT` —— 大臂总线舵机 |
 | `hand` | enum | `UP` / `MID` / `DOWN` —— 手爪 PWM 舵机 |
@@ -58,8 +58,8 @@ from main.arm import (
 | `set_pose(x_mm, y_mm, timeout=30)` | 一次设 x/y（**side/hand 已删 2026-07-16**） | mm | `POST /v1/execute {target:arm, name:set_arm_pose}` | 保护区拦截 |
 | `move_xy(x_mm, y_mm, v_max=150, a_max=400, timeout=None)` | 双轴同步 | mm, mm/s, mm/s² | `arm.goto_position` | 客户端 S 曲线 dry-run 算 `plan.T`，自动超时 = `max(5, T*2+1)` |
 | `move_y(y_mm, v_max=80, timeout=20)` | 单轴 y | mm | `arm.move_y_position` | 完成后做丢步核对（驱动层 + 上层） |
-| `move_x(x_mm, v_max_mms=40, out_time=15.0, timeout=30)` | 单轴 x | mm | `arm.move_x_position` | `v_max_mms` 业务层限速（**2026-07-16 真正生效**：SDK 端临时收紧 PID 主限幅）。`out_time` 避免 PID 脉冲式，撞墙时 `x_stop_check` 自动 calibrate |
-| `reset_x(direction="right", reset_velocity_mms=20.0, timeout=30)` | x 撞墙定原点 | mm/s | `arm.reset_x` | **opt-in**（不进 auto-init）。单档极慢撞墙，编码器 stall 50ms dwell 触发 calibrate；详见 §9 |
+| `move_x(x_mm, v_max_mms=40, out_time=15.0, timeout=30)` | 单轴 x | mm | `arm.move_x_position` | `v_max_mms` 业务层限速（SDK 端临时收紧 PID 主限幅）。`out_time` 避免 PID 脉冲式，**2026-08-01 根治：移除了 x_stop_check 中途 calibrate**——belt-slip 状态下不再假撞墙,exit 条件只剩 PID 收敛 + out_time 超时 |
+| `reset_x(direction="right", reset_velocity_mms=50.0, timeout=25.0)` | x 撞墙定原点 | mm/s | `arm.reset_x` | **2026-08-01 重写**：编码器位移是撞墙唯一凭证,单档正向驱动 + 窗口制 stall 检测(STALL_WINDOW_S=0.3s, 阈值 1mm, 连续 3 窗口不动=撞墙)。belt-slip 状态走满 seek_timeout=25s 后超时退出 |
 | `reset_all(arm_angle=0, hand_angle=-90, x_direction="right", reset_x_velocity_mms=20.0, timeout=120)` | 复合复位（**大臂+手爪+x 并行 → y 串行**） | — | `arm.reset_all` | ThreadPoolExecutor 并行三个独立动作，as_completed 后串行 `reset_y` 触底 |
 | `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [+90, -150]° + y 保护区，2026-07-27 重定义；+90 是复位位，-150 是结构极限**） | float（**必填**） | `arm.set_arm_angle` | angle > +90 / < -150 报 ValueError；+90° (复位位) / 0° (MID) 是 init 位置（保护区允许） |
 | `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
@@ -521,22 +521,21 @@ arm.set_storage_angle(30)    # 调开角（具体协议值物理含义由 caller
 
 ### 7.2 x 轴
 
-> **x 轴软限位已取消（2026-07-16）**：用户原话"灵活使用就好，一般不会超"。
-> 业务层 `ArmClient._check_safe` 不再校验 x；SDK `move_x_position` / `x_speed` / `goto_position` 不再 clamp。
+> **x 轴软限位 [x_min_m, x_max_m] 由 `arm_cfg.yaml:horiz_cfg` 配置（2026-08-01）**。
+> 当前 yaml 配 `x_min_m=-0.32` / `x_max_m=0.22`，允许 **0~-320mm + 0~+220mm** 全段。
+> 业务层 `ArmClient._check_safe` 不校验 x（保留签名兼容）；SDK 端 `move_x_position` 入口处 `limit_val()` 钳制到 [x_min_m, x_max_m] 并 warn。
 > 默认 PID 主限幅 `horiz_cfg.pid.output_limits = [-0.4, 0.4]` m/s 仍生效，作为速度上限。
-> **2026-07-16 业务限速真正生效**：`move_x_position(target, out_time, v_max_mms=None)` 可选传入 mm/s 上限，
+> **业务限速**：`move_x_position(target, out_time, v_max_mms=None)` 可选传入 mm/s 上限，
 > SDK 端临时收紧 `x_pid.output_limits` 和 `x_velocity_limit`，try/finally 还原。
-> 不传 = 用 yaml 默认 `[-0.4, 0.4]`（向后兼容）；传 40 → 实际 40mm/s 限幅（`ArmClient.move_x` 默认 `v_max_mms=40`）。
-> 物理墙由 `move_x_position` 的 `x_stop_check` 触发 calibrate 兜底；`reset_x` opt-in 主动撞墙（见 §9）。
+> 不传 = 用 yaml 默认 `[-0.4, 0.4]`（向后兼容）；推荐传 100（belt-slip 状态下 PID 力矩够大让带子有时间咬合,实测 0~-320mm 畅通）。
 
-- **业务 x 区间**：无软件上限；灵活使用。
-- **SDK x 限位**：无。`arm_cfg.yaml:horiz_cfg` 已删除 `threshold` / `slow_band_m` / `slow_velocity` / `top_slow_m` / `top_slow_velocity` / `reset_*` / `wall_*`。
-- **撞墙判据**（x 无传感器）：`move_x_position` 中 `x_stop_check`（`STOP_CHECK_THRESHOLD` 控制）+ 100ms dwell 后自动 calibrate `x_pose_start`。
-- **业务限速**：用 `move_x(x_mm, v_max_mms=40)` 即可临时收紧（不影响 yaml 默认）。多次 `move_x` 之间互不污染（try/finally 还原）。
-- **历史错配**：`x_threshold` 旧值 `[0, 0.315]`（单调正方向）已取消；`arm_origin.soft_x_min/max_m` 字段保留但固定 None。
+- **业务 x 区间**：默认 [-0.32, 0.22] m（0~-320mm + 0~+220mm）。
+- **撞墙判据**（x 无传感器）：**2026-08-01 根治** — `move_x_position` 完全移除 `x_stop_check` 中途 calibrate 路径，exit 条件只剩 PID 收敛 + `out_time` 超时；撞墙 calibrate 仅由 `reset_x` 触发（见 §9）。
+- **业务限速**：用 `move_x(x_mm, v_max_mms=100)` 即可临时收紧（不影响 yaml 默认）。多次 `move_x` 之间互不污染（try/finally 还原）。
+- **历史错配**：`x_threshold` 旧值 `[0, 0.315]`（单调正方向）已取消；`arm_origin.soft_x_min/max_m` 字段保留但固定 None（兼容旧 yaml）。
 
 > 历史：旧版 `soft_y_max_mm=180` + `threshold=[0, 0.2]`（错配，正方向）已统一改为 `200` + `[-0.20, 0.0]`。
-> **实测行程**：x 轴物理墙 ≈ ±119.5mm（2026-07-16 实测，之前注释里说 0.34m 是错的）。
+> **实测行程**：x 轴物理墙 ≈ 340mm（撞墙 calibrate 测得）；业务坐标系 0~-320mm 全段无障碍,belt-slip 物理极限下走 ~30mm/段,PID 力矩够大后能持续走满。
 
 ---
 
@@ -598,24 +597,26 @@ while 没超时:
 > 历史 commit `bc6b5c9` / `fb24b1a` 整体删除 `reset_x`（auto-init 反复撞墙 → PM2 死循环）。
 > 这次重写为 **单档极慢撞墙 + 故障不抛** 安全版，仅 opt-in 触发，避免重蹈覆辙。
 
-### 9.1 `reset_x` 单步撞墙
+### 9.1 `reset_x` 单步撞墙（2026-08-01 重写）
 
-`ArmClient.reset_x(direction="right", reset_velocity_mms=20.0, timeout=30)`
+`ArmClient.reset_x(direction="right", reset_velocity_mms=50.0, seek_timeout=25.0)`
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `direction` | `"right"` | `"right"` (target 增大方向) 或 `"left"` |
-| `reset_velocity_mms` | `20.0` (mm/s) | 撞墙速度，业务层 mm/s → SDK 转 m/s。参考 commit `1d5990e` 实测最稳定档 |
-| `timeout` | `30` (s) | HTTP 同步超时，车端实际可能 7-15s，留余量 |
+| `reset_velocity_mms` | `50.0` (mm/s) | 撞墙速度，业务层 mm/s → SDK 转 m/s。`0.05 m/s` 经实测是 belt-slip 状态下最稳定档 |
+| `seek_timeout` | `25.0` (s) | 总超时；belt-slip 状态走满超时后返回 False |
 
-**底层算法**（`arm_base.py:reset_x`）：
+**底层算法**（`arm_base.py:reset_x`，**2026-08-01 完全重写**）：
 
-1. 电机朝 `direction` 方向以 `reset_velocity` 速度驱动
-2. 循环检测编码器 stall（位移变化 < 1mm 视为不动）
-3. **`min_pre_trigger_disp_m=0.05`** 闸：电机必须先走过 ≥50mm 才允许触发撞墙（根治 commit `fb24b1a` 描述的"启动即误判 stall" bug）
-4. **stall dwell 50ms** 确认（防撞墙瞬间物理抖动误判）
-5. 撞墙成功 → `motor_x.set_linear(0)` hard-stop（绕开 PID 惯性），写 `x_pose_start = dis`、`_x_ref_encoder_at_zero = dis`、`_x_wall = direction`，返回 True
-6. 超时 15s / 急停 / 编码器死锁 2s → logger.warning + 返回 False（**绝不抛异常**）
+1. 电机朝 `direction` 方向以 `reset_velocity` 速度驱动（**单档**，无反向探针、无 pre_trigger 闸、无 DWELL_TIME、无中途往回走）
+2. 每 0.3s 检查一次窗口内位移（`STALL_WINDOW_S=0.3s`，`STALL_WINDOW_M=0.001m`）：
+   - `moved > 1mm` → 正常驱动,清零 `stall_count`
+   - `moved ≤ 1mm` → `stall_count += 1`
+3. `stall_count >= 3`（连续 3 窗口 ≈0.9s 不动）→ 撞墙 calibrate：`x_pose_start = dis`、`_x_ref_encoder_at_zero = dis`、`_x_wall = direction`、`return True`
+4. belt-slip 状态：电机持续空转,编码器不动,跑满 `seek_timeout=25s` 后超时退出,返回 False
+
+**为什么这样写**：belt-slip 跟真撞墙在编码器信号上完全等价（旧 reset_x 用的 `min_pre_trigger_disp_m` 闸 + 反向探针 + DWELL_TIME 在 belt-slip 下都会被绕过导致假撞墙）。新算法按"编码器位移是撞墙唯一凭证"原则,连续多个窗口不动才认撞墙,启动抖动不会误判。
 
 ### 9.2 `reset_all` 复合复位（**大臂+手爪+x 并行 → y 串行**）
 
@@ -662,17 +663,17 @@ x 位置仍主要靠视觉闭环控制（`move_to_detection_target` + `subscribe
 - 实物测试标定 x 物理行程边界（实测 ≈ ±119.5mm）
 - init 时跟 `reset_all` 一起跑，把 x 撞墙归零作为后续视觉闭环的起点
 
-### 9.5 实测结果（2026-07-16）
+### 9.5 实测结果（2026-08-01）
 
-| 速度 | 结果 | 耗时 |
-| --- | --- | --- |
-| 0.02 m/s | ✅ 撞墙 calibrate | 11-13s |
-| 0.03 m/s | ❌ 卡 35.5mm 处 stall | no_move_hard_timeout 2s 触发 |
-| 0.04 m/s | ✅ 撞墙 calibrate | 4-8s |
+| 速度 | 结果 | 耗时 | 备注 |
+| --- | --- | --- | --- |
+| 0.03 m/s | ❌ 卡 belt-slip 卡死点假撞墙 calibrate | 0.77s | ref 落到 ~24mm（belt-slip 卡死点），非真墙 |
+| 0.05 m/s + belt-slip | ⚠️ ref ~216mm（belt-slip 卡死点） | 6.19s | 比 0.03 好但仍非真墙 |
+| 0.05 m/s + 修带后 | ✅ 撞墙 calibrate 到真墙 | ~4s | ref ≈ 0,实测轨迹 `+3 → +13 → ... → +193 → 撞墙 → -0` |
 
-0.03 失败的根因是 stall 判定阈值太严（1e-5m = 0.01mm），撞墙瞬间机械臂物理抖动幅度超过阈值，`stall_since` 反复重置凑不齐 DWELL_TIME。修复：阈值放宽到 1e-3m (1mm)。
+belt-slip 是物理问题（同步带涨紧不够），代码层面只能让 reset_x 在 belt-slip 状态下不假撞墙、走满超时返回 False，**根治需现场修带**。
 
-**推荐速度**：业务用 0.02 m/s（对电机最温柔），调试用 0.04 m/s（最快 4s）。
+**推荐速度**：`reset_velocity_mms=50.0`（= 0.05 m/s，belt-slip 状态下最稳定档）。`move_x_position` 推荐 `v_max_mms=100`（PID 力矩够大让带子有时间咬合,实测 0~-320mm 畅通）。
 
 ### 9.6 `composite_run` / `composite_run_reset` — 四电机通用并行驱动器（2026-07-31 新增）
 
