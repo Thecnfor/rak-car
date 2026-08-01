@@ -86,13 +86,17 @@ def main(argv: list[str] | None = None) -> None:
             try:
                 if args.side:
                     val: float = read_ir(api, side=args.side)  # type: ignore[assignment]
-                    if args.side == "left":
-                        last_left = val
-                        last_right = 0.0
+                    if val is None:
+                        # 单侧无数据（传感器坏死/断线）：不更新 last_*，避免后续格式化崩溃
+                        _tui_print_err(f"{args.side} sensor: no data (None)", last_left, last_right)
                     else:
-                        last_right = val
-                        last_left = 0.0
-                    _tui_print_single(args.side, val)
+                        if args.side == "left":
+                            last_left = val
+                            last_right = 0.0
+                        else:
+                            last_right = val
+                            last_left = 0.0
+                        _tui_print_single(args.side, val)
                 else:
                     result = read_ir(api)
                     last_left = float(result.get("left", 0.0))

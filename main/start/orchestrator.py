@@ -68,10 +68,10 @@ class Waypoint:
 # 保留 DEFAULT_WAYPOINTS 作为 fallback —— 启动时优先从 yaml 加载.
 DEFAULT_WAYPOINTS: List[Waypoint] = [
     Waypoint("task1_seeding",     task_id=1,
-             ir_threshold_m=0.65, ir_side="right",
-             dis_at_least_m=0.88, trigger_op="AND"),
+             ir_threshold_m=0.60, ir_side="right",
+             dis_at_least_m=0.90, trigger_op="AND"),
     Waypoint("task2_water_tower", task_id=2,
-             ir_threshold_m=2.00, ir_side="left",
+             ir_threshold_m=1.50, ir_side="left",
              dis_at_least_m=2.30, trigger_op="AND"),
     Waypoint("task3_pest_scout",  task_id=3,
              ir_threshold_m=0.50, ir_side="right",
@@ -108,6 +108,9 @@ class Orchestrator:
         else:
             # 优先从 yaml 加载; 失败 fallback DEFAULT_WAYPOINTS
             self.waypoints = self._load_waypoints_from_yaml(config_path) or DEFAULT_WAYPOINTS
+            if self.waypoints is DEFAULT_WAYPOINTS:
+                logger.warning("using DEFAULT_WAYPOINTS fallback (%d waypoints)",
+                               len(self.waypoints))
         self.lane_hz = lane_hz
         self.ir_interval_s = ir_interval_s
 
@@ -132,6 +135,8 @@ class Orchestrator:
                 trigger_op=w.get("trigger_op", "AND"),
                 is_finish=w.get("is_finish", False),
             ))
+        logger.info("loaded %d waypoints from task_config.yml: %s",
+                    len(out), [w.name for w in out])
         return out
 
     def run(self) -> None:

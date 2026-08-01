@@ -93,7 +93,9 @@ def read_ir(
     fast = _read_ir_fast(api)
     if fast is not None:
         val = fast.get(_FLIP_SIDE.get(str(side), "left"))
-        return float(val) if val is not None else 0.0
+        # 返回 None（而非 0.0）表示该侧传感器无数据 —— 0.0 会掩盖"传感器坏死"，
+        # 与双侧读（保留 None）语义不一致,导致单侧测试看似正常而 orchestrator 永不触发。
+        return float(val) if val is not None else None
     flipped_side = _FLIP_SIDE.get(str(side), str(side))
     try:
         job = api.http.execute(
