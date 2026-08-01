@@ -138,6 +138,16 @@ class Orchestrator:
         client = RuntimeApiClient()
         if not client.wait_until_ready(timeout=10.0):
             raise RuntimeError("runtime not ready (pm2 logs rak-car-api)")
+
+        # 任务启动前清零里程计：每次 run.py 从零点起算，避免沿用上次任务的累计距离。
+        # 旧 car_start_2026.py 的 init() 会清零；orchestrator 接管后必须显式补上，
+        # 否则 run.py 连跑两次，第二次的 dis 起点 = 第一次的终点，所有 dis 阈值/终点全乱。
+        try:
+            client.execute("car", "reset_position", sync=True, timeout=10.0)
+            logger.info("odometry reset: mission starts from distance 0")
+        except Exception as exc:
+            logger.warning("reset_position failed, dis baseline may be stale: %s", exc)
+
         api = ChassisClient.connect()
         try:
             api.start_lane_feed(hz=self.lane_hz)
