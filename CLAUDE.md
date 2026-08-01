@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (smart-agriculture) track — a Jetson Nano + MC602 controller running on a WhalesBot mecanum-wheel chassis. A single run executes **8 fixed-order tasks** (seed → scout pests → water → shoot pests → harvest → sort → read order via OCR → deliver). The repo is a frozen-for-competition codebase; per-track calibration happens in `config_car.yml` and the odometry offsets hardcoded inside `car_task_function.py`.
+Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (smart-agriculture) track — an NVIDIA Orin Nano (JetPack/L4T) + MC602 controller running on a WhalesBot mecanum-wheel chassis. A single run executes **8 fixed-order tasks** (seed → scout pests → water → shoot pests → harvest → sort → read order via OCR → deliver). The repo is a frozen-for-competition codebase; per-track calibration happens in `config_car.yml` and the odometry offsets hardcoded inside `car_task_function.py`.
 
 ## Branches (check before reading)
 
@@ -60,7 +60,7 @@ Default URLs (override via env vars — see "Config surface" below):
 - cam2 MJPEG: `http://192.168.6.231:5050/video_feed/cam2`
 
 The runtime's job is to:
-- Hold a single `MyCar()` instance and serialize access through `car_lock`.
+- Hold a single `MyCar()` instance; access is serialized by the two-tier `_ref_lock` / `_realtime_gate` model (the old `car_lock` is a `RuntimeError`-raising property — see "Runtime concurrency model" below).
 - Run `auto_init` in the background — if the MC602 reboots, runtime rebuilds `MyCar()` automatically (see `RAK_CAR_AUTO_INIT`).
 - Provide a job queue (`/v1/jobs`, `/v1/execute`) so callers don't deadlock against an init in progress.
 - Expose vision results and camera streams without each caller rebuilding the inference backends.
@@ -82,12 +82,27 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission
 
 | 子包 | 用途 | 自己的 doc |
 | --- | --- | --- |
-| `main/arm/` | 机械臂业务：ArmClient + ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/` 闭环、`tasks/` 流程、`examples/` 模板、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) |
+| `main/arm/` | 机械臂业务：`api/`（ArmClient 聚合 8 个 mixin）、`vision/`（4-DOF 视觉伺服 + depth-aware PID + RealtimeLoop）、ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/` 闭环、`tasks/` 流程、`examples/` 模板、`tests/` 85+ 单测、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) / [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) |
 | `main/chassis/` | 底盘外环：ChassisClient + 50Hz 主循环；`controllers/` (P / Stanley / curvature_adaptive) + `loops/` (closed_loop, safety, telemetry) + `tasks/` (read_ir) + `cli/` (run_lane_follow, read_ir) + `config/` (lane_follow) | [README.md](./main/chassis/README.md) |
 | `main/misc/` | 单文件 mini 任务（射击、边走边打等），每个脚本可直接 `python3` 跑 | [README.md](./main/misc/README.md) |
 | `main/test/` | 离线硬件冒烟脚本（arm / storage / x / 循迹），**非正式测试**，绕过 runtime 直接打硬件；改动 main/ 任务前先在这里验证 | — |
 
 The two base clients — `RuntimeApiClient` (HTTP, `main/api_client.py`) and `RuntimeWsClient` (WebSocket, `main/ws_client.py`) — are used by all three subpackages. Full action surface and parameters: [main/API_REFERENCE.md](./main/API_REFERENCE.md) / [main/API.md](./main/API.md) / [main/CAPABILITY_LIST.md](./main/CAPABILITY_LIST.md) / [main/BUSINESS_API_GUIDE.md](./main/BUSINESS_API_GUIDE.md).
+
+## Visual servo (机械臂视觉伺服, `main/arm/vision/`)
+
+The arm's vision-feedback loop lives in `main/arm/vision/` (`ArmVisionClient = ServoLoop + RealtimeLoop`). It drives the **XY cross-slide only** (`x_mm` / `y_mm`); the big arm (`arm_angle`) and gripper (`hand`) are extra DOFs **frozen during the PID loop**, adjusted via the `on_strategic_4dof` callback (decoupled — the algorithm never drives them directly). **No IK by design**: 4 independent targets are packed into `composite_run`, which runs the 4 motors concurrently via `ThreadPoolExecutor`.
+
+Stack (bottom-up): bbox parse → `TargetSelector` (8 strategies) → depth-aware PID (`mm_per_norm_eff = mm_per_norm_base × D/ref_depth_m`; `focal_length_px=600` is a heuristic, **not self-calibrated**) → S-curve dry-run → `composite_run` + soft-limit net → SDK.
+
+Two closed-loop transports (see [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md) §13 for the on-track learnings):
+
+- **Position loop** — one `goto_position` per frame via `find_target` / `find_target_pid` (HTTP `/v1/vision/task`, 30 Hz). ⚠️ Position closed-loop is ~500 ms/step and queues into `arm_queue` — **backlog is the root cause of "discrete / random-walk" visual servo**; not suitable for high-frequency tracking.
+- **Velocity mode (recommended)** — `POST /v1/realtime/arm-velocity` `{"x_vel": 0.0, "y_vel": 0.0}` (m/s): goes through `_realtime_gate` (no `car_lock`, **no job_queue**), direct `x_speed()/y_speed()`. y has a magnetic-safety-gate + end deceleration; **x has no soft limit — the caller must send 0 when the target is lost**. Examples: `examples/07_velocity_track_yellow_ball.py` / `08_servo4_track.py`.
+
+Before a visual-servo run, `stop_arm_feed(force=True)` frees the serial port from the 20 Hz `arm_feed` poll (else its `goto_position` polls starve the queue); restore with `start_arm_feed`.
+
+Docs: [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) (1-page) / [VISION_SERVO_DESIGN.md](./main/arm/VISION_SERVO_DESIGN.md) / [VISION_REALTIME_DESIGN.md](./main/arm/VISION_REALTIME_DESIGN.md) / [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md).
 
 ## Big-picture architecture
 
@@ -116,7 +131,12 @@ Three layers, top-down. The names in **bold** are the files you'll touch most.
 
 ### D. Runtime service (`runtime/`)
 
-Owns the `MyCar()` singleton, exposes POST endpoints under `/v1/*` (and legacy `/api/*`), serializes access through `car_lock`, runs the auto-init background thread, and manages the inference ZMQ backends. Full surface and architecture in [runtime/README.md](./runtime/README.md) — don't duplicate it here.
+Owns the `MyCar()` singleton, exposes POST endpoints under `/v1/*` (and legacy `/api/*`), runs the auto-init background thread, and manages the inference ZMQ backends. Full surface and architecture in [runtime/README.md](./runtime/README.md) — don't duplicate it here.
+
+All three big modules were split into **aggregator + mixins** (2026-07):
+- `runtime/services/my_car/` — `class MyCar(MecanumDriver, *Mixins)`: `pid.py` + `state_mixin` / `sensors_mixin` / `hardware_io_mixin` / `detection_mixin` / `motion_mixin` + `feeds.py` (5 daemon caches: lane / arm / task / ir / odom). `__init__` / `close` must stay in the aggregate class — `super().close()` has to resolve `MecanumDriver` along the MRO.
+- `runtime/services/` — `car_runtime_service.py` aggregates 4 mixins (`controller_watcher` / `lifecycle_mixin` / `jobs_mixin` / `loops_mixin`).
+- `runtime/api/` — `app.py` + `router_registry.py` + `routers/` (jobs / keypress / legacy / realtime / stream / system / vision / ws). The old monolithic `api/routes.py` is gone.
 
 ## Data-flow during a typical task
 
@@ -165,7 +185,7 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 
 - **Module alias `my_car`**: `car_task_function.py` declares `global my_car` inside `init()` and assumes every task function is called after `init()`. Don't import `my_car` directly; invoke through the top-level task functions.
 - **`STOP_PARAM = True` is a class var on `MyCar`** that gates emergency-stop checks. `init()` sets it to `False` before each run.
-- **No unit tests**; verification is *observed behaviour on the physical track*. New code paths should be exercised via `car_start_2026.py` with the upstream tasks commented out.
+- **Unit tests live in `main/arm/tests/`** (85+ tests, stdlib `unittest` — *not* pytest). Run all: `/usr/bin/python3 -m unittest discover -s main/arm/tests -p 'test_*.py' -v`. They mock the HTTP/WS layer (offline, no hardware). Physical behaviour is still verified on-track via `main/arm/examples/*` against the [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md) checklist; legacy monolith paths are exercised via `car_start_2026.py` with the upstream tasks commented out.
 - **Chinese-only comments**: most module/function docstrings are in Chinese — match the style when adding new code.
 
 ## MC602 reboot behavior (read before touching runtime init)
@@ -203,9 +223,9 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 ## Pointers to deeper docs
 
 - **Legacy monolith path:** this file (sections A–C above) + `car_wrap_2026.py` + `config_car.yml` comments.
-- **Runtime HTTP API:** `runtime/README.md` (含并发任务模型、锁层次、双 worker 队列、/v1/execute 异步语义), `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
+- **Runtime HTTP API:** `runtime/README.md` (含并发任务模型、锁层次、双 worker 队列、/v1/execute 异步语义; ⚠️ 其目录清单早于 mixin 拆分, 实际结构见上文 §D), `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
 - **Business client:** `main/README.md`, `main/API.md`, `main/API_REFERENCE.md`, `main/BUSINESS_API_GUIDE.md`, `main/CAPABILITY_LIST.md`.
-- **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/QUICKSTART.md`; `main/chassis/README.md`; `main/misc/README.md`.
+- **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/QUICKSTART.md` + `main/arm/TEST_PREFLIGHT.md`（真机测试前检查）; 视觉伺服：`main/arm/VISUAL_SERVO_QUICKREF.md` / `VISION_SERVO_DESIGN.md` / `VISION_SERVO_PLAN.md` / `VISION_REALTIME_DESIGN.md`; `main/chassis/README.md`; `main/misc/README.md`.
 - **User-facing intro:** `README.md` (the original competition-tasks overview in Chinese).
 - **Controller lab:** `test/README.md`, `test/OPERATION_GUIDE.md`, `test/PROTOCOL_NOTES.md`.
 - **本地端到端验证脚本：** `main/test/verify_concurrent.py`（gitignored，本地用），跑双线程探针测 lane + arm 并发。
