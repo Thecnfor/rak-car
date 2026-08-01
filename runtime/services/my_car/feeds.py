@@ -403,6 +403,7 @@ class FeedsMixin:
                     set_state(
                         active=True,
                         mode="task_feed",
+                        frame_shape=list(img.shape) if img is not None else None,
                         detections=[
                             {
                                 "cls_id": int(d[0]) if len(d) > 0 else None,

@@ -33,7 +33,7 @@ from .. import (
 
 
 
-POSITION_ERROR_THRESHOLD = 4e-4 # 位置误差阈值
+POSITION_ERROR_THRESHOLD = 1.5e-3 # 位置误差阈值 (2026-08-02 调大: 滑轨清理后摩擦小, 原 0.4mm 阈值 bang-bang 反复触发抖动; 1.5mm 平衡精度和稳定性)
 STOP_CHECK_THRESHOLD = 1e-10 # 停止检查阈值
 
 # reset_y 成功触底后,机械臂自动升到的目标位置 (m)。负值 = 向上,远离磁感。
@@ -525,9 +525,9 @@ class ArmController:
           - 业务层 v_max_mms 仍可临时覆盖(默认 40mm/s 透传到 x_pid.output_limits)。
 
         算法:
-          - |error| > POSITION_ERROR_THRESHOLD (0.4mm) → x_speed(+v_max / -v_max)
-          - |error| <= 0.4mm → x_speed(0) 等带子减速
-          - 连续 5 帧 < 0.4mm (x_pid_flag CountRecord) → 到位退出
+          - |error| > POSITION_ERROR_THRESHOLD (1.5mm) → x_speed(+v_max / -v_max)
+          - |error| <= 1.5mm → x_speed(0) 等带子减速
+          - 连续 5 帧 < 1.5mm (x_pid_flag CountRecord) → 到位退出
           - out_time 超时兜底
 
         Args:

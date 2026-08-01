@@ -1,4 +1,4 @@
-"""main/arm/api/storage.py — 存储仓舵机 mixin (无 y 安全门, 2026-07-17 用户原话)."""
+"""main/arm/api/storage.py — 存储仓舵机 + 真空吸 mixin (无 y 安全门, 2026-07-17 用户原话)."""
 from __future__ import annotations
 
 from ..state import STORAGE_SIDES
@@ -14,7 +14,7 @@ def _normalize_storage_side(side):
 
 
 class StorageMixin:
-    """set_storage / get_storage / set_storage_angle."""
+    """set_storage / get_storage / set_storage_angle / grasp."""
 
     def set_storage(self, side: str, timeout: float = 10.0) -> dict:
         side = _normalize_storage_side(side)
@@ -51,6 +51,19 @@ class StorageMixin:
 
     def get_storage(self) -> str:
         return getattr(self, "_storage_side_cache", "UNKNOWN")
+
+    def grasp(self, on: bool, timeout: float = 10.0) -> dict:
+        """真空吸 / 放（不移动任何电机, 无位置安全门）。
+
+        runtime action "grasp" 透传 SDK arm_base.grasp(value):
+          pump.set(not value); valve.set(value)  → True=吸气, False=放气.
+        """
+        job = self._call_arm("grasp", timeout=timeout, value=bool(on))
+        return {
+            "ok": bool(isinstance(job, dict) and job.get("status") == "succeeded"),
+            "on": bool(on),
+            "raw_job": job,
+        }
 
     def set_storage_angle(self, angle: float, speed: int = 100,
                           timeout: float = 10.0) -> dict:

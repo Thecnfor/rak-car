@@ -57,6 +57,8 @@ class RealtimeLoop:
                              hz: float = 30.0,
                              mm_per_norm: float = 30.0,
                              settle_tol_norm: float = 0.05,
+                             setpoint_x_norm: float = 0.0,
+                             setpoint_y_norm: float = 0.0,
                              min_step_mm: float = 1.0,
                              timeout: float = 10.0,
                              on_missing_track: str = "abort",
@@ -133,8 +135,9 @@ class RealtimeLoop:
                 return
             state["consecutive_misses"] = 0
             state["last_detection"] = pick
-            dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
-            if pick.bbox_norm.is_centered_at(settle_tol_norm):
+            dx_norm = pick.bbox_norm.x_center - setpoint_x_norm
+            dy_norm = pick.bbox_norm.y_center - setpoint_y_norm
+            if abs(dx_norm) <= settle_tol_norm and abs(dy_norm) <= settle_tol_norm:
                 state["consecutive_settle"] += 1
                 if state["consecutive_settle"] >= settle_stable_frames:
                     abort_reason["reason"] = "converged"
@@ -228,6 +231,8 @@ class RealtimeLoop:
                           hz: float = 30.0,
                           mm_per_norm: float = 30.0,
                           settle_tol_norm: float = 0.10,
+                          setpoint_x_norm: float = 0.0,
+                          setpoint_y_norm: float = 0.0,
                           min_step_mm: float = 1.0,
                           max_iter: int = 500,
                           timeout: float = 30.0,
@@ -303,7 +308,8 @@ class RealtimeLoop:
             state["last_detection"] = pick
             state["iter_count"] += 1
 
-            dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
+            dx_norm = pick.bbox_norm.x_center - setpoint_x_norm
+            dy_norm = pick.bbox_norm.y_center - setpoint_y_norm
             if (not state["triggered_arm"] and on_strategic_4dof is not None
                     and abs(dx_norm) > arm_dx_threshold_norm):
                 try:

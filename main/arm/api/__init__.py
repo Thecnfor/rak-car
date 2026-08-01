@@ -87,6 +87,14 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
             x_origin_m=float(data.get("x_origin_m", 0.0)),
             x_wall=str(data.get("x_wall", "left")),
             soft_y_max_m=float(data.get("soft_y_max_m", 0.20)),
+            step_loss_y_mm=float(data.get("step_loss_y_mm", 2.0)),
+            step_loss_x_mm=float(data.get("step_loss_x_mm", 5.0)),
+            nozzle_offset_x_norm=float(data.get("nozzle_offset_x_norm", 0.0)),
+            nozzle_offset_y_norm=float(data.get("nozzle_offset_y_norm", 0.0)),
+            nozzle_offset_map={
+                str(k): (float(v[0]), float(v[1]))
+                for k, v in (data.get("nozzle_offset_map") or {}).items()
+            },
             calibrated_at=str(data.get("calibrated_at", "")),
         )
 
@@ -101,6 +109,13 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
                     "x_origin_m": origin.x_origin_m,
                     "x_wall": origin.x_wall,
                     "soft_y_max_m": origin.soft_y_max_m,
+                    "step_loss_y_mm": origin.step_loss_y_mm,
+                    "step_loss_x_mm": origin.step_loss_x_mm,
+                    "nozzle_offset_x_norm": origin.nozzle_offset_x_norm,
+                    "nozzle_offset_y_norm": origin.nozzle_offset_y_norm,
+                    "nozzle_offset_map": {
+                        k: [v[0], v[1]] for k, v in origin.nozzle_offset_map.items()
+                    },
                     "calibrated_at": origin.calibrated_at,
                 },
                 f, allow_unicode=True, sort_keys=False,

@@ -12,18 +12,21 @@ from .realtime import RealtimeLoop
 from .selector import SelectionStrategy, TargetSelector
 from .servo import ServoLoop
 from .types import BBoxNorm, BBoxPixels, Detection, ServoResult, ServoTrace
+from .velocity import VelocityLoop, VelocityResult, VelocityTrace
 
 __all__ = [
     "ArmVisionClient",
     "BBoxNorm", "BBoxPixels", "Detection",
     "ServoResult", "ServoTrace",
+    "VelocityResult", "VelocityTrace",
     "SelectionStrategy", "TargetSelector",
     "LabelInfo", "LABELS", "LABEL_GROUPS", "Label",
 ]
 
 
-class ArmVisionClient(ServoLoop, RealtimeLoop):
-    """末端摄像头视觉伺服客户端. 主路径 task_feed 30Hz cache; WS 路径走 push."""
+class ArmVisionClient(ServoLoop, RealtimeLoop, VelocityLoop):
+    """末端摄像头视觉伺服客户端. 主路径 task_feed 30Hz cache; WS 路径走 push;
+    velocity 模式 (07/08) 走 /v1/realtime/arm-velocity 直发 (免 queue)."""
 
     DEFAULT_FOCAL_LENGTH_PX = 600.0
     DEFAULT_REF_DEPTH_M = 0.30
