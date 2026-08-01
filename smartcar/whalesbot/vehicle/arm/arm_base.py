@@ -42,6 +42,15 @@ STOP_CHECK_THRESHOLD = 1e-10 # 停止检查阈值
 # "reset_y 完还在最低位,业务第一步 move_y 还要再走一次"。
 POST_RESET_TARGET_M = -0.15  # 触底归零后自动走到 -150mm
 
+# 2026-08-01 防伪触发: 磁感是模拟量(无滤波), 可能在非底部位置被噪声误判为触底,
+# 把 y_pose_start 覆盖成错误编码值 -> 位置基准漂移 -> 业务 move_y 反复来回走。
+# 真触底时电机被磁感物理挡死, 触发瞬间到 dwell 通过(50ms) 编码器位移 < 1mm;
+# 噪声伪触发时电机仍在移动, 位移 > 容差。用此容差区分真伪。
+Y_RESET_REF_STABILITY_TOL_M = 0.005  # 触发瞬间 ~ dwell 通过, 编码器最大允许位移 (m)
+# reset_y 会话内一致性: 本次成功 ref 与上次 (self._y_ref_encoder_at_zero) 偏差超过
+# 此值视为伪触发/失步, 拒绝更新基准 (真触底物理位置固定, 多次 reset 应回到同一 ref)。
+Y_RESET_REF_CONSISTENCY_TOL_M = 0.02  # 与上次成功触底 ref 的最大偏差 (m)
+
 
 def get_path_relative(*args):
     """
@@ -238,9 +247,37 @@ class ArmController:
                 if self.y_reset_check():
                     if triggered_at is None:
                         triggered_at = time.time()
+                        # 记录磁感触发瞬间的编码器位置
+                        trigger_ref = self.motor_y.get_dis()
                     elif time.time() - triggered_at >= DWELL_TIME:
                         # 成功！dwell 通过
                         ref = self.motor_y.get_dis()
+                        # 2026-08-01 防伪触发(1): 真触底电机被磁感挡死, 触发瞬间到
+                        # dwell 通过编码器位移 ~0; 噪声伪触发时电机仍在动, 位移 > 容差。
+                        if abs(ref - trigger_ref) > Y_RESET_REF_STABILITY_TOL_M:
+                            logger.error(
+                                "reset_y: dwell 通过但触发至通过位移 %.1fmm > 容差 %.1fmm, "
+                                "疑似磁感噪声伪触发, 拒绝更新 y_pose_start, 继续找底"
+                                % (abs(ref - trigger_ref) * 1000.0,
+                                   Y_RESET_REF_STABILITY_TOL_M * 1000.0)
+                            )
+                            triggered_at = None
+                            time.sleep(0.01)
+                            continue
+                        # 2026-08-01 防伪触发(2): 会话内一致性, 与上次成功触底 ref 偏差
+                        # 过大视为伪触发/失步, 拒绝覆盖基准 (真触底物理位置固定)。
+                        last_ref = getattr(self, "_y_ref_encoder_at_zero", None)
+                        if last_ref is not None and \
+                                abs(ref - last_ref) > Y_RESET_REF_CONSISTENCY_TOL_M:
+                            logger.error(
+                                "reset_y: ref=%.4f 与上次成功触底 %.4f 偏差 %.1fmm > 容差 %.1fmm, "
+                                "疑似基准漂移/伪触发, 拒绝更新 y_pose_start, 继续找底"
+                                % (ref, last_ref, abs(ref - last_ref) * 1000.0,
+                                   Y_RESET_REF_CONSISTENCY_TOL_M * 1000.0)
+                            )
+                            triggered_at = None
+                            time.sleep(0.01)
+                            continue
                         self.y_pose_start = ref
                         self.y_pose_now = 0
                         self._y_ref_encoder_at_zero = ref
@@ -331,6 +368,15 @@ class ArmController:
         target = limit_val(target, y_lo, y_hi)
         # 2) 命令位移记录
         prev_pos = self.y_get_position()
+        # 2026-08-01 防基准污染: 当前 y_pose_now 超出软限位区间外 150mm 视为基准可疑
+        # (y_pose_start 被磁感噪声伪触发覆盖), 拒绝执行, 避免在污染基准上无意义运动放大振荡。
+        if prev_pos < y_lo - 0.15 or prev_pos > y_hi + 0.15:
+            logger.error(
+                "move_y_position: 当前 y_pose_now=%.1fmm 超出合理区间 [%.1f,%.1f]mm, "
+                "疑似 y_pose_start 被污染, 拒绝执行 (请先 reset_y 校准)"
+                % (prev_pos * 1000.0, (y_lo - 0.15) * 1000.0, (y_hi + 0.15) * 1000.0)
+            )
+            return False
         self._y_expected_total_delta += abs(target - prev_pos)
         # 第一轮（保持原行为）
         self.y_pid.setpoint = target
@@ -352,6 +398,14 @@ class ArmController:
             actual = self.y_get_position()
             err = target - actual
             if abs(err) <= 0.002:
+                break
+            # 2026-08-01 防放大振荡: 未经 reset_y 校准 (基准不可信) 时不做兜底,
+            # 否则两轮 setpoint 在漂移基准上互相抵消, 越兜越摆。
+            if self._y_ref_encoder_at_zero is None:
+                logger.warning(
+                    "move_y_position: 未经 reset_y 校准 (ref=None), 跳过丢步兜底, "
+                    "err=%.1fmm" % (err * 1000.0)
+                )
                 break
             # 磁感已触发且 setpoint 已在触底方向 → 已经触底到位
             if self.y_reset_check() and target >= 0.0:
