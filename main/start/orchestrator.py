@@ -71,7 +71,7 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
              ir_threshold_m=0.65, ir_side="right",
              dis_at_least_m=0.88, trigger_op="AND"),
     Waypoint("task2_water_tower", task_id=2,
-             ir_threshold_m=1.20, ir_side="left",
+             ir_threshold_m=2.00, ir_side="left",
              dis_at_least_m=2.30, trigger_op="AND"),
     Waypoint("task3_pest_scout",  task_id=3,
              ir_threshold_m=0.50, ir_side="right",
