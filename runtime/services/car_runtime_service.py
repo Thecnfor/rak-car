@@ -212,31 +212,44 @@ class CarRuntimeService(
             "wheel_speeds": wheel_speeds,
         }
 
-    def set_arm_velocity(self, x_vel=None, y_vel=None):
-        """arm 实时速度命令 — 绕开 arm_queue, 供视觉伺服速度模式用。
+    def set_arm_velocity(self, x_vel=None, y_vel=None, arm_angle=None, hand_angle=None):
+        """arm 4-DOF 实时命令 — 绕开 arm_queue, 供视觉伺服连续追踪用。
 
-        与 set_chassis_velocity 同构: _realtime_gate 微秒级取 car 引用, 直发 motor 速度,
-        不进 job_queue、不持 car_lock。视觉伺服用它做连续追踪 (IBVS 速度模式)。
+        与 set_chassis_velocity 同构: _realtime_gate 微秒级取 car 引用, 直发,
+        不进 job_queue、不持 car_lock。
 
-        单位: m/s (与 arm_base.x_speed / y_speed 一致)。
-        x_vel / y_vel 为 None 时该轴不发 (保持当前速度), 传 0.0 显式停。
+        支持的轴 (全部可选, None = 该轴不动):
+          - x_vel / y_vel: 十字滑台速度 (m/s), 走 arm_base.x_speed / y_speed
+          - arm_angle:     大臂角度 (°), 走 set_arm_angle (舵机异步转到位)
+          - hand_angle:    手抓角度 (°), 走 set_hand_angle (舵机异步转到位)
 
-        软限位 (2026-08-01 用户约定): x ∈ [-0.30, 0] m, y ∈ [-0.20, 0] m (触底=0)。
-        速度模式下没有位置闭环, 靠此限位防撞物理极限:
-          - x_vel 方向朝超限边界 (x_vel>0 且 x>=0, 或 x_vel<0 且 x<=-0.30) → 强制 0
-          - y_vel 方向朝超限边界 (y_vel>0 且 y>=0 磁感, 或 y_vel<0 且 y<=-0.20) → 强制 0
-        注意: 读位置 x_get_position/y_get_position 走串口 (~ms), 每次命令前读,
-        速度命令频率建议 <=20Hz, 避免串口过载。
+        角度软限位 (2026-08-01 用户约定):
+          - 大臂: [-90, +90]  (-90=朝 x 左, +90=朝 x 右)
+          - 手抓: [-90, 0]    (-90=看正面/水平, 0=朝下)
+        十字速度软限位: x ∈ [-0.30, 0] m, y ∈ [-0.20, 0] m (触底=0)。
 
-        y 额外安全: y_speed 内部还有磁感安全门 + 末段/顶段减速 + 急停门。
+        注意: set_arm_angle/set_hand_angle 立即返回 (舵机异步转), 不阻塞;
+        但读位置 x_get_position/y_get_position 走串口 (~ms), 高频时建议 <=20Hz。
+        y 额外有磁感安全门 (arm_base 内置)。
         """
         with self._realtime_gate:
             self._realtime_check_locked()
             car = self.car
         out = {}
-        # 软限位 (m)。x 左墙=0/负方向到 -0.30; y 触底=0/向下正/向上负到 -0.20
+        # 角度软限位 (°)
+        ARM_MIN, ARM_MAX = -90.0, 90.0
+        HAND_MIN, HAND_MAX = -90.0, 0.0
+        # 十字速度软限位 (m)
         X_MIN_M, X_MAX_M = -0.30, 0.0
         Y_MIN_M, Y_MAX_M = -0.20, 0.0
+        if arm_angle is not None:
+            arm_angle = max(ARM_MIN, min(ARM_MAX, float(arm_angle)))
+            car.arm.set_arm_angle(arm_angle, speed=80)
+            out["arm_angle"] = arm_angle
+        if hand_angle is not None:
+            hand_angle = max(HAND_MIN, min(HAND_MAX, float(hand_angle)))
+            car.arm.set_hand_angle(hand_angle, speed=80)
+            out["hand_angle"] = hand_angle
         if x_vel is not None:
             x_vel = float(x_vel)
             try:
