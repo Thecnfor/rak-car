@@ -456,16 +456,21 @@ class ArmController:
 
     def move_x_position(self, target, out_time = 6.0, v_max_mms: float = None):
         """
-        移动水平方向指定位置。无软件软限位，仅 PID 闭环 + 编码器核对 + 兜底。
+        移动水平方向指定位置。PID 闭环 + out_time 超时兜底,无中途撞墙 calibrate。
 
-        1) 命令位移记录:本次指令 delta = target - current，记录累积预期位移;
-        2) PID 闭环到 < 1mm 或 out_time 超时或堵转跳出;
+        2026-08-01 根治: 旧逻辑在 belt-slip 状态下 x_stop_check 误判撞墙,
+        把 ref 重置到 belt-slip 卡死点 → 业务坐标错位,后续 move 永远到不了
+        0~-320 范围。新逻辑直接移除 x_stop_check 中途 calibrate 路径 —
+        exit 条件只剩 PID 收敛 + out_time 超时。
+
+        1) 命令位移记录:本次指令 delta = target - current,记录累积预期位移;
+        2) PID 闭环到 < 1mm 或 out_time 超时跳出;
         3) 命令/编码器核对:偏差 > 5mm 报警;
         4) 完成后 actual vs target 偏差 > 2mm 报警。
 
-        方向约定:target=0 在初始化时的位置,远离为正(默认右侧)。
-        软限位取消:用户原话"灵活使用就好,一般不会超"。物理墙 ≈ 0.34m 撞墙由
-        x_stop_check 触发后自动 calibrate（x_pose_start = 当前 dis, _x_wall 标注侧）。
+        方向约定:target=0 在 reset_x 撞墙位置,远离为正。
+        软限位 [x_min_m, x_max_m] 由 yaml 控制,默认 [0, 0.22]。当前 yaml
+        配 [−0.32, 0.22],允许 0~-320mm 全段。
 
         Args:
             target: 目标位置 (m)
@@ -494,13 +499,7 @@ class ArmController:
                 if time.time() > end_time:
                     break
                 if self.x_pid_moveto(target):
-                    break
-                if self.x_stop_check():
-                    # 撞墙 calibrate: 用相对零点(不调 motor.reset — 副作用锁电机)
-                    dis = self.motor_x.get_dis()
-                    self.x_pose_start = dis
-                    self._x_ref_encoder_at_zero = dis
-                    self._x_wall = "left" if dis < 0.15 else "right"
+                    # PID 收敛到 < 1mm,退出
                     break
                 time.sleep(0.05)
         finally:
