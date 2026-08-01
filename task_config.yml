@@ -19,44 +19,49 @@ task_cfg:
 
   auto_seeding:
     _doc: |
-      任务一:auto_seeding 自动移苗。
-              右侧 S1/S2/S3 三个育苗筒 → 左侧 T1/T2/T3 三个种植槽。
-              通过 cam2 视觉标签识别映射 (target_slot_map), 按 S1→S2→S3 顺序逐棵移栽。
+      任务一:auto_seeding 自动移苗 (2026-08-02 重写)。
+              三圆柱 (cylinder_1=大 / cylinder_2=中 / cylinder_3=小) 从右侧 S 列
+              抓到左侧 T 列 (cam2 视觉: 源头按 label, 目的地按 marker_label 识别)。
+              cam2 每列视野只看 1 个目标, 因此无 x 排序; S_i ↔ T_i 配对同列,
+              视觉伺服用吸嘴 setpoint (origin.nozzle_offset_x_norm/y_norm)。
+              抓取协议 2026-08-01: y 降到 0 → 验证到位 → 吸 (suck);
+              释放协议 2026-08-01: y 降到 0 → drop_object。
               检测/复位姿态 X=-100mm, 大臂=-90°, 手爪=0°, Y=-100mm;
-              抓取姿态 X=-100mm, Y=-10mm (大臂转 -90°+Y 下降);
               运输高度 Y=-150mm; 投放姿态 X=-270mm, 大臂=+90°, Y=-30mm.
 
-    source_position_order: [1, 2, 3]
-
-    target_slot_map:
-      cylinder_3: 1
+    marker_label: cylinder_set    # 左侧种植孔的目标检测 label (用户约定 2026-08-02)
+    pick_align: true               # 视觉伺服对齐 (基准位后人工摆目标, 量 setpoint)
+    place_align: true
+    source_position_order: [1, 2, 3]   # 按底盘列路径走 S1→S2→S3
+    target_slot_map:                 # label → 摆到的种植槽 (模型识别 + 路由, 一对一)
+      cylinder_1: 1
       cylinder_2: 2
-      cylinder_1: 3
+      cylinder_3: 3
 
     spacing_along_row_m: 0.15
 
     arm_pick_pose:
-      x_mm: -100
+      x_mm: 0               # 标定基准位 (x=0 = 最右, 与 nozzle_offset 标定对齐)
       arm_angle_deg: -90
-      y_mm: -10            # 下放高度(吸取)
-      hand_angle_deg: 0    # 吸取时末端向下
+      y_mm: -10             # 下放高度(吸取)
+      hand_angle_deg: 0     # 吸取时末端向下
 
     arm_carry_pose:
-      x_mm: -100
+      x_mm: 0
       arm_angle_deg: -90
-      y_mm: -150           # 安全高度
+      y_mm: -150            # 安全高度
       hand_angle_deg: -10
 
     arm_place_pose_T2:
       x_mm: -270
-      arm_angle_deg: 90    # 大臂指向左侧
-      y_mm: -30            # 下放高度(释放)
+      arm_angle_deg: 90     # 大臂指向左侧
+      y_mm: -30             # 下放高度(释放)
       hand_angle_deg: -10
 
     arm_return_S1_pose:
-      x_mm: -100
+      x_mm: 0
       arm_angle_deg: -90
-      y_mm: -100           # 放置后抬到检测高度，直接可下一轮检测
+      y_mm: -100            # 放置后抬到检测高度，直接可下一轮检测
       hand_angle_deg: -10
 
     init_y_mm: -100        # 初始化抬升高度(进入任务时)
@@ -126,15 +131,6 @@ waypoints:
     dis_at_least_m: 0.90
     trigger_op: AND
 
-  # ----- task2 -----
-  - name: task2_water_tower
-    task_id: 2
-    task_module: main.task.task2_water_tower
-    ir_threshold_m: 0.50
-    ir_side: left
-    dis_at_least_m: 7
-    trigger_op: AND
-
   # ----- task3 (TODO) -----
   - name: task3_pest_scout
     task_id: 3
@@ -142,6 +138,15 @@ waypoints:
     ir_threshold_m: 1.50
     ir_side: right
     dis_at_least_m: 2.33
+    trigger_op: AND
+
+  # ----- task2 -----
+  - name: task2_water_tower
+    task_id: 2
+    task_module: main.task.task2_water_tower
+    ir_threshold_m: 0.50
+    ir_side: left
+    dis_at_least_m: 7
     trigger_op: AND
 
   # ----- task4 -----

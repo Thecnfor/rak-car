@@ -160,11 +160,16 @@ class MyCar(
         """
         self._stop_flag = False
         self._end_flag = True
-        # 关闭 lane_feed 守护线程
-        try:
-            self.stop_lane_feed()
-        except Exception:
-            pass
+        # 2026-08-01 修复: 原来只 stop_lane_feed(且不传 force → NOOP), 漏停
+        # arm/task/ir/odom 四个守护线程。auto-init 重建 MyCar 时旧 feed 线程继续跑,
+        # 与新 car 的 feed 线程双写 streamer 缓存 → arm_state 交替正常/异常。
+        # close 是销毁整个实例, 必须 force=True 真正停掉全部 5 个 feed 线程。
+        # (stop_*_feed 默认 force=False 是 no-op, 见 feeds.py _stop_feed)
+        for _feed in ("lane_feed", "arm_feed", "task_feed", "ir_feed", "odom_feed"):
+            try:
+                getattr(self, "stop_%s" % _feed)(force=True)
+            except Exception:
+                pass
         # 按键线程已移除
         try:
             super(MyCar, self).close()

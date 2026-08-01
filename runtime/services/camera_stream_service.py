@@ -991,6 +991,7 @@ class CameraStreamService:
             "mode": "idle",          # task_feed | tracking | idle | stopped
             "detections": [],         # list[{cls_id, det_id, label, score, bbox_norm{...}}]
             "count": 0,
+            "frame_shape": None,       # [h, w, c] — task_feed 每帧带,供 client 从 bbox_norm 换算像素尺寸
             "updated_at": None,
         }
 
