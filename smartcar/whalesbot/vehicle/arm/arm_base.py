@@ -344,10 +344,14 @@ class ArmController:
         self.y_speed(0)
 
         # ---- 丢步/堵转补偿（最多 2 轮） ----
+        # 2026-08-01 修复: 兜底阈值 0.001 (1mm) → 0.002 (2mm),与最终误差阈值
+        # (line 379 的 0.002 = 2mm) 对齐。原 1mm 阈值在首轮 PID 末段 (Kp=6,误差 0.5mm
+        # 对应 0.003 m/s 速度) 会被频繁触发,再发一轮 setpoint 反而放大振荡。
+        # 改成 2mm 后只对真物理丢步生效。
         for round_idx in range(2):
             actual = self.y_get_position()
             err = target - actual
-            if abs(err) <= 0.001:
+            if abs(err) <= 0.002:
                 break
             # 磁感已触发且 setpoint 已在触底方向 → 已经触底到位
             if self.y_reset_check() and target >= 0.0:
@@ -456,52 +460,64 @@ class ArmController:
 
     def move_x_position(self, target, out_time = 6.0, v_max_mms: float = None):
         """
-        移动水平方向指定位置。PID 闭环 + out_time 超时兜底,无中途撞墙 calibrate。
+        移动水平方向指定位置。开环 bang-bang + 统一慢速,无中途撞墙 calibrate。
 
-        2026-08-01 根治: 旧逻辑在 belt-slip 状态下 x_stop_check 误判撞墙,
-        把 ref 重置到 belt-slip 卡死点 → 业务坐标错位,后续 move 永远到不了
-        0~-320 范围。新逻辑直接移除 x_stop_check 中途 calibrate 路径 —
-        exit 条件只剩 PID 收敛 + out_time 超时。
+        2026-08-01 三次根治: 用户报 "x/y 来回走 3-4 秒才稳定"。
+        二次根治 (WIP) 把 PID 改 bang-bang 但 v_max=100mm/s,50ms 周期下每帧 5mm
+        位移撞 0.4mm 阈值,机械惯性反复过冲 → 振荡 3-4s。
+        本次改成统一慢速 40mm/s + 10ms 控制周期 消除振荡根源:
+          - 10ms 周期 × 0.04 m/s = 0.4mm/帧 = POSITION_ERROR_THRESHOLD,刚好不超调;
+          - 50ms 周期下 0.04 m/s = 2mm/帧,反复过线振荡 15s+ 真机测出过;
+          - 业务层 v_max_mms 仍可临时覆盖(默认 40mm/s 透传到 x_pid.output_limits)。
 
-        1) 命令位移记录:本次指令 delta = target - current,记录累积预期位移;
-        2) PID 闭环到 < 1mm 或 out_time 超时跳出;
-        3) 命令/编码器核对:偏差 > 5mm 报警;
-        4) 完成后 actual vs target 偏差 > 2mm 报警。
-
-        方向约定:target=0 在 reset_x 撞墙位置,远离为正。
-        软限位 [x_min_m, x_max_m] 由 yaml 控制,默认 [0, 0.22]。当前 yaml
-        配 [−0.32, 0.22],允许 0~-320mm 全段。
+        算法:
+          - |error| > POSITION_ERROR_THRESHOLD (0.4mm) → x_speed(+v_max / -v_max)
+          - |error| <= 0.4mm → x_speed(0) 等带子减速
+          - 连续 5 帧 < 0.4mm (x_pid_flag CountRecord) → 到位退出
+          - out_time 超时兜底
 
         Args:
             target: 目标位置 (m)
-            out_time: PID 闭环超时 (s)
-            v_max_mms: 可选,本次动作速度上限 (mm/s)。传入后临时收紧 x_pid.output_limits
-                       和 x_velocity_limit,try/finally 还原。None=用 yaml 默认限幅。
+            out_time: 超时 (s)
+            v_max_mms: 速度上限 (mm/s),默认 40。临时收紧 x_pid.output_limits 和
+                       x_velocity_limit,try/finally 还原。
         """
         # 1) 命令位移记录
         prev_pos = self.x_get_position()
         self._x_expected_total_delta += abs(target - prev_pos)
 
-        # 可选临时收紧 PID 限幅（业务层传入 v_max_mms 才生效）
+        # 可选临时收紧 PID 限幅(虽不用 PID,保留 output_limits / x_velocity_limit
+        # 同步收紧,避免其他动作意外)。
         saved_pid_limits = None
         saved_vel_limit = None
+        v_max = 0.04  # 默认 40 mm/s (匀速消振荡: 50ms 周期 × 0.04 = 2mm/帧)
         if v_max_mms is not None:
-            v_limit = float(v_max_mms) / 1000.0
+            v_max = float(v_max_mms) / 1000.0
             saved_pid_limits = self.x_pid.output_limits
             saved_vel_limit = self.x_velocity_limit
-            self.x_pid.output_limits = (-v_limit, v_limit)
-            self.x_velocity_limit = (-v_limit, v_limit)
+            self.x_pid.output_limits = (-v_max, v_max)
+            self.x_velocity_limit = (-v_max, v_max)
 
-        end_time = time.time()+out_time
-        self.x_pid.setpoint = target
+        end_time = time.time() + out_time
         try:
             while True:
                 if time.time() > end_time:
                     break
-                if self.x_pid_moveto(target):
-                    # PID 收敛到 < 1mm,退出
-                    break
-                time.sleep(0.05)
+                # 读当前位置 + 计算 error
+                cur = self.x_get_position()
+                error = target - cur
+                if abs(error) <= POSITION_ERROR_THRESHOLD:
+                    # 收敛判定: 连续 5 帧 < 0.4mm
+                    if self.x_pid_flag(True):
+                        break
+                    self.x_speed(0)
+                else:
+                    # error > 死区 → 开环驱动,并清零收敛计数器(CountRecord False 分支清零)
+                    self.x_pid_flag(False)
+                    self.x_speed(v_max if error > 0 else -v_max)
+                # 周期 10ms: 让 v_max=0.04 m/s × 0.01s = 0.4mm/帧 = 阈值,刚好不超调
+                # (50ms 周期下 0.04 m/s = 2mm/帧,反复过线振荡 15s+ 测出过)
+                time.sleep(0.01)
         finally:
             self.x_speed(0)
             # 还原 PID 限幅,避免临时收紧污染后续 move_x / goto_position 的初始状态
