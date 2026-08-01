@@ -23,6 +23,8 @@ horiz_cfg:
   slow_band_m: 0.05
   slow_velocity: 0.02
   fast_velocity: 0.1
+  x_min_m: -0.32
+  x_max_m: 0.22
 vert_cfg:
   motor:
     id: 3
