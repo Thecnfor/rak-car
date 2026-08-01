@@ -314,6 +314,35 @@ runner = DoubleLoopRunner(api=api, outer=outer, hz=50.0, smoother=smoother)
 `DoubleLoopRunner` 默认会自己 new 一个 `WheelSmoother()`；要彻底关掉就显式传
 一个 `max_abs=math.inf / max_accel=math.inf` 的实例。
 
+### `ErrorCalibrator`：误差标定层（lane 模型裸输出 → 物理量）
+
+**问题**：lane 模型（128×128 CNN）输出 `result[0]/result[1]` 被原样当
+`error_y / error_angle` 喂给控制律，但控制律假设 `error_y` 单位是**米**。若模型
+训练时的输出尺度不是米（归一化 / 像素 / 量级 1e-3），`vy = -kp_y * error_y`
+≈ 0，横移通道失效 → 车只剩 ω 在修 → **出弯后修正慢、只能靠长直线修回来**。
+
+**工具**：`ErrorCalibrator`（`controllers/calibration.py`）在 `_sense()` 边界把
+原始误差标成物理量，控制器零改动：
+
+```python
+cal = ErrorCalibrator(scale_y=1000.0, ema_alpha=0.30)  # d_e 疑似缩 1e-3
+runner = DoubleLoopRunner(api=api, outer=outer, hz=50.0, calibrator=cal)
+```
+
+- 变换：`d_e' = (error_y - offset_y) * scale_y`，`d_a'` 同理
+- 可选 EMA 去抖（丢线自动 reset，恢复不跳）
+- **默认 scale=1 / offset=0 / 无 EMA → 严格 no-op**，不配置行为完全不变
+- CLI 入口：`run_lane_follow.py --error-scale-y <x> --error-scale-angle <x> --error-offset-y <x> --error-ema-alpha <x>`
+
+**先测量再调参**：跑 `python3 -m main.chassis.cli.diag_lane_error --seconds 30`，
+它只读不下发，统计原始 `error_y/error_angle` 的 min/max/mean/σ/分位，并提示
+标定倍率。现场流程：车静止在中线看零点漂移（offset）→ 开到明显偏移看模型
+输出幅值 → `scale_y ≈ 物理偏移(米) / 模型输出幅值`。
+
+**已知差距**：`base.mecanum_inverse` 与 SDK `vehicle_to_wheel_matrix` 对**纯横移**
+的 vy 轮序不一致（纯前进一致）。若修这里，所有 4 个控制律的 vy 行为一起变，
+务必实车 A/B。见 `tests/test_mecanum_inverse.py`。
+
 ### 新增一个控制律
 
 继承 `controllers/base.py:OuterLoop`，实现一个 `step()`：

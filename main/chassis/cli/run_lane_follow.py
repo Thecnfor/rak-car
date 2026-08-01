@@ -19,6 +19,7 @@ from ..config.lane_follow import (
     ControllerType,
     LaneFollowProfile,
 )
+from ..controllers.calibration import ErrorCalibrator
 from ..loops.closed_loop import DoubleLoopRunner
 from ..loops.telemetry import lane_trace
 
@@ -111,6 +112,26 @@ def main(argv: list[str] | None = None) -> None:
              "与 --no-trace 互斥（--tui 时 lane_trace 不启动）。\n"
              "快捷键: r/z 清零积分, p 切换 dry-run, s 急停零速, q 退出",
     )
+    parser.add_argument(
+        "--error-scale-y", type=float, default=None,
+        help="error_y 标定倍率（默认 None=不标定）。lane 模型裸输出单位未知，\n"
+             "先跑 diag_lane_error 实测分布再定；若 d_e 恒为 0.000x 而实车明显偏离，\n"
+             "典型倍率是 1e3~1e4。"
+    )
+    parser.add_argument(
+        "--error-scale-angle", type=float, default=None,
+        help="error_angle 标定倍率（默认 None=不标定）。通常模型输出已是角度量纲，\n"
+             "多半不需要动；若 d_a 也偏小再调。"
+    )
+    parser.add_argument(
+        "--error-offset-y", type=float, default=0.0,
+        help="error_y 零点偏移（视觉零漂，米/模型尺度）。默认 0。"
+    )
+    parser.add_argument(
+        "--error-ema-alpha", type=float, default=None,
+        help="误差 EMA 平滑系数 (0,1]，None=不平滑。越小越信任历史、越稳；\n"
+             "太大等于没滤。建议 0.2~0.5。"
+    )
     args = parser.parse_args(argv)
 
     profile = _build_profile(args)
@@ -136,6 +157,18 @@ def main(argv: list[str] | None = None) -> None:
             outer.locked_vx = (outer.vx_target == 0.0)
     smoother = profile.build_smoother()
 
+    # 误差标定层：只有显式传了标定参数才启用，否则 None → 完全 no-op。
+    cal_kwargs: dict = {}
+    if args.error_scale_y is not None:
+        cal_kwargs["scale_y"] = args.error_scale_y
+    if args.error_scale_angle is not None:
+        cal_kwargs["scale_angle"] = args.error_scale_angle
+    if args.error_offset_y != 0.0:
+        cal_kwargs["offset_y"] = args.error_offset_y
+    if args.error_ema_alpha is not None:
+        cal_kwargs["ema_alpha"] = args.error_ema_alpha
+    calibrator = ErrorCalibrator(**cal_kwargs) if cal_kwargs else None
+
     use_tui = bool(args.tui)
     if use_tui:
         # rich 是可选依赖，只在 --tui 时才 import；普通巡线不需要装 rich。
@@ -155,6 +188,7 @@ def main(argv: list[str] | None = None) -> None:
         dry_run=args.dry_run,
         smoother=smoother,
         on_tick=None if use_tui else runner_on_tick,
+        calibrator=calibrator,
     )
     try:
         if use_tui:

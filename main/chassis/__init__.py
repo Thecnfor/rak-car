@@ -10,6 +10,7 @@ from .controllers.base import OuterLoop, WheelSmoother
 from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
 from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
+from .controllers.calibration import ErrorCalibrator
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
 from .loops.telemetry import lane_trace
@@ -27,6 +28,7 @@ def subscribe_lane_state(
     dry_run: bool = False,
     with_trace: bool = True,
     on_tick: Optional[Callable[[LaneState, list[float]], None]] = None,
+    calibrator: Optional["ErrorCalibrator"] = None,
 ) -> None:
     """巡线外环的**一健装配**：profile → outer / smoother → DoubleLoopRunner。
 
@@ -75,6 +77,7 @@ def subscribe_lane_state(
         dry_run=dry_run,
         smoother=smoother,
         on_tick=on_tick,
+        calibrator=calibrator,
     )
     try:
         runner.run(max_seconds=profile.max_seconds if max_seconds is None else max_seconds)
@@ -93,6 +96,7 @@ __all__ = [
     "POuterLoop",
     "StanleyOuterLoop",
     "CurvatureAdaptiveOuterLoop",
+    "ErrorCalibrator",
     "DoubleLoopRunner",
     "EmergencyWatchdog",
     "LostLineDetector",
