@@ -130,7 +130,7 @@ waypoints:
   - name: task3_pest_scout
     task_id: 3
     task_module: main.task.task3_pest_scout
-    ir_threshold_m: 1.50
+    ir_threshold_m: 2.00
     ir_side: left
     dis_at_least_m: 2.33
     trigger_op: AND
@@ -141,7 +141,7 @@ waypoints:
     task_module: main.task.task2_water_tower
     ir_threshold_m: 0.70
     ir_side: right
-    dis_at_least_m: 4
+    dis_at_least_m: 4.05
     trigger_op: AND
 
   # ----- task4 -----
