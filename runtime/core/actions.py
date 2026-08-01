@@ -22,6 +22,12 @@ CAR_ACTIONS = {
     "lane_dis_offset": lambda car, *args, **kwargs: car.lane_dis_offset(*args, **kwargs),
     "start_lane_feed": lambda car, *args, **kwargs: car.start_lane_feed(*args, **kwargs),
     "stop_lane_feed": lambda car, *args, **kwargs: car.stop_lane_feed(**kwargs) if kwargs else car.stop_lane_feed(),
+    # 2026-08-01: 暴露 arm_feed 控制 —— 让视觉伺服等高频 arm 动作有路可走 (绕开 arm_queue 拥堵)。
+    # 安全前提:arm_feed 不被 lane_follow 外环依赖 (lane_follow 用 lane_feed),所以暂停安全。
+    # 用法:track 测试前 stop_arm_feed,跑完 start_arm_feed(hz=20) 恢复。
+    "start_arm_feed": lambda car, *args, **kwargs: car.start_arm_feed(*args, **kwargs),
+    "stop_arm_feed": lambda car, *args, **kwargs: car.stop_arm_feed(**kwargs) if kwargs else car.stop_arm_feed(),
+    "restart_arm_feed": lambda car, *args, **kwargs: car.restart_arm_feed(*args, **kwargs),
     # 2026-07-31: 左右 IR / 底盘里程计守护线程开关（默认 50Hz auto-start）。
     # 与 start_lane_feed / start_arm_feed / start_task_feed 同构。
     "start_ir_feed": lambda car, *args, **kwargs: car.start_ir_feed(*args, **kwargs),
