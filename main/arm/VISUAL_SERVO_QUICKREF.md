@@ -28,9 +28,11 @@ L3:  S 曲线 Dry ── plan_xy(x0,y0 → x1,y1) ─► 给 L4 估 timeout
 L2:  视觉伺服 ──── PID + depth-aware + 4-DOF ──► (dx_mm, dy_mm) ∈ mm
 L1:  解析选择 ──── bbox parse + TargetSelector ──► Detection {bbox_norm ∈ [-1,+1], bbox_px}
 
-L2 的传输有两条：
+L2 的传输有三条：
   · HTTP /v1/vision/task cache（30Hz 轮询） ──► find_target / find_target_pid / find_target_legacy
   · WS subscribe_task_detection（推流 ~25-60ms）─► find_target_realtime / find_target_track
+  · velocity 模式（推荐高频追踪, 免 arm_queue）─► find_target_velocity (XY) / find_target_4dof
+    （2026-08-02 封装, 原 07/08 示例抽成 VelocityLoop; ArmRunner.track_velocity / track_4dof 编排）
 ```
 
 详细函数签名看 `ARM_API.md §0-§10`，单测看 `tests/test_*.py`。

@@ -391,6 +391,76 @@ class ArmRunner:
             timeout=timeout, **kwargs,
         )
 
+    # ---- 2026-08-02: velocity 模式追踪 (07/08 封装, 免 arm_queue) ----
+
+    def _set_arm_feed(self, *, stop: bool) -> None:
+        """velocity 追踪前让位 / 后恢复 arm_feed (20Hz poll 会占串口)."""
+        try:
+            if stop:
+                self.client.http.execute(
+                    "car", "stop_arm_feed", kwargs={"force": True},
+                    sync=True, timeout=8.0)
+            else:
+                self.client.http.execute(
+                    "car", "start_arm_feed", args=[20.0],
+                    sync=True, timeout=8.0)
+        except Exception as exc:
+            logger.warning("_set_arm_feed(stop=%s) failed: %s", stop, exc)
+
+    def track_velocity(self, label: str, *,
+                       x_start: float = 0.0, y_start: float = -130.0,
+                       arm_start: float = 0.0, hand_start: float = -90.0,
+                       timeout: float = 30.0, hz: float = 20.0,
+                       gain: float = 0.05, deadzone: float = 0.02,
+                       max_vel: float = 0.15,
+                       sign_x: float = -1.0, sign_y: float = 1.0,
+                       no_reset: bool = False) -> "VelocityResult":
+        """velocity XY 追踪 (示例 07): composite_run 起始位 → 让位 arm_feed →
+        追踪 → 恢复 feed + 复位。返回 VelocityResult (hits/misses/elapsed/trace)。
+
+        方向 x_vel=-dx·gain, y_vel=+dy·gain 已按真机实测固化; 异常方向用 sign_* 覆盖。
+        """
+        self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
+                                  hand=hand_start, timeout=20.0)
+        try:
+            self._set_arm_feed(stop=True)
+            return self.client._make_vision_with_move().find_target_velocity(
+                label, timeout=timeout, hz=hz, gain=gain, deadzone=deadzone,
+                max_vel=max_vel, sign_x=sign_x, sign_y=sign_y)
+        finally:
+            self._set_arm_feed(stop=False)
+            if not no_reset:
+                self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
+                                          hand=hand_start, timeout=20.0)
+
+    def track_4dof(self, label: str, *,
+                   x_start: float = 0.0, y_start: float = -130.0,
+                   arm_start: float = 0.0, hand_start: float = -90.0,
+                   timeout: float = 30.0, hz: float = 20.0,
+                   gain_x: float = 0.05, gain_y: float = 0.05,
+                   gain_arm: float = 2.0, gain_hand: float = 2.0,
+                   deadzone: float = 0.02, max_vel: float = 0.15,
+                   no_reset: bool = False) -> "VelocityResult":
+        """4-DOF velocity 追踪 (示例 08, 方向修正后): xy + 大臂 + 手抓 增量联调.
+
+        角度目标从 arm_start/hand_start 起增量累加 (clamp 到 arm[-90,90]/hand[-90,0]),
+        全部打包一发 /v1/realtime/arm-velocity。检测丢失 → xy 停, 角度保持。
+        """
+        self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
+                                  hand=hand_start, timeout=20.0)
+        try:
+            self._set_arm_feed(stop=True)
+            return self.client._make_vision_with_move().find_target_4dof(
+                label, timeout=timeout, hz=hz,
+                gain_x=gain_x, gain_y=gain_y, gain_arm=gain_arm, gain_hand=gain_hand,
+                deadzone=deadzone, max_vel=max_vel,
+                arm_start=arm_start, hand_start=hand_start)
+        finally:
+            self._set_arm_feed(stop=False)
+            if not no_reset:
+                self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
+                                          hand=hand_start, timeout=20.0)
+
     def pick_by_vision_lower(self, selector, *,
                              x_mm: float, y_mm: float,
                              grasp_y_mm: float = 0.0,
