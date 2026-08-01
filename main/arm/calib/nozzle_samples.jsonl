@@ -1,0 +1,5 @@
+{"t": 1, "label": "cylinder_3", "score": 0.94, "cx": -0.165, "cy": -0.519, "w_norm": 0.96, "h_norm": 0.96, "px_w": 306, "px_h": 230, "frame": [480, 640, 3], "pose": "arm=-90 hand=0 x=0 y=-100"}
+{"t": 2, "label": "cylinder_2", "score": 0.87, "cx": 0.161, "cy": -0.519, "w_norm": 1.44, "h_norm": 0.96, "px_w": 460, "px_h": 230, "frame": [480, 640, 3], "pose": "arm=-90 hand=0 x=0 y=-100"}
+{"t": 3, "label": "cylinder_3", "score": 0.97, "cx": 0.163, "cy": -0.471, "w_norm": 1.63, "h_norm": 1.06, "px_w": 523, "px_h": 253, "frame": [480, 640, 3], "pose": "arm=-90 hand=0 x=0 y=-100"}
+{"t": 4, "label": "ball_yellow", "score": 0.95, "cx": 0.101, "cy": -0.704, "w_norm": 0.49, "h_norm": 0.59, "px_w": 156, "px_h": 141, "frame": [480, 640, 3], "pose": "arm=-90 hand=0 x=0 y=-100"}
+{"t": 5, "label": "ball_blue", "score": 0.89, "cx": 0.094, "cy": -0.69, "w_norm": 0.53, "h_norm": 0.62, "px_w": 170, "px_h": 148, "frame": [480, 640, 3], "pose": "arm=-90 hand=0 x=0 y=-100"}

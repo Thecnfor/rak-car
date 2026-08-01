@@ -2,19 +2,20 @@
 # -*- coding: utf-8 -*-
 """任务一: 自动移苗 (播种) — 右侧育苗筒 -> 左侧种植区.
 
-业务流程 (2026-08-02 重写, 用视觉伺服 + 新 grasp 协议):
-  1. 初始化: reset_x 撞墙校准 + 抬升 Y 到 init_y_mm + 走到 S 姿态 (arm=-90°, x=0,
-     y=init_y_mm, hand=0°)
+业务流程 (2026-08-02 重写, 用智能定位追踪 + 新 grasp/drop 协议):
+  1. 初始化: reset_x 撞墙校准 + 抬升 Y 到 init_y_mm (-180) + 走到 S 姿态
+     (arm=-90°, x=0, y=init_y_mm, hand=0°) — S 姿态 = track_velocity_pick 起始位
   2. 三轮循环 (按 source_position_order 走底盘列):
      a) 底盘纵向移到 SOURCE_POSITIONS_M[i]
      b) 视觉扫本列的 cylinder label (1/2/3);
-        runner.pick_by_vision_lower 对准 (吸嘴 setpoint) → y 降 0 → 吸气
-     c) composite_run 到 place 姿态 (arm=+90°, x=-270, y=carry, hand=-10°)
-     d) 底盘纵向移到 SLOT_POSITIONS_M[label_to_slot[label]]  (label→底盘位置, 写死映射)
-     e) 视觉扫本列 marker (cylinder_set, 1 个);
-        runner.move_to_vision_target 对准 (吸嘴 setpoint)
-     f) runner.move_y(0) → runner.drop_object() 释放
-     g) 抬回 carry 高度 + composite_run 回 S 姿态
+        runner.track_velocity_pick 智能定位抓取 (arm 控 cx + x 十字控 cy →
+        对准吸嘴 setpoint → y 降 0 → 吸气 → 抬回)
+     c) composite_run 到 place 姿态 (arm=+90°, x=-270, y=servo_start, hand=-10°)
+     d) 底盘纵向移到 SLOT_POSITIONS_M[target_slot_map[label]]  (label→底盘位置, 写死映射)
+     e) 视觉扫本列 marker (cylinder_set);
+        runner.track_velocity_pick(mode="drop") 智能定位释放 (对齐 marker 吸嘴
+        setpoint → y 降 0 → drop_object)
+     f) 归位: composite_run 回 S 姿态 (防碰撞顺序)
 
 底盘位置约定 (与 task_config.yml / _constants.py 对齐):
   SOURCE_POSITIONS_M / SLOT_POSITIONS_M {1:0.0, 2:0.15, 3:0.30}.
@@ -28,11 +29,19 @@
                  -90° = 右侧检测姿态 (对准 S 育苗筒方向, 大臂在右)
   hand_angle: -90° = 手爪竖直向上, 0° = 向下; 抓取时取 0°, 释放 hand=-10°
 
+机械结构实测映射 (2026-08-02 实机标定, y=-180 时):
+  画面 cx ← arm_angle (大臂更负 → cx 更右; 吸嘴中心 cx=0.161 对应 arm≈-97)
+  画面 cy ← x 十字位置 (x 更左 → cy 更上)
+  y 十字/手抓 → 锁死 (y 下移目标出视野, hand 固定 0° 朝下)
+
+吸嘴 setpoint (origin.nozzle_offset_map, 2026-08-02 标定):
+  目标在吸嘴正下方时其 bbox 中心坐标; 按 label 分组查表
+  (cylinder_1/2/3 → (0.161,-0.519), ball_* 各自分档, 未知回落全局默认).
+
 架构说明 (2026-08 重构):
-  本任务使用 main.arm.ArmRunner (含 y 保护区 / 角度硬限 / 丢步核对 / 并发执行)
-  + 视觉伺服 (find_target + 吸嘴 setpoint) + 新抓取协议
-  (y 降 0 → 验证 → 吸; y 降 0 → drop_object 释放),
-  不再依赖 main/task/_helpers.py (该文件已删除, 详见 main/task/README.md §架构历史).
+  本任务使用 main.arm.ArmRunner + ArmVisionClient.find_target_arm_cross
+  (velocity 模式实时追踪, 免 arm_queue) + 吸嘴 per-label setpoint + 新抓取协议
+  (y 降 0 → 吸气; y 降 0 → drop_object 释放).
 """
 from __future__ import annotations
 
@@ -135,8 +144,13 @@ def _chassis_move_for(
 
     走 ArmClient._call_car (HTTP car target). sync=True 让底层 SDK 跑完才返回.
     """
-    return arm_client._call_car(
-        "move_for", dx_m, timeout=timeout, sync=True,
+    # 注意: _call_car(name, timeout=20, *args, ...) — dx_m 必须走 args 关键字,
+    # 直接位置传会被当成 timeout (duplicate value bug).
+    # 直接用 http.execute_car_action — 绕开 _call_car(name, timeout, *args, ...) 的
+    # timeout 位置参数陷阱 (dx_m 位置传会被当 timeout → duplicate value bug).
+    # move_for 第一个参数是 position_offset=[x偏移(m), y偏移(m), 角偏移(rad)].
+    return arm_client.http.execute_car_action(
+        "move_for", [dx_m, 0.0, 0.0], timeout=timeout, sync=True,
     )
 
 
@@ -153,40 +167,37 @@ def _pick_at_source(
 
     Returns: 抓到的 cylinder label (1/2/3).
     """
-    pick = cfg["arm_pick_pose"]
-    init_y_mm = cfg.get("init_y_mm", -100)
-
     logger.info("[S%d] 视觉扫描源头 cylinder label", column_idx)
     label = _scan_cylinder_label(client, list(SOURCE_LABELS))
     if label is None:
         raise RuntimeError(
             f"S{column_idx} 位置未检测到任何 cylinder ({list(SOURCE_LABELS)})"
         )
-    logger.info("  -> 抓到 %s, 视觉伺服对准 + 抓取", label)
+    logger.info("  -> 抓到 %s, 智能定位抓取 (arm 控 cx + x 十字控 cy)", label)
 
-    # 现场 (2026-08-02): cam2 视野方向反了, dx_norm/dy_norm 跟物理 nozzle 移动方向相反;
-    #    mm_per_norm 传负值做符号补偿. 现场先验证 cylinder_2 能抓上.
-    pick_mm_per_norm = float(cfg.get("pick_mm_per_norm", -30.0))
-
-    result = runner.pick_by_vision_lower(
-        TargetSelector.for_label(
-            label, strategy=SelectionStrategy.HIGHEST_SCORE.value),
-        x_mm=float(pick["x_mm"]),
-        y_mm=init_y_mm,
-        arm_angle=float(pick["arm_angle_deg"]),
-        hand=float(pick["hand_angle_deg"]),
-        grasp_y_mm=0.0,
-        settle_tol_norm=0.05, timeout=10.0,
+    # 2026-08-02: 智能定位抓取 (track_velocity_pick) — find_target_arm_cross 实时追踪.
+    #   吸嘴中心 setpoint 走 per-label 查表 (origin.nozzle_offset_for(label));
+    #   追踪在 y=init_y_mm (-180, 准备高度, 看得清楚) 开始 — 本机械结构实测:
+    #     画面 cx ← arm_angle (吸嘴中心对应 arm≈-97)
+    #     画面 cy ← x 十字位置
+    #   大臂转 + x 十字把目标对准吸嘴中心 → y 降 0 → 吸气 → 抬回.
+    init_y_mm = float(cfg.get("init_y_mm", -180.0))
+    result = runner.track_velocity_pick(
+        label,
+        x_start=0.0, y_start=init_y_mm,
+        arm_start=-90.0, hand_start=0.0,
+        timeout=cfg.get("pick_track_timeout_s", 25.0),
+        hz=20.0,
+        gain_arm=0.4, gain_x=0.08,
+        deadzone=0.02, max_vel=0.15,
+        settle_hits=3,
         hold_s=cfg.get("vacuum_settle_s", 0.5),
         lift_back=True,
-        lock_first=True,
-        reposition=True,
-        align=bool(cfg.get("pick_align", True)),
-        mm_per_norm=pick_mm_per_norm,
     )
     if not result.get("ok"):
         raise RuntimeError(
-            f"S{column_idx} 抓取 {label} 失败: {result.get('reason')}"
+            f"S{column_idx} 智能定位抓取 {label} 失败: {result.get('reason')} "
+            f"(trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
         )
     return label
 
@@ -198,13 +209,13 @@ def _place_at_slot(
     cfg: Dict[str, Any],
     column_idx: int,
 ) -> None:
-    """第 i 列: 移到槽列, 扫描 marker, 视觉伺服对准, y 降 0 放."""
+    """第 i 列: 移到槽列, 扫描 marker, 智能定位对准 (mode=drop), y 降 0 释放."""
     place = cfg["arm_place_pose_T2"]
     marker_label = cfg.get("marker_label", "cylinder_set")
     carry_y = float(cfg["arm_carry_pose"]["y_mm"])
-    init_y_mm = cfg.get("init_y_mm", -100)
-    # 伺服起点 y 必须远高于 carry_y (留 50mm+ 给视觉伺服单步移动),
-    # 否则 y 推到 [-200, 0] 软限外会被 _check_safe 拦. -100 是 S 姿态高度.
+    init_y_mm = cfg.get("init_y_mm", -180)
+    # 智能定位起始 y: 需高于 carry_y (留 50mm+ 给追踪移动), 否则推到
+    # [-200,0] 软限外被 _check_safe 拦. 现 max(-180, -100) = -100.
     servo_start_y = max(init_y_mm, carry_y + 50.0)
 
     # 1) composite_run 到 place 姿态 (arm=+90, x=-270, y=servo_start, hand=-10)
@@ -225,23 +236,31 @@ def _place_at_slot(
             f"T{column_idx} 位置未检测到 marker {marker_label}"
         )
 
-    # 3) marker 对准: 现场默认走开环 (setpoint 在 arm=+90 方向反向, 伺服把吸嘴推错),
-    #    靠基准位 + 底盘到位 + marker 视觉确认可见即可.
+    # 3) marker 对准: 智能定位 (2026-08-02) — 复用 track_velocity_pick 的
+    #    arm 控 cx + x 十字控 cy 对齐逻辑, mode="drop" 对齐后 y 降 0 释放.
+    #    setpoint 走 per-label 查表 (cylinder_set 未标定回落全局默认).
     if cfg.get("place_align", True):
-        sel = TargetSelector.for_label(
-            marker_label, strategy=SelectionStrategy.HIGHEST_SCORE.value)
-        origin = arm_client.origin
-        sx, sy = origin.nozzle_offset_x_norm, origin.nozzle_offset_y_norm
-        cur = runner.client.get_state()
-        servo = runner.client._make_vision_with_move().find_target(
-            sel, x_mm=cur.x_mm, y_mm=cur.y_mm,
-            setpoint_x_norm=sx, setpoint_y_norm=sy,
-            mm_per_norm=30.0, settle_tol_norm=0.05, timeout=10.0,
+        result = runner.track_velocity_pick(
+            marker_label,
+            x_start=float(place["x_mm"]), y_start=servo_start_y,
+            arm_start=float(place["arm_angle_deg"]),
+            hand_start=float(place["hand_angle_deg"]),
+            grasp_y_mm=0.0,
+            mode="drop",
+            timeout=cfg.get("place_track_timeout_s", 20.0),
+            hz=20.0,
+            gain_arm=0.4, gain_x=0.08,
+            deadzone=0.02, max_vel=0.15,
+            settle_hits=3,
+            hold_s=0.0,
+            lift_back=False,  # 已在 place 姿态, 不抬回 (后续走 _return_to_source_pose)
         )
-        if not servo.converged:
+        if not result.get("ok"):
             raise RuntimeError(
-                f"T{column_idx} 视觉伺服未收敛 (iter={servo.iterations})"
+                f"T{column_idx} 智能定位释放 {marker_label} 失败: {result.get('reason')} "
+                f"(trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
             )
+        return  # 智能定位已含 y 降 0 + drop + (无 lift_back), 直接结束
 
     # 4) y 降 0 → drop_object
     logger.info("  移动 y→0 释放")
@@ -270,7 +289,7 @@ def _return_to_source_pose(
 # ── 主入口 ────────────────────────────────────────────────────────────────
 
 def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
-    """任务一主入口: 自动移苗 (S1/S2/S3 -> T1/T2/T3, 用视觉伺服 + 新 grasp 协议).
+    """任务一主入口: 自动移苗 (S1/S2/S3 -> T1/T2/T3, 智能定位追踪抓取/释放).
 
     Args:
         client: 可选的 RuntimeApiClient 实例, 未传入时自动创建新连接
@@ -298,7 +317,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     runner = ArmRunner(arm_client)
 
     completed: List[str] = []
-    init_y_mm = cfg.get("init_y_mm", -100)
+    # S 姿态 = track_velocity_pick 起始位 (y=-180, 看得清楚)
+    init_y_mm = cfg.get("init_y_mm", -180)
 
     try:
         # ===== 初始化步骤 1. X 编码器校准 (撞右墙硬限位定原点) =====

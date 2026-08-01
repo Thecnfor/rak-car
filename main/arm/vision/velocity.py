@@ -122,11 +122,13 @@ class VelocityLoop:
         return post
 
     def _run_velocity(self, label: str, *, timeout: float, hz: float,
-                      ws, step_fn) -> List[VelocityTrace]:
+                      ws, step_fn, selector=None) -> List[VelocityTrace]:
         """共享 velocity 核心: WS 订阅 → 每帧 step_fn(t, pick) → 超时/订阅退出.
 
         step_fn(t, pick) 负责算速度 + 发命令 + 返回 VelocityTrace;
         pick 为 None 表示该帧检测丢失 (step_fn 内部处理停)。
+        selector (可选): 多目标选择器, 传入后用 selector.matches + apply_strategy;
+        否则默认 label 过滤 + HIGHEST_SCORE。
         """
         t0 = time.time()
         trace: List[VelocityTrace] = []
@@ -143,11 +145,26 @@ class VelocityLoop:
             except Exception:
                 return
             pick = None
-            best = -1.0
-            for d in dets:
-                if d.label == label and (d.score or 0.0) > best:
-                    best = d.score or 0.0
-                    pick = d
+            if selector is not None:
+                # 用 selector.matches + apply_strategy (支持 lock_first)
+                cands = [d for d in dets if selector.matches(d)]
+                if selector.track_id is not None:
+                    # 已锁定: 只取该 track_id
+                    pick = next((d for d in cands if d.track_id == selector.track_id), None)
+                elif cands:
+                    # 未锁定: 用 CLOSEST_TO_CENTER 选离吸嘴 (0,0) 最近的目标, 锁定 track_id
+                    chosen = min(cands, key=lambda d:
+                                 abs(d.bbox_norm.x_center) + abs(d.bbox_norm.y_center))
+                    if chosen is not None and chosen.track_id is not None:
+                        selector.track_id = chosen.track_id  # 锁住
+                    pick = chosen
+            else:
+                # 默认 label 过滤 + HIGHEST_SCORE
+                best = -1.0
+                for d in dets:
+                    if d.label == label and (d.score or 0.0) > best:
+                        best = d.score or 0.0
+                        pick = d
             trace.append(step_fn(time.time() - t0, pick))
 
         stop_sub = ws.subscribe_task_detection(_on_push, hz=hz)
@@ -167,11 +184,15 @@ class VelocityLoop:
                              gain: float = 0.05, deadzone: float = 0.02,
                              max_vel: float = 0.15,
                              sign_x: float = -1.0, sign_y: float = 1.0,
+                             setpoint_x_norm: float = 0.0,
+                             setpoint_y_norm: float = 0.0,
                              post_fn: Optional[Callable] = None,
                              ws=None) -> VelocityResult:
         """velocity XY 追踪 (示例 07): 只动十字, 检测丢失即停.
 
         方向: x_vel=-dx·gain, y_vel=+dy·gain (真机实测已固化)。
+        setpoint_x/y_norm (2026-08-02): 吸嘴中心偏移 (目标在吸嘴正下方时其 bbox 中心
+        坐标)。默认 (0,0)=画面中心; 传标定值即把目标对准吸嘴正下方而非画面中心。
         """
         post_fn = post_fn or self._default_post_fn()
         ws = self._ensure_ws(ws)
@@ -180,8 +201,8 @@ class VelocityLoop:
             if pick is None:
                 _try_post(post_fn, x_vel=0.0, y_vel=0.0)
                 return VelocityTrace(t, 0.0, 0.0, 0.0, 0.0, score=0.0, miss=True)
-            dx = pick.bbox_norm.x_center
-            dy = pick.bbox_norm.y_center
+            dx = pick.bbox_norm.x_center - setpoint_x_norm
+            dy = pick.bbox_norm.y_center - setpoint_y_norm
             x_vel = 0.0 if abs(dx) < deadzone else _clamp(sign_x * dx * gain, -max_vel, max_vel)
             y_vel = 0.0 if abs(dy) < deadzone else _clamp(sign_y * dy * gain, -max_vel, max_vel)
             _try_post(post_fn, x_vel=x_vel, y_vel=y_vel)
@@ -204,12 +225,20 @@ class VelocityLoop:
                          hand_min: float = -90.0, hand_max: float = 0.0,
                          sign_x: float = -1.0, sign_y: float = 1.0,
                          sign_arm: float = 1.0, sign_hand: float = 1.0,
+                         setpoint_x_norm: float = 0.0,
+                         setpoint_y_norm: float = 0.0,
+                         hold_y: bool = True,
                          post_fn: Optional[Callable] = None,
                          ws=None) -> VelocityResult:
-        """4-DOF 追踪 (示例 08, 方向修正后): xy 十字 + 大臂 + 手抓 增量联调.
+        """4-DOF 追踪 (示例 08, 方向修正后): x 十字 + 大臂 + 手抓 增量联调.
 
         大臂/手抓是增量式角度目标 (从 arm_start/hand_start 起, 每帧 clamp 后累加),
         全部打包进 /v1/realtime/arm-velocity 一发。检测丢失 → xy 停, 角度不动。
+        setpoint_x/y_norm (2026-08-02): 吸嘴中心偏移 (目标在吸嘴正下方时其 bbox 中心
+        坐标)。默认 (0,0)=画面中心。
+        hold_y (2026-08-02, 默认 True): 用户协议 — 对齐阶段锁死 y 十字 (y_vel=0),
+        垂直误差只靠 hand 增量转补偿。原因: y=-180 对齐时一旦 y 十字下移, 目标立刻
+        被推出视野 (相机随 y 移动)。水平误差走 x 十字 + arm 转双通道。
         """
         post_fn = post_fn or self._default_post_fn()
         ws = self._ensure_ws(ws)
@@ -223,10 +252,11 @@ class VelocityLoop:
                 return VelocityTrace(t, 0.0, 0.0, 0.0, 0.0,
                                      arm=arm_target, hand=hand_target,
                                      score=0.0, miss=True)
-            dx = pick.bbox_norm.x_center
-            dy = pick.bbox_norm.y_center
+            dx = pick.bbox_norm.x_center - setpoint_x_norm
+            dy = pick.bbox_norm.y_center - setpoint_y_norm
             x_vel = 0.0 if abs(dx) < deadzone else _clamp(sign_x * dx * gain_x, -max_vel, max_vel)
-            y_vel = 0.0 if abs(dy) < deadzone else _clamp(sign_y * dy * gain_y, -max_vel, max_vel)
+            y_vel = 0.0 if hold_y else (
+                0.0 if abs(dy) < deadzone else _clamp(sign_y * dy * gain_y, -max_vel, max_vel))
             d_arm = 0.0 if abs(dx) < deadzone else sign_arm * dx * gain_arm
             d_hand = 0.0 if abs(dy) < deadzone else sign_hand * dy * gain_hand
             arm_target = _clamp(arm_target + d_arm, arm_min, arm_max)
@@ -242,6 +272,66 @@ class VelocityLoop:
         finally:
             _try_post(post_fn, x_vel=0.0, y_vel=0.0)  # 结束必然急停
         return _summarize(label, trace, time.time() - t0, arm_target, hand_target)
+
+
+    def find_target_arm_cross(self, label: str, *,
+                              timeout: float = 30.0, hz: float = 20.0,
+                              gain_arm: float = 0.4, gain_x: float = 0.08,
+                              deadzone: float = 0.02, max_vel: float = 0.15,
+                              arm_start: float = -90.0,
+                              arm_min: float = -150.0, arm_max: float = 90.0,
+                              setpoint_x_norm: float = 0.0,
+                              setpoint_y_norm: float = 0.0,
+                              sign_arm: float = 1.0, sign_x: float = -1.0,
+                              selector=None,
+                              post_fn: Optional[Callable] = None,
+                              ws=None) -> VelocityResult:
+        """机械臂专用追踪 (2026-08-02 实机标定): 大臂控 cx + x 十字控 cy.
+
+        本机械结构 (y=-180 标定姿态实测):
+          画面水平 cx  ← arm_angle (大臂更负 → cx 更右/更大)
+          画面垂直 cy  ← x 十字位置 (x 更左 → cy 更上/更小)
+          y 十字/手抓  → 锁死 (y 下移目标出视野, hand 固定 0° 朝下)
+
+        因此误差映射与通用 4-DOF 不同:
+          dx = cx - setpoint_x  → arm 增量 (d_arm = dx·gain_arm)
+          dy = cy - setpoint_y  → x 十字速度 (x_vel = sign_x·dy·gain_x, sign_x=-1)
+          y_vel 恒 0, hand 不动.
+
+        方向符号 (实机标定 2026-08-02):
+          dx>0 (目标偏右) → arm 要减小(更负) → sign_arm=+1 时 d_arm 负
+          dy>0 (目标偏下) → x 要往左 → x_vel 负 → sign_x=-1
+
+        Returns: VelocityResult (arm 终值 = end_arm).
+        """
+        post_fn = post_fn or self._default_post_fn()
+        ws = self._ensure_ws(ws)
+        arm_target = arm_start
+
+        def step(t: float, pick) -> VelocityTrace:
+            nonlocal arm_target
+            if pick is None:
+                _try_post(post_fn, x_vel=0.0, y_vel=0.0)
+                return VelocityTrace(t, 0.0, 0.0, 0.0, 0.0,
+                                     arm=arm_target, score=0.0, miss=True)
+            dx = pick.bbox_norm.x_center - setpoint_x_norm
+            dy = pick.bbox_norm.y_center - setpoint_y_norm
+            x_vel = 0.0 if abs(dy) < deadzone else _clamp(
+                sign_x * dy * gain_x, -max_vel, max_vel)
+            d_arm = 0.0 if abs(dx) < deadzone else sign_arm * dx * gain_arm
+            arm_target = _clamp(arm_target + d_arm, arm_min, arm_max)
+            _try_post(post_fn, x_vel=x_vel, y_vel=0.0,
+                      arm=arm_target)
+            return VelocityTrace(t, dx, dy, x_vel, 0.0,
+                                 arm=arm_target, score=pick.score)
+
+        t0 = time.time()
+        try:
+            trace = self._run_velocity(label, timeout=timeout, hz=hz, ws=ws,
+                                      step_fn=step, selector=selector)
+        finally:
+            _try_post(post_fn, x_vel=0.0, y_vel=0.0)
+        return _summarize(label, trace, time.time() - t0, arm_target, None)
 
 
 def _summarize(label: str, trace: List[VelocityTrace], elapsed_s: float,

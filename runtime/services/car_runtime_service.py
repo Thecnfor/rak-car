@@ -236,8 +236,9 @@ class CarRuntimeService(
             self._realtime_check_locked()
             car = self.car
         out = {}
-        # 角度软限位 (°)
-        ARM_MIN, ARM_MAX = -90.0, 90.0
+        # 角度软限位 (°) — arm 对齐业务层 [-150, 90] (2026-08-02).
+        # 之前 -90 过严: 吸嘴中心 cx=0.161 对应 arm≈-97 (实机标定), 被卡住.
+        ARM_MIN, ARM_MAX = -150.0, 90.0
         HAND_MIN, HAND_MAX = -90.0, 0.0
         # 十字速度软限位 (m)
         X_MIN_M, X_MAX_M = -0.30, 0.0

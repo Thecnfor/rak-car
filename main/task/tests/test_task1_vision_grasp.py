@@ -149,18 +149,20 @@ def _make_runtime():
     runner.client = arm_client  # runner.client.composite_run
     runner.drop_object.return_value = {"ok": True}
 
-    # pick_by_vision_lower → ok=True, servo 收敛
-    runner.pick_by_vision_lower.return_value = {
-        "ok": True, "reason": None, "servo": MagicMock(converged=True, iterations=2),
-        "steps": {"servo": True, "lower": True, "grasp": True, "lift": True},
-        "y_before": -100, "y_lower": 0,
+    # track_velocity_pick → ok=True, 对齐+下降+吸气+抬回
+    runner.track_velocity_pick.return_value = {
+        "ok": True, "reason": None, "trace_hits": 60, "settled": True,
+        "end_arm": -96.0, "end_hand": None,
+        "steps": {"settled": True, "lower": True, "suck": True, "lift": True},
     }
     # composite_run / move_y → ok
     arm_client.composite_run.return_value = {"ok": True}
     arm_client.move_y.return_value = {"ok": True}
     arm_client.reset_x.return_value = {"ok": True}
     arm_client.set_hand_angle.return_value = {"ok": True}
-    # arm_client._call_car → ok
+    # 底盘 move_for (2026-08-02 改走 http.execute_car_action) → ok
+    arm_client.http.execute_car_action.return_value = {"ok": True, "status": "succeeded"}
+    # 兼容旧路径
     arm_client._call_car.return_value = {"ok": True}
 
     # 视觉伺服调用 (move_to_vision_target 内层 find_target) → 收敛
@@ -225,19 +227,20 @@ class TestRun(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
 
-        # 3 次 pick_by_vision_lower
-        self.assertEqual(runner.pick_by_vision_lower.call_count, 3)
-        # 3 次 marker 视觉伺服 (find_target)
-        self.assertEqual(vision.find_target.call_count, 3)
-        # 3 次 drop_object (走 runner.drop_object)
-        self.assertEqual(runner.drop_object.call_count, 3)
+        # 6 次 track_velocity_pick: 3 次智能抓取 (mode=pick) + 3 次智能释放 (mode=drop)
+        self.assertEqual(runner.track_velocity_pick.call_count, 6)
+        # 其中 3 次是 mode="drop" (释放)
+        drop_modes = [c.kwargs.get("mode") for c in runner.track_velocity_pick.call_args_list]
+        self.assertEqual(drop_modes.count("drop"), 3)
+        # marker 放置已改用 track_velocity_pick(mode=drop), 不再走 find_target
+        self.assertEqual(vision.find_target.call_count, 0)
         # composite_run 调用: 每列 = place (1×) + return-to-source (1×)
-        # 注: pick_by_vision_lower 在真实实现中会内调 composite_run, 但 mock bypass 了
+        # 注: track_velocity_pick 在真实实现中会内调 composite_run, 但 mock bypass 了
         # 共 3 × 2 = 6 次
         self.assertEqual(arm_client.composite_run.call_count, 6)
 
-        # 底盘移动: S1→S2, S2→S3, 结束归位 S1 → 至少 3 次 _call_car
-        self.assertGreaterEqual(arm_client._call_car.call_count, 3)
+        # 底盘移动: S1→S2, S2→S3, 结束归位 S1 → 至少 3 次 execute_car_action
+        self.assertGreaterEqual(arm_client.http.execute_car_action.call_count, 3)
 
     def test_marker_label_passed_to_selector(self):
         # 验证 marker 视觉伺服的 selector.label 来自 cfg.marker_label
@@ -328,11 +331,11 @@ class TestRun(unittest.TestCase):
         http = MagicMock()
         http.wait_until_ready.return_value = True
         http.get.side_effect = responses
-        runner.pick_by_vision_lower.return_value = {
-            "ok": False, "reason": "servo_not_converged",
-            "servo": None,
-            "steps": {"servo": False, "lower": False, "grasp": False, "lift": None},
-            "y_before": None, "y_lower": None,
+        runner.track_velocity_pick.return_value = {
+            "ok": False, "reason": "not_settled",
+            "trace_hits": 0, "settled": False,
+            "end_arm": None, "end_hand": None,
+            "steps": {"settled": False, "lower": False, "suck": False, "lift": None},
         }
 
         with patch.object(m, "load_task_config", return_value=CFG.copy()), \

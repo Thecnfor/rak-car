@@ -91,6 +91,10 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
             step_loss_x_mm=float(data.get("step_loss_x_mm", 5.0)),
             nozzle_offset_x_norm=float(data.get("nozzle_offset_x_norm", 0.0)),
             nozzle_offset_y_norm=float(data.get("nozzle_offset_y_norm", 0.0)),
+            nozzle_offset_map={
+                str(k): (float(v[0]), float(v[1]))
+                for k, v in (data.get("nozzle_offset_map") or {}).items()
+            },
             calibrated_at=str(data.get("calibrated_at", "")),
         )
 
@@ -109,6 +113,9 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
                     "step_loss_x_mm": origin.step_loss_x_mm,
                     "nozzle_offset_x_norm": origin.nozzle_offset_x_norm,
                     "nozzle_offset_y_norm": origin.nozzle_offset_y_norm,
+                    "nozzle_offset_map": {
+                        k: [v[0], v[1]] for k, v in origin.nozzle_offset_map.items()
+                    },
                     "calibrated_at": origin.calibrated_at,
                 },
                 f, allow_unicode=True, sort_keys=False,

@@ -71,7 +71,8 @@ class MotionMixin:
         """单轴 x 移动 (编码器闭环)."""
         self._check_y_protected("move_x")
         job = self._call_arm("move_x_position", timeout=timeout,
-                             target=_mm_to_m(x_mm), out_time=out_time)
+                             target=_mm_to_m(x_mm), out_time=out_time,
+                             v_max_mms=v_max_mms)
         from ..state import ArmOrigin
         origin = self.origin or ArmOrigin()
         try:

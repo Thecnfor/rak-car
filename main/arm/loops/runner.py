@@ -10,7 +10,7 @@ from typing import Optional
 
 from ..api import ArmClient
 from ..state import ArmOrigin, ArmState
-from ..vision import SelectionStrategy
+from ..vision import SelectionStrategy, TargetSelector
 
 logger = logging.getLogger(__name__)
 
@@ -31,19 +31,21 @@ class ArmRunner:
 
     # ---- 吸嘴偏移 setpoint（视觉伺服对准"吸嘴正下方"而非画面中心） ----
 
-    def _nozzle_offset(self):
-        """origin 里已标定的吸嘴偏移；未标定(全 0)返回 None。"""
-        origin = self.client.origin or ArmOrigin()
-        sx, sy = origin.nozzle_offset_x_norm, origin.nozzle_offset_y_norm
-        if abs(sx) > 1e-9 or abs(sy) > 1e-9:
-            return sx, sy
-        return None
+    def _nozzle_offset(self, label: Optional[str] = None):
+        """origin 里已标定的吸嘴偏移；未标定(全 0)返回 None。
 
-    def _resolve_nozzle_setpoint(self, sx, sy):
-        """sx/sy 由调用方显式传入；两者皆 None 时回落到 origin 标定值。
+        2026-08-02 起按 label 查表：不同尺寸/类别目标检测中心不同
+        （cylinders cy≈-0.50, balls cy≈-0.70），单一全局 setpoint 有残余误差。
+        label 已知 → 查 nozzle_offset_map；未知 label 回落全局默认。
+        """
+        origin = self.client.origin or ArmOrigin()
+        return origin.nozzle_offset_for(label)
+
+    def _resolve_nozzle_setpoint(self, sx, sy, label: Optional[str] = None):
+        """sx/sy 由调用方显式传入；两者皆 None 时回落到 origin 标定值（按 label 查表）。
         返回 (x, y) 或 None（未标定且未显式传 → 不注入，保持旧行为对准画面中心）。"""
         if sx is None and sy is None:
-            return self._nozzle_offset()
+            return self._nozzle_offset(label)
         return (sx if sx is not None else 0.0,
                 sy if sy is not None else 0.0)
 
@@ -181,14 +183,20 @@ class ArmRunner:
         return self.client.grasp(on, timeout=timeout or self.default_timeout_s)
 
     def suck(self, timeout: Optional[float] = None) -> dict:
-        """吸气 (抓取协议 2026-08-01: 关闭阀门+关闭气泵 = SDK grasp(True)).
+        """吸气保持 (抓取协议 2026-08-02: 气泵开 + 阀门关 → 真空吸住).
 
         前提: y 已降到 0 (抓取位)。不移动任何电机。
+        实测确认 (2026-08-02): SDK grasp(True) = pump.set(False)+valve.set(True),
+        电平语义 = 气泵开 + 阀门关 → 建立真空保持吸住, 不一直开气泵.
         """
         return self.client.grasp(True, timeout=timeout or self.default_timeout_s)
 
     def drop_object(self, timeout: Optional[float] = None) -> dict:
-        """放下物体 (抓取协议 2026-08-01: 打开阀门 = SDK grasp(False))."""
+        """释放 (抓取协议 2026-08-02: 只开阀门 → 断真空放下).
+
+        实测确认 (2026-08-02): SDK grasp(False) = pump.set(True)+valve.set(False),
+        电平语义 = 气泵关 + 阀门开 → 断开真空, 物体落下.
+        """
         return self.client.grasp(False, timeout=timeout or self.default_timeout_s)
 
     def go_home(self) -> dict:
@@ -273,7 +281,8 @@ class ArmRunner:
             ServoResult（详见 VISION_SERVO_DESIGN.md）
         """
         kwargs = self._inject_setpoint(
-            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
+            kwargs, self._resolve_nozzle_setpoint(
+                setpoint_x_norm, setpoint_y_norm, label=selector.label))
         self.client.composite_run(
             arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
         )
@@ -329,7 +338,8 @@ class ArmRunner:
         **kwargs: 透传 find_target_realtime (PID/depth/4DOF).
         """
         kwargs = self._inject_setpoint(
-            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
+            kwargs, self._resolve_nozzle_setpoint(
+                setpoint_x_norm, setpoint_y_norm, label=selector.label))
         self.client.composite_run(
             arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
         )
@@ -381,7 +391,8 @@ class ArmRunner:
         **kwargs: 透传 find_target_track.
         """
         kwargs = self._inject_setpoint(
-            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
+            kwargs, self._resolve_nozzle_setpoint(
+                setpoint_x_norm, setpoint_y_norm, label=selector.label))
         self.client.composite_run(
             arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
         )
@@ -461,6 +472,114 @@ class ArmRunner:
                 self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
                                           hand=hand_start, timeout=20.0)
 
+    def track_velocity_pick(self, label: str, *,
+                            x_start: float = 0.0, y_start: float = -180.0,
+                            arm_start: float = -90.0, hand_start: float = 0.0,
+                            grasp_y_mm: float = 0.0,
+                            mode: str = "pick",
+                            timeout: float = 30.0, hz: float = 20.0,
+                            gain_arm: float = 0.4, gain_x: float = 0.08,
+                            deadzone: float = 0.02, max_vel: float = 0.15,
+                            sign_arm: float = 1.0, sign_x: float = -1.0,
+                            lock_first: bool = True,
+                            settle_hits: int = 3,
+                            hold_s: float = 0.5,
+                            lift_back: bool = True,
+                            no_reset: bool = False) -> dict:
+        """智能定位抓取 (arm 控 cx + x 十字控 cy + 吸嘴 setpoint, 2026-08-02).
+
+        用户协议 (2026-08-02 实机标定):
+          本机械结构在 y=-180 标定姿态下: 画面 cx ← 大臂角, 画面 cy ← x 十字位置.
+          吸嘴中心 setpoint 在 y=-100 标定 (nozzle_offset_for(label));
+          视觉追踪在 y=-180 开始, 大臂增量转把 cx 对准 setpoint_x, x 十字速度把
+          cy 对准 setpoint_y (find_target_arm_cross)。y 十字锁 0, 手抓固定 0° 朝下。
+          对齐 (末段连续 settle_hits 帧命中且 |dx|,|dy| < deadzone) 后 → y 降到 0 → 吸气。
+
+        方向符号 (实机标定 2026-08-02):
+          sign_arm=+1 (dx>0 → arm 更负), sign_x=-1 (dy>0 → x 往左).
+
+        为什么用 velocity 模式:
+          走 POST /v1/realtime/arm-velocity (免 arm_queue, 高频平滑).
+
+        Returns:
+            {"ok": bool, "reason": str|None, "trace_hits": int,
+             "settled": bool, "lower": bool, "suck": bool, "lift": bool|None,
+             "end_arm": float|None, "end_hand": float|None}
+        """
+        sp = self._resolve_nozzle_setpoint(None, None, label=label)
+        sx, sy = (sp if sp else (0.0, 0.0))
+        # 多目标场景: lock_first 默认选离画面中心 (吸嘴) 最近的目标并锁定 track_id,
+        # 避免选到远处 marker (2026-08-02 实机多 marker 验证)
+        selector = TargetSelector.for_label(
+            label,
+            strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
+        )
+        # 关闭 lock_first 时用 HIGHEST_SCORE (向后兼容)
+        if not lock_first:
+            selector = TargetSelector.for_label(
+                label,
+                strategy=SelectionStrategy.HIGHEST_SCORE.value,
+            )
+        self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
+                                  hand=hand_start, timeout=20.0)
+        try:
+            self._set_arm_feed(stop=True)
+            result = self.client._make_vision_with_move().find_target_arm_cross(
+                label, timeout=timeout, hz=hz,
+                gain_arm=gain_arm, gain_x=gain_x,
+                deadzone=deadzone, max_vel=max_vel,
+                arm_start=arm_start,
+                sign_arm=sign_arm, sign_x=sign_x,
+                setpoint_x_norm=sx, setpoint_y_norm=sy,
+                selector=selector)
+        finally:
+            self._set_arm_feed(stop=False)
+
+        trace_hits = result.hits
+        # 对齐判定 (2026-08-02): cx+cy 都要收敛到吸嘴 setpoint.
+        # 扫描末段窗口 (最多 30 帧) 找**任意**连续 settle_hits 帧全收敛的窗口 —
+        # 只看最后 3 帧太脆: 目标漂移/偶发 miss/尾段抖动都会误判 not_settled.
+        def _converged(t) -> bool:
+            return not t.miss and abs(t.dx) < deadzone and abs(t.dy) < deadzone
+
+        settled = False
+        tail = list(result.trace[-30:])
+        for start in range(len(tail) - settle_hits + 1):
+            window = tail[start:start + settle_hits]
+            if all(_converged(t) for t in window):
+                settled = True
+                break
+
+        steps = {"settled": False, "lower": False, "suck": False, "lift": None}
+        if not settled:
+            return {"ok": False, "reason": "not_settled",
+                    "trace_hits": trace_hits, "settled": False,
+                    "end_arm": result.end_arm, "end_hand": result.end_hand, "steps": steps}
+        steps["settled"] = True
+
+        # 对齐完成 → y 降 0 → mode=pick 吸气 / mode=drop 释放
+        try:
+            self.client.move_y(grasp_y_mm, timeout=20.0)
+            steps["lower"] = True
+            if mode == "drop":
+                self.client.drop_object()
+                steps["suck"] = True  # 语义复用字段: 完成释放动作
+            else:
+                self.client.grasp(True, timeout=20.0)
+                steps["suck"] = True
+            if hold_s > 0:
+                time.sleep(hold_s)
+            if lift_back:
+                self.client.move_y(y_start, timeout=20.0)
+                steps["lift"] = True
+        except Exception as exc:
+            return {"ok": False, "reason": f"grasp_failed:{exc}",
+                    "trace_hits": trace_hits, "settled": True,
+                    "end_arm": result.end_arm, "end_hand": result.end_hand, "steps": steps}
+        return {"ok": True, "reason": None, "trace_hits": trace_hits,
+                "settled": True, "end_arm": result.end_arm, "end_hand": result.end_hand,
+                "steps": steps}
+
     def pick_by_vision_lower(self, selector, *,
                              x_mm: float, y_mm: float,
                              grasp_y_mm: float = 0.0,
@@ -503,7 +622,8 @@ class ArmRunner:
         """
         selector = self._maybe_lock_first(selector, lock_first)
         kwargs = self._inject_setpoint(
-            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
+            kwargs, self._resolve_nozzle_setpoint(
+                setpoint_x_norm, setpoint_y_norm, label=selector.label))
         # 1. 粗定位
         if reposition:
             self.client.composite_run(

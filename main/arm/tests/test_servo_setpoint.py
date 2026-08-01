@@ -127,6 +127,33 @@ class TestFindTargetRoutingSetpoint(unittest.TestCase):
         self.assertTrue(result.settle_stable)
 
 
+class TestNozzleOffsetFor(unittest.TestCase):
+    """ArmOrigin.nozzle_offset_for 查表回落链 (2026-08-02 per-label)."""
+
+    def test_label_hits_map(self):
+        o = ArmOrigin(nozzle_offset_map={"ball_yellow": (0.101, -0.704)})
+        self.assertEqual(o.nozzle_offset_for("ball_yellow"), (0.101, -0.704))
+
+    def test_unknown_label_falls_back_default(self):
+        o = ArmOrigin(nozzle_offset_x_norm=0.08, nozzle_offset_y_norm=-0.63,
+                      nozzle_offset_map={"ball_yellow": (0.101, -0.704)})
+        self.assertEqual(o.nozzle_offset_for("h_tu_dou"), (0.08, -0.63))
+
+    def test_none_label_falls_back_default(self):
+        o = ArmOrigin(nozzle_offset_x_norm=0.08, nozzle_offset_y_norm=-0.63)
+        self.assertEqual(o.nozzle_offset_for(None), (0.08, -0.63))
+
+    def test_uncalibrated_returns_none(self):
+        o = ArmOrigin()
+        self.assertIsNone(o.nozzle_offset_for("cylinder_3"))
+        self.assertIsNone(o.nozzle_offset_for(None))
+
+    def test_map_zero_entry_falls_back(self):
+        o = ArmOrigin(nozzle_offset_x_norm=0.08, nozzle_offset_y_norm=-0.63,
+                      nozzle_offset_map={"cylinder_1": (0.0, 0.0)})
+        self.assertEqual(o.nozzle_offset_for("cylinder_1"), (0.08, -0.63))
+
+
 class TestRealtimeSetpoint(unittest.TestCase):
     """mock WS 推流, 验证 find_target_realtime 的 setpoint 偏移."""
 
@@ -241,6 +268,42 @@ class TestRunnerSetpointInjection(unittest.TestCase):
         runner.move_to_vision_target_realtime(
             TargetSelector.for_label("cylinder_3"), x_mm=0.0, y_mm=-100.0)
         kw = finder.find_target_realtime.call_args.kwargs
+        self.assertAlmostEqual(kw["setpoint_x_norm"], 0.08)
+        self.assertAlmostEqual(kw["setpoint_y_norm"], -0.63)
+
+    def test_per_label_map_beats_global_default(self):
+        """nozzle_offset_map 命中 label → 用分组值而非全局默认."""
+        runner, client, finder = self._runner(ArmOrigin(
+            nozzle_offset_x_norm=0.101, nozzle_offset_y_norm=-0.519,
+            nozzle_offset_map={"ball_yellow": (0.101, -0.704)},
+        ))
+        runner.move_to_vision_target(
+            TargetSelector.for_label("ball_yellow"), x_mm=0.0, y_mm=-100.0)
+        kw = finder.find_target.call_args.kwargs
+        self.assertAlmostEqual(kw["setpoint_x_norm"], 0.101)
+        self.assertAlmostEqual(kw["setpoint_y_norm"], -0.704)
+
+    def test_unknown_label_falls_back_to_global_default(self):
+        """map 无此 label → 回落全局默认 (nozzle_offset_x/y_norm)."""
+        runner, client, finder = self._runner(ArmOrigin(
+            nozzle_offset_x_norm=0.101, nozzle_offset_y_norm=-0.519,
+            nozzle_offset_map={"ball_yellow": (0.101, -0.704)},
+        ))
+        runner.move_to_vision_target(
+            TargetSelector.for_label("h_tu_dou"), x_mm=0.0, y_mm=-100.0)
+        kw = finder.find_target.call_args.kwargs
+        self.assertAlmostEqual(kw["setpoint_x_norm"], 0.101)
+        self.assertAlmostEqual(kw["setpoint_y_norm"], -0.519)
+
+    def test_map_entry_zero_ignored_falls_back(self):
+        """map 中某 label 是 (0,0) → 视为未标定, 回落全局默认."""
+        runner, client, finder = self._runner(ArmOrigin(
+            nozzle_offset_x_norm=0.08, nozzle_offset_y_norm=-0.63,
+            nozzle_offset_map={"cylinder_1": (0.0, 0.0)},
+        ))
+        runner.move_to_vision_target(
+            TargetSelector.for_label("cylinder_1"), x_mm=0.0, y_mm=-100.0)
+        kw = finder.find_target.call_args.kwargs
         self.assertAlmostEqual(kw["setpoint_x_norm"], 0.08)
         self.assertAlmostEqual(kw["setpoint_y_norm"], -0.63)
 

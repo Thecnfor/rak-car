@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 
 # 合法枚举
@@ -58,9 +58,31 @@ class ArmOrigin:
     # 目标放在吸嘴正下方（正确吸取位姿）时，其 bbox 中心在画面中的位置。
     # find_target_* 传 setpoint=(x, y) 即把目标对准"吸嘴正下方"而非画面正中心。
     # (0,0) = 未标定，保持旧行为（对准画面中心）。基准位 x=0 y=-100 大臂=-90 手抓=0 下标定。
+    # 2026-08-02 升级为**按 label 分组**：不同尺寸/类别目标检测中心天然不同
+    # （cylinders cy≈-0.50, balls cy≈-0.70），单一全局 setpoint 会有残余误差。
+    # nozzle_offset_map 优先查 label；未知 label 回落 nozzle_offset_x/y_norm（全局默认）。
     nozzle_offset_x_norm: float = 0.0
     nozzle_offset_y_norm: float = 0.0
+    nozzle_offset_map: Dict[str, Tuple[float, float]] = field(default_factory=dict)
     calibrated_at: str = ""           # ISO 8601
+
+    def nozzle_offset_for(self, label: Optional[str] = None) -> Optional[Tuple[float, float]]:
+        """给定目标 label → 吸嘴 setpoint；未知 label 回落全局默认。
+
+        Args:
+            label: 检测目标 label（如 "cylinder_2" / "ball_yellow"）。
+                None 或不在 map 中 → 回落 nozzle_offset_x/y_norm（全局默认）。
+
+        Returns:
+            (sx, sy) 归一化 setpoint；未标定（默认也全 0）返回 None。
+        """
+        if label:
+            sp = self.nozzle_offset_map.get(label)
+            if sp is not None and (abs(sp[0]) > 1e-9 or abs(sp[1]) > 1e-9):
+                return float(sp[0]), float(sp[1])
+        if abs(self.nozzle_offset_x_norm) > 1e-9 or abs(self.nozzle_offset_y_norm) > 1e-9:
+            return float(self.nozzle_offset_x_norm), float(self.nozzle_offset_y_norm)
+        return None
 
     @property
     def soft_y_max_mm(self) -> float:

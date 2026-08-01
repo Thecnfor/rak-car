@@ -64,7 +64,7 @@ task_cfg:
       y_mm: -100            # 放置后抬到检测高度，直接可下一轮检测
       hand_angle_deg: -10
 
-    init_y_mm: -100        # 初始化抬升高度(进入任务时)
+    init_y_mm: -180        # S 姿态抬升高度 = track_velocity_pick 起始位 (看得清楚, 2026-08-02)
 
     v_max_arm_lateral_mms: 60
 

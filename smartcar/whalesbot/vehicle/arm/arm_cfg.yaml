@@ -15,7 +15,7 @@ horiz_cfg:
   pid:
     Kp: 6
     Ki: 0
-    Kd: 0
+    Kd: 1.0           # 2026-08-02: 滑轨清理后摩擦骤减,纯 P 欠阻尼振荡 → 加 Kd 抑制
     setpoint: 0
     output_limits:
     - -0.4
@@ -34,7 +34,7 @@ vert_cfg:
   pid:
     Kp: 6
     Ki: 0
-    Kd: 0
+    Kd: 1.0           # 2026-08-02: 滑轨清理后摩擦骤减,纯 P 欠阻尼振荡 → 加 Kd 抑制
     setpoint: 0
     output_limits:
     - -0.1
