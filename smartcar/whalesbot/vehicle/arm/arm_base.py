@@ -34,7 +34,12 @@ from .. import (
 
 
 POSITION_ERROR_THRESHOLD = 4e-4 # 位置误差阈值
-STOP_CHECK_THRESHOLD = 1e-10 # 停止检查阈值
+STOP_CHECK_THRESHOLD = 1e-3  # 停止检查阈值 (2026-08-01: 1e-10 → 1e-3)
+
+# 1e-10 (100nm) 原来在 v_max=80mm/s 时 motor 启动加速期 (0-200ms) 
+# encoder 读数 < 100nm/cycle，x_stop_check (CountRecord(10) × 50ms = 500ms)
+# 误判为撞墙 calibrate，立刻 kill motor + 调 calibrate。reset_x 用 1e-3 + 2s 
+# 不受影响。改为 1e-3 (1mm/cycle = 20mm/s) 仍能 100% 抓到真 stall，但给加速期留余量。
 
 # reset_y 成功触底后,机械臂自动升到的目标位置 (m)。负值 = 向上,远离磁感。
 # 设为 None 表示"触底后停在 0 位不动"(历史默认);设为 -0.15 表示升到磁感上方 150mm。
