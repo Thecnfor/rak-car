@@ -19,10 +19,12 @@ task_cfg:
 
   auto_seeding:
     _doc: |
-      ???: ??(????)??? 3 ????????????,
-              ?? label ?????????????
-              ??? 4 ??: ?? X / ?? Y / ???? / ????,? Z ??,
-              ????????,???????
+      任务一:auto_seeding 自动移苗。
+              右侧 S1/S2/S3 三个育苗筒 → 左侧 T1/T2/T3 三个种植槽。
+              通过 cam2 视觉标签识别映射 (target_slot_map), 按 S1→S2→S3 顺序逐棵移栽。
+              检测/复位姿态 X=-100mm, 大臂=-90°, 手爪=0°, Y=-100mm;
+              抓取姿态 X=-100mm, Y=-10mm (大臂转 -90°+Y 下降);
+              运输高度 Y=-150mm; 投放姿态 X=-270mm, 大臂=+90°, Y=-30mm.
 
     source_position_order: [1, 2, 3]
 
@@ -32,20 +34,6 @@ task_cfg:
       cylinder_1: 3
 
     spacing_along_row_m: 0.15
-
-    cyl:
-      cylinder_3: { diam_m: 0.10, height_m: 0.06 }
-      cylinder_2: { diam_m: 0.08, height_m: 0.06 }
-      cylinder_1: { diam_m: 0.06, height_m: 0.06 }
-
-    car_to_cylinder_horizontal_m: 0.22
-
-    nozzle_offset_from_camera:
-      height_up_cm: 5
-      forward_cm: 2
-
-    fx_effective_px: 430
-    d1_camera_cm_formula: "3440 / w_pixel"
 
     arm_pick_pose:
       x_mm: -100
@@ -76,9 +64,7 @@ task_cfg:
     v_max_arm_lateral_mms: 80
 
     vacuum_settle_s: 0.5
-    no_pressure_feedback: true
 
-    chassis_longitudinal_step_m: 0.15
     chassis_move_timeout_s: 30
 
   water_tower_task:

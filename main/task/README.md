@@ -9,13 +9,12 @@ main/task/
 ├── README.md                  # 本文件
 ├── __init__.py                # TASK_RUNNERS = {1: run_task1_seeding, ..., 7: ...}
 ├── _config.py                 # load_task_config(task_name) + load_waypoints()
-├── _helpers.py                # 公共 motion/runtime/推理 helpers (已有, 跟 main/tasks 同源)
-├── task1_seeding.py           # 播种 (auto_seeding 既有实现)
-├── task2_water_tower.py       # 取水 (water_tower_task 既有实现)
+├── task1_seeding.py           # 播种 (auto_seeding 既有实现, 走 ArmRunner)
+├── task2_water_tower.py       # 取水 (water_tower_task 既有实现, 走 ArmRunner)
 ├── task3_pest_scout.py        # 害虫侦察 + 射击 (TODO, NotImplementedError)
 ├── task4_harvest.py           # 抓取作物 → main.arm.each_task.task4.target4
 ├── task5_sort.py              # 分拣作物 → main.arm.each_task.task5.the_final
-├── task6_get_order.py         # 接单 + 识别 (get_order 既有实现)
+├── task6_get_order.py         # 接单 + 识别 (get_order 既有实现, 走 ArmRunner)
 ├── task7_deliver.py           # 投放外卖 (TODO, NotImplementedError)
 └── tests/
     ├── test_task_index.py              # TASK_RUNNERS 字典 1..7 完整
@@ -23,6 +22,12 @@ main/task/
     ├── test_orchestrator_yaml.py       # task_config.yml waypoints 段加载
     └── test_task_skips_unimplemented.py # task3/7 抛 NotImpl 但不崩
 ```
+
+> **架构历史**: `_helpers.py` 在 2026-08 重构中被彻底删除. 该文件曾用 `client.execute("arm", "move_x", ...)` 等
+> HTTP 薄封装重新实现了 `main.arm.ArmRunner` + `CompositeMixin` 已有的全部能力,
+> 同时缺失 y 保护区 / 角度硬限 / 丢步核对 / composite_* 并发等 SafetyMixin 自动保护.
+> 重构后, task1/2/6 改为直接使用 `main.arm.ArmRunner` + `composite_pick / composite_release / composite_run`,
+> 业务层不再自己拼装串行 HTTP 调用. 详见各 task 文件头部 docstring 的「架构说明」段.
 
 ## 8 任务清单
 

@@ -1,55 +1,46 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-"""main/tasks/auto_seeding.py
+"""任务一: 自动移苗 (播种) — 右侧育苗筒 S1/S2/S3 -> 左侧种植区 T1/T2/T3.
 
-Task 1: seedling transfer (right side cylinders -> left side purple circles).
+业务流程 (按 S1 -> S2 -> S3 顺序循环处理每个源位置):
+  1. 机械臂复位到 S1 检测姿态 (X=-100, arm=-90°, Y=-100, 手爪=0°)
+  2. cam2 视觉扫描识别幼苗标签 (颜色/类别)
+  3. 通过 target_slot_map 查表得到目标种植槽编号 T1/T2/T3
+  4. Y 轴下降到抓取高度 -> 开真空吸苗 -> 等待真空稳定 -> 抬升到运输高度
+  5. 底盘纵向移动: 对齐源位置 S_idx 与目标槽 T_slot
+  6. 机械臂旋转到 +90° + X 轴伸出到种植槽上方 (X=-270)
+  7. Y 轴下降到放置高度 -> 关真空放苗
+  8. Y 轴抬升 -> 先收 X 到 -100 再旋转 arm 回 -90° (composite_run 内置防碰撞顺序)
+  9. 底盘纵向移动到下一个源位置 (或任务结束归位到 S1)
 
-Flow per source position (S1, S2, S3 in order):
-  1. arm already at S1 pick pose (X=-60, arm=-150, Y=-50, hand=-10)
-  2. detect label from cam2
-  3. slot = target_slot_map[label]
-  4. descend to pick y, grasp on, wait vacuum_settle_s, lift to carry y
-  5. move chassis long-axis to align T_slot
-  6. swing arm to 0 deg and slide X to -270 in parallel
-  7. descend to place y, grasp off
-  8. lift to carry y, swing arm back to -150, slide X back to -60
-  9. move chassis to next source position
+坐标约定 (与 task_config.yml 对齐):
+  x_mm:       0 = 机械臂最右端, 数值减小 = 向左伸出
+  y_mm:       0 = 最下端限位, 负值 = 向上抬升
+  arm_angle:  task1 用 ±90° 范围 (reset_x 撞右墙为原点, 与 task2 的 [-150°,+90°] 不同):
+                 +90° = 左侧最大角度 (对准 T2 种植槽方向)
+                 -90° = 右侧检测姿态 (对准 S1 育苗筒方向)
+  hand_angle: -90° = 手爪竖直向上, 0° = 向下; 抓取时取 0° (正下对准育苗筒)
 
-Coordinate conventions (see task_config.yml):
-  x_mm: 0 = rightmost, decrease = move left
-  y_mm: 0 = bottom limit, negative = up
-  arm_angle: 0 = MID, -150 = rightmost
-  hand_angle: -90 = UP, 0 = DOWN; pickup uses -10 (horizontal)
+架构说明 (2026-08 重构):
+  本任务使用 main.arm.ArmRunner (含 y 保护区 / 角度硬限 / 丢步核对 / 并发执行)
+  + CompositeMixin (composite_pick / composite_release / composite_run) 编排动作,
+  不再依赖 main/task/_helpers.py (该文件已删除, 详见 main/task/README.md §架构历史).
 """
 from __future__ import annotations
 
 import logging
-import sys
 import time
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-_PROJECT_ROOT = Path(__file__).resolve().parents[2]
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
-
 from main.api_client import RuntimeApiClient
-from main.arm.api import ArmClient
-from main.arm.loops.runner import ArmRunner
-
-from main.task._helpers import (
-    _ensure_runtime,
-    _wait_infer_ready,
-    _move_x as _helpers_move_x,
-    _move_y as _helpers_move_y,
-    _set_arm_angle,
-    _grasp,
-    _chassis_move_for,
-)
+from main.arm import ArmClient, ArmRunner
 from main.task._config import load_task_config
+from main.task._constants import SLOT_POSITIONS_M, SOURCE_POSITIONS_M
 
-logger = logging.getLogger("task.auto_seeding")
+logger = logging.getLogger("task.task1_seeding")
 
+
+# ── 视觉读取（cam2 缓存） ─────────────────────────────────────────
 
 def _scan_labels(
     client: RuntimeApiClient,
@@ -57,241 +48,250 @@ def _scan_labels(
     retries: int = 3,
     backoff_s: float = 0.5,
 ) -> Optional[str]:
-    """cam2 task detection via /v1/realtime/vision/task (HTTP cache).
+    """通过 cam2 实时视觉接口扫描幼苗标签（HTTP 缓存, 不直接打 ZMQ）.
 
-    This endpoint reads the in-memory cache populated by the task_feed
-    daemon thread (10Hz by default). It does NOT call ZMQ, does NOT take
-    car_lock, and does NOT crash the runtime when the inference backend
-    is stuck. This bypasses the runtime bug where /v1/vision/task (POST)
-    can deadlock the long-lived ZMQ REQ socket.
+    技术说明:
+      此接口读取 task_feed 守护线程（默认 10Hz）写入的内存缓存,
+      不直接调用 ZMQ 推理后端, 不持有 car_lock, 因此不会因推理后端卡死
+      而导致 runtime 崩溃. 该设计绕过了旧接口 /v1/vision/task (POST)
+      可能导致长生命周期 ZMQ REQ 套接字死锁的已知 bug.
 
-    task_state format:
-      {active, mode, detections: [{cls_id, det_id, label, score, bbox_norm{...}}],
-       count, updated_at}
+    返回数据格式 task_state:
+      {
+        active, mode,
+        detections: [{cls_id, det_id, label, score, bbox_norm{...}}],
+        count, updated_at
+      }
 
-    Returns the first valid label ordered by descending bbox_norm.width
-    (closest cylinder). Returns None after all retries exhausted.
+    筛选策略: 按 bbox_norm.width 降序排列（越靠近镜头的育苗筒检测框越宽）,
+    返回第一个属于 valid_labels 白名单的识别结果. 所有重试耗尽仍失败则返回 None.
     """
-    last_err: Optional[str] = None
-    for attempt in range(1, retries + 1):
+    for attempt in range(retries):
         try:
-            resp = client.get("/v1/realtime/vision/task", timeout=5)
+            resp = client.get("/v1/realtime/vision/task", timeout=2)
         except Exception as exc:
-            last_err = f"http exception: {type(exc).__name__}: {exc}"[:200]
-            logger.warning("cam2 attempt %d http failed: %s", attempt, last_err)
-            if attempt < retries:
-                time.sleep(backoff_s)
+            logger.warning("[scan_labels] 第 %d 次获取失败: %s", attempt + 1, exc)
+            time.sleep(backoff_s)
             continue
         if not isinstance(resp, dict) or not resp.get("ok"):
-            last_err = str(resp)[:200]
-            logger.warning("cam2 attempt %d not ok: %s", attempt, last_err)
-            if attempt < retries:
-                time.sleep(backoff_s)
+            time.sleep(backoff_s)
             continue
         task_state = resp.get("task_state") or {}
         if not task_state.get("active"):
-            last_err = f"task_feed not active (mode={task_state.get('mode')})"
-            logger.info("cam2 attempt %d: %s", attempt, last_err)
-            if attempt < retries:
-                time.sleep(backoff_s)
-            continue
-        dets = task_state.get("detections") or []
-        def _width(d):
-            bn = d.get("bbox_norm") or {}
-            try:
-                return float(bn.get("width", 0.0))
-            except Exception:
-                return 0.0
-        ordered = sorted(
-            [d for d in dets if isinstance(d, dict) and d.get("label") in valid_labels],
-            key=lambda d: -_width(d),
-        )
-        if ordered:
-            return ordered[0]["label"]
-        logger.info("cam2 attempt %d: ok but no valid label in %s (raw=%d, updated_at=%s)", attempt, valid_labels, len(dets), task_state.get("updated_at"))
-        last_err = "no valid label"
-        if attempt < retries:
             time.sleep(backoff_s)
-    logger.error("cam2 giving up after %d retries, last_err=%s", retries, last_err)
+            continue
+        dets = sorted(
+            task_state.get("detections") or [],
+            key=lambda d: -(float((d.get("bbox_norm") or {}).get("width", 0.0))),
+        )
+        for d in dets:
+            label = (d or {}).get("label", "")
+            if label in valid_labels:
+                return label
+        time.sleep(backoff_s)
     return None
 
 
-# _warmup_cam2 removed: it broke the long-lived ZMQ REQ socket
+# ── 底盘移动 ─────────────────────────────────────────────────────
+
+def _chassis_move_for(
+    arm_client: ArmClient,
+    dx_m: float,
+    timeout: float,
+) -> dict:
+    """底盘纵向 move_for 阻塞调用（sync=True 等结果）.
+
+    走 ArmClient._call_car (HTTP car target). sync=True 让底层 SDK 跑完才返回.
+    """
+    return arm_client._call_car(
+        "move_for", dx_m, timeout=timeout, sync=True,
+    )
 
 
-# Auto_seeding 业务层 alias: 走下层 _helpers._move_x / _move_y, 但允许外部
-# 通过 _arm_move_x / _arm_move_y 调用(保留命名一致性)
-def _arm_move_x(client: RuntimeApiClient, x_mm: float, v_max_mms: float = 80.0,
-                out_time: float = 15.0, timeout: float = 30.0) -> None:
-    """业务层 alias: 委托 main.task._helpers._move_x (含完整错误处理)."""
-    _helpers_move_x(client, x_mm, v_max_mms=v_max_mms, out_time=out_time, timeout=timeout)
-
-
-def _arm_move_y(client: RuntimeApiClient, y_mm: float, timeout: float = 25.0) -> None:
-    """业务层 alias: 委托 main.task._helpers._move_y."""
-    _helpers_move_y(client, y_mm, timeout=timeout)
-
-
-def _pick_one(runner: ArmRunner, client: RuntimeApiClient, cfg: Dict[str, Any]) -> str:
-    pick = cfg["arm_pick_pose"]
-    carry = cfg["arm_carry_pose"]
-    _arm_move_y(client, pick["y_mm"])
-    _grasp(client, True)
-    time.sleep(cfg["vacuum_settle_s"])
-    _arm_move_y(client, carry["y_mm"])
-    valid = list(cfg["target_slot_map"].keys())
-    label = _scan_labels(client, valid)
-    if label is None:
-        raise RuntimeError(f"cam2 not detecting any of {valid}")
-    return label
-
+# ── 单棵幼苗抓取 → 运输 → 放置 ─────────────────────────────────
 
 def _transport_to_slot(
     runner: ArmRunner,
-    client: RuntimeApiClient,
+    arm_client: ArmClient,
     cfg: Dict[str, Any],
     slot: int,
     source_idx: int,
 ) -> None:
-    spacing = cfg["spacing_along_row_m"]
+    """底盘纵向对齐 + 机械臂联合运动到目标种植槽.
+
+    执行顺序（composite_run 内置并发 + y 保护区）:
+      1. composite_run: arm → place.arm_angle_deg + X → place.x_mm + Y → carry_y 并发
+      2. 底盘 move_for: 从 SOURCE_POSITIONS_M[source_idx] 对齐到 SLOT_POSITIONS_M[slot]
+    """
     timeout = cfg["chassis_move_timeout_s"]
-    v_max = cfg["v_max_arm_lateral_mms"]
     place = cfg["arm_place_pose_T2"]
 
-    # ????? = source_idx ???? (??????? S_{source_idx})
-    source_to_pos = {1: 0.0, 2: +spacing, 3: +2 * spacing}
-    current = source_to_pos[source_idx]
-    # T_slot ????
-    slot_to_pos = {1: -spacing, 2: 0.0, 3: +spacing}
-    target = slot_to_pos[slot]
-    move_m = target - current
-    if abs(move_m) > 1e-3:
-        logger.info("chassis transport: from S%d (pos=%.2f) to T%d (pos=%.2f), dx=%.3f m", source_idx, current, slot, target, move_m)
-        _chassis_move_for(client, dx_m=move_m, timeout=timeout)
+    dx_m = SLOT_POSITIONS_M[slot] - SOURCE_POSITIONS_M[source_idx]
 
-    _arm_move_x(client, place["x_mm"], v_max_mms=v_max)
-    _set_arm_angle(client, place["arm_angle_deg"])
+    # 1) 复合动作: 大臂转 + X 伸出并发（composite_run 自动校验 y 保护区）
+    runner.client.composite_run(
+        arm=float(place["arm_angle_deg"]),
+        x_mm=float(place["x_mm"]),
+        y_mm=float(cfg["arm_carry_pose"]["y_mm"]),
+    )
+
+    # 2) 底盘纵向移动到目标槽
+    if abs(dx_m) > 1e-3:
+        logger.info("  底盘纵向移动 %.3f m (S%d → T%d)", dx_m, source_idx, slot)
+        _chassis_move_for(arm_client, dx_m, timeout=timeout)
 
 
-def _place_and_return(
+def _safe_return_to_s1(
     runner: ArmRunner,
-    client: RuntimeApiClient,
     cfg: Dict[str, Any],
-    next_chassis_offset_m: float,
 ) -> None:
-    place = cfg["arm_place_pose_T2"]
+    """防碰撞顺序归位: composite_run 自动按 (X 收 → 大臂转) 顺序提交.
+
+    约束说明（防止 X=-270 时大臂横扫撞到育苗筒）:
+      arm 在 +90° 状态下执行大角度旋转 (-90°) 时, 如果 X 还停在 -270 会
+      横扫底盘边缘. 因此顺序必须: 先收 X 到内侧, 再旋转大臂.
+      composite_run 把这两个动作并发, 但内部驱动层会自动按此顺序提交.
+    """
     ret = cfg["arm_return_S1_pose"]
-    carry_y = cfg["arm_carry_pose"]["y_mm"]
-    timeout = cfg["chassis_move_timeout_s"]
-    v_max = cfg["v_max_arm_lateral_mms"]
+    runner.client.composite_run(
+        arm=float(ret["arm_angle_deg"]),
+        x_mm=float(ret["x_mm"]),
+        y_mm=float(ret["y_mm"]),
+    )
 
-    _grasp(client, False)
-    runner.move_y(carry_y, verify=False)
-    _arm_move_x(client, ret["x_mm"], v_max_mms=v_max)
-    _set_arm_angle(client, ret["arm_angle_deg"])
-    if abs(next_chassis_offset_m) > 1e-3:
-        _chassis_move_for(client, dx_m=next_chassis_offset_m, timeout=timeout)
 
+# ── 主入口 ────────────────────────────────────────────────────────
 
 def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
+    """任务一主入口: 自动移苗 (S1/S2/S3 -> T1/T2/T3).
+
+    Args:
+        client: 可选的 RuntimeApiClient 实例, 未传入时自动创建新连接
+
+    Returns:
+        Dict: {
+            "ok": bool,           # 任务是否成功完成
+            "completed": List[str],  # 已成功处理的幼苗标签列表
+            "error": str          # 失败时的错误信息 (仅 ok=False 时存在)
+        }
+    """
     cfg = load_task_config("auto_seeding")
     if cfg.get("placeholder"):
-        raise NotImplementedError("auto_seeding not yet implemented")
+        raise NotImplementedError("任务 auto_seeding 配置尚未完成")
 
+    # 初始化 runtime 连接
     if client is None:
         client = RuntimeApiClient()
-    _ensure_runtime(client)
+    client.wait_until_ready(timeout=30.0)
 
+    # 初始化机械臂客户端与执行器 (ArmRunner 集成 SafetyMixin / Composite / 丢步核对)
     arm_client = ArmClient.connect()
     if not arm_client.ping():
-        raise RuntimeError("arm runtime not online")
+        raise RuntimeError("机械臂 runtime 未在线, 请检查 arm_feed 守护进程")
     runner = ArmRunner(arm_client)
 
     completed: List[str] = []
-    spacing = cfg["spacing_along_row_m"]
     init_y_mm = cfg.get("init_y_mm", -100)
 
-    # ===== -1. X 编码器校准 (撞右墙定原点) =====
-    logger.info("init: calibrate X encoder (reset_x)")
-    arm_client.reset_x(direction="right", reset_velocity_mms=20.0, timeout=30.0)
-    _wait_infer_ready(client, timeout_s=30.0)
-    # ===== 0. Y 直接到 -100 =====
-    logger.info("init: lift arm to Y=%s mm", init_y_mm)
-    _arm_move_y(client, init_y_mm)
-
-    pick = cfg["arm_pick_pose"]
-    carry = cfg["arm_carry_pose"]
-    place = cfg["arm_place_pose_T2"]
-    ret = cfg["arm_return_S1_pose"]
-    valid_labels = list(cfg["target_slot_map"].keys())
-
-    # 0.1 ? S1 ????: X=-60, ??=-150, ??=-10, Y ??? -100
-    _set_arm_angle(client, pick["arm_angle_deg"])
-    runner.client.set_hand_angle(pick["hand_angle_deg"], speed=80, timeout=10.0)
-    _arm_move_x(client, pick["x_mm"], v_max_mms=60.0)
-
     try:
-        for i, source_idx in enumerate(cfg["source_position_order"]):
-            logger.info("=== processing S%d (iteration %d) ===", source_idx, i + 1)
-            # ===== 0. ????? S1 ???? =====
-            #   y ?? -100, arm ?? -150, x ?? -60
-            #   ????? return ??? y_protect ??, ????????
-            logger.info("reset to detection pose: y=%s arm=%s x=%s", init_y_mm, pick["arm_angle_deg"], pick["x_mm"])
-            _arm_move_y(client, init_y_mm)
-            _set_arm_angle(client, pick["arm_angle_deg"])
-            runner.client.set_hand_angle(pick["hand_angle_deg"], speed=80, timeout=10.0)
-            _arm_move_x(client, pick["x_mm"], v_max_mms=60.0)
+        # ===== 初始化步骤 1. X 编码器校准 (撞右墙硬限位定原点) =====
+        logger.info("init: X 编码器撞墙校准 (reset_x → right)")
+        arm_client.reset_x(direction="right", timeout=30.0)
 
-            # ===== 1. ????(? -100 mm ???) =====
+        # ===== 初始化步骤 2. Y 轴抬升到安全初始高度 =====
+        logger.info("init: 抬升 Y 到 %s mm", init_y_mm)
+        runner.move_y(init_y_mm)
+
+        # ===== 初始化步骤 3. 走到 S1 检测姿态 =====
+        pick = cfg["arm_pick_pose"]
+        logger.info(
+            "init: S1 检测姿态 arm=%s° hand=%s° X=%s mm Y=%s mm",
+            pick["arm_angle_deg"], pick["hand_angle_deg"], pick["x_mm"], init_y_mm,
+        )
+        arm_client.set_hand_angle(float(pick["hand_angle_deg"]), speed=80, timeout=10.0)
+        runner.set_arm_angle(float(pick["arm_angle_deg"]), speed=80)
+        runner.move_x(float(pick["x_mm"]))
+
+        # ===== 主循环: 按 S1 → S2 → S3 顺序处理每个源位置 =====
+        source_position_order = cfg["source_position_order"]
+        valid_labels = list(cfg["target_slot_map"].keys())
+
+        for i, source_idx in enumerate(source_position_order):
+            logger.info("=== 处理 S%d (iteration %d/%d) ===",
+                        source_idx, i + 1, len(source_position_order))
+
+            # ===== 步骤 0. 复位到 S1 检测姿态 (from any previous pose) =====
+            _safe_return_to_s1(runner, cfg)
+            arm_client.set_hand_angle(float(pick["hand_angle_deg"]), speed=80, timeout=10.0)
+            runner.move_y(init_y_mm)
+
+            # ===== 步骤 1. 视觉识别幼苗标签 =====
             label = _scan_labels(client, valid_labels)
             if label is None:
-                raise RuntimeError(f"cam2 ? S{source_idx} ???? {valid_labels}")
+                raise RuntimeError(
+                    f"cam2 在 S{source_idx} 位置未检测到任何有效标签 {valid_labels}"
+                )
             slot = cfg["target_slot_map"][label]
-            logger.info("S%d detect %s -> T%d", source_idx, label, slot)
+            logger.info("S%d 检测到 %s → T%d", source_idx, label, slot)
 
-            # ===== 2. ?: Y ? -100 ??? -25, grasp on, 0.5s, ?? -150 =====
-            _arm_move_y(client, pick["y_mm"])
-            _grasp(client, True)
+            # ===== 步骤 2. 抓取幼苗 (composite_pick 一步完成 arm+X+Y+hand 并发) =====
+            runner.client.composite_pick(
+                arm_angle=float(pick["arm_angle_deg"]),
+                x_mm=float(pick["x_mm"]),
+                y_mm=float(pick["y_mm"]),
+                hand=float(pick["hand_angle_deg"]),
+                speed=80,
+            )
+            runner.grasp(on=True)
             time.sleep(cfg["vacuum_settle_s"])
-            _arm_move_y(client, carry["y_mm"])
+            runner.move_y(float(cfg["arm_carry_pose"]["y_mm"]))
 
-            # ===== 3. ??? T_slot =====
-            _transport_to_slot(runner, client, cfg, slot, source_idx)
+            # ===== 步骤 3. 底盘 + 机械臂联合运动到目标种植槽 =====
+            _transport_to_slot(runner, arm_client, cfg, slot, source_idx)
 
-            # ===== 4. ?: Y ? -150 ??? -25, grasp off, ?? -150 =====
-            _arm_move_y(client, place["y_mm"])
-            _grasp(client, False)
-            _arm_move_y(client, carry["y_mm"])
+            # ===== 步骤 4. 释放幼苗 (composite_release 一步完成) =====
+            place = cfg["arm_place_pose_T2"]
+            runner.client.composite_release(
+                drop_x_mm=float(place["x_mm"]),
+                drop_y_mm=float(place["y_mm"]),
+                hand=float(place["hand_angle_deg"]),
+                speed=80,
+            )
+            runner.grasp(on=False)
 
-            # ===== 5. ? S1 ????(??????) =====
-            # ??: ? X ?? -60 (arm ?? 0?), ?? arm -150
-            # ??: arm 0? ?? -150 ?, ??????????
-            #   ???? arm, ????? -260; ?? X ????
-            #   ?? X ??, ?? arm, ?????? S1 ???
-            _arm_move_x(client, ret["x_mm"], v_max_mms=60.0)
-            _set_arm_angle(client, ret["arm_angle_deg"])
-            logger.info("S1 pose ready (x=-60, arm=-150), proceeding to chassis offset")
-            # ??(?? S1 ??,?? m):
-            #   T1 = -spacing, T2 = 0, T3 = +spacing
-            #   S1 = 0, S2 = +spacing, S3 = +2*spacing
-            slot_to_chassis = {1: -spacing, 2: 0.0, 3: +spacing}
-            current_chassis = slot_to_chassis[slot]
-            if i + 1 < len(cfg["source_position_order"]):
-                next_source_idx = cfg["source_position_order"][i + 1]
-                source_to_chassis = {1: 0.0, 2: +spacing, 3: +2 * spacing}
-                next_chassis = source_to_chassis[next_source_idx]
+            # ===== 步骤 5. 防碰撞顺序归位 + 底盘纵向移动到下一个源 =====
+            carry_y = float(cfg["arm_carry_pose"]["y_mm"])
+            runner.move_y(carry_y)
+            _safe_return_to_s1(runner, cfg)
+
+            # 底盘位移编排: 源/槽位置常量见 main.task._constants
+            current_chassis = SLOT_POSITIONS_M[slot]
+            if i + 1 < len(source_position_order):
+                next_source_idx = source_position_order[i + 1]
+                next_chassis = SOURCE_POSITIONS_M[next_source_idx]
                 next_offset_m = next_chassis - current_chassis
                 if abs(next_offset_m) > 1e-3:
-                    logger.info("chassis: from slot=%d (pos=%.2f) to next source S%d (pos=%.2f), dx=%.3f m", slot, current_chassis, next_source_idx, next_chassis, next_offset_m)
-                    _chassis_move_for(client, dx_m=next_offset_m, timeout=cfg["chassis_move_timeout_s"])
+                    logger.info(
+                        "底盘: T%d (%.2f) → S%d (%.2f), dx=%.3f m",
+                        slot, current_chassis, next_source_idx, next_chassis, next_offset_m,
+                    )
+                    _chassis_move_for(
+                        arm_client, dx_m=next_offset_m,
+                        timeout=cfg["chassis_move_timeout_s"],
+                    )
             else:
-                # ????,??? T1/T2/T3 ???;???? T1/T3,??? S1
+                # 任务结束: 若落在 T1/T3, 需归位到 S1
                 if abs(current_chassis) > 1e-3:
-                    logger.info("chassis: end of task, return to S1 from pos=%.2f", current_chassis)
-                    _chassis_move_for(client, dx_m=-current_chassis, timeout=cfg["chassis_move_timeout_s"])
+                    logger.info("底盘: 任务结束, 从 %.2f 归位到 S1", current_chassis)
+                    _chassis_move_for(
+                        arm_client, dx_m=-current_chassis,
+                        timeout=cfg["chassis_move_timeout_s"],
+                    )
+
             completed.append(label)
+
     except Exception as exc:
-        logger.exception("auto_seeding failed: %s", exc)
+        logger.exception("task1_seeding 失败: %s", exc)
         return {"ok": False, "completed": completed, "error": str(exc)}
 
     return {"ok": True, "completed": completed}
@@ -300,5 +300,4 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     result = run()
-    print("auto_seeding result:", result)
-
+    print("任务一 自动移苗 执行结果:", result)

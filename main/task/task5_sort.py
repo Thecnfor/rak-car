@@ -1,16 +1,20 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-"""task5 / task5_sort —— 分拣作物.
+"""任务五: 作物颜色分拣 (按颜色分高/低仓放置).
 
-业务逻辑: main.arm.each_task.task5.the_final.main
-(4544 LOC, am 分支移植). 完整业务流程:
-  1. 识别高仓颜色 (blue/yellow) → color A
-  2. 同色球进高仓 (last_X_to_high)
+实际业务逻辑委托至: main.arm.each_task.task5.the_final.main
+(约 4544 行, 移植自 am 分支).
+
+完整业务流程概览:
+  1. 视觉识别高位仓颜色 (蓝/黄) → 记为 color_A
+  2. 将与 color_A 同色的球放入 HIGH 高仓 (last_X_to_high)
   3. 底盘后撤 165mm
-  4. 反色球进 LOW 仓 (last_X_to_low)
+  4. 将剩余反色的球放入 LOW 低仓 (last_X_to_low)
 
-⚠️ the_final.main(argv) 不接收 client, 内部 client = ArmClient.connect().
-   本 wrapper 因此忽略传入 client 参数 (call site 必须 no-arg).
+⚠️ 已知约束:
+   the_final.main(argv) 内部会自行执行 ArmClient.connect(),
+   不接受外部传入的 client. 因此本 wrapper 的 client 参数会被忽略,
+   调用方须以无参方式调用 run().
 """
 from __future__ import annotations
 
@@ -20,19 +24,24 @@ from main.api_client import RuntimeApiClient
 
 
 def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
-    """task5 入口. 包装 each_task.task5.the_final.main.
+    """任务五主入口: 薄封装 the_final.main.
 
     Args:
-        client: 传入但被忽略 (the_final 不接收).
+        client: 形式参数, 实际被忽略 (the_final.main 内部自建 ArmClient).
 
     Returns:
-        {"ok": bool, "task": "task5_sort", "rc": main 的 return code, "detail": str}
+        Dict: {
+            "ok": bool,                  # rc == EXIT_OK 即为成功
+            "task": "task5_sort",      # 固定任务名
+            "rc": int,                 # the_final.main 返回码 (EXIT_OK=0)
+            "detail": str              # 详情请查 the_final.main 的日志输出
+        }
     """
     # lazy import: each_task 包是业务代码
     from main.arm.each_task.task5 import the_final
 
-    rc = the_final.main(argv=None)  # 用默认 CLI args (内部识别色)
+    rc = the_final.main(argv=None)  # 使用默认 CLI 参数 (内部执行颜色识别)
 
-    # the_final 用 EXIT_OK/EXIT_BAD_COLOR 常量
-    ok = (rc == 0)  # EXIT_OK = 0
+    # the_final.main 用常量: EXIT_OK = 0, EXIT_BAD_COLOR = 非 0
+    ok = (rc == 0)
     return {"ok": ok, "task": "task5_sort", "rc": rc, "detail": "see the_final.main logs"}
