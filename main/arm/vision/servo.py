@@ -24,6 +24,8 @@ class ServoLoop:
                             x_mm: float, y_mm: float,
                             mm_per_norm: float = 30.0,
                             settle_tol_norm: float = 0.05,
+                            setpoint_x_norm: float = 0.0,
+                            setpoint_y_norm: float = 0.0,
                             min_step_mm: float = 1.0,
                             max_iter: int = 500,
                             timeout: float = 10.0,
@@ -64,8 +66,9 @@ class ServoLoop:
                 continue
             consecutive_misses = 0
             last_detection = pick
-            dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
-            if pick.bbox_norm.is_centered_at(settle_tol_norm):
+            dx_norm = pick.bbox_norm.x_center - setpoint_x_norm
+            dy_norm = pick.bbox_norm.y_center - setpoint_y_norm
+            if abs(dx_norm) <= settle_tol_norm and abs(dy_norm) <= settle_tol_norm:
                 trace.append(ServoTrace(t_s=time.time() - t0, iteration=i, dx_norm=dx_norm, dy_norm=dy_norm,
                                         x_mm=last_x_mm, y_mm=last_y_mm, score=pick.score,
                                         selected_track_id=pick.track_id))
@@ -102,7 +105,8 @@ class ServoLoop:
         new_algo_keys = {"kp", "ki", "kd", "target_real_height_m",
                          "focal_length_px", "mm_per_norm_base", "ref_depth_m",
                          "settle_stable_frames", "arm_dx_threshold_norm",
-                         "on_strategic_4dof"}
+                         "on_strategic_4dof",
+                         "setpoint_x_norm", "setpoint_y_norm"}
         if new_algo_keys & set(kwargs.keys()):
             return self.find_target_pid(selector, **kwargs)
         return self.find_target_legacy(selector, **kwargs)
@@ -110,12 +114,15 @@ class ServoLoop:
     def find_target_pid(self, selector, *,
                          x_mm: float, y_mm: float,
                          mm_per_norm_base: float = 30.0,
+                         mm_per_norm: Optional[float] = None,
                          ref_depth_m: float = 0.30,
                          focal_length_px: float = 600.0,
                          target_real_height_m: Optional[float] = None,
                          kp: float = 1.0, ki: float = 0.05, kd: float = 0.2,
                          settle_tol_norm: float = 0.05,
                          settle_stable_frames: int = 3,
+                         setpoint_x_norm: float = 0.0,
+                         setpoint_y_norm: float = 0.0,
                          min_step_mm: float = 1.0,
                          max_iter: int = 500,
                          timeout: float = 10.0,
@@ -132,7 +139,14 @@ class ServoLoop:
           3. 4 自由度策略: |dx_norm| > arm_dx_threshold_norm 时, 通过 on_strategic_4dof 回调
              触发大臂转 (业务层在回调里调 composite_run)
           4. 稳定收敛: 连续 settle_stable_frames 帧满足阈值才 converged=True + settle_stable=True
+        setpoint_x_norm / setpoint_y_norm: 吸嘴偏移 setpoint（目标在吸嘴正下方时其
+          bbox 中心坐标）。默认 (0,0)=画面正中心，保持旧行为；传非 0 即把目标对准
+          "吸嘴正下方"那个点（误差 = center - setpoint）。
+        mm_per_norm: legacy 别名桥 — find_target 路由到 PID 时 runner 会同时传
+          mm_per_norm，本参数存在时覆盖 mm_per_norm_base，兼容旧调用。
         """
+        if mm_per_norm is not None:
+            mm_per_norm_base = mm_per_norm
         t0 = time.time()
         trace: List[ServoTrace] = []
         locked_track_id: Optional[int] = None
@@ -183,10 +197,11 @@ class ServoLoop:
             consecutive_misses = 0
             last_detection = pick
 
-            dx_norm, dy_norm = pick.bbox_norm.x_center, pick.bbox_norm.y_center
+            dx_norm = pick.bbox_norm.x_center - setpoint_x_norm
+            dy_norm = pick.bbox_norm.y_center - setpoint_y_norm
 
             # ---- settle stable: 连续 N 帧满足阈值才收敛 ----
-            if pick.bbox_norm.is_centered_at(settle_tol_norm):
+            if abs(dx_norm) <= settle_tol_norm and abs(dy_norm) <= settle_tol_norm:
                 consecutive_settle += 1
                 if consecutive_settle >= settle_stable_frames:
                     trace.append(ServoTrace(t_s=now - t0, iteration=i, dx_norm=dx_norm, dy_norm=dy_norm,
@@ -214,6 +229,7 @@ class ServoLoop:
             # ---- depth-aware adaptive gain ----
             if (target_real_height_m and target_real_height_m > 0
                     and pick.bbox_pixels is not None and pick.bbox_pixels.height > 0):
+                from . import ArmVisionClient  # 局部 import 避免循环
                 depth_m = ArmVisionClient.compute_depth(
                     pick.bbox_pixels, target_real_height_m, focal_length_px)
                 mm_per_norm_eff = mm_per_norm_base * (depth_m / ref_depth_m)

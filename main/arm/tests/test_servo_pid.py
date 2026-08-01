@@ -19,21 +19,25 @@ def _det_dict(dx=0.0, dy=0.0, label="h_dou_jiao", score=0.9, height=100):
     }
 
 
-def _make_http_with_dets(dicts):
-    """每次 get_vision_task_cache 返回新的 dict 列表 (避免 list 复用)."""
+def _make_http_with_dets(dicts, frame_shape=None):
+    """每次 get_vision_task_cache 返回新的 dict 列表 (避免 list 复用).
+
+    frame_shape 非 None 时注入 task_state (模拟 2026-08-01 task_feed 带帧尺寸,
+    client 端 _parse_cache 由 bbox_norm 自算 bbox_pixels → depth-aware 生效).
+    """
     http = MagicMock()
     counter = [0]
     pool = [d for d in dicts]
 
     def _next_state():
         counter[0] += 1
-        # 深拷贝: 重新构造 dict, 避免 _parse_cache 改 list 元素后污染下次
-        return {
-            "task_state": {
-                "detections": [{k: v for k, v in d.items()} for d in pool],
-                "updated_at": float(counter[0]),
-            }
+        state = {
+            "detections": [{k: v for k, v in d.items()} for d in pool],
+            "updated_at": float(counter[0]),
         }
+        if frame_shape:
+            state["frame_shape"] = frame_shape
+        return {"task_state": state}
 
     http.get_vision_task_cache.side_effect = _next_state
     return http
@@ -60,12 +64,11 @@ class TestPIDDepth(unittest.TestCase):
         # 第一步 x_mm ≈ -3.0 (dx=0.1, pure P, mm_per_norm_eff=30)
         self.assertAlmostEqual(result.trace[0].x_mm, -3.0, places=1)
 
-    def test_depth_aware_gain_skipped_without_bbox_pixels(self):
-        """cache 路径 (_parse_cache) 不提供 bbox_pixels → depth-aware 跳过, 走 mm_per_norm_base.
+    def test_depth_aware_gain_skipped_without_frame_shape(self):
+        """旧后端 (task_state 无 frame_shape) → bbox_pixels=None → depth-aware 跳过.
 
-        注: depth-aware 在 vision servo 真实生产中不触发, 因为 task_feed 30Hz cache
-        无 bbox_pixels 字段. 深度估计只在用户调用 snap (POST /v1/vision/task) 时可用.
-        本测试只验 PID 路径不破; compute_depth 单元测试在 test_servo_depth.py 覆盖.
+        mm_per_norm_eff 恒 = mm_per_norm_base = 30, dx_mm = -0.1*30 = -3.0.
+        兼容降级路径, 行为与历史一致.
         """
         det = _det_dict(dx=0.1, dy=0.0, label="cylinder_1", height=100)
         http = _make_http_with_dets([det])
@@ -85,6 +88,32 @@ class TestPIDDepth(unittest.TestCase):
         # bbox_pixels=None → mm_per_norm_eff = mm_per_norm_base = 30
         # dx_mm = -0.1 * 30 = -3.0
         self.assertAlmostEqual(result.trace[0].x_mm, -3.0, places=1)
+
+    def test_depth_aware_gain_active_with_frame_shape(self):
+        """2026-08-01: task_feed 带 frame_shape → _parse_cache 自算 bbox_pixels →
+        depth-aware 增益在 HTTP 伺服主路径生效 (原死代码复活).
+
+        bbox_norm.height=0.5, frame_shape=[480,640,3] → box_h = 0.5/2*480 = 120px
+        depth = 0.12*600/120 = 0.60m → mm_per_norm_eff = 30 * (0.60/0.30) = 60
+        纯 P: dx_mm = -0.1 * 60 = -6.0 (无 frame_shape 时 -3.0, 步长放大 2 倍).
+        """
+        det = _det_dict(dx=0.1, dy=0.0, label="cylinder_1", height=100)
+        det["bbox_norm"]["height"] = 0.5
+        http = _make_http_with_dets([det], frame_shape=[480, 640, 3])
+        client = ArmVisionClient(http)
+        sel = TargetSelector.for_label("cylinder_1")
+        result = client.find_target_pid(
+            sel, x_mm=0.0, y_mm=-100.0,
+            kp=1.0, ki=0.0, kd=0.0,
+            settle_tol_norm=0.05,
+            settle_stable_frames=99,
+            target_real_height_m=0.12,
+            focal_length_px=600.0,
+            ref_depth_m=0.30,
+            mm_per_norm_base=30.0,
+            timeout=0.5, max_iter=2,
+        )
+        self.assertAlmostEqual(result.trace[0].x_mm, -6.0, places=1)
 
     def test_compute_depth_formula(self):
         """compute_depth 公式: depth = real_height * focal / bbox_h

@@ -54,6 +54,12 @@ class ArmOrigin:
     # y 是步进电机，堵转/失步较常见，默认 2mm（≈1 step）；x 是编码器闭环，默认 5mm。
     step_loss_y_mm: float = 2.0
     step_loss_x_mm: float = 5.0
+    # 吸嘴-相机刚性偏移（视觉伺服 setpoint，归一化坐标）：
+    # 目标放在吸嘴正下方（正确吸取位姿）时，其 bbox 中心在画面中的位置。
+    # find_target_* 传 setpoint=(x, y) 即把目标对准"吸嘴正下方"而非画面正中心。
+    # (0,0) = 未标定，保持旧行为（对准画面中心）。基准位 x=0 y=-100 大臂=-90 手抓=0 下标定。
+    nozzle_offset_x_norm: float = 0.0
+    nozzle_offset_y_norm: float = 0.0
     calibrated_at: str = ""           # ISO 8601
 
     @property

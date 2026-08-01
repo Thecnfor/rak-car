@@ -3,12 +3,14 @@ ArmRunner：把 ArmClient + 业务动作 + dry-run 包成同步调用。
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import time
 from typing import Optional
 
 from ..api import ArmClient
-from ..state import ArmState
+from ..state import ArmOrigin, ArmState
+from ..vision import SelectionStrategy
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +28,41 @@ class ArmRunner:
     def __init__(self, client: ArmClient, default_timeout_s: float = 30.0):
         self.client = client
         self.default_timeout_s = default_timeout_s
+
+    # ---- 吸嘴偏移 setpoint（视觉伺服对准"吸嘴正下方"而非画面中心） ----
+
+    def _nozzle_offset(self):
+        """origin 里已标定的吸嘴偏移；未标定(全 0)返回 None。"""
+        origin = self.client.origin or ArmOrigin()
+        sx, sy = origin.nozzle_offset_x_norm, origin.nozzle_offset_y_norm
+        if abs(sx) > 1e-9 or abs(sy) > 1e-9:
+            return sx, sy
+        return None
+
+    def _resolve_nozzle_setpoint(self, sx, sy):
+        """sx/sy 由调用方显式传入；两者皆 None 时回落到 origin 标定值。
+        返回 (x, y) 或 None（未标定且未显式传 → 不注入，保持旧行为对准画面中心）。"""
+        if sx is None and sy is None:
+            return self._nozzle_offset()
+        return (sx if sx is not None else 0.0,
+                sy if sy is not None else 0.0)
+
+    @staticmethod
+    def _inject_setpoint(kwargs, sp):
+        if sp is not None:
+            kwargs["setpoint_x_norm"] = sp[0]
+            kwargs["setpoint_y_norm"] = sp[1]
+        return kwargs
+
+    @staticmethod
+    def _maybe_lock_first(selector, lock_first: bool):
+        """多目标场景防跳变：默认 HIGHEST_SCORE 每帧重选会来回跳不收敛；
+        lock_first=True 且 selector 未显式指定策略/轨迹时，升级为锁定首个目标。"""
+        if (lock_first and selector.track_id is None
+                and selector.strategy == SelectionStrategy.HIGHEST_SCORE.value):
+            return dataclasses.replace(
+                selector, strategy=SelectionStrategy.LOCK_FIRST_SEEN.value)
+        return selector
 
     # ---- 基础动作 ----
 
@@ -143,6 +180,17 @@ class ArmRunner:
     def grasp(self, on: bool, timeout: Optional[float] = None) -> dict:
         return self.client.grasp(on, timeout=timeout or self.default_timeout_s)
 
+    def suck(self, timeout: Optional[float] = None) -> dict:
+        """吸气 (抓取协议 2026-08-01: 关闭阀门+关闭气泵 = SDK grasp(True)).
+
+        前提: y 已降到 0 (抓取位)。不移动任何电机。
+        """
+        return self.client.grasp(True, timeout=timeout or self.default_timeout_s)
+
+    def drop_object(self, timeout: Optional[float] = None) -> dict:
+        """放下物体 (抓取协议 2026-08-01: 打开阀门 = SDK grasp(False))."""
+        return self.client.grasp(False, timeout=timeout or self.default_timeout_s)
+
     def go_home(self) -> dict:
         """回到 y=0, x=0，hand=UP（-90），arm=MID（0）。
 
@@ -201,6 +249,8 @@ class ArmRunner:
                               mm_per_norm: float = 30.0,
                               settle_tol_norm: float = 0.05,
                               timeout: float = 10.0,
+                              setpoint_x_norm: Optional[float] = None,
+                              setpoint_y_norm: Optional[float] = None,
                               **kwargs):
         """高层组合：composite_run 粗定位 → 视觉伺服精调。
 
@@ -214,11 +264,16 @@ class ArmRunner:
             mm_per_norm: bbox 归一化坐标 → mm 转换系数（现场可调）
             settle_tol_norm: 收敛阈值
             timeout: 视觉伺服超时（秒）
+            setpoint_x_norm / setpoint_y_norm: 吸嘴偏移 setpoint（目标在吸嘴正下方时
+                其 bbox 中心坐标）。默认 None → 自动读 origin 标定值；已标定即把目标
+                对准吸嘴正下方，未标定保持对准画面中心。传 (0,0) 显式强制对准画面中心。
             **kwargs: 透传给 find_target (PID: kp/ki/kd; depth: target_real_height_m/focal_length_px)
 
         Returns:
             ServoResult（详见 VISION_SERVO_DESIGN.md）
         """
+        kwargs = self._inject_setpoint(
+            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
         self.client.composite_run(
             arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
         )
@@ -231,16 +286,25 @@ class ArmRunner:
     def pick_by_vision(self, selector, *,
                        x_mm: float, y_mm: float, arm_angle: float = -90.0,
                        settle_tol_norm: float = 0.05,
-                       timeout: float = 10.0, **kwargs) -> dict:
+                       timeout: float = 10.0,
+                       lock_first: bool = True,
+                       setpoint_x_norm: Optional[float] = None,
+                       setpoint_y_norm: Optional[float] = None,
+                       **kwargs) -> dict:
         """最高层：粗定位 → 视觉伺服 → composite_pick → grasp。
 
         业务前置：必须在 y < -30mm 保护区外。
+        setpoint_x_norm / setpoint_y_norm: 吸嘴偏移 setpoint，默认 None → 读 origin 标定值。
+        lock_first: 多目标场景锁定首个检测目标（默认 True）。
         **kwargs: 透传 find_target (PID/depth/4DOF 策略).
         """
+        selector = self._maybe_lock_first(selector, lock_first)
         self.move_to_vision_target(
             selector, x_mm=x_mm, y_mm=y_mm,
             arm_angle=arm_angle, hand=-90.0,
-            settle_tol_norm=settle_tol_norm, timeout=timeout, **kwargs,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+            setpoint_x_norm=setpoint_x_norm, setpoint_y_norm=setpoint_y_norm,
+            **kwargs,
         )
         return self.client.composite_pick(
             arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
@@ -256,11 +320,16 @@ class ArmRunner:
                                         mm_per_norm: float = 30.0,
                                         settle_tol_norm: float = 0.05,
                                         timeout: float = 10.0,
+                                        setpoint_x_norm: Optional[float] = None,
+                                        setpoint_y_norm: Optional[float] = None,
                                         **kwargs):
         """高层组合：composite_run 粗定位 → 视觉伺服（WS 实时推流）。
 
+        setpoint_x_norm / setpoint_y_norm: 吸嘴偏移 setpoint，默认 None → 读 origin 标定值。
         **kwargs: 透传 find_target_realtime (PID/depth/4DOF).
         """
+        kwargs = self._inject_setpoint(
+            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
         self.client.composite_run(
             arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
         )
@@ -273,15 +342,24 @@ class ArmRunner:
     def pick_by_vision_realtime(self, selector, *,
                                  x_mm: float, y_mm: float, arm_angle: float = -90.0,
                                  settle_tol_norm: float = 0.05,
-                                 timeout: float = 10.0, **kwargs) -> dict:
+                                 timeout: float = 10.0,
+                                 lock_first: bool = True,
+                                 setpoint_x_norm: Optional[float] = None,
+                                 setpoint_y_norm: Optional[float] = None,
+                                 **kwargs) -> dict:
         """最高层（实时版）：粗定位 → WS 伺服 → composite_pick → grasp.
 
+        setpoint_x_norm / setpoint_y_norm: 吸嘴偏移 setpoint，默认 None → 读 origin 标定值。
+        lock_first: 多目标场景锁定首个检测目标（默认 True）。
         **kwargs: 透传 find_target_realtime.
         """
+        selector = self._maybe_lock_first(selector, lock_first)
         self.move_to_vision_target_realtime(
             selector, x_mm=x_mm, y_mm=y_mm,
             arm_angle=arm_angle, hand=-90.0,
-            settle_tol_norm=settle_tol_norm, timeout=timeout, **kwargs,
+            settle_tol_norm=settle_tol_norm, timeout=timeout,
+            setpoint_x_norm=setpoint_x_norm, setpoint_y_norm=setpoint_y_norm,
+            **kwargs,
         )
         return self.client.composite_pick(
             arm_angle=arm_angle, x_mm=x_mm, y_mm=y_mm,
@@ -294,11 +372,16 @@ class ArmRunner:
                             hz: float = 30.0,
                             mm_per_norm: float = 30.0,
                             timeout: float = 30.0,
+                            setpoint_x_norm: Optional[float] = None,
+                            setpoint_y_norm: Optional[float] = None,
                             **kwargs):
         """持续实时追踪（永不收敛停）：WS 推送驱动，timeout 后返回。
 
+        setpoint_x_norm / setpoint_y_norm: 吸嘴偏移 setpoint，默认 None → 读 origin 标定值。
         **kwargs: 透传 find_target_track.
         """
+        kwargs = self._inject_setpoint(
+            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
         self.client.composite_run(
             arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
         )
@@ -307,3 +390,104 @@ class ArmRunner:
             hz=hz, mm_per_norm=mm_per_norm,
             timeout=timeout, **kwargs,
         )
+
+    def pick_by_vision_lower(self, selector, *,
+                             x_mm: float, y_mm: float,
+                             grasp_y_mm: float = 0.0,
+                             arm_angle: float = -90.0, hand: float = 0.0,
+                             mm_per_norm: float = 30.0,
+                             settle_tol_norm: float = 0.05,
+                             timeout: float = 10.0,
+                             hold_s: float = 0.4,
+                             lift_back: bool = True,
+                             lock_first: bool = True,
+                             reposition: bool = True,
+                             align: bool = True,
+                             setpoint_x_norm: Optional[float] = None,
+                             setpoint_y_norm: Optional[float] = None,
+                             **kwargs) -> dict:
+        """识别 → 视觉伺服对准(吸嘴setpoint) → y 下降 lower_mm → 抓取.
+
+        用户约定 (2026-08-01): 识别到目标后直接 y 下降 80mm 去抓;
+        中途丢失目标没关系 —— 下降是开环的, 基于对准后的位置。
+
+        流程:
+          1. composite_run 粗定位 (arm/hand 姿态 + xy); reposition=False 时跳过,
+             直接用当前位姿当伺服起点 (x_mm/y_mm 参数被当前实际位置覆盖)
+          2. find_target 视觉伺服, 把目标对准吸嘴 setpoint (origin 注入);
+             默认 lock_first=True → 锁定首个检测目标 (多目标场景防来回跳)
+             align=False 时跳过伺服, 直接基于当前位姿下降抓 (目标已大致对准,
+             大臂略偏不影响吸住 —— 用户约定 2026-08-01)
+          3. move_y 降到 grasp_y_mm (默认 0 = 抓取位; 协议 2026-08-01: y 降到 0 才能吸;
+             开环下降, 中途丢目标没关系), 下降后验证到位才吸气
+          4. 吸气 (关闭阀门+关闭气泵 = grasp(True)), hold hold_s
+          5. 可选 lift_back: 回到下降前 y (离开保护区, 方便后续移动)
+
+        安全: 下降进入 y∈[-30,0] 保护区, 但 move_y 只查 _check_safe、grasp 不动电机,
+        都不触发 _check_y_protected; 抬回同样安全。若期间想动大臂/手爪会被安全门拒绝。
+
+        Returns:
+            {"ok": bool, "reason": str|None, "servo": ServoResult|None,
+             "steps": {"servo": bool, "lower": bool, "grasp": bool, "lift": bool|None},
+             "y_before": float, "y_lower": float}
+        """
+        selector = self._maybe_lock_first(selector, lock_first)
+        kwargs = self._inject_setpoint(
+            kwargs, self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm))
+        # 1. 粗定位
+        if reposition:
+            self.client.composite_run(
+                arm=arm_angle, x_mm=x_mm, y_mm=y_mm, hand=hand, timeout=20.0,
+            )
+        else:
+            st = self.client.get_state()
+            x_mm, y_mm = st.x_mm, st.y_mm
+        # 2. 视觉伺服对准 (吸嘴 setpoint); align=False 跳过
+        servo = None
+        if align:
+            try:
+                servo = self.client._make_vision_with_move().find_target(
+                    selector, x_mm=x_mm, y_mm=y_mm,
+                    mm_per_norm=mm_per_norm, settle_tol_norm=settle_tol_norm,
+                    timeout=timeout, **kwargs,
+                )
+            except RuntimeError as exc:
+                return {"ok": False, "reason": f"servo_miss:{exc}", "servo": None,
+                        "steps": {"servo": False, "lower": False, "grasp": False,
+                                  "lift": None},
+                        "y_before": None, "y_lower": None}
+            if not servo.converged:
+                return {"ok": False, "reason": "servo_not_converged", "servo": servo,
+                        "steps": {"servo": False, "lower": False, "grasp": False,
+                                  "lift": None},
+                        "y_before": None, "y_lower": None}
+        # 3. 降到 grasp_y_mm (协议: y 降到 0 才能吸; 开环下降, 中途丢目标没关系)
+        st = self.client.get_state()
+        y_before = st.y_mm
+        self.client.move_y(grasp_y_mm, timeout=20.0)
+        # 验证到位 (协议强制: 未降到目标 y 不吸气)
+        st = self.client.get_state()
+        y_err = abs(st.y_mm - grasp_y_mm)
+        if y_err > 10.0:
+            return {"ok": False, "reason": f"y未到位 err={y_err:.1f}mm",
+                    "servo": servo,
+                    "steps": {"servo": bool(servo is not None), "lower": False,
+                              "grasp": False, "lift": None},
+                    "y_before": y_before, "y_lower": grasp_y_mm}
+        # 4. 吸气 (关闭阀门+关闭气泵)
+        time.sleep(hold_s)
+        grasp_job = self.suck(timeout=10.0)
+        # 5. 抬回 (离开保护区)
+        lift_job = None
+        if lift_back:
+            lift_job = self.client.move_y(y_before, timeout=15.0)
+        return {
+            "ok": bool(grasp_job.get("ok")),
+            "reason": None,
+            "servo": servo,
+            "steps": {"servo": bool(servo is not None), "lower": True,
+                      "grasp": bool(grasp_job.get("ok")),
+                      "lift": bool(lift_job and lift_job.get("status") == "succeeded")
+                               if lift_job else None},
+            "y_before": y_before, "y_lower": grasp_y_mm,
+        }

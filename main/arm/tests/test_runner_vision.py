@@ -2,6 +2,7 @@
 import unittest
 from unittest.mock import MagicMock
 from main.arm.loops.runner import ArmRunner
+from main.arm.state import ArmOrigin
 from main.arm.vision import TargetSelector, ServoResult
 
 
@@ -18,6 +19,7 @@ def _fake_servo_result(converged=True, x_mm=0.0, y_mm=-100.0, label="h_dou_jiao"
 class TestMoveToVisionTarget(unittest.TestCase):
     def test_calls_composite_run_then_vision_servo(self):
         client = MagicMock()
+        client.origin = ArmOrigin()  # runner 会读 origin 决定是否注入吸嘴 setpoint
         self.finder = client._make_vision_with_move.return_value
         self.finder.find_target.return_value = _fake_servo_result()
 
@@ -40,6 +42,7 @@ class TestMoveToVisionTarget(unittest.TestCase):
 class TestPickByVision(unittest.TestCase):
     def test_calls_3_actions_in_order(self):
         client = MagicMock()
+        client.origin = ArmOrigin()  # runner 会读 origin 决定是否注入吸嘴 setpoint
         self.finder = client._make_vision_with_move.return_value
         self.finder.find_target.return_value = _fake_servo_result()
         client.composite_pick.return_value = {"ok": True, "steps": {}}

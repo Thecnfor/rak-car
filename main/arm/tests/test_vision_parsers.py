@@ -81,6 +81,27 @@ class TestParseCache(unittest.TestCase):
         dets = _parse_cache({"ok": True, "task_state": {"detections": []}})
         self.assertEqual(dets, [])
 
+    def test_parse_fills_bbox_pixels_when_frame_shape_present(self):
+        """2026-08-01: task_feed 带 frame_shape 时, bbox_pixels 由 bbox_norm 自算.
+        bbox_norm {x_center:0.10, y_center:-0.05, width:0.22, height:0.15},
+        frame_shape [480, 640, 3] → center=(352, 228), box=(70, 36), x1y1x2y2=(317,210,387,246).
+        """
+        raw = {**CACHE_FIXTURE}
+        raw["task_state"] = {**CACHE_FIXTURE["task_state"], "frame_shape": [480, 640, 3]}
+        d = _parse_cache(raw)[0]
+        self.assertIsNotNone(d.bbox_pixels)
+        self.assertEqual(d.bbox_pixels.x1, 317)
+        self.assertEqual(d.bbox_pixels.y1, 210)
+        self.assertEqual(d.bbox_pixels.x2, 387)
+        self.assertEqual(d.bbox_pixels.y2, 246)
+        self.assertEqual(d.bbox_pixels.width, 70)
+        self.assertEqual(d.bbox_pixels.height, 36)
+
+    def test_parse_missing_frame_shape_keeps_none(self):
+        """无 frame_shape(旧后端) → bbox_pixels 仍 None, 行为不变."""
+        d = _parse_cache(CACHE_FIXTURE)[0]
+        self.assertIsNone(d.bbox_pixels)
+
 
 class TestParseSync(unittest.TestCase):
     def test_parse_returns_detection_with_pixels(self):

@@ -202,13 +202,21 @@ def main() -> int:
             d_arm = 0.0
         else:
             x_vel = -dx * args.gain_x
-            d_arm = -dx * args.gain_arm
+            # 2026-08-01 方向修正: 目标在相机左 (dx<0) → 大臂应向左转 (arm_target 减小)。
+            # 原 d_arm=-dx*gain 会让大臂朝反方向转 → 越追越偏 → 球出画面 → 漏检链。
+            d_arm = +dx * args.gain_arm
         if abs(dy) < args.deadzone:
             y_vel = 0.0
             d_hand = 0.0
         else:
-            y_vel = -dy * args.gain_y
-            d_hand = -dy * args.gain_hand
+            # 2026-08-01 方向修正 (y 轴): 目标在画面上方 (dy<0) → 机械臂应向上移。
+            # 实测 y_vel 正方向 = 向下 (球在上 dy<0 时原 -dy 给出正 y_vel → 往下走 = 反)。
+            # 改 +dy: dy<0 → y_vel<0 → 向上 ✓。
+            y_vel = +dy * args.gain_y
+            # 手抓垂直转向 (同大臂): 目标在画面上方 (dy<0) → 手抓应向上抬
+            # (hand 减小向 -90)。原 d_hand=-dy*gain 让相机越看越低 → 球跑出画面顶部
+            # → miss 92% 的根因之一。trace 验证: dy<0 时 hand -89→-55 持续下转 = 反了。
+            d_hand = +dy * args.gain_hand
 
         # 限速 ±0.15 m/s
         x_vel = max(-0.15, min(0.15, x_vel))
