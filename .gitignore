@@ -154,3 +154,7 @@ cython_debug/
 **/test/**
 main/arm/arm_origin.yaml
 docs
+
+# arm 视觉伺服追踪测试产物 (不提交)
+track_trace_*.jsonl
+vel_trace_*.jsonl

@@ -212,6 +212,29 @@ class CarRuntimeService(
             "wheel_speeds": wheel_speeds,
         }
 
+    def set_arm_velocity(self, x_vel=None, y_vel=None):
+        """arm 实时速度命令 — 绕开 arm_queue, 供视觉伺服速度模式用。
+
+        与 set_chassis_velocity 同构: _realtime_gate 微秒级取 car 引用, 直发 motor 速度,
+        不进 job_queue、不持 car_lock。视觉伺服用它做连续追踪 (IBVS 速度模式)。
+
+        单位: m/s (与 arm_base.x_speed / y_speed 一致)。
+        x_vel / y_vel 为 None 时该轴不发 (保持当前速度), 传 0.0 显式停。
+        注意: 只发速度不做位置闭环; 调用方负责收敛 (检测丢失时发 0 停)。
+        y 轴安全: y_speed 内部有磁感安全门 + 末段/顶段减速 + 急停门, 不会撞磁感。
+        """
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        out = {}
+        if x_vel is not None:
+            car.arm.x_speed(float(x_vel))
+            out["x_vel"] = float(x_vel)
+        if y_vel is not None:
+            car.arm.y_speed(float(y_vel))
+            out["y_vel"] = float(y_vel)
+        return out
+
     def get_wheel_encoders(self):
         with self._realtime_gate:
             self._realtime_check_locked()

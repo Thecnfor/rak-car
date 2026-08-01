@@ -94,6 +94,27 @@ def _move_safe(client: ArmClient, *, x_mm: float, y_mm: float) -> None:
     raise RuntimeError(f"composite_run 3 次均失败: {last_err}")
 
 
+def _set_arm_feed(client: ArmClient, *, stop: bool) -> None:
+    """让位机制: track 前停 arm_feed 释放 arm_queue, track 后恢复。
+
+    2026-08-01: arm_feed 20Hz 持续 poll arm_queue, 视觉伺服的 goto_position
+    排队在 poll 之后, 每帧要等几百 ms (实测 0.5 iter/s)。停掉后 ~1.9 iter/s。
+    注意: stop/start_arm_feed 在 CAR_ACTIONS (target=car), 不是 ARM_ACTIONS,
+    所以走 http.execute("car", ...) 而不是 execute_arm_action(target=arm)。
+    """
+    try:
+        if stop:
+            r = client.http.execute("car", "stop_arm_feed", kwargs={"force": True},
+                                    sync=True, timeout=8.0)
+            print(f"  stop_arm_feed(force) -> {r.get('job', {}).get('result')}", flush=True)
+        else:
+            r = client.http.execute("car", "start_arm_feed", args=[20.0],
+                                    sync=True, timeout=8.0)
+            print(f"  start_arm_feed(20Hz) -> {r.get('job', {}).get('result')}", flush=True)
+    except Exception as e:
+        print(f"  ⚠️  _set_arm_feed(stop={stop}) failed: {type(e).__name__}: {e}", flush=True)
+
+
 def _sign(x: float) -> int:
     if x > 0: return 1
     if x < 0: return -1
@@ -278,6 +299,10 @@ def main() -> int:
         print(f"🔴 起始安全位下发失败: {e}", flush=True)
         return 1
 
+    # 0.5 让位: 停 arm_feed 释放 arm_queue (track 前)
+    _section("让位: stop_arm_feed (释放 arm_queue)")
+    _set_arm_feed(client, stop=True)
+
     # 1. 持续追踪
     _section(f"track_vision_target({args.label}) | timeout={args.timeout}s hz={args.hz}")
     runner = ArmRunner(client)
@@ -304,6 +329,7 @@ def main() -> int:
         print(f"🔴 追踪异常: {e}", flush=True)
         if not args.no_reset:
             _move_safe(client, x_mm=args.x_start, y_mm=args.y_start)
+        _set_arm_feed(client, stop=False)  # 恢复 arm_feed
         return 2
 
     # 2. 汇总 + 落盘
@@ -320,6 +346,10 @@ def main() -> int:
             _move_safe(client, x_mm=args.x_start, y_mm=args.y_start)
         except Exception as e:
             print(f"⚠️ 复位失败 (非致命): {e}", flush=True)
+
+    # 4. 恢复 arm_feed (track 后)
+    _section("恢复: start_arm_feed (20Hz)")
+    _set_arm_feed(client, stop=False)
 
     return 0
 

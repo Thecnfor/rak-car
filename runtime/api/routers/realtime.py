@@ -125,6 +125,32 @@ def build_realtime_router(service):
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router_v1.post("/realtime/arm-velocity")
+    def v1_realtime_arm_velocity(payload: dict = Body(default={})):
+        """arm (x_vel, y_vel) 直发 — 绕开 arm_queue, 供视觉伺服速度模式。
+
+        与 /realtime/chassis-velocity 同构: 走 _realtime_gate 免 car_lock, 不进 job_queue。
+        单位 m/s (与 arm_base.x_speed / y_speed 一致)。
+        x_vel / y_vel 缺省或 null 表示该轴不动; 传 0.0 显式停。
+        ⚠️ 只发速度不做位置闭环; 调用方负责收敛 (检测丢失时发 0 停), 否则 x 可能直行撞墙。
+        """
+        try:
+            x_vel = payload.get("x_vel")
+            y_vel = payload.get("y_vel")
+            if x_vel is not None:
+                x_vel = float(x_vel)
+            if y_vel is not None:
+                y_vel = float(y_vel)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="x_vel/y_vel 必须是数字")
+        try:
+            return {
+                "ok": True,
+                "result": service.set_arm_velocity(x_vel, y_vel),
+            }
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
     @router_v1.post("/realtime/motor/speed")
     def v1_realtime_motor_speed(payload: dict = Body(default={})):
         port = payload.get("port")
