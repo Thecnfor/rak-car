@@ -277,8 +277,15 @@ class Orchestrator:
 
     @staticmethod
     def _pause_lane(runner: DoubleLoopRunner, api: ChassisClient) -> None:
-        """暂停外环（#1）：runner.pause() 阻塞下一帧 + 主动发零速兜底。"""
-        runner.pause()
+        """暂停外环（#1）：runner.pause() 同步等到外环确认停住（已补发零速），
+        再主动发零速兜底（双保险，防止在途非零帧残留）。
+
+        旧实现 pause() 是异步的：外环当前帧可能在 stop_wheel_speeds() 之后
+        又下发非零，且随后阻塞不再补零 → 车停不下来。现在 pause() 同步后才返回。
+        """
+        paused = runner.pause()
+        if not paused:
+            logger.warning("runner.pause() 超时未确认，外环线程可能已退出，仍补发零速")
         try:
             api.stop_wheel_speeds()
         except Exception:

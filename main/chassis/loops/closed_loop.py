@@ -28,7 +28,7 @@ class DoubleLoopRunner:
         threading.Thread(target=runner.run, kwargs={"max_seconds": math.inf},
                          daemon=True).start()
         ...
-        runner.pause()      # 停外环（断触发保护：smoother 保持最后值）
+        runner.pause()      # 停外环（同步等确认：外环补发零速 + 阻塞，smoother 保持最后值）
         do_task()
         runner.resume()     # 续外环（smoother 重置为 0，避免 stale 数据跳变）
         ...
@@ -65,6 +65,10 @@ class DoubleLoopRunner:
         # smoother 保持最后值，不会"忘记"已下发速度（避免发零后恢复时跳变）。
         self._pause = threading.Event()
         self._pause.set()  # 初始为"运行"状态
+        # 2026-08-01：pause 同步确认。外环检测到暂停时先补发零速、再 set 这个
+        # ack、然后才阻塞；pause() 等到 ack 才返回 —— 保证调用方随后补发的零速
+        # 不会被外环在途的非零 wheel_speeds 覆盖（旧实现的"停不下来"竞态）。
+        self._paused_ack = threading.Event()
 
     def stop(self) -> None:
         """请求 run() 退出（finally 会兜底 zero out + api.close）。"""
@@ -72,14 +76,27 @@ class DoubleLoopRunner:
         # 唤醒 _pause.wait()，让 run() 立刻看到 _stop
         self._pause.set()
 
-    def pause(self) -> None:
-        """暂停外环：当前帧跑完后阻塞在 _pause.wait()。smoother 保留最后值。
+    def pause(self, timeout: float = 1.0) -> bool:
+        """暂停外环：**同步**等到外环线程确认已停后才返回。
 
-        安全：调用方通常紧跟着 ``api.stop_wheel_speeds()`` 主动发零速，
-        然后跑任务逻辑（车端内环 PID 接管）。这样 resume() 时车已静止，
-        smoother 重置到 0 是连续的。
+        时序：
+            1. 清 _paused_ack + 清 _pause
+            2. 外环跑完当前帧后在循环顶部发现 _pause 已清：
+               先补发零速兜底（覆盖在途非零帧），再 set _paused_ack，然后阻塞在 _pause.wait()
+            3. 本方法等到 _paused_ack 后返回 True（超时返回 False）
+
+        为什么同步：旧实现 pause() 只是清事件立即返回，外环把当前帧跑完时可能
+        在 ``stop_wheel_speeds()`` **之后**又下发一条非零轮速；而外环随后就阻塞，
+        再没有任何零速补发 → MC602 保持最后收到的非零速度，车停不下来。
+        同步后，调用方在 pause() 返回后补发的零速一定是"最新一条命令"。
+
+        幂等：已在暂停且已确认过 → 直接返回 True（避免重复等 ack 卡 1s）。
         """
+        if not self._pause.is_set() and self._paused_ack.is_set():
+            return True
+        self._paused_ack.clear()
         self._pause.clear()
+        return self._paused_ack.wait(timeout)
 
     def resume(self) -> None:
         """恢复外环：smoother 重置为 0，下一帧从静止起步（避免 stale 跳变）。"""
@@ -103,8 +120,8 @@ class DoubleLoopRunner:
             safe = self.smoother.step(raw)       # 单轮饱和 + slew rate 限幅
             api.set_wheel_speeds(safe)           # dry_run=False 时才下发
 
-        pause/resume（#1）：pause 时循环阻塞在 ``_pause.wait()``，
-        唤醒后从阻塞处继续；resume() 同时清 smoother 记忆。
+        pause/resume（#1）：pause() 后循环先补发零速 + set _paused_ack，
+        再阻塞在 ``_pause.wait()``；resume() 唤醒并同时清 smoother 记忆。
         """
         deadline = time.monotonic() + max(0.0, float(max_seconds))
         next_tick = time.monotonic()
@@ -112,8 +129,21 @@ class DoubleLoopRunner:
         self.smoother.reset([0.0, 0.0, 0.0, 0.0])
         try:
             while not self._stop:
-                # pause 点（#1）：pause() 后阻塞；resume() / stop() 唤醒。
-                self._pause.wait()
+                # pause 点（#1）：pause() 清事件后这里先补发零速 + set ack，再阻塞；
+                # resume() / stop() 唤醒。注意必须先于任何非零帧检查 _pause：
+                # 否则当前帧在 stop_wheel_speeds() 之后下发的非零会把零速顶掉（2026-08-01）。
+                if not self._pause.is_set():
+                    # 已暂停：补发零速兜底（覆盖可能刚下发的在途非零帧），
+                    # set ack 让 pause() 知道外环已真正停住，然后阻塞等恢复。
+                    if not self.dry_run:
+                        try:
+                            self.api.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+                        except Exception:
+                            pass
+                    self._paused_ack.set()
+                    self._pause.wait()
+                    self._paused_ack.clear()
+                    continue
                 if self._stop:
                     break
                 now = time.monotonic()
