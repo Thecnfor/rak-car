@@ -1,15 +1,13 @@
 """麦轮逆解一致性单测 — 手写 IK vs SDK matrix。
 
-背景：runtime ``set_wheel_speeds`` 把 [v1..v4] 直通 WheelWrap（port[1,2,3,4]），
+判定标准：runtime ``set_wheel_speeds`` 把 [v1..v4] 直通 WheelWrap（port[1,2,3,4]），
 与 SDK ``set_velocity`` 的 ``inverse_kinematics``（car @ vehicle_to_wheel_matrix）
-喂同一个物理轮序。因此对同一 (vx, vy, ω)，两套逆解必须产生**相同数组**才物理一致。
+喂同一个物理轮序。因此对同一 (vx, vy, ω)，手写 ``mecanum_inverse`` 必须与 SDK
+矩阵产生**相同数组**才物理一致。
 
-实测结论（2026-08-01）：
-  - 纯前进：一致 ✓（vy=ω=0，只有 vx 模式 [1,-1,-1,1]）
-  - 纯横移 / 前进+横移：**不一致 ✗** —— 手写 IK 的元素 0/3 的 vy 符号
-    与其引用的矩阵推导相反。
-  哪个物理正确需实车确认（本测试只把差距钉死，避免未来有人"顺手修掉"
-  却没有意识到它在改所有控制律的横移行为）。
+2026-08-01 修复后（stable tag 之后）：
+  - 纯前进 / 纯横移 / 纯旋转 / 组合：与 SDK 一致（tan_r≈1 近似，量级差 <10%）
+  - 用 SDK 正运动学做闭环自检：fk(ik(v)) ≈ v —— 旧版纯横移反解出 0 的问题已消除。
 """
 import math
 import unittest
@@ -29,66 +27,86 @@ def _sdk_matrix_ik(vx, vy, wz):
     ]
 
 
-class TestForwardConsistent(unittest.TestCase):
+def _sdk_forward_kinematics(wheels):
+    """复刻 SDK forward_kinematics：wheel_velocity @ wheel_to_vehicle_matrix。
+
+    用于闭环自检 fk(ik(v)) ≈ v，验证逆解是否真的产生目标速度。
+    """
+    tan_r = math.tan(math.pi / 4.0 * 1.052)
+    r_c = 0.30 / 2.0 * tan_r + 0.28 / 2.0
+    w = list(wheels)
+    vx = (w[0] - w[1] - w[2] + w[3]) / 4.0
+    vy = (w[0] + w[1] - w[2] - w[3]) / (4.0 * tan_r)
+    wz = (w[0] + w[1] + w[2] + w[3]) / (4.0 * r_c)
+    return vx, vy, wz
+
+
+class TestMatchesSdk(unittest.TestCase):
     def test_pure_forward_matches_sdk(self):
-        """纯前进两套必须一致（这是实车能跑的前提）。"""
         for vx in (0.1, 0.3, 0.5):
             s = _sdk_matrix_ik(vx, 0.0, 0.0)
             c = mecanum_inverse(vx, 0.0, 0.0, r=0.30)
             for a, b in zip(s, c):
                 self.assertAlmostEqual(a, b, places=4)
 
+    def test_pure_strafe_matches_sdk(self):
+        """修复核心：纯横移的 vy 轮序必须与 SDK 一致（旧版这里反解出 0）。"""
+        for vy in (-0.15, -0.1, 0.1, 0.15):
+            s = _sdk_matrix_ik(0.0, vy, 0.0)
+            c = mecanum_inverse(0.0, vy, 0.0, r=0.30)
+            # 符号必须逐位一致（这是本质）；量级差 tan_r≈1 vs 1.08 <10%
+            self.assertEqual([1 if a > 0 else -1 for a in s],
+                             [1 if b > 0 else -1 for b in c])
+            for a, b in zip(s, c):
+                self.assertAlmostEqual(a, b, delta=0.02)
+
     def test_pure_rotation_matches_sdk(self):
-        """纯旋转只差 r 系数（0.3028 vs 0.30），符号必须一致（全同向）。"""
-        s = _sdk_matrix_ik(0.0, 0.0, 0.5)
-        c = mecanum_inverse(0.0, 0.0, 0.5, r=0.30)
-        self.assertEqual(all(v > 0 for v in s), all(v > 0 for v in c))
+        for wz in (-0.5, 0.5):
+            s = _sdk_matrix_ik(0.0, 0.0, wz)
+            c = mecanum_inverse(0.0, 0.0, wz, r=0.30)
+            self.assertEqual([1 if v > 0 else -1 for v in s],
+                             [1 if v > 0 else -1 for v in c])
+            for a, b in zip(s, c):
+                self.assertAlmostEqual(a, b, delta=0.01)
+
+    def test_combined_matches_sdk(self):
+        for vx, vy, wz in [(0.3, 0.1, 0.0), (0.0, 0.1, 0.5), (0.2, -0.1, 0.3)]:
+            s = _sdk_matrix_ik(vx, vy, wz)
+            c = mecanum_inverse(vx, vy, wz, r=0.30)
+            self.assertEqual([1 if a > 0 else -1 for a in s],
+                             [1 if b > 0 else -1 for b in c])
+            for a, b in zip(s, c):
+                self.assertAlmostEqual(a, b, delta=0.02)
 
 
-class TestStrafeKnownGap(unittest.TestCase):
-    """把已知的横移差异钉死：当前手写 IK 的 vy 轮序 ≠ SDK 推导。
+class TestClosedLoopSelfConsistent(unittest.TestCase):
+    """闭环自检：fk(ik(v)) ≈ v。旧版纯横移这步会得 0，修复后必须还原目标速度。"""
 
-    这不是"断言代码必须错"，而是防止无意识改动：任何人修这个差异时，
-    都意味着所有 4 个控制律的 vy 通道行为一起变化，必须先实车 A/B。
-    """
+    def test_pure_forward_roundtrip(self):
+        vx, vy, wz = 0.3, 0.0, 0.0
+        fvx, fvy, fwz = _sdk_forward_kinematics(mecanum_inverse(vx, vy, wz, r=0.30))
+        self.assertAlmostEqual(fvx, vx, places=6)
+        self.assertAlmostEqual(fvy, vy, places=6)
+        self.assertAlmostEqual(fwz, wz, places=6)
 
-    def test_strafe_diverges_from_sdk(self):
-        s = _sdk_matrix_ik(0.0, 0.1, 0.0)
-        c = mecanum_inverse(0.0, 0.1, 0.0, r=0.30)
-        # 两套确实不一致（这是 2026-08-01 记录的已知差距）
-        self.assertNotEqual(
-            [round(v, 4) for v in s],
-            [round(v, 4) for v in c],
-            "手写 IK 与 SDK 矩阵纯横移一致了？如果是，说明横移轮序问题已被修复，"
-            "请更新本测试与 diag_lane_error 的提示。",
-        )
+    def test_pure_strafe_roundtrip(self):
+        """关键回归：vy 命令必须产生真实横向速度（旧版为 0）。"""
+        for vy in (0.05, 0.1, 0.2):
+            fvx, fvy, fwz = _sdk_forward_kinematics(
+                mecanum_inverse(0.0, vy, 0.0, r=0.30)
+            )
+            self.assertAlmostEqual(fvy, vy, delta=0.02)   # 横向真的动了
+            self.assertAlmostEqual(fvx, 0.0, places=6)     # 不带前进
+            self.assertAlmostEqual(fwz, 0.0, places=6)     # 不带旋转
 
-    def test_gap_is_vy_sign_flip_on_wheels_0_and_3(self):
-        """差距的本质：纯横移时元素 0/3 的 vy 符号与 SDK 相反。
-
-        SDK vy 系数 [+, +, -, -]；chassis 实际输出 [-, +, -, +]——
-        即元素 0 和 3 的 vy 符号反了（roller_angle 近似只影响量级，不影响此结论）。
-        """
-        c = mecanum_inverse(0.0, 0.1, 0.0, r=0.30)
-        s = _sdk_matrix_ik(0.0, 0.1, 0.0)
-        c_sign = [1 if v > 0 else -1 for v in c]
-        s_sign = [1 if v > 0 else -1 for v in s]
-        self.assertEqual(s_sign, [1, 1, -1, -1])   # SDK：元素 0/1 同向
-        self.assertEqual(c_sign, [-1, 1, -1, 1])   # chassis：元素 0/3 与 SDK 相反
-
-    def test_sdk_matrix_with_tan_r_is_self_consistent(self):
-        """基准校验：_sdk_matrix_ik 自身数学自洽（tan_r 项必须参与 vy 贡献）。"""
-        tan_r = math.tan(math.pi / 4.0 * 1.052)
-        r_c = 0.30 / 2.0 * tan_r + 0.28 / 2.0
-        vx, vy, wz = 0.3, 0.1, 0.0
-        expected = [
-            vx + vy * tan_r + wz * r_c,
-            -vx + vy * tan_r + wz * r_c,
-            -vx - vy * tan_r + wz * r_c,
-            vx - vy * tan_r + wz * r_c,
-        ]
-        for a, b in zip(_sdk_matrix_ik(vx, vy, wz), expected):
-            self.assertAlmostEqual(a, b, places=9)
+    def test_combined_roundtrip(self):
+        for vx, vy, wz in [(0.2, 0.1, 0.0), (0.15, -0.1, 0.3)]:
+            fvx, fvy, fwz = _sdk_forward_kinematics(
+                mecanum_inverse(vx, vy, wz, r=0.30)
+            )
+            self.assertAlmostEqual(fvx, vx, delta=0.02)
+            self.assertAlmostEqual(fvy, vy, delta=0.02)
+            self.assertAlmostEqual(fwz, wz, delta=0.02)
 
 
 if __name__ == "__main__":

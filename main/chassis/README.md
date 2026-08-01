@@ -272,6 +272,8 @@ class IrState:
 | `kappa_axis_center` / `kappa_axis_width` | 1.0 / 0.5 | `axis_mix` sigmoid 分水岭 / 过渡带宽度。<br/>`axis_mix ≈ 0` → 由 `vy` 接管（朝向不变、质心斜向滑动）；<br/>`axis_mix ≈ 1` → 由 `ω` 接管（后轮做轴、前轮差速旋转）。<br/>现场调：<ul><li>直线上小抖就触发到 ω → 调高 `kappa_axis_width` 到 0.7+</li><li>进弯后才打到 ω 全额 → 调低 `kappa_axis_center` 到 0.7</li></ul> |
 | `vy_floor` | 0.15 | **弯道段 vy 保底比例（修复 2026-07-16 弯内侧压边界）**：弯道段（axis_mix≈1）保留 `vy_raw * vy_floor` 的横向修正能力，否则 `error_y` 在长弯里完全不被修、弯内侧贴线/压边。`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`。<br/>现场调：<ul><li>弯内侧仍贴线 → 调到 0.20~0.25</li><li>弯里车头晃 / 旋转被稀释 → 调到 0.10</li><li>想回到原"轴向互斥"行为 → 设 0（不推荐）</li></ul> |
 | `ki_y` / `ey_int_cap` / `ey_int_decay` | 0.6 / 0.10 m / 0.5 | **横向 I 项（修复 2026-07-16 直行稳态误差）**：纯 P 控制遇到恒定 bias（视觉零漂 / 机械零漂 / 地面不平）时永远需要稳态 error_y 维持修正力，看起来就是"过偏了才矫正"。leaky 积分项消除稳态偏差：`I(t+dt) = I(t)*exp(-decay*dt) + ey*dt`，夹到 `[-cap, +cap]`。<br/>现场调：<ul><li>直行还有稳态偏移 → 调大 `ki_y` 到 1.0~1.5</li><li>过弯出弯后车头晃 → 调大 `ey_int_decay` 到 1.0（半衰期≈0.7s）</li><li>想回到纯 P → 设 `ki_y=0`</li></ul> |
+| `lookahead_s` | 0.15 s | **前瞻（2026-08-01 阶段二）**：用预测横向误差 `ey_pred = ey + vx·sin(ea)·T` 喂 vy / 积分通道。出弯时 ea≈0 但横向还偏，纯看当前 ey 会错过回正时机，预测项提前动手。T 太大=过度抢跑。<br/>现场调：<ul><li>出弯修正慢 → 调到 0.2~0.3</li><li>入弯抢跑 / 蛇形 → 调回 0.1 或设 0 关闭</li><li>误差标定未完成前先设 0（避免放大坏的 d_e）</li></ul> |
+| `omega_lag_alpha` | 0.40 | **ω 一阶滞后（2026-08-01 阶段二）**：对合成后的目标 ω 做低通，抑制急弯 boost 顶到 `omega_cap` 时的转向猛打（"转弯过头"来源）。α=1 关闭；越小越平滑但车越钝。<br/>现场调：<ul><li>转弯过头仍明显 → 降到 0.25~0.30</li><li>过弯拖沓 / 转向不足 → 升回 0.6~0.8 或设 1.0 关闭</li></ul> |
 | `r_eff` | 0.30 m | 麦轮几何系数 |
 
 **`axis_mix` 是什么**：来自「轴向互斥」设计——直线段由 `vy` 修横向偏差（`ω=0`、
@@ -339,9 +341,10 @@ runner = DoubleLoopRunner(api=api, outer=outer, hz=50.0, calibrator=cal)
 标定倍率。现场流程：车静止在中线看零点漂移（offset）→ 开到明显偏移看模型
 输出幅值 → `scale_y ≈ 物理偏移(米) / 模型输出幅值`。
 
-**已知差距**：`base.mecanum_inverse` 与 SDK `vehicle_to_wheel_matrix` 对**纯横移**
-的 vy 轮序不一致（纯前进一致）。若修这里，所有 4 个控制律的 vy 行为一起变，
-务必实车 A/B。见 `tests/test_mecanum_inverse.py`。
+**2026-08-01 已修复**：`base.mecanum_inverse` 元素 0/3 的 vy 符号曾与 SDK
+`vehicle_to_wheel_matrix` 相反 —— 用 SDK 正运动学验证，旧版纯横移的 4 轮目标
+`[-.1,+.1,-.1,+.1]` 反解出的横向速度为 **0**（vy 通道物理上推不动车横移）。
+已对齐 SDK 矩阵轮序，`fk(ik(v)) ≈ v` 闭环自检通过，见 `tests/test_mecanum_inverse.py`。
 
 ### 新增一个控制律
 

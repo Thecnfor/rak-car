@@ -17,16 +17,26 @@ from ..state import LaneState
 
 
 def mecanum_inverse(vx: float, vy: float, omega: float, r: float) -> List[float]:
-    """按 vehicle_to_wheel_matrix = [[1,-1,-1,1],[t,t,-t,-t],[r,r,r,r]] 推。
-    这里只取机械混合部分（忽略 roller_angle），
-    omega -> r*omega 中 r = half_track*tan(roller) + half_wheel_base。
+    """按 vehicle_to_wheel_matrix = [[1,-1,-1,1],[t,t,-t,-t],[r,r,r,r]] 推，
+    与 SDK ``calculate_wheel_velocities`` 的输出轮序**完全一致**。
+
+    2026-08-01 修复（配合稳定 tag stable/chassis-error-calibration-v1.0）：
+    旧实现的元素 0/3 把 vy 符号写反了。用 SDK 正运动学
+    (wheel_to_vehicle_matrix) 验证：旧版对纯横移 vy=0.1 的 4 轮目标
+    ``[-.1,+.1,-.1,+.1]`` 反解出的横向速度为 **0** —— 即 vy 通道物理上
+    根本推不动车横移（"只能靠长直线修回来"的机制之一）。修正后
+    ``[+.1,+.1,-.1,-.1]`` 才是真正的纯横移（正向 0.1 m/s）。
+
+    说明：这里沿用"忽略 roller_angle"的近似（tan_roller≈1），
+    vy 系数与 SDK 的 ``tan(π/4·1.052)≈1.08`` 差 ~8%，量级留给增益调。
+    r 即 SDK 的 ``half_track·tan(roller) + half_wheel_base``。
     """
     r_eff = max(r, 1e-6)
     return [
-        vx - vy + r_eff * omega,
+        vx + vy + r_eff * omega,
         -vx + vy + r_eff * omega,
         -vx - vy + r_eff * omega,
-        vx + vy + r_eff * omega,
+        vx - vy + r_eff * omega,
     ]
 
 

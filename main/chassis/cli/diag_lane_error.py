@@ -45,13 +45,17 @@ def _sdk_ik(vx: float, vy: float, wz: float) -> List[float]:
 
 
 def _chassis_ik(vx: float, vy: float, wz: float) -> List[float]:
-    """main/chassis/controllers/base.py 的手写逆解（r_eff=0.30）。"""
+    """main/chassis/controllers/base.py 的手写逆解（r_eff=0.30）。
+
+    2026-08-01 已修正对齐 SDK 矩阵的 vy 轮序（此前元素 0/3 符号反、
+    纯横移反解出的横向速度为 0）。
+    """
     r = 0.30
     return [
-        vx - vy + r * wz,
+        vx + vy + r * wz,
         -vx + vy + r * wz,
         -vx - vy + r * wz,
-        vx + vy + r * wz,
+        vx - vy + r * wz,
     ]
 
 
@@ -72,8 +76,8 @@ def print_ik_table() -> None:
         match = "✓" if ok else "✗ 不一致！"
         print(f"{name:22s}  SDK   = [{', '.join('%+.4f' % v for v in s)}]")
         print(f"{'':22s}  chassis= [{', '.join('%+.4f' % v for v in c)}]  {match}")
-    print("  纯前进一致是必然（vy=ω=0）；若纯横移/纯旋转标 ✗，")
-    print("  说明两套 IK 对 vy 通道的解释不同 —— 需要实车确认哪套物理正确。\n")
+    print("  纯前进一致是必然（vy=ω=0）。若纯横移标 ✗，说明手写 IK 与 SDK")
+    print("  的 vy 轮序又不一致了 —— 需要实车确认哪套物理正确。\n")
 
 
 # ── 统计 ───────────────────────────────────────────────────────

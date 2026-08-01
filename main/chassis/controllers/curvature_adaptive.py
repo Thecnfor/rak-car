@@ -49,6 +49,16 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         sharp_omega_gain: float = 1.10,
         sharp_ki_curve_boost: float = 2.8,
         sharp_k_curvature: float = 0.65,
+        # ---- 2026-08-01 阶段二：前瞻 + ω 阻尼（治转弯过头 / 出弯修正慢）----
+        # 前瞻：用"未来 T 秒的预测横向误差"喂 vy/积分通道，
+        #   ey_pred = ey + vx·sin(ea)·T
+        # 直觉：出弯时车头已摆正（ea≈0）但横向还偏着，此刻 ey 可能很小，
+        #   若只看当前 ey 会错过回正时机；预测项把"车头方向 × 速度"的
+        #   侧向漂移提前算进去，让 vy 提前动手。T 太大=过度抢跑。
+        lookahead_s: float = 0.15,
+        # ω 一阶滞后：对 omega_raw 做低通，抑制急弯 boost 顶到上限时的转向猛打
+        #   （"转弯过头"的直接来源）。α=1 关闭；越小越平滑但车越钝。
+        omega_lag_alpha: float = 0.40,
     ) -> None:
         self.v_max = float(v_max)
         self.v_min = float(v_min)
@@ -85,7 +95,12 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         self.sharp_omega_gain = float(sharp_omega_gain)
         self.sharp_ki_curve_boost = max(0.0, float(sharp_ki_curve_boost))
         self.sharp_k_curvature = float(sharp_k_curvature)
+        self.lookahead_s = max(0.0, float(lookahead_s))
+        self.omega_lag_alpha = float(omega_lag_alpha)
 
+        self._omega_lagged: Optional[float] = None
+        # 上一帧实际使用的横向误差（前瞻后），debug 用
+        self._ey_used: float = 0.0
         self._kappa_ema: float = 0.0
         self._prev_ea: Optional[float] = None
         self._prev_ea_t: Optional[float] = None
@@ -137,19 +152,14 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         ez = math.exp(z)
         return ez / (1.0 + ez)
 
-    def _update_release(self, state: LaneState, dt: float) -> bool:
-        ey = state.error_y
-        ea = state.error_angle
-        if ey is None or ea is None:
-            return False
+    def _update_release(self, ey: float, ea: float, dt: float) -> bool:
         if abs(ey) < self.ey_release and abs(ea) < self.ea_release:
             self._straight_streak_ms += dt * 1000.0
         else:
             self._straight_streak_ms = 0.0
         return self._straight_streak_ms >= self.hold_ms
 
-    def _update_ey_integral(self, state: LaneState, dt: float) -> None:
-        ey = float(state.error_y)
+    def _update_ey_integral(self, ey: float, dt: float) -> None:
         self._ey_integral = (
             self._ey_integral * math.exp(-self.ey_int_decay * dt)
             + ey * dt
@@ -180,12 +190,16 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             self._prev_sign *= math.exp(-1.0 * dt)
             self._ey_integral = 0.0
             self._ea_integral = 0.0
+            self._omega_lagged = None  # 丢线：ω 滞后状态一并复位，恢复时不拖
             return self._safe_zero()
 
         now = time.monotonic()
         kappa = self._update_curvature(state, now)
-        released = self._update_release(state, dt)
-        self._update_ey_integral(state, dt)
+        ea_now = float(state.error_angle)
+        ey_raw = float(state.error_y)
+
+        # 直道释放判定用**原始** ey（避免与下方 lookahead 的 vx 依赖成环）
+        released = self._update_release(ey_raw, ea_now, dt)
         self._update_ea_integral(state, dt)
 
         # 急弯检测：kappa 超过阈值时切到强化参数组
@@ -197,16 +211,25 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             eff_v_min = self.sharp_v_min if is_sharp else self.v_min
             vx = self._vx_from_kappa(kappa, v_min=eff_v_min)
 
+        # 前瞻：ey_pred = ey + vx·sin(ea)·T —— 把"车头方向×速度"的侧向漂移
+        # 提前算进误差，喂 vy / 积分通道。出弯时 ea≈0 但横向还偏，这个预测项
+        # 让 vy 提前回正，而不是等 ey 自己涨上来。T=0 时退化为原始 ey。
+        if self.lookahead_s > 0:
+            ey_used = ey_raw + vx * math.sin(ea_now) * self.lookahead_s
+        else:
+            ey_used = ey_raw
+        self._ey_used = ey_used
+        self._update_ey_integral(ey_used, dt)
+
         eff_ki_boost = self.sharp_ki_curve_boost if is_sharp else self.ki_curve_boost
         i_boost = 1.0 + eff_ki_boost * kappa
 
-        vy_raw = -self.kp_y * float(state.error_y) - self.ki_y * self._ey_integral * i_boost
+        vy_raw = -self.kp_y * ey_used - self.ki_y * self._ey_integral * i_boost
 
         eff_omega_gain = self.sharp_omega_gain if is_sharp else self.omega_gain
         boost = 1.0 + eff_omega_gain * min(kappa, KAPPA_HARD_CAP)
         # 前馈符号：用 state.error_angle 实时方向更新 _prev_sign，
         # 而不是用 _prev_ea 兜底（_prev_ea 在 has_error=False 时被复位会丢符号）。
-        ea_now = float(state.error_angle)
         if ea_now != 0.0:
             self._prev_sign = math.copysign(1.0, ea_now)
 
@@ -226,6 +249,23 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             omega_raw = self.omega_cap
         elif omega_raw < -self.omega_cap:
             omega_raw = -self.omega_cap
+
+        # ω 一阶滞后：低通抑制急弯 boost 的转向猛打（α=1 关闭）。
+        # 只对"反馈+前馈合成的目标 ω"做平滑，不碰 cap 语义。
+        if self.omega_lag_alpha >= 1.0:
+            pass
+        elif self._omega_lagged is None:
+            self._omega_lagged = omega_raw
+        else:
+            self._omega_lagged = (
+                self.omega_lag_alpha * omega_raw
+                + (1.0 - self.omega_lag_alpha) * self._omega_lagged
+            )
+            omega_raw = self._omega_lagged
+            if omega_raw > self.omega_cap:
+                omega_raw = self.omega_cap
+            elif omega_raw < -self.omega_cap:
+                omega_raw = -self.omega_cap
 
         vy_keep = self.vy_floor + (1.0 - self.vy_floor) * (1.0 - self._axis_mix)
         vy_decided = vy_keep * vy_raw
@@ -257,4 +297,8 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
             "ki_y": self.ki_y,
             "ea_int": self._ea_integral,
             "ki_theta": self.ki_theta,
+            "ey_used": self._ey_used,
+            "omega_lagged": self._omega_lagged,
+            "lookahead_s": self.lookahead_s,
+            "omega_lag_alpha": self.omega_lag_alpha,
         }
