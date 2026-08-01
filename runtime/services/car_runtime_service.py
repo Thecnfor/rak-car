@@ -220,19 +220,49 @@ class CarRuntimeService(
 
         单位: m/s (与 arm_base.x_speed / y_speed 一致)。
         x_vel / y_vel 为 None 时该轴不发 (保持当前速度), 传 0.0 显式停。
-        注意: 只发速度不做位置闭环; 调用方负责收敛 (检测丢失时发 0 停)。
-        y 轴安全: y_speed 内部有磁感安全门 + 末段/顶段减速 + 急停门, 不会撞磁感。
+
+        软限位 (2026-08-01 用户约定): x ∈ [-0.30, 0] m, y ∈ [-0.20, 0] m (触底=0)。
+        速度模式下没有位置闭环, 靠此限位防撞物理极限:
+          - x_vel 方向朝超限边界 (x_vel>0 且 x>=0, 或 x_vel<0 且 x<=-0.30) → 强制 0
+          - y_vel 方向朝超限边界 (y_vel>0 且 y>=0 磁感, 或 y_vel<0 且 y<=-0.20) → 强制 0
+        注意: 读位置 x_get_position/y_get_position 走串口 (~ms), 每次命令前读,
+        速度命令频率建议 <=20Hz, 避免串口过载。
+
+        y 额外安全: y_speed 内部还有磁感安全门 + 末段/顶段减速 + 急停门。
         """
         with self._realtime_gate:
             self._realtime_check_locked()
             car = self.car
         out = {}
+        # 软限位 (m)。x 左墙=0/负方向到 -0.30; y 触底=0/向下正/向上负到 -0.20
+        X_MIN_M, X_MAX_M = -0.30, 0.0
+        Y_MIN_M, Y_MAX_M = -0.20, 0.0
         if x_vel is not None:
-            car.arm.x_speed(float(x_vel))
-            out["x_vel"] = float(x_vel)
+            x_vel = float(x_vel)
+            try:
+                x_pos = car.arm.x_get_position()
+            except Exception:
+                x_pos = None
+            if x_pos is not None:
+                if x_vel > 0 and x_pos >= X_MAX_M:
+                    x_vel = 0.0
+                elif x_vel < 0 and x_pos <= X_MIN_M:
+                    x_vel = 0.0
+            car.arm.x_speed(x_vel)
+            out["x_vel"] = x_vel
         if y_vel is not None:
-            car.arm.y_speed(float(y_vel))
-            out["y_vel"] = float(y_vel)
+            y_vel = float(y_vel)
+            try:
+                y_pos = car.arm.y_get_position()
+            except Exception:
+                y_pos = None
+            if y_pos is not None:
+                if y_vel > 0 and y_pos >= Y_MAX_M:
+                    y_vel = 0.0
+                elif y_vel < 0 and y_pos <= Y_MIN_M:
+                    y_vel = 0.0
+            car.arm.y_speed(y_vel)
+            out["y_vel"] = y_vel
         return out
 
     def get_wheel_encoders(self):

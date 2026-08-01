@@ -134,8 +134,12 @@ def main() -> int:
     ap.add_argument("--no-reset", action="store_true")
     args = ap.parse_args()
 
+    # 方向约定 (2026-08-01 真机实测):
+    #   x: bbox 偏右 dx>0 → x 向左追 (x_vel 负)  → sign_x=-1 (默认)
+    #   y: bbox 偏下 dy>0 → y 需... 真机实测默认 y 用 +1 (bbox 偏上 dy>0 → y_vel 正追)
+    #     用户反馈默认 -1 时 y 反了 → 默认 +1; 若仍反用 --negate-y
     sign_x = -1.0 if not args.negate_x else 1.0
-    sign_y = -1.0 if not args.negate_y else 1.0
+    sign_y = 1.0 if not args.negate_y else -1.0
 
     http = RuntimeApiClient()
     print(f"server: {os.environ.get('RAK_CAR_API_BASE', 'default')}", flush=True)
