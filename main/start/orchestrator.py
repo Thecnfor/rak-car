@@ -100,7 +100,7 @@ class Orchestrator:
     def __init__(self,
                  waypoints: Optional[List[Waypoint]] = None,
                  lane_hz: float = 50.0,
-                 ir_interval_s: float = 0.1,
+                 ir_interval_s: float = 0.02,
                  config_path: Optional[str] = None):
         """config_path: 自定义 task_config.yml 路径, None 走默认 (根目录 task_config.yml)."""
         if waypoints is not None:
@@ -198,7 +198,8 @@ class Orchestrator:
         try:
             for wp in self.waypoints:
                 logger.info("=== navigating to %s ===", wp.name)
-                self._wait_until_triggered(wp, api, dis_buf, tui_buf)
+                self._wait_until_triggered(wp, api, dis_buf, tui_buf,
+                                           interval_s=self.ir_interval_s)
                 if wp.is_finish:
                     logger.info("finish waypoint reached (dis=%.2fm), mission done",
                                 dis_buf[0])
@@ -281,7 +282,7 @@ class Orchestrator:
     @staticmethod
     def _wait_until_triggered(wp: Waypoint, api: ChassisClient,
                               dis_buf: list, tui_buf: List[Dict[str, Any]],
-                              interval_s: float = 0.1) -> None:
+                              interval_s: float = 0.02) -> None:
         """轮询 IR + 里程计，直到 wp 的触发条件满足（默认 AND）。
 
         任一条件字段为 None 时视为「已满足」，避免任务永不触发。

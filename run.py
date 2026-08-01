@@ -22,7 +22,7 @@ from main.start.orchestrator import Orchestrator
 def main() -> None:
     p = argparse.ArgumentParser(prog="run.py", description="rak-car 全流程入口")
     p.add_argument("--lane-hz", type=float, default=50.0)
-    p.add_argument("--ir-interval-s", type=float, default=0.1)
+    p.add_argument("--ir-interval-s", type=float, default=0.02)
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(name)s] %(message)s")
