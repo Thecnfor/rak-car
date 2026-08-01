@@ -23,11 +23,22 @@ def main() -> None:
     p = argparse.ArgumentParser(prog="run.py", description="rak-car 全流程入口")
     p.add_argument("--lane-hz", type=float, default=50.0)
     p.add_argument("--ir-interval-s", type=float, default=0.02)
+    p.add_argument(
+        "--task", type=int, default=None, choices=range(1, 8), metavar="1-7",
+        help=(
+            "只跑单个任务（1-7）: 巡线到该任务点位 → IR/里程计触发 → 执行任务 → 停止。"
+            "不指定时跑全流程 8 任务。"
+        ),
+    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(name)s] %(message)s")
-    Orchestrator(lane_hz=args.lane_hz,
-                 ir_interval_s=args.ir_interval_s).run()
+    orch = Orchestrator(lane_hz=args.lane_hz,
+                        ir_interval_s=args.ir_interval_s)
+    if args.task is not None:
+        orch.run_single_task(args.task)
+    else:
+        orch.run()
 
 
 if __name__ == "__main__":

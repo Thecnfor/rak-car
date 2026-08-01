@@ -143,7 +143,12 @@ class Orchestrator:
         logger.info("loaded %d waypoints from task_config.yml: %s", len(out), wp_summary)
         return out
 
-    def run(self) -> None:
+    def _run_mission(self, waypoints: List[Waypoint]) -> List[str]:
+        """核心逻辑：初始化底盘/巡线/IR/里程计/TUI，按 waypoints 列表顺序导航并执行任务。
+
+        由 run()（全流程）和 run_single_task()（单任务测试）共用。
+        返回 completed 列表。
+        """
         client = RuntimeApiClient()
         if not client.wait_until_ready(timeout=10.0):
             raise RuntimeError("runtime not ready (pm2 logs rak-car-api)")
@@ -215,7 +220,7 @@ class Orchestrator:
 
         completed: List[str] = []
         try:
-            for wp in self.waypoints:
+            for wp in waypoints:
                 logger.info("=== navigating to %s ===", wp.name)
                 self._wait_until_triggered(wp, api, dis_buf, tui_buf,
                                            interval_s=self.ir_interval_s)
@@ -258,6 +263,28 @@ class Orchestrator:
                 pass
             # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
             logger.info("mission completed: %s", completed)
+        return completed
+
+    def run(self) -> None:
+        """全流程 8 任务（巡线 + IR/里程计触发 + 顺序执行）。"""
+        self._run_mission(self.waypoints)
+
+    def run_single_task(self, task_id: int) -> None:
+        """单任务独立测试模式：只巡线到一个任务点位，触发后执行该任务，然后停止。
+
+        Args:
+            task_id: 任务编号 1-7。
+        """
+        wp = next((w for w in self.waypoints if w.task_id == task_id), None)
+        if wp is None:
+            available = sorted(
+                {w.task_id for w in self.waypoints if w.task_id is not None}
+            )
+            raise ValueError(
+                f"waypoints 中没有 task_id={task_id}，可用: {available}"
+            )
+        logger.info("single-task mode: task_id=%d → waypoint %s", task_id, wp.name)
+        self._run_mission([wp])
 
 # ── 后台线程 ────────────────────────────────────────────
 
