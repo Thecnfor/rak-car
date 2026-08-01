@@ -118,7 +118,7 @@ class LifecycleMixin:
         # 但**不**单独补 reset_x —— 复用路径下 x 由视觉闭环控制，避免 auto-init 反复撞墙
         # (commit fb24b1a 描述的 PM2 死循环)。
         try:
-            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.03"))
+            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.05"))
             reset_res = car.arm.reset_all(
                 arm_angle=90,        # 复位位 +90°
                 hand_angle=-90,      # UP
@@ -229,7 +229,7 @@ class LifecycleMixin:
                         # 反复撞墙触发 commit fb24b1a 描述的 PM2 死循环;只有真正创建新 car 的
                         # _create_car_locked 才默认 reset_x=True 撞墙定原点。
                         try:
-                            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.03"))
+                            init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.05"))
                             reset_res = self.car.arm.reset_all(
                                 arm_angle=90,
                                 hand_angle=-90,
