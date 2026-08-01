@@ -11,6 +11,18 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+class ArmSafetyError(ValueError):
+    """机械臂安全门拦截时抛的异常。
+
+    业务层入口（move_x / move_y / set_arm_angle / set_hand_angle）目前的
+    保护区检查仍统一抛 ``ValueError``；本类作为 ``ValueError`` 的子类提供
+    显式语义——调用方可以用 ``except ArmSafetyError`` 单独拦截安全门拦截，
+    而不必 match 字符串。当前所有安全检查仍抛 ValueError 的实现在此统一
+    收敛前，本类可被后续代码直接 raise / 作基类使用。
+    """
+    pass
+
+
 class SafetyMixin:
     """ArmClient 的安全门行为."""
 
