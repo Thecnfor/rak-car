@@ -1,17 +1,21 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-"""task4 / task4_harvest —— 抓取作物.
+"""任务四: 作物抓取 (收割).
 
-业务逻辑: main.arm.each_task.task4.target4.step_target4
-(4642 LOC, am 分支移植). 完整业务流程:
-  - 摆臂到 target1 (y=-133, arm=+90°, hand=0°)
-  - 循环: 底盘前移 + 视觉识别 + 抓球
-  - 多轮抓取后回 init 位
+实际业务逻辑委托至: main.arm.each_task.task4.target4.step_target4
+(约 4642 行, 移植自 am 分支).
 
-本文件只做薄封装: new ArmClient + ArmRunner, 调 step_target4.
-如果 client 已传就复用 (orchestrator 场景);否则内部 new RuntimeApiClient.
+完整业务流程概览:
+  1. 摆臂到初始姿态 target1 (Y=-133, 大臂=+90°, 手爪=0°)
+  2. 进入循环: 底盘前移 → 视觉识别作物 → 抓取作物 → 放入存储
+  3. 多轮抓取完毕后, 机械臂回到 init 等待位
 
-失败语义: step_target4 抛任何异常都往上抛, orchestrator 捕获.
+本文件职责: 纯薄封装. 只负责:
+  - 新建或复用 RuntimeApiClient (orchestrator 传 client 场景下不复用新连接)
+  - 新建 ArmClient + ArmRunner
+  - lazy import 并调用 step_target4
+
+失败语义: step_target4 内部抛出的任何异常都直接向上抛出, 由 orchestrator 统一捕获.
 """
 from __future__ import annotations
 
@@ -22,19 +26,23 @@ from main.arm import ArmClient, ArmRunner
 
 
 def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
-    """task4 入口. 包装 each_task.task4.target4.step_target4.
+    """任务四主入口: 薄封装 step_target4.
 
     Args:
-        client: 复用的 RuntimeApiClient;None 时内部 new.
+        client: 复用 RuntimeApiClient; None 时内部新建连接 (orchestrator 场景走复用).
 
     Returns:
-        {"ok": bool, "task": "task4_harvest", "detail": step_target4 返回值}
+        Dict: {
+            "ok": bool,                    # step_target4 成功与否
+            "task": "task4_harvest",      # 固定任务名
+            "detail": step_target4 原始返回值  # 业务层详细数据
+        }
     """
     cli = client or RuntimeApiClient()
     arm = ArmClient(http=cli)
     runner = ArmRunner(arm)
 
-    # lazy import: each_task 包是业务代码,不进 cold path
+    # lazy import: each_task 包体积较大, 不进入 cold path
     from main.arm.each_task.task4.target4 import step_target4
 
     detail = step_target4(

@@ -2,7 +2,7 @@
 
 外部 import 只允许指向 main.*，不接触 runtime / smartcar。
 """
-from .api import ArmClient
+from .api import ArmClient, ArmSafetyError
 from .state import (
     ArmState,
     ArmOrigin,
@@ -32,7 +32,7 @@ from .vision import (
 )
 
 __all__ = [
-    "ArmClient", "ArmRunner", "ArmState", "ArmOrigin",
+    "ArmClient", "ArmSafetyError", "ArmRunner", "ArmState", "ArmOrigin",
     "SIDES", "HANDS", "STORAGE_SIDES",
     "STORAGE_DEFAULT_LEFT_ANGLE", "STORAGE_DEFAULT_RIGHT_ANGLE",
     "OriginCalibrator", "run_calibrator",

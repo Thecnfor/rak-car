@@ -68,8 +68,8 @@ class Waypoint:
 # 保留 DEFAULT_WAYPOINTS 作为 fallback —— 启动时优先从 yaml 加载.
 DEFAULT_WAYPOINTS: List[Waypoint] = [
     Waypoint("task1_seeding",     task_id=1,
-             ir_threshold_m=0.6, ir_side="right",
-             dis_at_least_m=1.00, trigger_op="AND"),
+             ir_threshold_m=0.65, ir_side="right",
+             dis_at_least_m=0.8, trigger_op="AND"),
     Waypoint("task2_water_tower", task_id=2,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=5.20, trigger_op="AND"),
@@ -100,7 +100,7 @@ class Orchestrator:
     def __init__(self,
                  waypoints: Optional[List[Waypoint]] = None,
                  lane_hz: float = 50.0,
-                 ir_interval_s: float = 0.1,
+                 ir_interval_s: float = 0.02,
                  config_path: Optional[str] = None):
         """config_path: 自定义 task_config.yml 路径, None 走默认 (根目录 task_config.yml)."""
         if waypoints is not None:
@@ -138,6 +138,16 @@ class Orchestrator:
         client = RuntimeApiClient()
         if not client.wait_until_ready(timeout=10.0):
             raise RuntimeError("runtime not ready (pm2 logs rak-car-api)")
+
+        # 任务启动前清零里程计：每次 run.py 从零点起算，避免沿用上次任务的累计距离。
+        # 旧 car_start_2026.py 的 init() 会清零；orchestrator 接管后必须显式补上，
+        # 否则 run.py 连跑两次，第二次的 dis 起点 = 第一次的终点，所有 dis 阈值/终点全乱。
+        try:
+            client.execute("car", "reset_position", sync=True, timeout=10.0)
+            logger.info("odometry reset: mission starts from distance 0")
+        except Exception as exc:
+            logger.warning("reset_position failed, dis baseline may be stale: %s", exc)
+
         api = ChassisClient.connect()
         try:
             api.start_lane_feed(hz=self.lane_hz)
@@ -198,7 +208,8 @@ class Orchestrator:
         try:
             for wp in self.waypoints:
                 logger.info("=== navigating to %s ===", wp.name)
-                self._wait_until_triggered(wp, api, dis_buf, tui_buf)
+                self._wait_until_triggered(wp, api, dis_buf, tui_buf,
+                                           interval_s=self.ir_interval_s)
                 if wp.is_finish:
                     logger.info("finish waypoint reached (dis=%.2fm), mission done",
                                 dis_buf[0])
@@ -266,8 +277,15 @@ class Orchestrator:
 
     @staticmethod
     def _pause_lane(runner: DoubleLoopRunner, api: ChassisClient) -> None:
-        """暂停外环（#1）：runner.pause() 阻塞下一帧 + 主动发零速兜底。"""
-        runner.pause()
+        """暂停外环（#1）：runner.pause() 同步等到外环确认停住（已补发零速），
+        再主动发零速兜底（双保险，防止在途非零帧残留）。
+
+        旧实现 pause() 是异步的：外环当前帧可能在 stop_wheel_speeds() 之后
+        又下发非零，且随后阻塞不再补零 → 车停不下来。现在 pause() 同步后才返回。
+        """
+        paused = runner.pause()
+        if not paused:
+            logger.warning("runner.pause() 超时未确认，外环线程可能已退出，仍补发零速")
         try:
             api.stop_wheel_speeds()
         except Exception:
@@ -281,7 +299,7 @@ class Orchestrator:
     @staticmethod
     def _wait_until_triggered(wp: Waypoint, api: ChassisClient,
                               dis_buf: list, tui_buf: List[Dict[str, Any]],
-                              interval_s: float = 0.1) -> None:
+                              interval_s: float = 0.02) -> None:
         """轮询 IR + 里程计，直到 wp 的触发条件满足（默认 AND）。
 
         任一条件字段为 None 时视为「已满足」，避免任务永不触发。

@@ -1,28 +1,32 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-"""main/tasks/get_order.py
+"""任务六: 智能接单 (推杆扫订单 + OCR 读单 + 抓取对应蔬菜).
 
-Task 6: get_order (smart order pickup / 智能接单).
+推杆动作完整序列 (sweep 期间 Y 保持 = 0 触底):
+  1. X 收至 -200 mm (PID 闭环定位)
+  2. 大臂 arm → -95° + 等待 2s 稳定
+  3. 手爪 hand → -90° + 等待 1s 稳定
+  4. Y 下降 → 0 mm (触底限位, 推杆前保持此高度)
+  5. hand → -55° (推杆准备姿态)
+  6. X 推杆扫动: -200 → -120 @ 100 mm/s (PID 闭环带动推牌杆)
+  7. X 回退 → -150 mm (调整位置)
+  8. 先抬 Y → -80 (防碰撞) 再转大臂 arm → -85° (读单姿态)
+  9. hand → -55° (确认)
+  10. Y → -100 mm (安全抬升)
 
-Full motion sequence (Y=0 during sweep):
-  1. X → -200 mm (PID)
-  2. arm → -95° + settle 2s
-  3. hand → -90° + settle 1s
-  4. Y → 0 mm (touch bottom)          ← sweep 时 Y 保持 0
-  5. hand → -45° (push-bar ready)
-  6. X sweep: -200 → -120 at 100 mm/s (推杆, PID 闭环)
-  7. X → -150 mm (reposition)
-  8. arm → -85° (carry-ready)
-  9. hand → -45° (confirm)
-  10. Y → -100 mm (safe lift)
+=== 分阶段划分 ===
+  阶段 1-2: 推杆动作 + X/Y/arm 复位 (读单前姿态准备)
+  阶段 3  : LLM × 2 轮读单 (调用 test_order_read.run)
+  阶段 4  : 抓取对应蔬菜 → LLM 视觉识别 + 真空抓取 × 2 棵
+  阶段 5  : 回到运送待命姿态 (准备给任务七, 目前 stub)
 
-Phases:
-  Phase 1-2: push-bar pose + sweep + reposition
-  Phase 3: order reading ×2 via LLM (→ test_order_read.run)
-  Phase 4: pick goods — veggie detect + vacuum pick ×2
-  Phase 5: carry pose for Task 7 (stub)
+动作辅助函数来源: 统一走 main.arm.ArmRunner (含 y 保护区 / 角度硬限 /
+丢步核对 / composite_* 并发执行). 自定义的安全门不再存在 —— SafetyMixin
+在每个动作入口处统一校验.
 
-Motion helpers: 统一从 main.task._helpers 取 (与 task1/task2 共用)。
+架构说明 (2026-08 重构):
+  本任务使用 main.arm.ArmRunner + CompositeMixin 编排动作,
+  不再依赖 main/task/_helpers.py (该文件已删除, 详见 main/task/README.md).
 """
 from __future__ import annotations
 
@@ -31,402 +35,429 @@ import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
+import yaml
+
 from main.api_client import RuntimeApiClient
-from main.task._helpers import (
-    _ensure_runtime,
-    _wait_infer_ready,
-    _move_x,
-    _move_y,
-    _set_arm_angle,
-    _set_hand_angle,
-    _grasp,
-    _chassis_move_for,
-    _move_x_checked,
-    _read_x_mm,
-)
+from main.arm import ArmClient, ArmRunner
 from main.misc.test_order_read import run as order_read_run
 from main.misc.test_veggie_detect import run as veggie_detect_run
-
-import yaml
 
 # task6 配置独立保留在 test/task6_config.yml (避免侵入 task_config.yml 其它段)
 _TASK6_CONFIG = Path(_PROJECT_ROOT) / "test" / "task6_config.yml"
 
+logger = logging.getLogger("task.get_order")
+
+
+# ── 配置加载 ──────────────────────────────────────────────────
 
 def _load_task6_config() -> Dict[str, Any]:
-    """只读 test/task6_config.yml, 不碰 task_config.yml."""
+    """加载任务六独立配置 (只读 test/task6_config.yml, 不侵入 task_config.yml)."""
     if not _TASK6_CONFIG.exists():
         raise FileNotFoundError(f"任务六配置文件不存在: {_TASK6_CONFIG}")
     with _TASK6_CONFIG.open("r", encoding="utf-8") as f:
         data = yaml.safe_load(f) or {}
     cfg = data.get("get_order") if isinstance(data, dict) else {}
     if not cfg or cfg.get("placeholder"):
-        raise KeyError("task6_config.yml 中没有 get_order 段")
+        raise KeyError("task6_config.yml 中未找到 get_order 配置段或为占位")
     return cfg
 
-logger = logging.getLogger("task.get_order")
 
+# ── 蔬菜货架 X 坐标映射 (从上到下共 4 行) ──
 
-# ── 货架 X 位置（从上到下 4 行）──
 _SHELF_X_BY_ROW = [-50.0, -100.0, -140.0, -180.0]
 
 
 def _pos_to_row(pos: str) -> int:
-    """将 LLM 输出的位置文字映射到货架行号 (0=最上1, 3=最下4).
+    """将 LLM 输出的中文位置文本映射到货架行号 (0=最上第1行, 3=最下第4行).
 
-    格式: "右1"=右边第一排第1行, "左3"=左边第二排第3行.
+    支持格式示例: "右1"=右排第1行, "左3"=左排第3行.
+    解析失败 fallback 到第 2 行 (下标 1).
     """
     pos = (pos or "").strip()
     m = re.search(r'[左右]\s*(\d)', pos)
     if m:
         n = int(m.group(1))
         return max(0, min(3, n - 1))  # 1→0, 2→1, 3→2, 4→3
-    return 1  # fallback
+    return 1  # 兜底: 默认第 2 行
 
 
 def _pos_to_side(pos: str) -> str:
-    """返回 'left' 或 'right'."""
+    """根据中文位置判断货架左右排, 返回 'left' 或 'right'."""
     return "left" if "左" in (pos or "") else "right"
 
 
-def _pick_one_veggie(client, target_x_mm: float, carry_y_mm: float,
-                     drop_y_mm: float, label: str = ""):
-    """取一个蔬菜: X到位→末端0°→Y降→吸→Y抬→X→0→末端-90°大臂+95°→Y降→放.
+# ── 底盘移动 ──────────────────────────────────────────────────
+
+def _chassis_move_for(
+    arm_client: ArmClient,
+    dx_m: float,
+    timeout: float,
+) -> dict:
+    """底盘纵向 move_for 阻塞调用 (sync=True 等结果)."""
+    return arm_client._call_car("move_for", dx_m, timeout=timeout, sync=True)
+
+
+# ── 单棵蔬菜抓取+投放 (走 ArmRunner + composite_*) ──────────────────
+
+def _pick_one_veggie(
+    arm_client: ArmClient,
+    runner: ArmRunner,
+    target_x_mm: float,
+    carry_y_mm: float,
+    drop_y_mm: float,
+    label: str = "",
+) -> None:
+    """单棵蔬菜抓取+投放流程: 抓取预备 → 抓取 → 投放预备 → 投放.
+
+    执行顺序 (composite_run 内置并发 + SafetyMixin 自动 y 保护区校验):
+      1. composite_run: 大臂 → -95° + 手爪 → -10° + Y → -200 (预备, 并发)
+      2. composite_run: X → target_x_mm + 手爪 → 0° (伸出, 并发)
+      3. move_y → -20 (下降接近蔬菜)
+      4. grasp on + 真空稳定等待
+      5. move_y → carry_y (运输高度, 第 1 棵 -110, 第 2 棵 -140 避免碰撞)
+      6. composite_run: X → 0 + 大臂 → +95° + 手爪 → -20° (投放姿态, 并发)
+      7. move_y → drop_y (第 1 棵 -40, 第 2 棵 -80 防止堆叠)
+      8. grasp off 释放
 
     Args:
-        target_x_mm: 该蔬菜对应的货架 X 位置
-        carry_y_mm: 吸取后抬升 Y（第一个 -90, 第二个 -140）
-        drop_y_mm: 投放时下降 Y（第一个 -40, 第二个 -80）
-        label: 日志标记
+        target_x_mm: 该蔬菜所在货架行对应的 X 坐标
+        carry_y_mm: 吸取后抬升的 Y
+        drop_y_mm: 投放时下降的 Y
+        label: 用于日志标识的蔬菜名称
     """
     tag = f"[{label}]" if label else ""
-    logger.info("%s pick: X=%.0f carry_y=%.0f drop_y=%.0f", tag, target_x_mm, carry_y_mm, drop_y_mm)
+    logger.info("%s 抓取: X=%.0f 抬升Y=%.0f 投放Y=%.0f", tag, target_x_mm, carry_y_mm, drop_y_mm)
 
-    # 0) 恢复取菜姿势: arm→-95°, hand→-10°, Y→-200
-    _set_arm_angle(client, -95.0, speed=40)
-    time.sleep(1.5)
-    _set_hand_angle(client, -10.0, speed=80)
+    # 1) 抓取预备姿态: 大臂 → -95° + 手爪 → -10° + Y → -200 (并发)
+    runner.client.composite_run(arm=-95.0, hand=-10.0, y_mm=-200.0)
+
+    # 2) 伸出 + 手爪朝下: X → target_x_mm + 手爪 → 0° (并发)
+    runner.client.composite_run(x_mm=target_x_mm, hand=0.0)
+
+    # 3) 下降到接近蔬菜
+    runner.move_y(-20.0)
+    logger.info("  %s X → %.0f mm, 手爪→0°, Y→-20 mm (抓取就绪)", tag, target_x_mm)
+
+    # 4) 开真空吸盘吸住蔬菜 → 稳定等待
+    runner.grasp(on=True)
     time.sleep(0.5)
-    _move_y(client, -200.0)
-    logger.info("  %s pose reset: arm=-95 hand=-10 Y=-200", tag)
+    logger.info("  %s 真空开启 (吸附保持)", tag)
 
-    # 1) X 到位
-    _move_x(client, target_x_mm, v_max_mms=40.0)
-    logger.info("  %s X -> %.0f mm", tag, target_x_mm)
+    # 5) Y 抬升到运输安全高度
+    runner.move_y(carry_y_mm)
+    logger.info("  %s Y → %.0f mm (运输高度)", tag, carry_y_mm)
 
-    # 2) 先转末端 0°, 再降 Y 到 -20
-    _set_hand_angle(client, 0.0, speed=80)
+    # 6) 投放前转换姿态: X 收回 + 大臂 + 手爪 (并发)
+    runner.client.composite_run(x_mm=0.0, arm=95.0, hand=-20.0)
+    logger.info("  %s X → 0, 大臂→+95°, 手爪→-20° (投放姿态)", tag)
+
+    # 7) Y 下降到投放高度
+    runner.move_y(drop_y_mm)
+    logger.info("  %s Y → %.0f mm (投放)", tag, drop_y_mm)
+
+    # 8) 关真空释放蔬菜
+    runner.grasp(on=False)
     time.sleep(0.3)
-    _move_y(client, -20.0)
-    logger.info("  %s hand -> 0 deg, Y -> -20 mm (pick ready)", tag)
-
-    # 3) 吸泵: 开气阀吸气→关阀保持真空
-    _grasp(client, True)
-    time.sleep(0.5)
-    logger.info("  %s grasp ON (vacuum hold)", tag)
-
-    # 4) Y 抬升
-    _move_y(client, carry_y_mm)
-    logger.info("  %s Y -> %.0f mm (carry)", tag, carry_y_mm)
-
-    # 5) 投放: 先 X→0, 再转大臂+末端
-    _move_x(client, 0.0, v_max_mms=80.0)
-    logger.info("  %s X -> 0 mm", tag)
-    _set_arm_angle(client, 95.0, speed=40)
-    time.sleep(1.5)
-    _set_hand_angle(client, -20.0, speed=80)
-    time.sleep(0.5)
-    logger.info("  %s arm -> +95 deg, hand -> -20 deg (drop pose)", tag)
-
-    # 6) Y 下降投放
-    _move_y(client, drop_y_mm)
-    logger.info("  %s Y -> %.0f mm (drop)", tag, drop_y_mm)
-
-    # 7) 放气
-    _grasp(client, False)
-    time.sleep(0.3)
-    logger.info("  %s grasp OFF (release)", tag)
+    logger.info("  %s 真空关闭 (释放)", tag)
 
 
-def _enter_push_bar_pose(client, cfg):
-    """Push-bar pose → sweep → reposition — full sequence.
+# ── 推杆姿态 + 扫牌 + 读单姿态 ──────────────────────────────────────
 
-    Target sequence (values from task_config.yml):
-      1. X → push_bar_pose.x_mm (PID)
-      2. arm → push_bar_pose.arm_angle_deg + settle 2s
-      3. hand → push_bar_pose.hand_angle_deg + settle 1s
-      4. Y → push_bar_pose.y_mm (PID, touch bottom)
-      5. hand → -55° (push-bar ready)
-      6. X sweep: x_mm → sweep_x_end_mm at sweep_speed_mms (推杆, Y=0)
-      7. X → reposition_pose.x_mm (reposition)
-      8. Y → reposition_pose.y_mm (先抬升, 防止转臂碰撞)
-      9. arm → reposition_pose.arm_angle_deg (carry-ready)
-      10. hand → reposition_pose.hand_angle_deg (confirm)
-      11. X → reposition_pose.final_x_mm (final position after lift)
+def _enter_push_bar_pose(
+    arm_client: ArmClient,
+    runner: ArmRunner,
+    cfg: Dict[str, Any],
+) -> None:
+    """推杆姿态准备 → X 扫动推牌 → 调整到读单姿态 — 完整序列.
 
-    Motion order (critical to avoid Jetson brown-out / cam2 USB disconnect):
-      X first, then arm + sleep 2s, then hand + sleep 1s, then Y.
+    目标动作顺序 (参数取自 task6_config.yml):
+      第一部分 (推杆姿态准备):
+        1. X 收至 push_bar_pose.x_mm (PID 闭环)
+        2. 大臂 arm → push_bar_pose.arm_angle_deg + 等待 2s 稳定
+        3. 手爪 hand → push_bar_pose.hand_angle_deg + 等待 1s 稳定
+        4. Y 下降 → push_bar_pose.y_mm (PID 闭环, 直至触底限位)
+        5. hand → -55° (推杆姿态就绪, 手爪作为推牌杆)
+      第二部分 (X 扫动推牌, Y 保持 = 0):
+        6. X 扫动: x_mm → sweep_x_end_mm @ sweep_speed_mms
+      第三部分 (调整到读单姿态):
+        7. X 回退 → reposition_pose.x_mm (中途重定位)
+        8. Y 抬升 → reposition_pose.y_mm (先抬 Y 再转大臂, 防 Y=0 转臂碰撞)
+        9. arm → reposition_pose.arm_angle_deg (转到读单/携带姿态)
+       10. hand → reposition_pose.hand_angle_deg (确认)
+       11. X → reposition_pose.final_x_mm (抬升后的最终 X 位置)
+
+    ⚠️ 动作顺序硬约束 (防止 Jetson 瞬时大电流掉电 / cam2 USB 断连):
+       先 X → 再 arm(+sleep 2s) → 再 hand(+sleep 1s) → 最后 Y.
+       顺序绝不能换, 否则多个大电流舵机同时启动会触发硬件保护.
     """
     pose = cfg["push_bar_pose"]
-    v_x = cfg["v_max_arm_x_mms"]
     sweep_end = cfg.get("sweep_x_end_mm", -120.0)
     sweep_speed = cfg.get("sweep_speed_mms", 100.0)
     repos = cfg["reposition_pose"]
 
-    # === push-bar pose ===
+    # === 第一部分: 推杆姿态准备 ===
     logger.info(
-        "Phase 1: push-bar pose (x=%.0f arm=%.0f hand=%.0f y=%.0f)",
+        "阶段 1: 推杆姿态准备 (x=%.0f arm=%.0f hand=%.0f y=%.0f)",
         pose["x_mm"], pose["arm_angle_deg"],
         pose["hand_angle_deg"], pose["y_mm"],
     )
 
-    # a) X axis: PID closed-loop (blocks until reached)
-    _move_x(client, pose["x_mm"], v_max_mms=v_x)
-    logger.info("  X -> %.0f mm done", pose["x_mm"])
+    # a) X 轴: PID 闭环移动到位
+    runner.move_x(float(pose["x_mm"]))
+    logger.info("  X → %.0f mm 完成", pose["x_mm"])
 
-    # b) arm rotation
-    _set_arm_angle(client, pose["arm_angle_deg"], speed=40)
-    time.sleep(2.0)  # big rotation settle
-    logger.info("  arm -> %.0f deg done", pose["arm_angle_deg"])
+    # b) 大臂旋转 (大扭矩动作, 单独执行 + 长等待稳定)
+    runner.set_arm_angle(float(pose["arm_angle_deg"]), speed=40)
+    time.sleep(2.0)
+    logger.info("  大臂 → %.0f° 完成", pose["arm_angle_deg"])
 
-    # c) hand rotation to -90°
-    _set_hand_angle(client, pose["hand_angle_deg"], speed=80)
+    # c) 手爪旋转到 -90°
+    arm_client.set_hand_angle(float(pose["hand_angle_deg"]), speed=80, timeout=10.0)
     time.sleep(1.0)
-    logger.info("  hand -> %.0f deg done", pose["hand_angle_deg"])
+    logger.info("  手爪 → %.0f° 完成", pose["hand_angle_deg"])
 
-    # d) Y axis: PID closed-loop to bottom
-    _move_y(client, pose["y_mm"])
-    logger.info("  Y -> %.0f mm done (sweep 前 Y 已触底)", pose["y_mm"])
+    # d) Y 轴: PID 闭环下降到底部限位 (必须最后执行 Y)
+    runner.move_y(float(pose["y_mm"]))
+    logger.info("  Y → %.0f mm 完成 (扫动前 Y 已触底)", pose["y_mm"])
 
-    # e) hand → -55° (push-bar ready)
-    _set_hand_angle(client, -55.0, speed=80)
+    # e) 手爪转到 -55° (与推牌杆配合的推杆姿态)
+    arm_client.set_hand_angle(-55.0, speed=80, timeout=10.0)
     time.sleep(0.5)
-    logger.info("  hand -> -55 deg done (push-bar ready)")
+    logger.info("  手爪 → -55° 完成 (推杆姿态就绪)")
 
-    logger.info("Push-bar pose ready (X=%.0f arm=%.0f hand=-45 Y=%.0f)",
+    logger.info("推杆姿态就绪 (X=%.0f arm=%.0f hand=-45 Y=%.0f)",
                 pose["x_mm"], pose["arm_angle_deg"], pose["y_mm"])
 
-    # === sweep: X at Y=0, PID closed-loop ===
-    logger.info("Phase 1b: sweep X %.0f → %.0f at %.0f mm/s (Y=%.0f)",
+    # === 第二部分: X 扫动推牌 (Y 保持触底) ===
+    logger.info("阶段 1b: X 扫动推牌 %.0f → %.0f @ %.0f mm/s (Y=%.0f)",
                 pose["x_mm"], sweep_end, sweep_speed, pose["y_mm"])
-    _move_x(client, sweep_end, v_max_mms=sweep_speed)
-    logger.info("  sweep done, X=%.0f mm", sweep_end)
+    runner.move_x(float(sweep_end))
+    logger.info("  扫动完成, X=%.0f mm", sweep_end)
 
-    # === reposition ===
+    # === 第三部分: 调整到读单姿态 ===
     logger.info(
-        "Phase 1c: reposition (x=%.0f arm=%.0f hand=%.0f y=%.0f)",
+        "阶段 1c: 调整读单姿态 (x=%.0f arm=%.0f hand=%.0f y=%.0f)",
         repos["x_mm"], repos["arm_angle_deg"],
         repos["hand_angle_deg"], repos["y_mm"],
     )
 
-    # f) X → repos.x_mm (先移到 -170)
-    _move_x(client, repos["x_mm"], v_max_mms=v_x)
-    logger.info("  X -> %.0f mm done", repos["x_mm"])
+    # f) X 先移到 reposition x
+    runner.move_x(float(repos["x_mm"]))
+    logger.info("  X → %.0f mm 完成", repos["x_mm"])
 
-    # g) Y → repos.y_mm (先抬升 Y 再转大臂，防止 Y=0 时转臂撞到)
-    _move_y(client, repos["y_mm"])
-    logger.info("  Y -> %.0f mm done", repos["y_mm"])
+    # g) Y 先抬升 (必须先抬 Y 再转大臂, 避免 Y=0 时大臂横扫撞到推牌机构)
+    runner.move_y(float(repos["y_mm"]))
+    logger.info("  Y → %.0f mm 完成", repos["y_mm"])
 
-    # h) arm → repos.arm_angle_deg
-    _set_arm_angle(client, repos["arm_angle_deg"], speed=40)
+    # h) 大臂转到读单/携带角度
+    runner.set_arm_angle(float(repos["arm_angle_deg"]), speed=40)
     time.sleep(1.5)
-    logger.info("  arm -> %.0f deg done", repos["arm_angle_deg"])
+    logger.info("  大臂 → %.0f° 完成", repos["arm_angle_deg"])
 
-    # i) hand → repos.hand_angle_deg (confirm)
-    _set_hand_angle(client, repos["hand_angle_deg"], speed=80)
+    # i) 手爪转到确认角度
+    arm_client.set_hand_angle(float(repos["hand_angle_deg"]), speed=80, timeout=10.0)
     time.sleep(0.5)
-    logger.info("  hand -> %.0f deg done", repos["hand_angle_deg"])
+    logger.info("  手爪 → %.0f° 完成", repos["hand_angle_deg"])
 
-    # j) X → final_x_mm (Y 抬升+转臂后编码器可能偏移, 不用校验防误杀)
-    final_x = repos.get("final_x_mm", -140)
-    _move_x(client, final_x, v_max_mms=v_x)
-    logger.info("  X -> %.0f mm done", final_x)
+    # j) 最后精修 X 坐标 (抬 Y+转臂后编码器可能漂移, 这里不做严格校验避免误杀)
+    final_x = float(repos.get("final_x_mm", -140))
+    runner.move_x(final_x)
+    logger.info("  X → %.0f mm 完成", final_x)
 
-    logger.info("Full push-bar + sweep + reposition complete")
-
-
-# ============================================================
-# Phase 3-5: subsequent steps (stubs only)
-# Phase 1 (push-bar pose + sweep) is handled by _enter_push_bar_pose
-# ============================================================
-
-def _detect_and_ocr(client, cfg):
-    """Phase 3: cam2 detect front order + OCR read + parse. Stub."""
-    raise NotImplementedError("Phase 3 detect_and_ocr - to be implemented")
-
-
-def _pick_goods(client, cfg):
-    """Phase 4: physically pick 5cm cube from order shelf. Stub."""
-    raise NotImplementedError("Phase 4 pick_goods - to be implemented")
-
-
-def _lift_and_carry(client, cfg):
-    """Phase 5: lift + carry pose (prepare for Task 7). Stub."""
-    raise NotImplementedError("Phase 5 lift_and_carry - to be implemented")
+    logger.info("推杆 + 扫牌 + 读单姿态调整完成")
 
 
 # ============================================================
-# run() entry point
+# 阶段 3-5 存根 (目前 stub, 部分逻辑已在 run() 中内联实现)
+# 阶段 1-2 (推杆姿态 + 扫牌) 由 _enter_push_bar_pose 统一处理
 # ============================================================
 
-def run(client: Optional[RuntimeApiClient] = None):
-    """Task 6 main entry. Runs push-bar pose + sweep + reposition.
+def _detect_and_ocr(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -> dict:
+    """阶段 3 存根: cam2 检测前方订单牌 + OCR 读取 + 解析. 当前未实现."""
+    raise NotImplementedError("阶段 3 detect_and_ocr - 待实现")
 
-    Returns: {"ok": bool, "completed": [...], "order_list": [], "error": str}
+
+def _pick_goods(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -> dict:
+    """阶段 4 存根: 物理抓取 5cm 订单方块. 当前未实现 (run 中另有实现)."""
+    raise NotImplementedError("阶段 4 pick_goods - 待实现")
+
+
+def _lift_and_carry(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -> dict:
+    """阶段 5 存根: 抬升 + 运输待命姿态 (为任务七做准备). 当前未实现."""
+    raise NotImplementedError("阶段 5 lift_and_carry - 待实现")
+
+
+# ============================================================
+# run() 主入口
+# ============================================================
+
+def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
+    """任务六主入口: 推杆扫牌 + LLM 双轮读单 + 蔬菜识别匹配 + 抓取投放.
+
+    Args:
+        client: 可选 RuntimeApiClient, None 时内部新建
+
+    Returns:
+        Dict: {
+            "ok": bool,                          # 任务是否成功
+            "completed": List[str],             # 已完成的子步骤列表
+            "order_list": {"round1":[], "round2":[]},  # 两轮 LLM 读单结果
+            "error": str                        # 失败时的错误信息 (仅 ok=False)
+        }
     """
     cfg = _load_task6_config()
 
     if client is None:
         client = RuntimeApiClient()
-    _ensure_runtime(client)
-    _wait_infer_ready(client, timeout_s=30.0)
+    client.wait_until_ready(timeout=30.0)
 
-    completed = []
-    order_list = []
+    # 初始化机械臂客户端与执行器
+    arm_client = ArmClient.connect()
+    if not arm_client.ping():
+        raise RuntimeError("机械臂 runtime 未在线, 请检查 arm_feed 守护进程")
+    runner = ArmRunner(arm_client)
+
+    completed: List[str] = []
+    order_list: List[Dict[str, Any]] = []
 
     try:
-        # ===== Phase 1+2: push-bar pose + sweep + reposition =====
-        logger.info("=== Task 6: push-bar pose + sweep + reposition ===")
-        _enter_push_bar_pose(client, cfg)
-        completed.append("push_bar_pose")
-        completed.append("sweep")
-        completed.append("reposition")
+        # ===== 阶段 1+2: 推杆姿态准备 + X 扫动推牌 + 调整到读单姿态 =====
+        logger.info("=== 任务六阶段 1+2: 推杆姿态 + 扫牌 + 读单姿态调整 ===")
+        _enter_push_bar_pose(arm_client, runner, cfg)
+        completed.extend(["push_bar_pose", "sweep", "reposition"])
 
-        # ===== Phase 3: order detection via LLM (round 1) =====
-        logger.info("=== Phase 3a: order reading round 1 (current position) ===")
+        # ===== 阶段 3a: LLM 读单 (第一轮, 当前位置) =====
+        logger.info("=== 阶段 3a: LLM 读单 第一轮 (当前位置) ===")
         round1 = order_read_run()
         if round1.get("ok") and round1.get("orders"):
-            logger.info("  [round1] %d orders:", len(round1["orders"]))
+            logger.info("  [第一轮] 读取到 %d 条订单:", len(round1["orders"]))
             for o in round1["orders"]:
-                logger.info("    %s ← %s → %s号楼", o["name"], o["goods"], o["address"])
+                logger.info("    客户: %s | 商品: %s | 地址: %s号楼", o["name"], o["goods"], o["address"])
         else:
-            logger.warning("  [round1] failed: %s", round1.get("error", "no orders"))
+            logger.warning("  [第一轮] 读取失败: %s", round1.get("error", "未识别到订单"))
         completed.append("order_read_1")
 
-        # ===== Phase 3b: adjust pose for second reading =====
-        logger.info("=== Phase 3b: X→-150 hand→-70° Y→0 for round 2 ===")
-        _move_x(client, -150.0, v_max_mms=80.0)
-        logger.info("  X -> -150 mm done")
-        _set_hand_angle(client, -70.0, speed=80)
+        # ===== 阶段 3b: 调整姿态 (为第二轮读单做不同角度尝试) =====
+        logger.info("=== 阶段 3b: 调整姿态 X→-150 hand→-70° Y→0 准备第二轮读单 ===")
+        runner.move_x(-150.0)
+        logger.info("  X → -150 mm 完成")
+        arm_client.set_hand_angle(-70.0, speed=80, timeout=10.0)
         time.sleep(0.5)
-        logger.info("  hand -> -70 deg done")
-        _move_y(client, 0.0)
-        logger.info("  Y -> 0 mm done")
+        logger.info("  手爪 → -70° 完成")
+        runner.move_y(0.0)
+        logger.info("  Y → 0 mm 完成")
 
-        # ===== Phase 3c: order detection via LLM (round 2) with retry =====
-        round2 = {"ok": False, "orders": [], "error": "no attempts"}
+        # ===== 阶段 3c: LLM 读单 第二轮 (多角度重试: -70°→-55°→-90°) =====
+        round2: Dict[str, Any] = {"ok": False, "orders": [], "error": "no attempts"}
         for attempt, hand_angle in enumerate([-70.0, -55.0, -90.0]):
-            logger.info("=== Phase 3c: order reading round 2 (hand=%.0f°) ===", hand_angle)
+            logger.info("=== 阶段 3c: LLM 读单 第二轮 (手爪=%.0f°, 第 %d 次尝试) ===", hand_angle, attempt + 1)
             if attempt > 0:
-                _set_hand_angle(client, hand_angle, speed=80)
+                arm_client.set_hand_angle(hand_angle, speed=80, timeout=10.0)
                 time.sleep(0.5)
-                logger.info("  hand -> %.0f deg (retry)", hand_angle)
+                logger.info("  手爪 → %.0f° (重试)", hand_angle)
             round2 = order_read_run()
             if round2.get("ok") and round2.get("orders"):
-                logger.info("  [round2] %d orders (attempt %d, hand=%.0f°):",
+                logger.info("  [第二轮] 读取到 %d 条订单 (第 %d 次尝试, hand=%.0f°):",
                             len(round2["orders"]), attempt + 1, hand_angle)
                 for o in round2["orders"]:
-                    logger.info("    %s ← %s → %s号楼", o["name"], o["goods"], o["address"])
+                    logger.info("    客户: %s | 商品: %s | 地址: %s号楼", o["name"], o["goods"], o["address"])
                 break
-            logger.warning("  [round2] attempt %d failed (hand=%.0f°): %s",
-                           attempt + 1, hand_angle, round2.get("error", "no orders"))
+            logger.warning("  [第二轮] 第 %d 次尝试失败 (hand=%.0f°): %s",
+                           attempt + 1, hand_angle, round2.get("error", "未识别到订单"))
         completed.append("order_read_2")
 
-        # merge both rounds into order_list
+        # 合并两轮读单结果
         order_list = {
             "round1": round1.get("orders", []),
             "round2": round2.get("orders", []),
         }
 
-        # ===== Phase 4: pick goods =====
-        logger.info("=== Phase 4: pick goods ===")
+        # ===== 阶段 4: 识别并抓取订单中的蔬菜 =====
+        logger.info("=== 阶段 4: 抓取订单对应蔬菜 ===")
 
-        # 4a) 调整姿态: Y→-200, arm→-95°, hand→-10°
-        logger.info("  adjusting pick pose: Y→-200 arm→-95 hand→-10")
-        _move_y(client, -200.0)
-        _set_arm_angle(client, -95.0, speed=40)
-        time.sleep(1.5)
-        _set_hand_angle(client, -10.0, speed=80)
-        time.sleep(0.5)
-        logger.info("  pick pose ready")
+        # 4a) 调整抓取预备姿态: Y→-200, arm→-95°, hand→-10°
+        logger.info("  调整抓取预备姿态: Y→-200 arm→-95 hand→-10")
+        runner.client.composite_run(arm=-95.0, hand=-10.0, y_mm=-200.0)
+        logger.info("  抓取预备姿态就绪")
 
-        # 4b) 底盘前进 18cm
-        _chassis_move_for(client, dx_m=0.15, timeout=30.0)
-        logger.info("  chassis forward 15cm done")
+        # 4b) 底盘前进 15cm 靠近蔬菜货架
+        _chassis_move_for(arm_client, dx_m=0.15, timeout=30.0)
+        logger.info("  底盘前进 15cm 完成")
 
-        # 4c) 蔬菜识别
-        logger.info("  running veggie detection via LLM...")
+        # 4c) LLM 视觉识别货架上所有蔬菜
+        logger.info("  调用 LLM 进行蔬菜识别...")
         veggie_result = veggie_detect_run()
         veggie_items = veggie_result.get("items", []) if veggie_result.get("ok") else []
         if not veggie_items:
-            logger.warning("  veggie detection: no items found, skip pick")
+            logger.warning("  蔬菜识别: 未找到任何目标, 跳过抓取")
         else:
-            logger.info("  veggie detection: %d items found", len(veggie_items))
+            logger.info("  蔬菜识别: 共识别到 %d 棵", len(veggie_items))
             for it in veggie_items:
-                logger.info("    [%s] %s conf=%s", it.get("position", "?"), it.get("name", "?"), it.get("confidence", "?"))
+                logger.info("    [位置:%s] %s 置信度:%s",
+                            it.get("position", "?"), it.get("name", "?"), it.get("confidence", "?"))
 
-        # 4d) 从订单中提取需要的蔬菜列表
-        ordered_goods = set()
+        # 4d) 从两轮订单中提取出所有被订购的蔬菜名集合
+        ordered_goods: set = set()
         for rnd in [round1, round2]:
             for o in (rnd.get("orders") or []):
                 g = o.get("goods", "")
                 if g:
                     ordered_goods.add(g)
-        logger.info("  ordered goods: %s", ordered_goods)
+        logger.info("  订单需求蔬菜集合: %s", ordered_goods)
 
-        # 4e) 匹配: 只取订单里有的蔬菜
+        # 4e) 匹配: 优先抓取订单里有的蔬菜; 没匹配到时 fallback 抓右侧货架 (兜底)
         matched = [v for v in veggie_items if v.get("name") in ordered_goods]
         if not matched:
-            logger.warning("  no veggie matches order, falling back to right-side items")
+            logger.warning("  订单蔬菜未匹配识别结果, 兜底: 取右侧货架上的蔬菜")
             matched = [v for v in veggie_items if _pos_to_side(v.get("position", "")) == "right"]
         else:
-            logger.info("  matched %d veggies from order", len(matched))
+            logger.info("  订单匹配成功 %d 棵蔬菜", len(matched))
 
-        # 分左右, 右侧优先取
+        # 分左右排: 右侧优先取 (近, 不需要额外底盘位移)
         right_targets = [v for v in matched if _pos_to_side(v.get("position", "")) == "right"]
         left_targets = [v for v in matched if _pos_to_side(v.get("position", "")) == "left"]
         pick_idx = 0
 
-        # ── 先取右侧 ──
+        # ── 先抓右侧货架 (最多 2 棵, 右侧距离近) ──
         for veg in right_targets[:2]:
             row = _pos_to_row(veg.get("position", ""))
             x_pos = _SHELF_X_BY_ROW[min(row, 3)]
             carry_y = -110.0 if pick_idx == 0 else -140.0
             drop_y = -40.0 if pick_idx == 0 else -80.0
-            label = veg.get("name", f"item{pick_idx+1}")
-            logger.info("  → [right] picking '%s' row=%d X=%.0f (pick %d)", label, row, x_pos, pick_idx+1)
-            _pick_one_veggie(client, x_pos, carry_y, drop_y, label=label)
-            completed.append(f"picked_{pick_idx+1}")
+            label = veg.get("name", f"item{pick_idx + 1}")
+            logger.info("  → [右侧] 抓取 '%s' 行=%d X=%.0f (第 %d 棵)", label, row, x_pos, pick_idx + 1)
+            _pick_one_veggie(arm_client, runner, x_pos, carry_y, drop_y, label=label)
+            completed.append(f"picked_{pick_idx + 1}")
             pick_idx += 1
 
-        # ── 左侧: 底盘前进 13cm 再取 ──
+        # ── 再抓左侧货架 (如果还未抓满 2 棵, 需要底盘再前进 12cm 才够到) ──
         if left_targets and pick_idx < 2:
-            logger.info("  chassis forward 12cm for left-side veggies")
-            _chassis_move_for(client, dx_m=0.12, timeout=30.0)
+            logger.info("  底盘前进 12cm 以够到左侧蔬菜")
+            _chassis_move_for(arm_client, dx_m=0.12, timeout=30.0)
             for veg in left_targets[:2 - pick_idx]:
                 row = _pos_to_row(veg.get("position", ""))
                 x_pos = _SHELF_X_BY_ROW[min(row, 3)]
                 carry_y = -110.0 if pick_idx == 0 else -140.0
                 drop_y = -50.0 if pick_idx == 0 else -100.0
-                label = veg.get("name", f"item{pick_idx+1}")
-                logger.info("  → [left] picking '%s' row=%d X=%.0f (pick %d)", label, row, x_pos, pick_idx+1)
-                _pick_one_veggie(client, x_pos, carry_y, drop_y, label=label)
-                completed.append(f"picked_{pick_idx+1}")
+                label = veg.get("name", f"item{pick_idx + 1}")
+                logger.info("  → [左侧] 抓取 '%s' 行=%d X=%.0f (第 %d 棵)", label, row, x_pos, pick_idx + 1)
+                _pick_one_veggie(arm_client, runner, x_pos, carry_y, drop_y, label=label)
+                completed.append(f"picked_{pick_idx + 1}")
                 pick_idx += 1
 
         if pick_idx == 0:
-            logger.warning("  no targets to pick")
+            logger.warning("  最终未能抓取任何蔬菜 (无可选目标)")
 
         completed.append("pick_goods")
 
     except Exception as exc:
-        logger.exception("get_order failed: %s", exc)
+        logger.exception("get_order 任务失败: %s", exc)
         return {
             "ok": False,
             "completed": completed,
@@ -444,4 +475,4 @@ def run(client: Optional[RuntimeApiClient] = None):
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
     result = run()
-    print("get_order result:", result)
+    print("任务六 智能接单 执行结果:", result)

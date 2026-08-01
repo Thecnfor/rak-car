@@ -74,6 +74,10 @@ def read_dis(
     dt = 1.0 / hz
     deadline = None if max_seconds is None else time.monotonic() + max_seconds
 
+    # 单调保护：累计距离只能增大。读到更小的值（读取失败回落 0 / 里程计被清零）
+    # 一律保持上次读数，避免 dis_buf 中途掉到 0 污染 waypoint 触发判定。
+    last_value: float = 0.0
+
     try:
         while True:
             t0 = time.monotonic()
@@ -86,6 +90,11 @@ def read_dis(
                 value = _read_distance(api, timeout=timeout)
             except Exception:
                 value = float("nan")
+
+            if value != value or value < last_value:
+                value = last_value  # 保持上次，不往下跳
+            else:
+                last_value = value
 
             if on_tick is not None:
                 try:

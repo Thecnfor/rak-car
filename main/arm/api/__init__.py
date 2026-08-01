@@ -17,7 +17,7 @@ from ..trajectory import TrajectoryGenerator
 from .composite import CompositeMixin
 from .motion import MotionMixin
 from .reset_ops import ResetOpsMixin
-from .safety import SafetyMixin
+from .safety import ArmSafetyError, SafetyMixin
 from .setters import SettersMixin
 from .state_io import StateIOMixin
 from .storage import StorageMixin
