@@ -21,6 +21,7 @@ from ..config.lane_follow import (
 )
 from ..loops.closed_loop import DoubleLoopRunner
 from ..loops.telemetry import lane_trace
+from ..loops.tui import lane_tui
 
 
 # 内置 profile 列表（#3）：CLI 与 subscribe_lane_state 共用同一份装配逻辑
@@ -95,6 +96,22 @@ def main(argv: list[str] | None = None) -> None:
         metavar="key=value",
         help="覆盖任意 profile 字段（直接走 dataclasses.replace）",
     )
+    parser.add_argument(
+        "--vx-target",
+        type=float,
+        default=None,
+        help="正交模式的前向速度（m/s）。默认 None=保留 outer 默认值：\n"
+             "  * orthogonal 默认 0.0（原地水平稳定，只横移+旋转修正 d_e/d_a）\n"
+             "  * 传正值切到正交巡航（例如 --vx-target 0.25），\n"
+             "    相当于把 vx 通道也独立打开，三个自由度各管各的",
+    )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="打开 TUI 常驻面板（rich.Live，全屏实时刷新 + 单键快捷键）。\n"
+             "与 --no-trace 互斥（--tui 时 lane_trace 不启动）。\n"
+             "快捷键: r/z 清零积分, p 切换 dry-run, s 急停零速, q 退出",
+    )
     args = parser.parse_args(argv)
 
     profile = _build_profile(args)
@@ -111,8 +128,22 @@ def main(argv: list[str] | None = None) -> None:
         pass
 
     outer = profile.build_outer()
+    # --vx-target 只作用在有 vx_target 字段的控制器（OrthogonalOuterLoop 等），
+    # 用来从"原地水平稳定（vx=0）"切到"正交巡航"。其他 outer 没有这个字段
+    # 也没关系，跳过即可。
+    if args.vx_target is not None and hasattr(outer, "vx_target"):
+        outer.vx_target = float(args.vx_target)
+        if hasattr(outer, "locked_vx"):
+            outer.locked_vx = (outer.vx_target == 0.0)
     smoother = profile.build_smoother()
-    on_tick = None if args.no_trace else lane_trace(outer)
+
+    use_tui = bool(args.tui)
+    # --tui 时自动抑制 --no-trace，不做滚动打印
+    if use_tui:
+        on_tick_factory = None  # 先占位，with 块里拿 runner 后再绑定
+        runner_on_tick = None
+    else:
+        runner_on_tick = None if args.no_trace else lane_trace(outer)
 
     runner = DoubleLoopRunner(
         api=api,
@@ -122,10 +153,16 @@ def main(argv: list[str] | None = None) -> None:
         lost_line_ms=effective_lost_line,
         dry_run=args.dry_run,
         smoother=smoother,
-        on_tick=on_tick,
+        on_tick=None if use_tui else runner_on_tick,
     )
     try:
-        runner.run(max_seconds=effective_max_seconds)
+        if use_tui:
+            with lane_tui(outer, title=f"底盘正交寻路 · {profile.controller_type.value}") as make_cb:
+                on_tick = make_cb(runner)
+                runner.on_tick = on_tick
+                runner.run(max_seconds=effective_max_seconds)
+        else:
+            runner.run(max_seconds=effective_max_seconds)
     finally:
         try:
             api.stop_lane_feed()

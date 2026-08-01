@@ -23,6 +23,7 @@ class ControllerType(str, Enum):
     CURVATURE_ADAPTIVE = "curvature_adaptive"
     STANLEY = "stanley"
     P = "p"
+    ORTHOGONAL = "orthogonal"
 
 
 # ─── Magic-number 集中点（#8）─────────────────────────────────
@@ -74,6 +75,12 @@ class LaneFollowProfile:
         if self.controller_type == ControllerType.P:
             from ..controllers.p_controller import POuterLoop
             return POuterLoop()
+        if self.controller_type == ControllerType.ORTHOGONAL:
+            from ..controllers.orthogonal import OrthogonalOuterLoop
+            # 默认 vx=0："原地水平稳定"；
+            # 如果想切"正交巡航"，传 tuned(controller_type=ORTHOGONAL)
+            # 后再在调用侧 outer.vx_target = 0.30（或新 CLI --vx-target 传）
+            return OrthogonalOuterLoop()
 
         from ..controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
         return CurvatureAdaptiveOuterLoop()
