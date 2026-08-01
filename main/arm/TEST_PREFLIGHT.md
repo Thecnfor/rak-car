@@ -274,3 +274,37 @@ echo "$(date -Iseconds) | $(whoami) | VISUAL_SERVO SMOKE PASS" >> .remember/test
 ```
 
 满足 7/7 才能进赛道。
+
+---
+
+## 13. 架构约束速查（2026-08-01 真机踩坑总结）
+
+### 13.1 arm_queue 积压是"视觉伺服离散/乱跑"的根因 ⚠️
+
+| 症状 | 根因 | 实测数据 |
+|---|---|---|
+| 视觉伺服"不连续 / 离散" | `find_target_track` 每帧发 HTTP `goto_position` 进 arm_queue | 位置闭环 ~500ms/次,视觉 ~8Hz,命令积压 100+ |
+| "停下来了还在乱跑" | queue 里积压的 `goto_position` 继续依次执行 | 191 个 running/queued 积压 |
+| `goto_position` 504 | arm_feed 20Hz poll 占满 arm_queue | 15 次连续 goto_position 全部 504, 0.5 iter/s |
+
+**结论**:位置闭环模式 (`goto_position` / `move_x_position`) 天然 ~500ms/步,不适合高频视觉伺服。**视觉伺服必须用速度模式**。
+
+### 13.2 实时速度通道 (`/v1/realtime/arm-velocity`)
+
+| 项 | 值 |
+|---|---|
+| 端点 | `POST /v1/realtime/arm-velocity` |
+| payload | `{"x_vel": 0.0, "y_vel": 0.0}` 单位 m/s;缺省/null = 该轴不动;`0.0` = 显式停 |
+| 实现 | `service.set_arm_velocity()` → `car.arm.x_speed()/y_speed()` 直发, `_realtime_gate` 免 car_lock, 不进 job_queue |
+| 安全 | `y_speed` 内置磁感安全门 + 末段/顶段减速; `x_speed` 有急停门。**x 无软限位,调用方必须在检测丢失时发 0** |
+| 用法 | 见 `main/arm/examples/07_velocity_track_yellow_ball.py` |
+
+### 13.3 arm_feed 让位机制 (可选但推荐)
+
+`stop_arm_feed(force=True)` 释放串口给视觉伺服(降 queue 竞争); 跑完 `start_arm_feed(20Hz)` 恢复。
+安全前提: arm_feed 不被 lane_follow 外环依赖。06/07 脚本已内置该逻辑。
+
+### 13.4 单测覆盖提醒
+
+- `test_vision_track.py` 测 `find_target_track` — 但 track 模式**不写 trace**(`trace=()`),只返回 `iterations`。若需逐帧观测请用 velocity 模式 (07 脚本) 或自写循环。
+- `find_target_realtime` 默认 `on_missing_track="abort"`(5 帧未命中抛错); `find_target_track` 默认 `"wait"`(不抛,等目标回来)。
