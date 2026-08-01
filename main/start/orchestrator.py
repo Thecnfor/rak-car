@@ -135,8 +135,12 @@ class Orchestrator:
                 trigger_op=w.get("trigger_op", "AND"),
                 is_finish=w.get("is_finish", False),
             ))
-        logger.info("loaded %d waypoints from task_config.yml: %s",
-                    len(out), [w.name for w in out])
+        wp_summary = ", ".join(
+            f"{w.name}(side={w.ir_side},thr={w.ir_threshold_m},dis={w.dis_at_least_m},"
+            f"op={w.trigger_op})"
+            for w in out
+        )
+        logger.info("loaded %d waypoints from task_config.yml: %s", len(out), wp_summary)
         return out
 
     def run(self) -> None:
@@ -311,6 +315,10 @@ class Orchestrator:
         IR 分左右：wp.ir_side 取 left / right，"any" 表示两侧任一触发即可。
         每轮更新 tui_buf 供 TUI 线程读取。
         """
+        # 诊断(#task2-not-stop): 目标 IR 侧每次从"高于阈值"→"低于阈值"打一条日志,
+        # 记录触发瞬间的 dis —— 用于判断是否 AND 窗口错位 (IR 触发时 dis 门限还没到).
+        fired_before = False
+        last_diag_log = 0.0
         while True:
             ir: dict = {}
             try:
@@ -337,6 +345,21 @@ class Orchestrator:
                 ir_ok = right is not None and right < wp.ir_threshold_m
 
             dis_ok = (wp.dis_at_least_m is None or dis >= wp.dis_at_least_m)
+
+            # 诊断日志: 首次触发 + 持续触发期间每 ~1s 提醒 (看"等 dis"阶段), IR 回升则复位.
+            if wp.ir_threshold_m is not None and ir_ok:
+                if not fired_before:
+                    fired_before = True
+                    last_diag_log = time.time()
+                    logger.info("[trigger] %s IR %s fired at dis=%.2f (gate=%s, dis_ok=%s)",
+                                wp.name, wp.ir_side, dis, wp.dis_at_least_m, dis_ok)
+                elif time.time() - last_diag_log >= 1.0:
+                    last_diag_log = time.time()
+                    logger.info("[trigger] %s IR %s still fired at dis=%.2f (gate=%s, dis_ok=%s)",
+                                wp.name, wp.ir_side, dis, wp.dis_at_least_m, dis_ok)
+            elif wp.ir_threshold_m is not None:
+                fired_before = False  # IR 回升到阈值以上 → 复位, 下次再触发会重新打日志
+
             hit = (ir_ok and dis_ok) if wp.trigger_op == "AND" else (ir_ok or dis_ok)
             if hit:
                 logger.info("triggered: %s (ir_left=%s ir_right=%s dis=%.2f)",
