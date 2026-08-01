@@ -21,7 +21,7 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         dkappa_full: float = 1.0,
         kp_y: float = 0.55,
         kp_theta: float = 1.10,
-        kp_theta_straight: float = 0.85,
+        kp_theta_straight: float = 0.75,
         ki_y: float = 0.40,
         ey_int_cap: float = 0.10,
         ey_int_decay: float = 0.40,
@@ -35,19 +35,20 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         ey_release: float = 0.02,
         ea_release: float = 0.05,
         hold_ms: float = 250.0,
-        kappa_axis_center: float = 1.5,
+        kappa_axis_center: float = 1.3,
         kappa_axis_width: float = 0.5,
         vy_floor: float = 0.15,
-        omega_floor: float = 0.15,
+        omega_floor: float = 0.25,
         r_eff: float = 0.30,
         ki_curve_boost: float = 1.5,
         # ---- 急弯专用参数（kappa >= sharp_kappa_threshold 时生效） ----
-        sharp_kappa_threshold: float = 2.0,
-        sharp_v_min: float = 0.06,
-        sharp_kp_theta: float = 1.50,
-        sharp_omega_gain: float = 0.90,
-        sharp_ki_curve_boost: float = 2.5,
-        sharp_k_curvature: float = 0.55,
+        # 提前进入 sharp 模式 + 加大角速度增益，让车在急弯入口更早开始转向。
+        sharp_kappa_threshold: float = 1.4,
+        sharp_v_min: float = 0.05,
+        sharp_kp_theta: float = 1.80,
+        sharp_omega_gain: float = 1.10,
+        sharp_ki_curve_boost: float = 2.8,
+        sharp_k_curvature: float = 0.65,
     ) -> None:
         self.v_max = float(v_max)
         self.v_min = float(v_min)
