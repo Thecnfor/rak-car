@@ -7,12 +7,15 @@
 """
 import threading
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, TYPE_CHECKING
 
 from .safety import EmergencyWatchdog, LostLineDetector
 from ..api import ChassisClient
 from ..state import LaneState
 from ..controllers.base import OuterLoop, WheelSmoother
+
+if TYPE_CHECKING:
+    from ..controllers.calibration import ErrorCalibrator
 
 
 class DoubleLoopRunner:
@@ -45,6 +48,7 @@ class DoubleLoopRunner:
         dry_run: bool = False,
         on_tick: Optional[Callable[[LaneState, List[float]], None]] = None,
         smoother: Optional[WheelSmoother] = None,
+        calibrator: Optional["ErrorCalibrator"] = None,
     ) -> None:
         self.api = api
         self.outer = outer
@@ -60,6 +64,9 @@ class DoubleLoopRunner:
         self.on_tick = on_tick
         # 默认挂一个 smoother；要彻底关掉就显式传一个 max_abs=∞ / max_accel=∞ 的实例
         self.smoother = smoother if smoother is not None else WheelSmoother()
+        # 误差标定层（scale/offset/EMA）。None = 不标定，控制律吃原始误差。
+        # 传入后 _sense() 在喂给控制律之前先过一遍 calibrate()。
+        self.calibrator = calibrator
         self._stop = False
         # pause/resume 控制（#1）：pause 后外环在 _pause.wait() 处阻塞；
         # smoother 保持最后值，不会"忘记"已下发速度（避免发零后恢复时跳变）。
@@ -110,7 +117,12 @@ class DoubleLoopRunner:
     def _sense(self) -> LaneState:
         # ChassisClient.read_lane() 内部已 ws 优先 + 异常兜底返回空 LaneState，
         # 外环不再自己 try/except —— 空 state 的 has_error 为 False，控制律自然输出零速。
-        return self.api.read_lane()
+        state = self.api.read_lane()
+        # 标定层：把 lane 模型裸输出标成控制律物理量（默认 no-op）。
+        # 放在 _sense 边界而不是控制律内部，控制器零改动。
+        if self.calibrator is not None:
+            state = self.calibrator.calibrate(state)
+        return state
 
     def run(self, max_seconds: float = 30.0) -> None:
         """阻塞：每 ~dt 跑一次外环 + 下发；任何异常路径都会 zero out 退出。
