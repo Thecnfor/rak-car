@@ -21,7 +21,6 @@ from ..config.lane_follow import (
 )
 from ..loops.closed_loop import DoubleLoopRunner
 from ..loops.telemetry import lane_trace
-from ..loops.tui import lane_tui
 
 
 # 内置 profile 列表（#3）：CLI 与 subscribe_lane_state 共用同一份装配逻辑
@@ -138,8 +137,10 @@ def main(argv: list[str] | None = None) -> None:
     smoother = profile.build_smoother()
 
     use_tui = bool(args.tui)
-    # --tui 时自动抑制 --no-trace，不做滚动打印
     if use_tui:
+        # rich 是可选依赖，只在 --tui 时才 import；普通巡线不需要装 rich。
+        from ..loops.tui import lane_tui
+        # --tui 时自动抑制 --no-trace，不做滚动打印
         on_tick_factory = None  # 先占位，with 块里拿 runner 后再绑定
         runner_on_tick = None
     else:

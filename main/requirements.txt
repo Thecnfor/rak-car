@@ -1,4 +1,5 @@
 requests>=2.31,<3.0
 websocket-client>=1.8,<2.0
 textual>=8.0,<9.0            # TUI 仪表盘（lane_monitor_tui.py）
+rich>=13.0,<15.0             # 底盘外环 TUI 调试面板（loops/tui.py，--tui）
 PyYAML>=6.0,<7.0             # task_config.yml / arm_origin.yaml 解析
