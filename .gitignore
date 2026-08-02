@@ -158,4 +158,4 @@ docs
 # arm 视觉伺服追踪测试产物 (不提交)
 track_trace_*.jsonl
 vel_trace_*.jsonl
-servo4_trace_*.jsonl
+servo4_trace_*.jsonl.claude/worktrees/
