@@ -200,6 +200,19 @@ def _pick_at_source(
         raise RuntimeError(
             f"S{column_idx} 位置未检测到任何 cylinder ({list(SOURCE_LABELS)})"
         )
+
+    # 用户 22:40: 全场只有 1 个 cylinder, 1 和 3 容易认错.
+    # 第一次识别到啥就是啥; 之后如果又识别到同一个, 自动 swap 1↔3.
+    if hasattr(_pick_at_source, "_seen_first"):
+        first = _pick_at_source._seen_first
+        if label == first and first in ("cylinder_1", "cylinder_3"):
+            corrected = "cylinder_3" if first == "cylinder_1" else "cylinder_1"
+            logger.info("  label 纠错: %s → %s (全场只有一个, 和第一次重复)", label, corrected)
+            label = corrected
+    else:
+        _pick_at_source._seen_first = label
+        logger.info("  首次识别: %s (后续 1↔3 自动纠错)", label)
+
     logger.info("  -> 抓到 %s, 智能定位抓取 (arm 控 cx + x 十字控 cy)", label)
 
     # 2026-08-02 调优: S 姿态就是工作起点, 不再跑去 x=0
@@ -409,13 +422,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
     completed: List[str] = []
 
-    # 用户 22:28: task1 里程计单独记录, 不依赖全局. 重置 odom 让 align_odom_x 从 0 起算.
-    try:
-        client.execute("car", "reset_position", sync=True, timeout=10.0)
-        logger.info("task1 odom reset: 从 0 起算")
-    except Exception as exc:
-        logger.warning("task1 odom reset 失败 (%s), 用全局值", exc)
-
+    # 用户 22:54: 不用 reset_x / reset_position, 直接到 S 姿态开始
     # S 姿态 = track_velocity_pick 起始位 (y=-180, 看得清楚)
     init_y_mm = cfg.get("init_y_mm", -180)
 
@@ -435,10 +442,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             logger.info("step 1: PLACE visual align 已禁用 (chassis_align.enabled=False)")
             align_odom_x, _ = _odom_curr_x_y()
 
-        # ===== 初始化步骤 2. (旧) X 编码器校准, 默认跳过 =====
-        _init_step1_reset_x(arm_client)
-
-        # ===== 初始化步骤 3. (旧) S 姿态 — 现在作为 pick 前切换的辅助 =====
+        # ===== 初始化: 直接到 S 姿态开始 (用户 22:56: 不要 reset_x!) =====
         #   注意: 主循环 _pick_at_source 前也会调用 _init_step2_s_pose 来切换到 S 姿态.
         #   这里先跑一次是为了刷新视觉伺服起点 =====
         # (暂时跳过, 主循环已经处理)
@@ -575,22 +579,26 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             label = _pick_at_source(runner, arm_client, client, cfg, column_idx)
             completed.append(label)
 
-            # (3) pick→place 连贯: 抬y + 底盘移T + 切PLACE姿态 三路并发 (用户 22:08: 不要等!)
+            # (3) 用户 22:47: pick 后先抬 y, 再动底盘! 不然推倒种子
+            runner.client.move_y(-100.0, timeout=10.0)
+            # 确保 hand=0 (用户 22:47: hand 必须是 0 才抓得住)
+            arm_client.composite_run(arm=None, x_mm=None, y_mm=None, hand=0.0,
+                                     speed=100, timeout=5.0)
+
+            # (4) 底盘移T + 切PLACE姿态 并发 (y 已抬好, 安全)
             slot_idx = int(target_slot_map[label])
             target_t_world = SLOT_POSITIONS_M[slot_idx]
             target_t = align_odom_x + target_t_world
-            place_x_override = float(cfg.get("place_x_overrides", {}).get(label, place_x_mm))
-            logger.info("  → T%d (label=%s, x=%s) 并发: y↑ + 底盘 + PLACE姿态(x快)",
-                        slot_idx, label, place_x_override)
-            with ThreadPoolExecutor(max_workers=4) as ex:
-                f_y = ex.submit(runner.client.move_y, -100.0, 10.0)
+            logger.info("  → T%d (label=%s, x=%s) 并发: 底盘 + PLACE姿态",
+                        slot_idx, label, place_x_mm)
+            with ThreadPoolExecutor(max_workers=3) as ex:
                 f_chassis = ex.submit(_chassis_goto, target_t)
-                f_x = ex.submit(arm_client.move_x, place_x_override, 100.0, 10.0, 15.0)
+                f_x = ex.submit(arm_client.move_x, place_x_mm, 100.0, 10.0, 15.0)
                 f_ah = ex.submit(arm_client.composite_run,
                                   arm=place_arm, x_mm=None,
-                                  y_mm=None, hand=place_hand,
+                                  y_mm=None, hand=0.0,
                                   speed=100, timeout=15.0)
-                f_y.result(); f_chassis.result(); f_x.result(); f_ah.result()
+                f_chassis.result(); f_x.result(); f_ah.result()
 
             # (5) 放: y→-20 → grasp → y→-100 (用户 22:08: 先抬y再动底盘, 不推倒种子!)
             logger.info("[T%d] place: y→-20 + grasp + y→-100", slot_idx)

@@ -948,6 +948,7 @@ class ArmController:
         speed: int = 80,
         timeout: float = 30.0,
         y_pid_timeout: float = 10.0,
+        x_v_max_mms: float = 100.0,
     ) -> dict:
         """四电机通用并行驱动器：在一路 runtime job 内同时驱动 motor_y / motor_x / arm_servo / hand_servo。
 
@@ -990,7 +991,7 @@ class ArmController:
         if arm is not None:
             todo.append(("arm", lambda: self.set_arm_angle(arm, speed=speed)))
         if x is not None:
-            todo.append(("x", lambda: self.move_x_position(float(x))))
+            todo.append(("x", lambda: self.move_x_position(float(x), v_max_mms=x_v_max_mms)))
         if y is not None:
             todo.append(("y", lambda: self.move_y_position(float(y))))
         if hand is not None:

@@ -56,7 +56,7 @@ class CompositeMixin:
     def composite_run(self, *, arm: Optional[float] = None,
                       x_mm: Optional[float] = None, y_mm: Optional[float] = None,
                       hand: Optional[float] = None, speed: int = 80,
-                      timeout: float = 30.0) -> dict:
+                      timeout: float = 30.0, x_v_max_mms: float = 100.0) -> dict:
         if y_mm is not None:
             self._check_y_protected("composite_run")
             self._check_safe(y_mm=y_mm)
@@ -66,6 +66,7 @@ class CompositeMixin:
             x=_mm_to_m(x_mm) if x_mm is not None else None,
             y=_mm_to_m(y_mm) if y_mm is not None else None,
             hand=hand, speed=speed,
+            x_v_max_mms=x_v_max_mms,
         )
 
     def composite_run_reset(self, *, arm_angle: float = 90.0,
