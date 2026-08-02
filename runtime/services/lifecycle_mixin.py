@@ -8,6 +8,7 @@
 `ControllerWatcherMixin` 的 `_ensure_controller_ready` / `_is_car_ready` /
 `_probe_controller` / `_sync_controller_health_state` 等。
 """
+import gc
 import logging
 import os
 import threading
@@ -102,11 +103,22 @@ class LifecycleMixin:
 
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
-        car = self._get_car_class()(
-            cap_front=self.shared_front_camera,
-            cap_side=self.shared_side_camera,
-            streamer=self.stream_service,
-        )
+        # 2026-08-03: 构造 MyCar 期间禁 GC。GC finalizer 可能 finalize 泄漏的
+        # zmq.Context, __del__ → destroy() → term() 永等未关 socket —— 若卡在构造
+        # 线程里, initializing 永真, 自愈循环整体瘫痪 (证据:
+        # .dbg/mc602-download-stuck-pyspy-20260803.txt)。MyCar.close 已显式清理
+        # zmq, 这里是第二层保险: finalizer 推迟到构造结束后再跑, 卡也卡不到 init。
+        _gc_was_enabled = gc.isenabled()
+        gc.disable()
+        try:
+            car = self._get_car_class()(
+                cap_front=self.shared_front_camera,
+                cap_side=self.shared_side_camera,
+                streamer=self.stream_service,
+            )
+        finally:
+            if _gc_was_enabled:
+                gc.enable()
         self._remember_shared_cameras(car)
         car.STOP_PARAM = self.stop_after_action
         car.beep()
@@ -309,16 +321,34 @@ class LifecycleMixin:
     def _safe_close_locked(self):
         if self.car is None:
             return
-        try:
-            self.car.stop()
-        except Exception:
-            pass
-        try:
-            self.car.close()
-        except Exception:
-            pass
+        car = self.car
+        # 2026-08-03: 先翻引用再关——realtime gate 立刻看到 car=None,
+        # 不会把指令打到正在销毁的旧车上。
         self.car = None
         self.controller_generation = None
+
+        def _close_worker():
+            try:
+                car.stop()
+            except Exception:
+                pass
+            try:
+                car.close()
+            except Exception:
+                pass
+
+        # close 超时护栏: car.close 若 hang (串口/电机/zmq 卡死), 不能无限堵住
+        # _ref_lock 与后续重建。15s 上限覆盖 5 个 feed join(timeout=5) 的正常慢路径;
+        # 超时后旧实例线程在后台自然收尾, 资源依赖 MyCar.close 显式清理兜底。
+        closer = threading.Thread(
+            target=_close_worker, daemon=True, name="car_close_guard",
+        )
+        closer.start()
+        closer.join(timeout=15.0)
+        if closer.is_alive():
+            logger.error(
+                "car.close 超过 15s 未返回, 放弃等待; 旧实例线程/socket 可能泄漏"
+            )
 
     def close(self, disable_auto_init=True):
         if disable_auto_init:

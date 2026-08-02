@@ -24,6 +24,8 @@ import os
 import threading
 import time
 
+import zmq
+
 from smartcar import Camera, logger
 from smartcar.whalesbot.tools import get_yaml
 from smartcar.whalesbot.vehicle import (
@@ -168,6 +170,32 @@ class MyCar(
         for _feed in ("lane_feed", "arm_feed", "task_feed", "ir_feed", "odom_feed"):
             try:
                 getattr(self, "stop_%s" % _feed)(force=True)
+            except Exception:
+                pass
+        # 2026-08-03 修复: 显式关闭 infer ZMQ 客户端 (业务 3 个 + lane/task feed 独立 2 个)。
+        # 不清理时, 泄漏的 zmq.Context 会在后续某次 GC 被 finalize, __del__ → destroy()
+        # → term() 无限等待未关闭的 socket —— 若恰好发生在下一辆 MyCar 构造期间, init 线程
+        # 永卡, initializing 永真, 全系统瘫痪 (py-spy 证据:
+        # .dbg/mc602-download-stuck-pyspy-20260803.txt)。
+        # 顺序: 必须在 feed 停止之后 (不在 feed 线程 recv 时关 socket)、super().close() 之前。
+        # id() 去重: _lane_feed_infer 创建失败时 fallback 复用 self.crusie, 是同一对象。
+        _closed_sock_ids = set()
+        for _attr in ("crusie", "task_det", "ocr_rec",
+                      "_lane_feed_infer", "_task_feed_infer"):
+            _client = getattr(self, _attr, None)
+            _sock = getattr(_client, "client", None) if _client is not None else None
+            if _sock is None or id(_sock) in _closed_sock_ids:
+                continue
+            _closed_sock_ids.add(id(_sock))
+            try:
+                if not _sock.closed:
+                    _sock.close(0)  # linger=0: 丢弃未发完消息立即关, 不阻塞
+            except Exception:
+                pass
+            _ctx = getattr(_sock, "context", None)
+            try:
+                if _ctx is not None and not _ctx.closed:
+                    _ctx.destroy(linger=0)
             except Exception:
                 pass
         # 按键线程已移除
