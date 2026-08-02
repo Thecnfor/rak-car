@@ -210,12 +210,12 @@ def _pick_at_source(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
         arm_start=pick_arm_start, hand_start=0.0,
-        timeout=cfg.get("pick_track_timeout_s", 2.5),   # 21:48 用户: 更快! 2.5s
+        timeout=cfg.get("pick_track_timeout_s", 2.0),   # 22:03 用户: 还是太慢! 2s
         hz=20.0,
-        gain_arm=2.0, gain_x=0.45,                     # 21:48 用户: 再快! 无缝衔接
-        deadzone=0.08, max_vel=0.60,                   # 死区 0.08 更快锁, max_vel 0.60
+        gain_arm=2.5, gain_x=0.55,                     # 22:03: 再再快!
+        deadzone=0.06, max_vel=0.70,                   # 死区 0.06 极速锁
         settle_hits=1,
-        hold_s=cfg.get("vacuum_settle_s", 0.10),
+        hold_s=0.05,                                    # 几乎不等
         lift_back=False,
     )
     if not result.get("ok"):
@@ -260,9 +260,9 @@ def _place_at_slot(
     place = cfg["arm_place_pose_T2"]
     # PLACE 工作平面已经在 _parallel_chassis_arm 里并发设好了 (arm/x/y/hand 4 轴 concurrent)
     # 这里只做: move_y(0) → grasp → move_y(-100), 用 ThreadPoolExecutor 并发 y 下降 + 真空
-    logger.info("[T%d] [B+D] 并发: move_y(0) + grasp(False) + move_y(-100)", column_idx)
-    # move_y 走 _check_safe 不走 _check_y_protected, 可以直接到 0
-    runner.client.move_y(0.0, timeout=15.0)
+    logger.info("[T%d] [B+D] 并发: move_y(-20) + grasp(False) + move_y(-100)", column_idx)
+    # move_y 走 _check_safe 不走 _check_y_protected, 可以直接到 -20
+    runner.client.move_y(-20.0, timeout=10.0)
     arm_client.grasp(False)
     runner.client.move_y(-100.0, timeout=15.0)
 
@@ -568,6 +568,12 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # 或 -100 (fallback 完整). 都用 move_y(-100, use _check_safe 走旁路) 兜底.
             runner.client.move_y(-100.0, timeout=15.0)
 
+            # (2.6) 安全兜底: 确认 y 不在保护区 [0,-30] 再做 composite_run
+            st = arm_client.get_state()
+            if st.y_mm > -30:
+                logger.warning("  y=%.1f 仍在保护区, 再抬一次", st.y_mm)
+                runner.client.move_y(-100.0, timeout=10.0)
+
             # (3) 计算 place 位置 (SLOT 按 target_slot_map 路由, 写死在 cfg)
             slot_idx = int(target_slot_map[label])
             target_t_world = SLOT_POSITIONS_M[slot_idx]
@@ -619,21 +625,23 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         logger.exception("task1_seeding 失败: %s", exc)
         return {"ok": False, "completed": completed, "error": str(exc)}
 
-    # 用户 21:57: 收尾时底盘去30 + reset机械臂 并发, 不耽误巡航
-    logger.info("task1 完成, 并发: 底盘→30 + reset 机械臂...")
+    # 用户 22:03: reset 静默运行, 不等它执行完
+    logger.info("task1 完成, 底盘→30 + reset 机械臂 (fire-and-forget)...")
     try:
         final_x = align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]]
-        with ThreadPoolExecutor(max_workers=2) as ex:
-            f_chassis = ex.submit(_chassis_goto, final_x)
-            def _reset_arm():
+        _chassis_goto(final_x)
+        # reset 异步, 不阻塞返回
+        import threading
+        def _bg_reset():
+            try:
                 runner.client.move_y(-100.0, timeout=15.0)
                 runner.client.move_x(0.0, timeout=15.0)
                 runner.client.composite_run(arm=0.0, x_mm=None, y_mm=None, hand=-90.0, speed=100, timeout=15.0)
                 arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
-            f_arm = ex.submit(_reset_arm)
-            f_chassis.result()
-            f_arm.result()
-        logger.info("  底盘到 %.3f m, 机械臂已 reset", final_x)
+            except Exception:
+                pass
+        threading.Thread(target=_bg_reset, daemon=True).start()
+        logger.info("  底盘到 %.3f m, reset 后台运行中", final_x)
     except Exception as exc:
         logger.warning("  收尾失败 (%s), 跳过", exc)
 
