@@ -18,6 +18,9 @@ from ...tools import logger
 # from pydownload import Scratch_Download_MC602P
 from smartcar.whalesbot.vehicle.base.serial_wrap import (
     ControllerNoResponseError,
+    PRIORITY_NORMAL,
+    PRIORITY_READ,
+    PRIORITY_URGENT,
     serial_wrap,
 )
 
@@ -102,6 +105,11 @@ class DevCmdInterface:
         self.last_data = None
         # 参数保存位置
         self.arg_reg = 1
+        # 2026-08-03 串口引擎提示位（SerialEngine 调度参数）：
+        # _coalesce_key: 同 key 写帧队列内只留最新（轮速/速度下发用）
+        # _share_key:    同 key 并发读合并为一次物理读（编码器/模拟量用）
+        self._coalesce_key = None
+        self._share_key = None
 
     def set_time_out(self, time_out):
         self.time_out = time_out
@@ -150,8 +158,13 @@ class DevCmdInterface:
             data = data[0]
         return data
     
-    def send_get(self, bytes_tmp:bytes):
-        ret = self.ser.get_anwser(bytes_tmp, self.time_out)
+    def send_get(self, bytes_tmp:bytes, priority=PRIORITY_NORMAL):
+        ret = self.ser.get_anwser(
+            bytes_tmp, self.time_out,
+            priority=priority,
+            coalesce_key=self._coalesce_key,
+            share_key=self._share_key,
+        )
         if ret is None:
             raise ControllerNoResponseError("控制器返回空数据")
         self.last_data = self.get_result(ret)
@@ -165,18 +178,18 @@ class DevCmdInterface:
         data_bytes = self.get_bytes(*args, mode=3, port_id=port_id)
         return self.send_get(data_bytes)
     
-    # 设置操作
+    # 设置操作（写帧：可写合并 → 队列里同 key 只留最新）
     def set(self, *args, port_id=None):
         # print(args)
         data_bytes = self.get_bytes(*args, mode=2, port_id=port_id)
         # print(data_bytes.hex(" "))
         return self.send_get(data_bytes)
     
-    # 获取操作
+    # 获取操作（读帧：低优先级 + 可共享合并）
     def get(self, *args, port_id=None):
         data_bytes = self.get_bytes(*args, mode=1, port_id=port_id)
         # print(data_bytes)
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, priority=PRIORITY_READ)
     
     # 没有操作符号时
     def no_act(self, port_id=None):
@@ -201,7 +214,27 @@ class DevListWrap:
             bytes_all += self.dev_list[i].get_bytes(args[i], mode=mode)
             # bytes_all += self.dev_list[i].act_default(args[i])
         # print(bytes_all.hex(' '))
-        res = serial_mc602.get_anwser(bytes_all)
+        # 2026-08-03 串口引擎调度提示：
+        #   - mode=2（写,如 4 轮速下发）→ coalesce_key：50Hz 外环突发时
+        #     队列内只保留最新一帧,不堆积过期轮速。
+        #   - mode=1/3 且设备数>=4（批量读,如 encoder4）→ share_key：
+        #     odom_feed / realtime 端点 / odometry_update 并发读合并成一次物理读。
+        coalesce_key = None
+        share_key = None
+        priority = PRIORITY_NORMAL
+        if mode == 2:
+            first_dev_id = getattr(self.dev_list[0], "dev_id", None) if self.dev_list else None
+            coalesce_key = "set_dev{}".format(first_dev_id)
+        elif len(self.dev_list) >= 4:
+            first_dev_id = getattr(self.dev_list[0], "dev_id", None) if self.dev_list else None
+            share_key = "get_dev{}_n{}".format(first_dev_id, len(self.dev_list))
+            priority = PRIORITY_READ
+        res = serial_mc602.get_anwser(
+            bytes_all,
+            priority=priority,
+            coalesce_key=coalesce_key,
+            share_key=share_key,
+        )
         data_ret = []
         if res is not None:
             index = 0
@@ -244,15 +277,20 @@ class Motor_2(DevCmdInterface):
 class AnalogInput_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
         super().__init__(**ctl602_dev_list["sensor_analog"], port_id=port_id)
+        # ir_feed 50Hz 双路读：并发读合并为一次物理帧（按端口共享）
+        self._share_key = "analog_in_{}".format(port_id)
 
 # 红外传感器
 class Infrared_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:
         super().__init__(**ctl602_dev_list["sensor_infrared"], port_id=port_id)
+        self._share_key = "infrared_{}".format(port_id)
 
 class Sensor_Analog2_2(DevCmdInterface):
     def __init__(self, port_id=None):
         super().__init__(**ctl602_dev_list["sensor_analog_a"], port_id=port_id)
+        # arm y 磁感门在 PID 循环里高频读（y_speed 每次调用都查一次）
+        self._share_key = "analog2_{}".format(port_id)
     def read(self):
         return self.no_act()
 
@@ -416,6 +454,8 @@ class NixieTube_2(DevCmdInterface):
 class Motor4_2(DevCmdInterface):
     def __init__(self) -> None:
         super().__init__(**ctl602_dev_list["motor4"])
+        # 批量轮速写帧：50Hz 外环突发时队列内只留最新
+        self._coalesce_key = "motor4_batch"
     
     def set_speed(self, speeds):
         return super().set(*speeds)
@@ -467,6 +507,8 @@ class EncoderMotor_2(DevCmdInterface):
     def __init__(self, port_id=None, reverse=-1) -> None:
         self.reverse = reverse
         super().__init__(**ctl602_dev_list["encoder"], port_id=port_id)
+        # odom / arm PID / realtime 端点并发读同一端口编码器 → 合并为一次物理读
+        self._share_key = "encoder_{}".format(port_id)
     
     def get_encoder(self):
         return self.get()*self.reverse
@@ -474,6 +516,8 @@ class EncoderMotor_2(DevCmdInterface):
 class EncoderMotors4_2(DevCmdInterface):
     def __init__(self) -> None:
         super().__init__(**ctl602_dev_list["encoder4"])
+        # 批量编码器读帧：odom / realtime 并发读合并成一次物理读
+        self._share_key = "encoder4_batch"
 
 class ServoPwm_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:

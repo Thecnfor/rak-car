@@ -569,6 +569,9 @@ class InferServer:
                             "gpu_only": gpu_only,
                             "mem_method": getattr(self, "_mem_method_per_model", {}).get(name, self._mem_method),
                             "lazy_load_count": int(self._lazy_load_count.get(name, 0)),
+                            # 2026-08-03：raw1 帧传输能力位。客户端（infer_front）
+                            # 见到 True 后改发 b"raw1"+裸帧,省掉 JPEG encode/decode。
+                            "supports_raw": True,
                         }
                     else:
                         res = False
@@ -591,6 +594,37 @@ class InferServer:
                     if evicted:
                         gc.collect()
                     res = {"evicted": evicted, "rss_mb": self._read_self_rss_mb()}
+                elif response.startswith(b"raw1"):
+                    # 2026-08-03 raw1 协议：b"raw1" + <III h/w/ch + 裸 BGR bytes。
+                    # 同机传输免 cv2.imencode/imdecode（Nano 上每帧各省 ~1-2ms）。
+                    img = None
+                    if len(response) >= 16:
+                        h, w, ch = np.frombuffer(response[4:16], dtype=np.uint32)
+                        img = np.frombuffer(response[16:], dtype=np.uint8)
+                        expect = int(h) * int(w) * max(int(ch), 1)
+                        if img.size == expect:
+                            img = img.reshape((int(h), int(w)) if int(ch) == 1 else (int(h), int(w), int(ch)))
+                        else:
+                            print("{} raw1 size mismatch ({} != {})".format(name, img.size, expect))
+                            img = None
+                    if img is None:
+                        res = []
+                    elif self.flag_infer_initok:
+                        try:
+                            future = self._infer_executor.submit(func, img)
+                            try:
+                                res = future.result(timeout=self._frame_timeout_s)
+                            except concurrent.futures.TimeoutError:
+                                print(
+                                    "{} frame timeout (>{}s); cancel future".format(
+                                        name, self._frame_timeout_s
+                                    )
+                                )
+                                future.cancel()
+                                res = []
+                        except Exception as infer_exc:
+                            print("{} infer err: {}".format(name, infer_exc))
+                            res = []
                 elif response.startswith(b"image"):
                     img = cv2.imdecode(np.frombuffer(response[5:], dtype=np.uint8), 1)
                     if self.flag_infer_initok:

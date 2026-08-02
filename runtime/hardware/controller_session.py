@@ -485,6 +485,23 @@ class ControllerSessionManager:
             serial_wrap = self._get_loaded_serial_wrap()
             if serial_wrap is None:
                 continue
+            # 2026-08-03：业务流量即存活证据。引擎路径每次成功 IO 都刷
+            # serial_wrap.last_ok_at（节流后的 note_io_success 也刷）。
+            # 2s 内有成功 IO → 不发 ping,避免心跳帧和业务帧抢 io 线程；
+            # 静默才打 ping（掉线检测语义不变）。
+            try:
+                last_ok = float(getattr(serial_wrap, "last_ok_at", 0.0) or 0.0)
+                if last_ok and (time.time() - last_ok) < 2.0:
+                    self._refresh_from_serial(serial_wrap)
+                    with self._lock:
+                        self._set_state_locked(STATE_PROGRAM_READY, mode="program", detail="控制器 program 模式在线")
+                        self._failure_count = 0
+                        self._last_ok_at = max(self._last_ok_at, last_ok)
+                        self._last_program_ok_at = self._last_ok_at
+                        self._recover_suppressed_until = 0.0
+                    continue
+            except Exception:
+                pass
             try:
                 if serial_wrap.ping_current(timeout=0.03):
                     self.note_io_success()

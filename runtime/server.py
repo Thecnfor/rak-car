@@ -25,6 +25,9 @@ def main():
         port=settings.get_bind_port(),
         reload=False,
         log_level="info",
+        # 2026-08-03：关 access log。50Hz realtime 轮询下每请求一行 INFO,
+        # 磁盘写 + 格式化是纯开销；排障走 pm2 logs 的应用日志。
+        access_log=False,
     )
 
 

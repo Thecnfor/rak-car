@@ -7,7 +7,7 @@ import numpy as np
 import json
 import yaml
 
-import time, os, sys
+import time, os, sys, struct
 # 添加上两层目录
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..","..", "..")))
 from smartcar.whalesbot.tools.log_wrap import logger
@@ -141,9 +141,14 @@ class ClintInterface:
             "last_recv_at": 0.0,
             "last_state_at": 0.0,
         }
+        # 2026-08-03：raw 帧传输。同机 ZMQ 传 JPEG 是纯浪费（encode+decode 各
+        # ~1-2ms @ Nano）。协商式启用：后端 ATATA 响应带 supports_raw=True 才走
+        # raw1 头；旧后端继续走 b"image"+JPEG，滚动升级零风险。
+        self._supports_raw = False
         logger.info("{}连接服务器...".format(name))
         model_cfg = self.get_config(name)
         self.img_size = model_cfg['img_size']
+        self.raw_stats = {"raw_frames": 0, "jpeg_frames": 0}
         self.port = model_cfg['port']
         self.client = self.get_zmp_client(self.port)
 
@@ -287,13 +292,25 @@ class ClintInterface:
                     pass
                 return None
         response = json.loads(response)
+        if isinstance(response, dict):
+            self._supports_raw = bool(response.get("supports_raw"))
         return response
 
     def get_infer(self, img):
         if self.img_size is not None:
             img = cv2.resize(img, self.img_size)
-        img = cv2.imencode('.jpg', img)[1].tobytes()
-        data = bytes('image', encoding='utf-8') + img
+        if self._supports_raw:
+            # raw1 协议：4B magic + <III h/w/ch + 裸 BGR bytes（免 encode/decode）
+            if not img.flags["C_CONTIGUOUS"]:
+                img = np.ascontiguousarray(img)
+            h, w = img.shape[0], img.shape[1]
+            ch = 1 if img.ndim == 2 else img.shape[2]
+            data = b"raw1" + struct.pack("<III", h, w, ch) + img.tobytes()
+            self.raw_stats["raw_frames"] += 1
+        else:
+            img = cv2.imencode('.jpg', img)[1].tobytes()
+            data = bytes('image', encoding='utf-8') + img
+            self.raw_stats["jpeg_frames"] += 1
         with self._socket_lock:
             try:
                 self.client.send(data)

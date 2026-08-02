@@ -100,6 +100,29 @@ class ArmController:
         self.x_params_init(**self.config["horiz_cfg"])
         self.hand_params_init(**self.config["hand_cfg"])
         self.position_params_init()
+        # 2026-08-03：协作取消接线。runtime cancel_job / emergency_stop 会置
+        # car._stop_flag=True 与 car._estop_event.set()（见 my_car/__init__.py
+        # 的 self.arm._estop = self._estop_event）。长 PID 循环每帧查本方法，
+        # 取消后不再"自然跑完"（旧 README 记载的已知限制）。
+        self._stop_flag = False
+        # 2026-08-03：runtime 会把这个 provider 指到 car._stop_flag（见
+        # my_car/__init__.py）。_must_stop 优先查 provider，独立运行时退回
+        # 自身 _stop_flag 属性。
+        self._stop_flag_provider = None
+
+    def _must_stop(self):
+        """协作停止检查：急停（_estop）或任务取消（_stop_flag）任一命中 → True。
+        所有运动循环每帧调用；命中方必须停车后退出。"""
+        estop = getattr(self, "_estop", None)
+        if estop is not None and estop.is_set():
+            return True
+        provider = getattr(self, "_stop_flag_provider", None)
+        if provider is not None:
+            try:
+                return bool(provider())
+            except Exception:
+                return bool(getattr(self, "_stop_flag", False))
+        return bool(getattr(self, "_stop_flag", False))
 
 
     def y_params_init(self, motor, limit_port, pid, threshold,
@@ -238,10 +261,9 @@ class ArmController:
 
         try:
             while True:
-                # 1) 急停优先
-                estop = getattr(self, "_estop", None)
-                if estop is not None and estop.is_set():
-                    logger.warning("reset_y: 收到急停，中止找底")
+                # 1) 急停 / 取消优先
+                if self._must_stop():
+                    logger.warning("reset_y: 收到急停/取消，中止找底")
                     break
                 # 2) 磁感触发 → 记录 dwell 起点
                 if self.y_reset_check():
@@ -381,6 +403,9 @@ class ArmController:
         # 第一轮（保持原行为）
         self.y_pid.setpoint = target
         while True:
+            if self._must_stop():
+                logger.info(f"move_y_position: 急停/取消,中止移动到{target}")
+                break
             if self.y_pid_moveto(target):
                 logger.info(f"移动到高度{target}（PID 收敛）")
                 break
@@ -416,6 +441,8 @@ class ArmController:
             )
             self.y_pid.setpoint = target
             while True:
+                if self._must_stop():
+                    break
                 if self.y_pid_moveto(target):
                     break
                 if self.y_stop_check():
@@ -555,6 +582,8 @@ class ArmController:
         end_time = time.time() + out_time
         try:
             while True:
+                if self._must_stop():
+                    break
                 if time.time() > end_time:
                     break
                 # 读当前位置 + 计算 error
@@ -624,9 +653,8 @@ class ArmController:
 
         try:
             while True:
-                estop = getattr(self, "_estop", None)
-                if estop is not None and estop.is_set():
-                    logger.warning("reset_x: 收到急停,中止撞墙")
+                if self._must_stop():
+                    logger.warning("reset_x: 收到急停/取消,中止撞墙")
                     return False
                 if time.time() - start > seek_timeout:
                     logger.error(
@@ -1165,8 +1193,7 @@ class ArmController:
             velocity: 速度值
         """
         # === 急停门：外部置位急停时强制 0，任何 y 运动都被此 chokepoint 拦死 ===
-        estop = getattr(self, "_estop", None)
-        if estop is not None and estop.is_set():
+        if self._must_stop():
             velocity = 0
         # === 末段减速 / 顶段减速：根据当前位置分档限幅 ===
         # 注意:必须先分档限幅,最后再做 velocity_limit (主限幅)
@@ -1194,8 +1221,7 @@ class ArmController:
         物理墙保护由 move_x_position 中的 x_stop_check 触发 calibrate 兜底。
         """
         # === 急停门：外部置位急停时强制 0 ===
-        estop = getattr(self, "_estop", None)
-        if estop is not None and estop.is_set():
+        if self._must_stop():
             velocity = 0
         velocity = limit_val(velocity, *self.x_velocity_limit)
         self.motor_x.set_linear(velocity)
@@ -1435,6 +1461,11 @@ class ArmController:
             # 到达结束标志结束
             if y_flag and x_flag:
                 break
+            # 2026-08-03 协作取消：急停/任务取消 → 立即停车退出
+            if self._must_stop():
+                self.x_speed(0)
+                self.y_speed(0)
+                return
             # 获取剩余时间
             time_remain = time_end - time.time()
             # 超时处理

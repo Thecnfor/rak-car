@@ -18,6 +18,10 @@ except ImportError:  # pragma: no cover
 class RuntimeApiClient:
     def __init__(self, settings=None):
         self.settings = settings or load_settings()
+        # 2026-08-03：持久 Session = HTTP keep-alive。旧实现每请求 requests.request()
+        # 新建 TCP 连接,50Hz 外环每次多付一个 RTT 的握手成本（~20-40ms LAN）。
+        # Session 内部连接池线程安全（每次调用从池取连接）。
+        self._session = requests.Session()
 
     @property
     def api_base(self):
@@ -32,7 +36,7 @@ class RuntimeApiClient:
 
     def _request(self, method, path, payload=None, timeout=None):
         timeout = timeout or self.settings.request_timeout
-        response = requests.request(
+        response = self._session.request(
             method=method,
             url=self.build_url(path),
             json=payload,

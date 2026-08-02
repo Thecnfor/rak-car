@@ -169,13 +169,22 @@ runtime 把「动作执行」与「init / 引用替换」分到两把锁，让�
 | --- | --- | --- | --- |
 | `_ref_lock` | `Lock()` | `self.car` 引用替换（init / recover / close） | 微秒级 |
 | `_realtime_gate` | `Lock()` | realtime 端点入口微秒级取 `self.car` 引用 | 微秒级 |
-| `serial_mc602.lock`（SDK） | `Lock()` | MC602 串口字节流串行 | 单 byte round-trip ~5-20ms |
+| `SerialEngine`（SDK, 2026-08-03） | 单 io 线程 + 帧队列 | MC602 串口字节流串行调度 | 单帧 round-trip ~5-20ms，写合并/读共享后吞吐翻倍余量 |
 | ~~`car_lock`~~ | —— | **已删除**，保留同名 property 抛 `RuntimeError` | —— |
 
 旧 `car_lock = RLock()` 在 `_dispatch` 里被长动作全程持锁，是「巡线 + 机械臂」互卡的根因。改造后：
 
-- 长动作（`arm.goto_position` 1-3s 闭环）执行期间**不持任何 runtime 锁**，靠 SDK 串口锁字节流串行
+- 长动作（`arm.goto_position` 1-3s 闭环）执行期间**不持任何 runtime 锁**
 - realtime 端点入口瞬时取 `car` 引用后立即释放，50Hz 调 `set_wheel_speeds` 不再被 arm 长动作挡住
+
+**串口层（2026-08-03）**：字节流串行是物理约束，但旧的"每个调用方持 `serial_mc602.lock` 阻塞 write+read"模型已换成 **SerialEngine**（`smartcar/whalesbot/vehicle/base/serial_wrap.py`）——单 io 线程持有 fd，所有设备调用 = 提交帧 + 等自己的 Event：
+
+- **写合并**：`coalesce_key` 相同的写帧（如 4 轮速 `motor4_batch`）在队列里只保留最新一条——50Hz 外环 + 视觉伺服同时下发轮速不再堆积物理帧，合并的调用方共享最新帧应答
+- **读共享**：`share_key` 相同的读请求（`encoder_N` / `analog2_N` / `encoder4_batch`）并发时只打一个物理读帧，结果广播——odom_feed、realtime 端点、odometry 线程读同一编码器不再各付一个 RTT
+- **优先级**：URGENT > NORMAL > READ；零速/急停帧插队
+- **心跳让路**：controller_session 心跳在 2s 内有业务 IO 时不发 ping 帧（有流量即存活证据）
+- **降级**：引擎未 attach / `RAK_CAR_SERIAL_ENGINE=0` / mc601 → 自动退回旧 lock 同步路径，异常语义不变
+- 离线单测：`smartcar/test/test_serial_engine.py`（16 项，无硬件，`/usr/bin/python3 smartcar/test/test_serial_engine.py`）
 
 ### 双 worker 队列
 
@@ -193,7 +202,7 @@ ARM_ACTIONS 列表：`go_for` / `goto_position` / `grasp` / `move_x_position` / 
 - 详见 [main/arm/ARM_API.md §9](../main/arm/ARM_API.md#9-reset_x--reset_all--opt-in-撞墙复位2026-07-16-恢复)
 | `car_queue` | `target="car" / "task" / "system"` | 短动作专用，短动作不被 arm 长动作排在同一个 worker 后 |
 
-底层字节流仍由 SDK 串口锁串行——两个 worker 在 Python 层是并行的，**字节流在硬件层是串行的**（物理约束，不可消除）。
+底层字节流由 SerialEngine 单 io 线程串行调度（见上节）——两个 worker 在 Python 层是并行的，**字节流在硬件层是串行的**（物理约束，不可消除；写合并/读共享把串行利用率拉满）。
 
 ### `/v1/execute` 默认异步
 
@@ -220,20 +229,20 @@ curl -X POST "http://localhost:5050/v1/jobs/$JOB/stop"
 # {"ok":true,"cancelled":true,"job_id":"..."}
 ```
 
-`/v1/jobs/{id}/stop` 立即返回 `cancelled=true`，同时 set job 的 `stop_event` 和 `car._stop_flag`。**SDK arm_base PID 循环目前不查 `stop_event` / `_stop_flag`**（要 SDK 配合），所以 cancel 后 arm 动作会自然跑完，不会立刻中断。这是已知限制，跟 runtime 并发改造正交。
+`/v1/jobs/{id}/stop` 立即返回 `cancelled=true`，同时 set job 的 `stop_event`、`car._stop_flag` 与 `car._hardware_stop`。**2026-08-03 起 arm SDK 长循环（`goto_position` / `move_x_position` / `move_y_position` / `reset_x` / `reset_y`）每帧查 `arm._must_stop()`**（急停事件 + `_stop_flag` provider，接线在 `my_car/__init__.py`），cancel/emergency-stop 会立刻中止闭环并停车——旧的"cancel 后自然跑完"已知限制已解除。
 
 ### 端到端验证
 
 `main/test/verify_concurrent.py`（gitignored，本地工具）跑双线程探针：
 
-- lane 50Hz 持续发 `/v1/realtime/wheels/speeds`（HTTP 实际 ~12Hz，受 `requests.post` 单次 30-50ms 限制）
+- lane 50Hz 持续发 `/v1/realtime/wheels/speeds`（HTTP 路径 2026-08-03 起走 `requests.Session` keep-alive；生产外环用 WS op，免每请求握手 ~20-40ms）
 - 同时下发异步 `arm.goto_position` 长动作
 - 关键判据：**arm 闭环期间 realtime 必须持续有帧**（旧的 car_lock bug 表现是 arm 跑期间 realtime 一帧都没有）
 - 次要判据：`realtime` 间隔 p99 < 100ms + max gap < 1s（任何 1s+ 间隔就是 car_lock 黑洞症状）
 
 ### `lane_feed` / `arm_feed` 守护线程依赖 `_stop_flag`
 
-`car_wrap_2026.py:1301` 的 lane_feed 循环检查 `self._stop_flag`，看到 True 就 `break` 并把 `lane_state.active=False`。触发场景：
+`runtime/services/my_car/feeds.py` 的 lane_feed 循环检查 `self._stop_flag`，看到 True 就 `break` 并把 `lane_state.active=False`。触发场景：
 
 - `POST /v1/control/emergency-stop`
 - `POST /v1/jobs/{id}/stop`（cancel_job 会写 `car._stop_flag=True`）

@@ -8,6 +8,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover
         "/home/jetson/workspace/rak-car/runtime/requirements.txt"
     ) from exc
 
+
 from runtime.api.router_registry import create_legacy_router, create_runtime_router, get_public_links
 from runtime.core import settings
 from runtime.services.camera_stream_service import CameraStreamService
@@ -18,6 +19,37 @@ service = CarRuntimeService()
 camera_stream_service = CameraStreamService(service)
 service.set_stream_service(camera_stream_service)
 _startup_ran = False
+
+
+class NoStoreMiddleware:
+    """2026-08-03：全部 HTTP 响应加 Cache-Control: no-store（纯 ASGI,零拷贝）。
+
+    状态缓存端点（lane/arm/task/ir/odom state、health、jobs）都是实时数据,
+    任何中间代理/客户端缓存都会把外环喂过期帧。
+    不用 BaseHTTPMiddleware —— 它会在长连接 MJPEG 上引入缓冲层与断连悬挂问题。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_no_store(message):
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers", []))
+                has_cc = any(
+                    name.decode("latin-1", "ignore").lower() == "cache-control"
+                    for name, _ in headers
+                )
+                if not has_cc:
+                    headers.append((b"cache-control", b"no-store"))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_no_store)
 
 
 def create_app():
@@ -53,6 +85,7 @@ def create_app():
         }
 
     app.include_router(create_runtime_router(service, camera_stream_service))
+    app.add_middleware(NoStoreMiddleware)
     app.include_router(create_legacy_router(service))
     return app
 

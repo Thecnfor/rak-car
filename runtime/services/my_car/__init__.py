@@ -106,6 +106,11 @@ class MyCar(
         # 与 _stop_flag 一起构成"协作式取消"，可被 runtime 无锁抢占。
         self._estop_event = threading.Event()
         self.arm._estop = self._estop_event
+        # 2026-08-03：协作取消接线（arm 侧）。cancel_job / emergency_stop 置
+        # car._stop_flag / _estop_event 后,arm 的长 PID 循环（goto_position /
+        # move_x_position / reset_y / reset_x）每帧查 _must_stop 立即退出,
+        # 不再"自然跑完"。provider 指到本实例属性,car 重建时随新 arm 重新绑定。
+        self.arm._stop_flag_provider = lambda: self._stop_flag
         # 硬件急停标志:emergency_stop() 触发;与 _stop_flag 不同 —— 硬件 loop 必须
         # 响应(让底盘/arm 停转),但 lane_feed/arm_feed/task_feed 守护线程不受影响,
         # 上位机视觉/推理持续对外提供数据流。需要 reset_stop 复位。

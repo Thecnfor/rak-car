@@ -206,6 +206,24 @@ class ChassisClient:
                 self.ws_ready = False
         return self.http.realtime_wheel_speeds(speeds)
 
+    def set_chassis_velocity(self, vx: float, vy: float, wz: float = 0.0,
+                             timeout: float = 5.0):
+        """(vx, vy, wz) 直发 — runtime 内部 IK 反算 4 轮速。
+
+        优先 ws 长连接（免每请求 TCP 握手）;ws 不通回退 HTTP keep-alive。
+        """
+        if self.ws_ready:
+            try:
+                return self.ws.realtime_chassis_velocity(
+                    vx, vy, wz, timeout=timeout)
+            except Exception:
+                self.ws_ready = False
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/chassis-velocity",
+            payload={"vx": float(vx), "vy": float(vy), "wz": float(wz)},
+            timeout=timeout,
+        )
+
     def set_single_motor(self, port: int, speed: float, reverse: int = 1, timeout: float = 5.0):
         if self.ws_ready:
             try:

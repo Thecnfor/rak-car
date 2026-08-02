@@ -10,7 +10,8 @@
       label; "h_tu_dou" = 土豆; "vegetable" = 整个蔬菜组;
     - labels 传列表: 任一在列表内都算匹配；
     - setpoint 传 (cx,cy): 目标 bbox 中心要落到的画面坐标, 默认 (0,0)；
-    - select_mode: "nearest_to_center" (默认, 画面中心最近) / "largest_area" (面积最大)
+    - select_mode: "nearest_to_center" (默认, 画面中心最近) / "largest_area" (面积最大) /
+      "leftmost" (画面横向 cx 最小 = 画面最左, 平局取面积大; task4 采收多球场景)
 
 **轴映射（2026-08-02 现场对标）**:
     画面 cx（横向） ↔ 车前后（vx）: cx 负(画面左/靠前) → vx 负(后退)
@@ -80,7 +81,7 @@ def expand_label_set(targets: Union[str, Collection[str]]) -> set:
 # ============ 选择策略 ============
 
 
-SelectMode = str  # "nearest_to_center" | "largest_area"
+SelectMode = str  # "nearest_to_center" | "largest_area" | "leftmost"
 
 
 def _select_target(
@@ -120,6 +121,12 @@ def _select_target(
         return None
     if mode == "largest_area":
         return max(matched, key=lambda d: _bbox_area(d))
+    if mode == "leftmost":
+        # 画面横向 cx 最小 (画面最左); 平局取面积大的 (更可信)
+        with_c = [(d, c) for d in matched for c in [_bbox_cx_cy(d)] if c is not None]
+        if not with_c:
+            return matched[0]
+        return min(with_c, key=lambda dc: (dc[1][0], -_bbox_area(dc[0])))[0]
     best_d2: Optional[float] = None
     best_det: Optional[Dict[str, Any]] = None
     for d in matched:
@@ -260,6 +267,7 @@ def track_chassis(
       - ``target="cylinder_2"`` → 圆柱体 2 号
       - ``target=["water_l1","water_l2"]`` → 列表任一匹配
       - ``setpoint_cxcy=(-0.1, 0.1)`` → 对齐到非画面中心的标定点
+      - ``select_mode="leftmost"`` → 多目标选画面最左 (cx 最小, 平局取大), task4 采收用
 
     控制律（2026-08-02 现场调好的轴映射 + 符号）:
       - 画面 cx（横向） ↔ 车前后（vx）: cx 负(画面左/靠前) → vx 负(后退)
@@ -284,19 +292,17 @@ def track_chassis(
     def _set_vel(vx: float, vy: float) -> None:
         if dry_run:
             return
+        # 2026-08-03：单通道下发。旧实现同时发 mecanum_inverse 轮速 + HTTP
+        # chassis-velocity（同一速度两路,服务端 IK 再算一遍,互相覆盖还各占一个
+        # 串口 RTT）。现在只走 set_chassis_velocity（ws 优先,HTTP keep-alive 兜底）。
         try:
-            ws = mecanum_inverse(vx, vy, 0.0, 0.30)
-            api.set_wheel_speeds(ws)
+            api.set_chassis_velocity(vx, vy, 0.0, timeout=1.5)
         except Exception:
-            pass
-        try:
-            api.http.post(
-                "/v1/realtime/chassis-velocity",
-                {"vx": float(vx), "vy": float(vy), "wz": 0.0},
-                timeout=1.5,
-            )
-        except Exception:
-            pass
+            try:
+                # ws/HTTP 都挂时最后兜底：本地 IK 直发轮速
+                api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30))
+            except Exception:
+                pass
 
     frames = 0
     in_band = 0

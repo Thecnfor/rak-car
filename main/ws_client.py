@@ -153,6 +153,16 @@ class RuntimeWsClient:
     def realtime_wheel_encoders(self, timeout=None):
         return self.request("realtime/wheel_encoders", request_timeout=timeout)
 
+    def realtime_chassis_velocity(self, vx, vy, wz=0.0, timeout=None):
+        """(vx, vy, wz) 直发 — runtime 内部 IK 反算 4 轮速（实时门路径）。"""
+        return self.request(
+            "realtime/chassis_velocity",
+            request_timeout=timeout,
+            vx=float(vx),
+            vy=float(vy),
+            wz=float(wz),
+        )
+
     def realtime_motor_speed(self, port, speed, reverse=1, timeout=None):
         return self.request(
             "realtime/motor_speed",

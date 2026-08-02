@@ -202,9 +202,9 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 - **`_realtime_gate`** — realtime 端点（`/v1/realtime/*`）入口微秒级取引用
 - 旧 `car_lock` 改成抛 `RuntimeError` 的 property，漏改的代码路径立即崩
 
-`job_queue` 拆成 `arm_queue` + `car_queue` 两个独立 worker：arm worker 卡在 1-3s PID 闭环里不影响 car worker。字节流仍由 SDK 的 `serial_mc602.lock` 串行——**这是物理约束，不可消除**。
+`job_queue` 拆成 `arm_queue` + `car_queue` 两个独立 worker：arm worker 卡在 1-3s PID 闭环里不影响 car worker。字节流物理串行不变，但 2026-08-03 起由 SDK 的 **SerialEngine**（`serial_wrap.py`，单 io 线程 + 帧队列）统一调度，替代旧的调用方持 `serial_mc602.lock` 一问一答：写合并（`coalesce_key`，轮速突发只发最新帧）、读共享（`share_key`，encoder/模拟量并发读合并成一次物理读）、URGENT 插队（零速/急停帧优先）、心跳静默检测（有业务流量就不发 ping 帧）。`RAK_CAR_SERIAL_ENGINE=0` 可整体退回旧同步路径。离线单测：`smartcar/test/test_serial_engine.py`（16 项，无硬件）。
 
-`/v1/execute` 默认改成异步（立即返回 `job_id`，状态查 `/v1/jobs/{id}`），旧同步调用方加 `"sync": true`。`/v1/jobs/{id}/stop` 协作取消（**注意**：SDK arm_base PID 循环不查 stop_event，cancel 后 arm 动作会自然跑完——这是已知 SDK 限制，不是 runtime bug）。
+`/v1/execute` 默认改成异步（立即返回 `job_id`，状态查 `/v1/jobs/{id}`），旧同步调用方加 `"sync": true`。`/v1/jobs/{id}/stop` 协作取消（2026-08-03 起 SDK arm 长循环每帧查 `arm._must_stop()`，cancel/emergency-stop 会立刻中止 PID 闭环——旧的"cancel 后自然跑完"限制已解除；接线见 `my_car/__init__.py` 的 `arm._stop_flag_provider` / `arm._estop`）。
 
 `lane_feed` / `arm_feed` 守护线程检查 `self._stop_flag`：急停或 cancel_job 后 `_stop_flag=True`，守护线程 break 退出，`lane_state.active` 变 `false`。**清 stop 必须 POST `/v1/control/reset-stop` + 重启 lane_feed**。
 
