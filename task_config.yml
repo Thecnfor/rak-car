@@ -48,7 +48,7 @@ task_cfg:
       hand_angle_deg: -10
 
     arm_place_pose_T2:
-      x_mm: -245           # 2026-08-02 21:48 用户: place x=-245
+      x_mm: -260           # 2026-08-02 22:13 用户: 默认 place x=-260
       arm_angle_deg: 90    # 大臂指向左侧
       y_mm: 0              # 真到 y=0 释放, 通过临时 hand=-90 (UP) 绕开安全门
       hand_angle_deg: 0     # 用户: pick/place 手爪都该是 0 (place 临时变 -90 是为解锁 y=0)
@@ -67,9 +67,9 @@ task_cfg:
 
     chassis_move_timeout_s: 30
 
-    # 2026-08-02 21:57: 按 label 覆盖 place x (cylinder_1 用 -230, 其他用默认 -245)
+    # 2026-08-02 22:13: 按 label 覆盖 place x (cylinder_3 用 -220, 其他用默认 -260)
     place_x_overrides:
-      cylinder_1: -230
+      cylinder_3: -220
 
     # 2026-08-02: pick 前视觉对齐底盘 (用户自己写 _chassis_align_by_area,
     # 用 set_chassis_velocity 经 IK, 不像 VisualAlignRunner 那样旋转).
