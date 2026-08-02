@@ -572,61 +572,70 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             slot_idx = int(target_slot_map[label])
             target_t_world = SLOT_POSITIONS_M[slot_idx]
             target_t = align_odom_x + target_t_world
-            logger.info("  → T%d (label=%s, world=%.3f → odom target %.3f)",
-                        slot_idx, label, target_t_world, target_t)
+            # 用户 21:57: cylinder_1 place x=-230 (其他用默认 -245)
+            place_x_override = float(cfg.get("place_x_overrides", {}).get(label, place_x_mm))
+            logger.info("  → T%d (label=%s, world=%.3f → odom target %.3f, x=%s)",
+                        slot_idx, label, target_t_world, target_t, place_x_override)
             _parallel_chassis_arm(
                 target_x_m=target_t,
                 arm_kwargs=dict(
                     arm=place_arm,
-                    x_mm=place_x_mm,
+                    x_mm=place_x_override,
                     y_mm=-100.0,
-                    hand=place_hand,   # 0 — 全程不抬
+                    hand=place_hand,
                 ),
             )
 
-            # (5) 放 — 简单的 grasp(False), hand 不动
-            _place_at_slot(runner, arm_client, client, cfg, slot_idx)
-
-            # (6) 用户 21:44: place 后不回 S 姿态, 保持 PLACE 姿态直接往前走 + 对齐
+            # (5) 放 — move_y(0) + grasp + move_y(-100) 尽量并发
+            logger.info("[T%d] place: y→0 + grasp + y→-100", slot_idx)
+            runner.client.move_y(0.0, timeout=15.0)
+            arm_client.grasp(False)
+            # y 抬回 与 下一列底盘移动 并发 (用户 21:57: 不要串行等!)
             if i + 1 < len(source_position_order):
                 next_col_idx = source_position_order[i + 1]
                 next_source_world = SOURCE_POSITIONS_M[next_col_idx]
                 next_source = align_odom_x + next_source_world
-                logger.info("  底盘 → 下一源列 S%d (world=%.3f → odom %.3f), 保持 PLACE 姿态",
-                            next_col_idx, next_source_world, next_source)
-                _chassis_goto(next_source)
-                # (7) 对齐 (step1): 切 PLACE align 姿态 + track_chassis
-                # 用户 21:51: 下一列可能已放上物体挡住 set, 对齐失败就 pass
-                logger.info("  === 列 %d 完成, 执行 step1 对齐再进下一列 ===", i + 1)
+                logger.info("  并发: y→-100 + 底盘→S%d + 切PLACE对齐姿态", next_col_idx)
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    f_y = ex.submit(runner.client.move_y, -100.0, 15.0)
+                    f_chassis = ex.submit(_chassis_goto, next_source)
+                    f_arm = ex.submit(arm_client.composite_run,
+                                      arm=90.0, x_mm=-320.0, y_mm=None, hand=0.0,
+                                      speed=100, timeout=15.0)
+                    f_y.result(); f_chassis.result(); f_arm.result()
+                # 对齐 (可能被挡住, 失败就 pass)
                 try:
-                    _init_step1_place_align(arm_client, cfg)
+                    from main.chassis import track_chassis, track_trace
+                    marker_label = cfg.get("marker_label", "cylinder_set")
+                    r = track_chassis(marker_label, dry_run=False, max_seconds=8.0, on_tick=track_trace(5))
+                    logger.info("  对齐: arrived=%s frames=%d", r.arrived, r.frames)
                 except Exception as exc:
-                    logger.warning("  对齐失败 (%s), pass 继续下一列", exc)
+                    logger.warning("  对齐失败 (%s), pass", exc)
             else:
-                # 最后一列: 留在 30 位置, 不回 0
+                runner.client.move_y(-100.0, timeout=15.0)
                 logger.info("  最后一列完成, 底盘留在 %.3f m", align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]])
 
     except Exception as exc:
         logger.exception("task1_seeding 失败: %s", exc)
         return {"ok": False, "completed": completed, "error": str(exc)}
 
-    # 用户 21:48: 所有动作做完, y/x/arm/hand 都恢复默认
-    logger.info("task1 完成, 恢复所有轴默认...")
+    # 用户 21:57: 收尾时底盘去30 + reset机械臂 并发, 不耽误巡航
+    logger.info("task1 完成, 并发: 底盘→30 + reset 机械臂...")
     try:
-        # 先抬 y 到安全区 (避免 reset 时撞底)
-        runner.client.move_y(-100.0, timeout=15.0)
-        # 收 x 回 0
-        runner.client.move_x(0.0, timeout=15.0)
-        # arm 回 MID (0°), hand 回 UP (-90°)
-        runner.client.composite_run(
-            arm=0.0, x_mm=None, y_mm=None, hand=-90.0,
-            speed=100, timeout=15.0,
-        )
-        # reset_position (y 触底定原点)
-        arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
-        logger.info("  所有轴已恢复默认")
+        final_x = align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]]
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            f_chassis = ex.submit(_chassis_goto, final_x)
+            def _reset_arm():
+                runner.client.move_y(-100.0, timeout=15.0)
+                runner.client.move_x(0.0, timeout=15.0)
+                runner.client.composite_run(arm=0.0, x_mm=None, y_mm=None, hand=-90.0, speed=100, timeout=15.0)
+                arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
+            f_arm = ex.submit(_reset_arm)
+            f_chassis.result()
+            f_arm.result()
+        logger.info("  底盘到 %.3f m, 机械臂已 reset", final_x)
     except Exception as exc:
-        logger.warning("  恢复默认失败 (%s), 跳过", exc)
+        logger.warning("  收尾失败 (%s), 跳过", exc)
 
     return {"ok": True, "completed": completed}
 

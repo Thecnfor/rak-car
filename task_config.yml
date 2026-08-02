@@ -67,6 +67,10 @@ task_cfg:
 
     chassis_move_timeout_s: 30
 
+    # 2026-08-02 21:57: 按 label 覆盖 place x (cylinder_1 用 -230, 其他用默认 -245)
+    place_x_overrides:
+      cylinder_1: -230
+
     # 2026-08-02: pick 前视觉对齐底盘 (用户自己写 _chassis_align_by_area,
     # 用 set_chassis_velocity 经 IK, 不像 VisualAlignRunner 那样旋转).
     chassis_align:
