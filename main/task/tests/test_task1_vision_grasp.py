@@ -21,10 +21,11 @@ from main.task import _constants as C
 
 # ── 视觉数据辅助 ──────────────────────────────────────────────────────────────
 
-def _det(label: str, x_c: float = 0.0, score: float = 0.9, tid: int = 1) -> dict:
+def _det(label: str, x_c: float = 0.0, y_c: float = 0.0,
+         score: float = 0.9, tid: int = 1) -> dict:
     return {
         "cls_id": 0, "det_id": tid, "label": label, "score": score,
-        "bbox_norm": {"x_center": x_c, "y_center": 0.0,
+        "bbox_norm": {"x_center": x_c, "y_center": y_c,
                        "width": 0.1, "height": 0.1},
     }
 
@@ -70,16 +71,42 @@ class _ScanCylinder(unittest.TestCase):
     def test_skips_non_whitelist(self):
         # 见到 cylinder_2 (不在白名单) 和 cylinder_1 (在) → 跳过 cylinder_2, 返回 cylinder_1
         r = self._call([
-            _ts(True, [_det("other_label"), _det("cylinder_1")]),
+            _ts(True, [_det("other_label", x_c=-0.5, y_c=-0.5),
+                     _det("cylinder_1", x_c=0.0, y_c=-0.4)]),
         ])
         self.assertEqual(r, "cylinder_1")
 
-    def test_first_whitelist_match_wins(self):
-        # 服务端按 detections 顺序给; 我们也按这个顺序匹配, 不重新排序
-        r = self._call([
-            _ts(True, [_det("cylinder_2"), _det("cylinder_1")]),
+    def test_closest_to_setpoint_wins(self):
+        # 2026-08-02: 多 cylinder 可见时取离 setpoint 最近的.
+        # cylinder_3 在 (-0.87, -0.21), cylinder_2 在 (-0.05, -0.45) — setpoint=(-0.04, -0.42)
+        # cylinder_2 比 cylinder_3 更近, 应该返回 cylinder_2
+        import main.task.task1_seeding as m
+        client = MagicMock()
+        client.get.return_value = _ts(True, [
+            _det("cylinder_3", x_c=-0.87, y_c=-0.21),
+            _det("cylinder_2", x_c=-0.05, y_c=-0.45),
         ])
+        r = m._scan_cylinder_label(
+            client, list(m.SOURCE_LABELS),
+            retries=1, backoff_s=0.0,
+            setpoint_xy=(-0.04, -0.42),
+        )
         self.assertEqual(r, "cylinder_2")
+
+    def test_first_match_when_no_setpoint(self):
+        # 没传 setpoint → 退回按顺序的第一个 (老行为).
+        import main.task.task1_seeding as m
+        client = MagicMock()
+        client.get.return_value = _ts(True, [
+            _det("cylinder_3", x_c=0.0, y_c=-0.4),
+            _det("cylinder_2", x_c=0.5, y_c=-0.4),
+        ])
+        r = m._scan_cylinder_label(
+            client, list(m.SOURCE_LABELS),
+            retries=1, backoff_s=0.0,
+            setpoint_xy=None,
+        )
+        self.assertEqual(r, "cylinder_3")
 
     def test_active_false_retries(self):
         # 第一次 active=False (跳过), 第二次 active=True + 检测到
@@ -140,6 +167,9 @@ def _make_runtime():
     arm_client.ping.return_value = True
     arm_client.origin = ArmOrigin(nozzle_offset_x_norm=0.0, nozzle_offset_y_norm=0.0)
     arm_client.get_state.return_value = ArmState(x_mm=0.0, y_mm=-100.0)
+    # runtime settings.api_base: 给 move_to_position 用 (task1_seeding 直接 requests.post 打这条)
+    arm_client.http.settings = MagicMock()
+    arm_client.http.settings.api_base = "http://test-runtime:0"
     # reset_x / move_y / set_hand_angle / set_arm_angle / move_x 走默认值
 
     runner = MagicMock()
@@ -199,17 +229,14 @@ class TestRun(unittest.TestCase):
                 return m.run(http)
 
     def test_three_columns_succeed(self):
-        # 3 列 × 2 次扫描 (cylinder + marker)
-        # 列 1: cylinder_1 (S1) → cylinder_set (T1)
-        # 列 2: cylinder_2 (S2) → cylinder_set (T2)
-        # 列 3: cylinder_3 (S3) → cylinder_set (T3)
+        # 2026-08-02: place 写死后不再调 marker detection; 每列 1 次 cylinder scan.
+        # 列 1: cylinder_1 (S1) → T1 (硬编码 PLACE)
+        # 列 2: cylinder_2 (S2) → T2
+        # 列 3: cylinder_3 (S3) → T3
         responses = [
-            _ts(True, [_det("cylinder_1")]),  # S1 扫描源头
-            _ts(True, [_det("cylinder_set")]), # T1 扫描 marker
-            _ts(True, [_det("cylinder_2")]),  # S2 扫描源头
-            _ts(True, [_det("cylinder_set")]), # T2 扫描 marker
-            _ts(True, [_det("cylinder_3")]),  # S3 扫描源头
-            _ts(True, [_det("cylinder_set")]), # T3 扫描 marker
+            _ts(True, [_det("cylinder_1")]),  # S1 扫源头
+            _ts(True, [_det("cylinder_2")]),  # S2 扫源头
+            _ts(True, [_det("cylinder_3")]),  # S3 扫源头
         ]
         arm_client, runner, vision = _make_runtime()
         from main.task import task1_seeding as m
@@ -227,48 +254,20 @@ class TestRun(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
 
-        # 6 次 track_velocity_pick: 3 次智能抓取 (mode=pick) + 3 次智能释放 (mode=drop)
-        self.assertEqual(runner.track_velocity_pick.call_count, 6)
-        # 其中 3 次是 mode="drop" (释放)
+        # 3 次 track_velocity_pick: 3 次智能抓取 (mode=pick); 0 次释放 (place 写死, 不再伺服)
+        self.assertEqual(runner.track_velocity_pick.call_count, 3)
         drop_modes = [c.kwargs.get("mode") for c in runner.track_velocity_pick.call_args_list]
-        self.assertEqual(drop_modes.count("drop"), 3)
-        # marker 放置已改用 track_velocity_pick(mode=drop), 不再走 find_target
-        self.assertEqual(vision.find_target.call_count, 0)
-        # composite_run 调用: init (1×) + 每列 place (1×) + return-to-source (1×)
-        # 注: track_velocity_pick 在真实实现中会内调 composite_run, 但 mock bypass 了
+        self.assertEqual(drop_modes.count("drop"), 0)
+        # composite_run 调用 (2026-08-02 重构成并发底盘+臂后):
+        #   init (1×) +
+        #   每列: 并发 PLACE arm (1×) + 并发 return-to-S arm (1×) = 2 次
+        # 注: chassis 跟 arm 并发 (ThreadPoolExecutor), 底盘用 execute_car_action,
+        #     不计 composite_run.
         # 共 1 + 3 × 2 = 7 次
         self.assertEqual(arm_client.composite_run.call_count, 7)
 
         # 底盘移动: S1→S2, S2→S3, 结束归位 S1 → 至少 3 次 execute_car_action
         self.assertGreaterEqual(arm_client.http.execute_car_action.call_count, 3)
-
-    def test_marker_label_passed_to_selector(self):
-        # 验证 marker 视觉伺服的 selector.label 来自 cfg.marker_label
-        responses = [
-            _ts(True, [_det("cylinder_1")]),
-            _ts(True, [_det("cylinder_set")]),
-            _ts(True, [_det("cylinder_2")]),
-            _ts(True, [_det("cylinder_set")]),
-            _ts(True, [_det("cylinder_3")]),
-            _ts(True, [_det("cylinder_set")]),
-        ]
-        arm_client, runner, vision = _make_runtime()
-        from main.task import task1_seeding as m
-        http = MagicMock()
-        http.wait_until_ready.return_value = True
-        http.get.side_effect = responses
-
-        with patch.object(m, "load_task_config", return_value=CFG.copy()), \
-             patch.object(m, "ArmClient") as arm_cls, \
-             patch.object(m, "RuntimeApiClient", return_value=http):
-            arm_cls.connect.return_value = arm_client
-            with patch.object(m, "ArmRunner", return_value=runner):
-                m.run(http)
-
-        # 每次 marker 伺服的 selector.label == marker_label
-        for call in vision.find_target.call_args_list:
-            sel = call.args[0]
-            self.assertEqual(sel.label, "cylinder_set")
 
     def test_no_cylinder_fails(self):
         # S1 没扫到 → 立即 ok=False, error 包含 S1
@@ -298,10 +297,10 @@ class TestRun(unittest.TestCase):
         self.assertEqual(result["completed"], [])
 
     def test_no_marker_fails(self):
-        # S1 扫到 cylinder_1, T1 没扫到 marker → ok=False
+        # 2026-08-02: marker 检测已废弃 (走写死 PLACE). 这个测试改验 "S1 pick 失败后
+        # 不会再进入 place" — 也就是 S1 错误时 completed 应该空, 不会假装有 done.
         responses = [
-            _ts(True, [_det("cylinder_1")]),    # S1 ok
-            _ts(True, []), _ts(True, []), _ts(True, []), _ts(True, []), _ts(True, []),  # T1 重试
+            _ts(True, []), _ts(True, []), _ts(True, []),  # S1 失败
         ]
         arm_client, runner, vision = _make_runtime()
         from main.task import task1_seeding as m
@@ -317,8 +316,9 @@ class TestRun(unittest.TestCase):
                 result = m.run(http)
 
         self.assertFalse(result["ok"])
-        self.assertIn("T1", result["error"])
-        self.assertEqual(result["completed"], ["cylinder_1"])
+        self.assertEqual(result["completed"], [])
+        # S1 scan 失败 → raise 之前只跑了 init S-pose composite_run, 没 place
+        self.assertEqual(arm_client.grasp.call_count, 0)  # 没 grasp(False)
 
     def test_pick_failure_does_not_drop(self):
         # pick_by_vision_lower 返回 ok=False → 后续 drop 不调用
