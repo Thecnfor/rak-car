@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (smart-agriculture) track — an NVIDIA Orin Nano (JetPack/L4T) + MC602 controller running on a WhalesBot mecanum-wheel chassis. A single run executes **8 fixed-order tasks** (seed → scout pests → water → shoot pests → harvest → sort → read order via OCR → deliver). The repo is a frozen-for-competition codebase; per-track calibration happens in `config_car.yml` and the odometry offsets hardcoded inside `car_task_function.py`.
+Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (smart-agriculture) track — an NVIDIA Orin Nano (JetPack/L4T) + MC602 controller running on a WhalesBot mecanum-wheel chassis. A single run executes **fixed-order tasks** (seed → water → scout/shoot pests → harvest → sort → read order via OCR → deliver; registry in `main/task/`). The repo is a frozen-for-competition codebase; per-track calibration happens in `config_car.yml` (chassis/PID/inference) and `task_config.yml` (per-task arm poses, slot maps, waypoint list).
 
 ## Branches (check before reading)
 
-- **`main`** — the live Python monolith + runtime FastAPI service. **You are here.** This file documents `main`.
+- **`main`** — runtime FastAPI service (car-side, `runtime/`) + HTTP/WS business client (`main/`) + the `run.py` mission orchestrator. The legacy Python monolith was deleted in commit `c23c871`. **You are here.** This file documents `main`.
 - **`develop/ros2-sidecar`** — a ROS2 experiment with a different top level (`ros2_ws/`, `urdf/`, `config_sensors.yml`). The Python-monolith docs do **not** apply there.
 - **`feat/chassis-p0-mecanum-8.10`** / **`legacy/main`** / **`local-snapshot-0712`** — work-in-progress and historical branches; do not target unless the user says so.
 
@@ -16,23 +16,19 @@ Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (sma
 
 The codebase has **three independent entry surfaces**. Pick the one that matches what you're doing:
 
-### 1. Legacy monolith script (CLI / REPL — one-shot runs)
+### 1. Legacy monolith script — REMOVED (commit `c23c871`)
 
-```bash
-python car_start_2026.py          # full 8-task mission
-python main/quick_start.py        # (legacy) sanity check
-```
-
-`car_start_2026.py` calls `init()` then each task in sequence — comment out the others to run a single task. This path constructs `MyCar()` directly in the calling process; inference backends are **auto-spawned** the first time `MyCar()` is constructed.
+`car_start_2026.py`, `car_task_function.py`, and `car_wrap_2026.py` no longer exist, and neither does the nav-only placeholder `main/start/whole_no_task.py`. The `MyCar` facade now lives **only** inside the runtime service (`runtime/services/my_car/`). Don't write code that constructs or imports `MyCar` outside `runtime/` — use the mission entry (§1.5) or the HTTP API (§2/§3).
 
 ### 1.5 Mission orchestrator (`run.py`)
 
 ```bash
-python run.py                      # full 8-task mission via main.start.orchestrator
+python run.py                      # full mission via main.start.orchestrator
+python run.py --task 1             # single task: lane-follow to its waypoint → trigger → run → stop
 python run.py --lane-hz 30         # slower outer loop for tuning
 ```
 
-`run.py` is a thin shell that delegates to `main.start.orchestrator.Orchestrator`. The orchestrator runs a 50Hz lane-following outer loop in a background thread, accumulates wheel odometry in a second background thread, and the main thread advances through a fixed `DEFAULT_WAYPOINTS` list (8 tasks + 1 finish). Each waypoint waits on an IR + distance trigger (default AND), then pauses the outer loop, calls the task module, and resumes. The point list lives in `main/start/orchestrator.py` as a Python constant — there is **no yaml config**. Replace `main/start/whole_no_task.py` (the old nav-only placeholder) with this orchestrator as the canonical mission entry.
+`run.py` is a thin shell that delegates to `main.start.orchestrator.Orchestrator` — the canonical mission entry. The orchestrator runs a 50Hz lane-following outer loop in a background thread (`DoubleLoopRunner`, pause/resume), accumulates wheel odometry in a second background thread (20 Hz), and the main thread advances through the waypoint list (tasks + 1 finish). Each waypoint waits on an IR + distance trigger (default AND), then pauses the outer loop, dispatches `main.task.TASK_RUNNERS[task_id](client)`, and resumes. The waypoint list is loaded from the `waypoints:` section of `task_config.yml` at startup; `DEFAULT_WAYPOINTS` in `main/start/orchestrator.py` is only the fallback when that load fails.
 
 ### 2. Runtime API service (production / remote / debug — preferred for daily work)
 
@@ -71,7 +67,7 @@ If you only need to drive the car (no internal changes), you should be writing a
 
 ### 3. Business client (`main/`)
 
-`main/` is a separate Python package that depends **only** on the runtime API via HTTP. It splits into three subpackages — pick the one matching your area:
+`main/` is a separate Python package that depends **only** on the runtime API via HTTP (it never imports `runtime/` or `MyCar`). It splits into subpackages — pick the one matching your area:
 
 ```bash
 export RAK_CAR_SERVER_ORIGIN=http://192.168.6.231
@@ -82,12 +78,13 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission
 
 | 子包 | 用途 | 自己的 doc |
 | --- | --- | --- |
-| `main/arm/` | 机械臂业务：`api/`（ArmClient 聚合 8 个 mixin）、`vision/`（4-DOF 视觉伺服 + depth-aware PID + RealtimeLoop）、ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/` 闭环、`tasks/` 流程、`examples/` 模板、`tests/` 85+ 单测、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) / [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) |
+| `main/arm/` | 机械臂业务：`api/`（ArmClient 聚合 8 个 mixin）、`vision/`（4-DOF 视觉伺服 + depth-aware PID + RealtimeLoop）、ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/`（闭环 + `VisualOrchestrator`）、`each_task/`（task1/2/4/5/6/7 业务逻辑）、`tasks/` 流程、`examples/` 模板、`tests/` 141 单测、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) / [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) |
 | `main/chassis/` | 底盘外环：ChassisClient + 50Hz 主循环；`controllers/` (P / Stanley / curvature_adaptive) + `loops/` (closed_loop, safety, telemetry) + `tasks/` (read_ir) + `cli/` (run_lane_follow, read_ir) + `config/` (lane_follow) | [README.md](./main/chassis/README.md) |
+| `main/task/` | 8 任务编排索引：`TASK_RUNNERS = {1..7: run}` + `_config.py`（`load_task_config` 读 `task_config.yml`）；task1/2/6 逻辑在本目录（走 ArmRunner），task4/5 包装 `main/arm/each_task/`，task3/7 抛 `NotImplementedError`（orchestrator 捕获跳过）；`tests/` 14 单测 | [README.md](./main/task/README.md) |
 | `main/misc/` | 单文件 mini 任务（射击、边走边打等），每个脚本可直接 `python3` 跑 | [README.md](./main/misc/README.md) |
 | `main/test/` | 离线硬件冒烟脚本（arm / storage / x / 循迹），**非正式测试**，绕过 runtime 直接打硬件；改动 main/ 任务前先在这里验证 | — |
 
-The two base clients — `RuntimeApiClient` (HTTP, `main/api_client.py`) and `RuntimeWsClient` (WebSocket, `main/ws_client.py`) — are used by all three subpackages. Full action surface and parameters: [main/API_REFERENCE.md](./main/API_REFERENCE.md) / [main/API.md](./main/API.md) / [main/CAPABILITY_LIST.md](./main/CAPABILITY_LIST.md) / [main/BUSINESS_API_GUIDE.md](./main/BUSINESS_API_GUIDE.md).
+The two base clients — `RuntimeApiClient` (HTTP, `main/api_client.py`) and `RuntimeWsClient` (WebSocket, `main/ws_client.py`) — are used by all subpackages. Full action surface and parameters: [main/API_INDEX.md](./main/API_INDEX.md)（HTTP / WS / 客户端方法权威速查，含 runtime `core/actions.py` 注册表）；5-minute onboarding: [main/QUICKSTART.md](./main/QUICKSTART.md). The older `API.md` / `API_REFERENCE.md` / `CAPABILITY_LIST.md` / `BUSINESS_API_GUIDE.md` referenced in some docs are gone — `API_INDEX.md` replaced them.
 
 ## Visual servo (机械臂视觉伺服, `main/arm/vision/`)
 
@@ -102,17 +99,22 @@ Two closed-loop transports (see [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md
 
 Before a visual-servo run, `stop_arm_feed(force=True)` frees the serial port from the 20 Hz `arm_feed` poll (else its `goto_position` polls starve the queue); restore with `start_arm_feed`.
 
+**`VisualOrchestrator`** (`main/arm/loops/orch_visual.py`, import from `main.arm.loops`) is the combined chassis→arm pick pipeline used by task1 — three stages: ① `track_chassis()` centers the target in frame using the chassis' two velocity DOFs; ② `track_velocity_pick()` aligns the 4-DOF arm onto the suction-nozzle setpoint in velocity mode; ③ y drops to 0 → `grasp(True)`. One-call entry: `track_and_grasp(label, chassis_max_seconds=..., arm_timeout=...)`; stages are also usable individually (`chassis_only` / `arm_only` / `grasp`). The screen-axis → motion sign mapping is field-calibrated in [orch_visual.md](./main/arm/loops/orch_visual.md) (cx→chassis vx/vy, dx→arm_angle, dy→x — read it before flipping any sign).
+
 Docs: [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) (1-page) / [VISION_SERVO_DESIGN.md](./main/arm/VISION_SERVO_DESIGN.md) / [VISION_REALTIME_DESIGN.md](./main/arm/VISION_REALTIME_DESIGN.md) / [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md).
 
 ## Big-picture architecture
 
 Three layers, top-down. The names in **bold** are the files you'll touch most.
 
-### A. Top-level scripts (monolith path only)
+### A. Mission layer (`run.py` → orchestrator → `main/task/`)
 
-- `car_start_2026.py` — thin `main()` that calls `init()` then each task in sequence.
-- `car_task_function.py` — the 8 task functions. Each is mostly a hand-tuned sequence of `my_car.move_to_position(...)`, `my_car.move_to_detection_target()`, `my_car.arm.grasp(...)`, etc. Coordinates here (e.g. `cylinder_loc` in `auto_seeding`) are *track-specific magic numbers* — they are the calibration surface when porting to a different venue.
-- **`car_wrap_2026.py`** — defines `class MyCar(MecanumDriver)`. This is the single facade the task layer talks to; it's also what the runtime owns. Construction order is: chassis → screen → streamer → arm → sensor (`Key4Btn`, `ServoPwm` for storage, `BluetoothPad`, `PoutD` for shooter) → PID → cameras → paddle infer → ERNIE bot → key-press daemon thread.
+- **`run.py`** — thin CLI shell (adds repo root to `sys.path`, parses args) delegating to `main.start.orchestrator.Orchestrator`. Flags: `--lane-hz`, `--ir-interval-s`, `--task N` (single-task run: lane-follow to that waypoint → trigger → run → stop).
+- **`main/start/orchestrator.py`** — background thread A: 50 Hz lane-follow outer loop (`main.chassis.loops.closed_loop.DoubleLoopRunner`, pause/resume); thread B: 20 Hz wheel-odometry accumulation; main thread: walks waypoints (loaded from `task_config.yml` `waypoints:`, fallback `DEFAULT_WAYPOINTS`), each waits on an IR + odometry trigger (default AND) → pauses the loop → `main.task.TASK_RUNNERS[task_id](client)` → resumes. Only `main.start` should import this file — it serves `run.py` exclusively.
+- **`main/task/`** — numbered task registry. Each `task{N}_*.py` exposes `run(client=None) -> Dict`; unimplemented tasks (3/7) raise `NotImplementedError`, which the orchestrator catches and skips. Business logic lives in the wrapper itself (task1/2/6, built on `main.arm.ArmRunner` + `composite_pick` / `composite_release` / `composite_run`) or in `main/arm/each_task/` (task4/5). Per-task poses/slots come from `task_config.yml` via `main/task/_config.py::load_task_config()` — **that yaml is the calibration surface when porting to a different venue**, not the task code.
+- task1's vision grasp runs through `VisualOrchestrator` (see "Visual servo" above): chassis track → 4-DOF align → grasp.
+
+The legacy monolith (`car_start_2026.py` / `car_task_function.py` / `car_wrap_2026.py`) was deleted in `c23c871`; the `MyCar(MecanumDriver, *Mixins)` facade now lives only in `runtime/services/my_car/` (§D).
 
 ### B. WhalesBot hardware SDK (`smartcar/whalesbot/`)
 
@@ -140,9 +142,7 @@ All three big modules were split into **aggregator + mixins** (2026-07):
 
 ## Data-flow during a typical task
 
-**Legacy monolith:** `my_car.cap_side.read()` → image → `my_car.task_det(img)` (REQs `tcp://127.0.0.1:5002`) → JSON boxes → `my_car.get_detection_results()` → `Bbox` objects with normalised `pos_from_center()` → used as the error signal for a PD loop that drives `move_to_detection_target()`.
-
-**Runtime path:** Caller POSTs `{"target":"car","name":"move_to_detection_target",...}` to `/v1/execute`. The service enqueues a job, holds `car_lock`, dispatches onto the same `MyCar()` singleton, returns the result. The same flow applies for vision reads (`/v1/vision/task`, `/v1/vision/lane`, `/v1/vision/ocr`) — see `runtime/VISION_API.md`.
+Caller POSTs `{"target":"car","name":"move_to_detection_target",...}` to `/v1/execute` (async by default → returns `job_id`). The job lands on the `arm_queue` or `car_queue` worker, which takes the `MyCar` reference under `_ref_lock` and dispatches onto the singleton (see "Runtime concurrency model" below). The same flow applies for vision reads (`/v1/vision/task`, `/v1/vision/lane`, `/v1/vision/ocr`) — see `runtime/VISION_API.md`. Detection itself: camera frame → ZMQ REQ to the inference backend → JSON boxes → normalised `pos_from_center()` → PD error signal driving `move_to_detection_target()`.
 
 Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5002, front detection uses 5003, OCR uses 5004 with no resize (`img_size: Null`).
 
@@ -150,7 +150,8 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 
 | Where | What it controls | When to touch |
 | --- | --- | --- |
-| `config_car.yml` (root) | Cameras, speed limits, PID gains, infer_cfg, ERNIE token | Track-specific calibration |
+| `config_car.yml` (root) | Cameras, speed limits, PID gains, infer_cfg, ERNIE token | Track-specific calibration (chassis / inference side) |
+| `task_config.yml` (root) | Per-task arm poses & slot maps (`task_cfg:` section) + the orchestrator waypoint list (`waypoints:` section); loaded by `main/task/_config.py` and `Orchestrator` | Track-specific calibration (task / arm side) — port venues by editing this, not task code |
 | `runtime/core/settings.py` | Runtime bind/public host:port, auto-init flags, job queue limits | Sharing IP/port with teammates |
 | `main/settings.py` | Where `RuntimeApiClient` points (env-var driven) | Running `main/` from a different host |
 | `ecosystem.config.js` | PM2 process definition (path, env, restart policy) | Changing the production daemon |
@@ -183,14 +184,15 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 
 ## Conventions and gotchas
 
-- **Module alias `my_car`**: `car_task_function.py` declares `global my_car` inside `init()` and assumes every task function is called after `init()`. Don't import `my_car` directly; invoke through the top-level task functions.
-- **`STOP_PARAM = True` is a class var on `MyCar`** that gates emergency-stop checks. `init()` sets it to `False` before each run.
-- **Unit tests live in `main/arm/tests/`** (85+ tests, stdlib `unittest` — *not* pytest). Run all: `/usr/bin/python3 -m unittest discover -s main/arm/tests -p 'test_*.py' -v`. They mock the HTTP/WS layer (offline, no hardware). Physical behaviour is still verified on-track via `main/arm/examples/*` against the [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md) checklist; legacy monolith paths are exercised via `car_start_2026.py` with the upstream tasks commented out.
+- **Business layer never touches hardware directly**: `main/` code talks to the runtime only via `RuntimeApiClient` / `RuntimeWsClient` — it must not import `runtime/` or `MyCar`. `/v1/execute` is async by default (returns `job_id`; chained calls need explicit `sync=True` + `wait_job`), and clearing `_stop_flag` after an e-stop / cancel requires `POST /v1/control/reset-stop` before the feed daemons will run again.
+- **底盘平移一律 `move_for([dx,0,0])`，禁止给 `move_to_position` 世界坐标绝对目标**：实车麦克纳姆轮 odom theta 漂移极大（单次运行实测 0.8–3.2 rad），但车头物理上是正的、odom x/y/theta 自洽。SDK 内部 `world_to_car_velocity(v, 当前theta)` 拿这个垃圾 theta 配轮速 —— 只有闭式用法（`move_for` 正用反用各一次）能抵消：世界坐标目标会转头（theta=0）或斜走（保持 theta），拿 odom x 算网格还会偏远 1/cosθ 倍。网格用沿车头相对位移自记账（参考 `main/task/task1_seeding.py` 的 `pos_along`）。2026-08-03 实车验证。
+- **`STOP_PARAM`** is a class var on the runtime-side `MyCar` (`runtime/services/my_car/`) that gates emergency-stop checks.
+- **Unit tests live in `main/arm/tests/` (141) and `main/task/tests/` (14)** — stdlib `unittest`, *not* pytest; they mock the HTTP/WS layer (offline, no hardware). Run: `/usr/bin/python3 -m unittest discover -s main/arm/tests -p 'test_*.py'` and `/usr/bin/python3 -m unittest discover -s main/task/tests -p 'test_*.py'`. Physical behaviour is still verified on-track via `main/arm/examples/*` against the [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md) checklist.
 - **Chinese-only comments**: most module/function docstrings are in Chinese — match the style when adding new code.
 
 ## MC602 reboot behavior (read before touching runtime init)
 
-The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each reboot. Three concurrency hazards (USB re-enumeration races, init-queue jams, lock contention) have been investigated in past debug sessions — check `.dbg/` for environment snapshots and Trae-format `.ndjson` traces (each session pairs a `debug-<slug>.md` note at the repo root with `.dbg/<slug>.{env,ndjson}` artefacts; older sessions may live only in `.dbg/`). Read them before changing init/lock code, and check the `# debug-point runtime-init-queue-session` instrumentation in `runtime/services/runtime_service.py`. **Status on the controller-download-stuck issue: OPEN — don't refactor the recovery layer until it's closed.**
+The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each reboot. Three concurrency hazards (USB re-enumeration races, init-queue jams, lock contention) have been investigated in past debug sessions — check `.dbg/` for environment snapshots and Trae-format `.ndjson` traces (a session's artefacts live in `.dbg/<slug>.{env,ndjson}`, sometimes paired with a `debug-<slug>.md` note at the repo root — the latest session, `mc602-download-stuck`, has only the `.dbg/` artefacts). Read them before changing init/lock code, and check the `# debug-point runtime-init-queue-session` instrumentation in `runtime/services/runtime_service.py`. **Status on the controller-download-stuck issue: OPEN — don't refactor the recovery layer until it's closed.**
 
 ## Runtime concurrency model (replaces `car_lock`)
 
@@ -210,7 +212,7 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 
 ## Debug instrumentation
 
-`.dbg/` contains environment snapshots and structured logs from the most recent debug sessions (`.env` files and Trae-format `.ndjson` traces). They are committed alongside the corresponding `debug-*.md` so a future session can resume the same line of investigation. When you open a new debug session, mirror this layout: a `debug-<short-slug>.md` at the repo root and matching `.dbg/<short-slug>.{env,ndjson}` artefacts. `runtime/services/runtime_service.py` already emits debug points under `DEBUG_SERVER_URL` / `TRAE_DEBUG_API_URL`; check for them before adding new ones.
+`.dbg/` contains environment snapshots and structured logs from the most recent debug sessions (`.env` files and Trae-format `.ndjson` traces). They are committed so a future session can resume the same line of investigation (the latest session, `.dbg/mc602-download-stuck.*`, has no root-level note). When you open a new debug session, mirror this layout: a `debug-<short-slug>.md` at the repo root and matching `.dbg/<short-slug>.{env,ndjson}` artefacts. `runtime/services/runtime_service.py` already emits debug points under `DEBUG_SERVER_URL` / `TRAE_DEBUG_API_URL`; check for them before adding new ones.
 
 ## Submission intake
 
@@ -222,11 +224,11 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 
 ## Pointers to deeper docs
 
-- **Legacy monolith path:** this file (sections A–C above) + `car_wrap_2026.py` + `config_car.yml` comments.
+- **Mission layer:** `main/start/orchestrator.py` docstring + `main/task/README.md` + `task_config.yml` comments (the venue-calibration surface).
 - **Runtime HTTP API:** `runtime/README.md` (含并发任务模型、锁层次、双 worker 队列、/v1/execute 异步语义; ⚠️ 其目录清单早于 mixin 拆分, 实际结构见上文 §D), `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
-- **Business client:** `main/README.md`, `main/API.md`, `main/API_REFERENCE.md`, `main/BUSINESS_API_GUIDE.md`, `main/CAPABILITY_LIST.md`.
-- **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/QUICKSTART.md` + `main/arm/TEST_PREFLIGHT.md`（真机测试前检查）; 视觉伺服：`main/arm/VISUAL_SERVO_QUICKREF.md` / `VISION_SERVO_DESIGN.md` / `VISION_SERVO_PLAN.md` / `VISION_REALTIME_DESIGN.md`; `main/chassis/README.md`; `main/misc/README.md`.
+- **Business client:** `main/README.md`, `main/QUICKSTART.md`, `main/API_INDEX.md`（权威 action / HTTP / WS 速查）.
+- **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/QUICKSTART.md` + `main/arm/TEST_PREFLIGHT.md`（真机测试前检查）; 视觉伺服：`main/arm/VISUAL_SERVO_QUICKREF.md` / `VISION_SERVO_DESIGN.md` / `VISION_SERVO_PLAN.md` / `VISION_REALTIME_DESIGN.md`; chassis→arm 联调流水线：`main/arm/loops/orch_visual.md`; `main/chassis/README.md`; `main/task/README.md`; `main/misc/README.md`.
 - **User-facing intro:** `README.md` (the original competition-tasks overview in Chinese).
 - **Controller lab:** `test/README.md`, `test/OPERATION_GUIDE.md`, `test/PROTOCOL_NOTES.md`.
 - **本地端到端验证脚本：** `main/test/verify_concurrent.py`（gitignored，本地用），跑双线程探针测 lane + arm 并发。
-- **Debug sessions:** `debug-*.md` at repo root (each is self-contained).
+- **Debug sessions:** `debug-*.md` notes at repo root and/or `.dbg/` artefacts (e.g. `.dbg/mc602-download-stuck.*`); each session is self-contained.
