@@ -493,8 +493,14 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 logger.info("  底盘已在 %.3f m (距离 target %.3f < 5cm), 跳过移动",
                             curr_x, target_x_m)
                 return
-            # 用户 22:28: 保证和车道平行 (theta→0), 不然对不齐
-            logger.info("  闭环底盘移动 odom=%.3f → target=%.3f m (y 锁 %.3f, theta→0)",
+            # 用户 23:10: 不修 theta! odom theta 是累积误差, 不代表真实朝向.
+            # move_to_position 传当前 theta, 只动 x/y, 不让车转.
+            try:
+                odom = arm_client.http.get("/v1/realtime/odom/state", timeout=3).get("odom_state") or {}
+                cur_theta = float(odom.get("theta", 0.0))
+            except Exception:
+                cur_theta = 0.0
+            logger.info("  闭环底盘移动 odom=%.3f → target=%.3f m (y 锁 %.3f, theta 不动)",
                         curr_x, target_x_m, curr_y)
             import requests as _req
             api_base = getattr(arm_client.http, "settings", None)
@@ -505,7 +511,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     json={
                         "target": "car",
                         "name": "move_to_position",
-                        "args": [[target_x_m, curr_y, 0.0]],   # theta→0 保持平行
+                        "args": [[target_x_m, curr_y, cur_theta]],   # theta 保持当前值, 不转!
                         "kwargs": {},
                         "sync": True,
                         "timeout": chassis_move_timeout,
@@ -554,17 +560,6 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 _chassis_goto(target_s)
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
-                # 用户 22:28: 第一列也要保证 theta≈0 (和车道平行)
-                try:
-                    odom = arm_client.http.get("/v1/realtime/odom/state", timeout=3).get("odom_state") or {}
-                    th = float(odom.get("theta", 0.0))
-                    if abs(th) > 0.02:
-                        logger.info("  theta=%.3f 偏了, 修正→0", th)
-                        arm_client.http.execute_car_action(
-                            "move_to_position", [curr_x, float(odom.get("y", 0.0)), 0.0],
-                            timeout=10.0, sync=True)
-                except Exception:
-                    pass
 
             # (1.5) 切 S 姿态 — x 用 move_x(v_max=100), arm/y/hand 用 composite_run 并发
             logger.info("  切 S 姿态: arm=-90° x=-80 y=-100 hand=0°")
