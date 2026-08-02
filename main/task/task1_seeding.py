@@ -210,34 +210,32 @@ def _pick_at_source(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
         arm_start=pick_arm_start, hand_start=0.0,
-        timeout=cfg.get("pick_track_timeout_s", 3.0),   # 21:36 用户: 快速! 3s 超时直接 fallback
+        timeout=cfg.get("pick_track_timeout_s", 2.5),   # 21:48 用户: 更快! 2.5s
         hz=20.0,
-        gain_arm=1.5, gain_x=0.35,                     # 21:36 用户: 灵敏! 快速对齐
-        deadzone=0.10, max_vel=0.50,                   # 死区 0.10 快速锁, max_vel 0.50 快
+        gain_arm=2.0, gain_x=0.45,                     # 21:48 用户: 再快! 无缝衔接
+        deadzone=0.08, max_vel=0.60,                   # 死区 0.08 更快锁, max_vel 0.60
         settle_hits=1,
-        hold_s=cfg.get("vacuum_settle_s", 0.15),
+        hold_s=cfg.get("vacuum_settle_s", 0.10),
         lift_back=False,
     )
     if not result.get("ok"):
         # (5) 失败 fallback: 不对齐, 写死下降+吸, 跑完全程
+        # 用户 21:51: hand 保持 0 (不变 90), arm 不超限位 (用 -90 安全值)
         logger.warning(
             "[S%d] pick servo 未收敛 (trace_hits=%s end_arm=%s) → fallback 写死 pick",
             column_idx, result.get('trace_hits'), result.get('end_arm'),
         )
-        # 先把 y 抬到工作平面 (move_y 走 _check_safe 不走 _check_y_protected)
         runner.client.move_y(init_y_mm, timeout=15.0)
-        # 设手爪 UP(-90°) — exception 让 y=0 不被 _check_y_protected 拒绝 (但当前 y 已经 -100, 不需要)
-        runner.client.set_hand_angle(-90.0, speed=80, timeout=15.0)
-        # 设置更 open 的 arm 角度 (-110°, 物理范围 [-150, +90])
-        runner.client.set_arm_angle(-110.0, speed=80, timeout=15.0)
-        # 降到动作平面
+        # hand 保持 0, arm 用 -90 (安全, 不超限位)
+        runner.client.composite_run(
+            arm=-90.0, x_mm=None, y_mm=None, hand=0.0,
+            speed=100, timeout=15.0,
+        )
         runner.client.move_y(0.0, timeout=15.0)
-        # 真空 on (idempotent — 可能 pick servo 已经 ON, 但确保)
         arm_client.grasp(True)
-        time.sleep(0.3)  # vacuum settle
-        # 抬高回工作平面
+        time.sleep(0.2)
         runner.client.move_y(init_y_mm, timeout=15.0)
-        logger.info("  -> fallback 完成: arm=-110 hand=-90 吸嘴在吸")
+        logger.info("  -> fallback 完成: arm=-90 hand=0 吸嘴在吸")
     return label
 
 
@@ -598,8 +596,12 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                             next_col_idx, next_source_world, next_source)
                 _chassis_goto(next_source)
                 # (7) 对齐 (step1): 切 PLACE align 姿态 + track_chassis
+                # 用户 21:51: 下一列可能已放上物体挡住 set, 对齐失败就 pass
                 logger.info("  === 列 %d 完成, 执行 step1 对齐再进下一列 ===", i + 1)
-                _init_step1_place_align(arm_client, cfg)
+                try:
+                    _init_step1_place_align(arm_client, cfg)
+                except Exception as exc:
+                    logger.warning("  对齐失败 (%s), pass 继续下一列", exc)
             else:
                 # 最后一列: 留在 30 位置, 不回 0
                 logger.info("  最后一列完成, 底盘留在 %.3f m", align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]])
@@ -608,13 +610,23 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         logger.exception("task1_seeding 失败: %s", exc)
         return {"ok": False, "completed": completed, "error": str(exc)}
 
-    # 用户 21:36: 执行完之后 reset 机械臂
-    logger.info("task1 完成, reset 机械臂...")
+    # 用户 21:48: 所有动作做完, y/x/arm/hand 都恢复默认
+    logger.info("task1 完成, 恢复所有轴默认...")
     try:
+        # 先抬 y 到安全区 (避免 reset 时撞底)
+        runner.client.move_y(-100.0, timeout=15.0)
+        # 收 x 回 0
+        runner.client.move_x(0.0, timeout=15.0)
+        # arm 回 MID (0°), hand 回 UP (-90°)
+        runner.client.composite_run(
+            arm=0.0, x_mm=None, y_mm=None, hand=-90.0,
+            speed=100, timeout=15.0,
+        )
+        # reset_position (y 触底定原点)
         arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
-        logger.info("  reset_position 完成")
+        logger.info("  所有轴已恢复默认")
     except Exception as exc:
-        logger.warning("  reset_position 失败 (%s), 跳过", exc)
+        logger.warning("  恢复默认失败 (%s), 跳过", exc)
 
     return {"ok": True, "completed": completed}
 
