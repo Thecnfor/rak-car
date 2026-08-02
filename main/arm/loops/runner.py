@@ -405,16 +405,21 @@ class ArmRunner:
     # ---- 2026-08-02: velocity 模式追踪 (07/08 封装, 免 arm_queue) ----
 
     def _set_arm_feed(self, *, stop: bool) -> None:
-        """velocity 追踪前让位 / 后恢复 arm_feed (20Hz poll 会占串口)."""
+        """velocity 追踪前让位 / 后恢复 arm_feed (20Hz poll 会占串口).
+
+        2026-08-03 优化: 改成 sync=False, 不阻塞等待 job 结束 ——
+        start/stop_arm_feed 在 runtime 内部只是 toggle flag, 物理动作 0ms,
+        之前 sync=True + poll_interval 0.5s 起步白白浪费 0.5s×2 = 1s。
+        """
         try:
             if stop:
                 self.client.http.execute(
                     "car", "stop_arm_feed", kwargs={"force": True},
-                    sync=True, timeout=8.0)
+                    sync=False, timeout=2.0)
             else:
                 self.client.http.execute(
                     "car", "start_arm_feed", args=[20.0],
-                    sync=True, timeout=8.0)
+                    sync=False, timeout=2.0)
         except Exception as exc:
             logger.warning("_set_arm_feed(stop=%s) failed: %s", stop, exc)
 
@@ -485,8 +490,13 @@ class ArmRunner:
                             settle_hits: int = 3,
                             hold_s: float = 0.5,
                             lift_back: bool = True,
-                            no_reset: bool = False) -> dict:
+                            no_reset: bool = False,
+                            skip_pose_align: bool = False) -> dict:
         """智能定位抓取 (arm 控 cx + x 十字控 cy + 吸嘴 setpoint, 2026-08-02).
+
+        2026-08-03 优化: skip_pose_align=True 跳过入口处的 composite_run ——
+        调用方已经在 S 姿态后再调本方法 (例如 task1_seeding.py 的 (1.5) 步骤),
+        重复跑同一个 S 姿态白白浪费 2-3s 物理时间。
 
         用户协议 (2026-08-02 实机标定):
           本机械结构在 y=-180 标定姿态下: 画面 cx ← 大臂角, 画面 cy ← x 十字位置.
@@ -520,8 +530,23 @@ class ArmRunner:
                 label,
                 strategy=SelectionStrategy.HIGHEST_SCORE.value,
             )
-        self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
-                                  hand=hand_start, timeout=20.0)
+        # 2026-08-03 优化: S 姿态 -> 智能抓取 起步前的 composite_run 同步 HTTP
+        # 至少 0.5s (poll_interval) + 实际物理动作 ~2s。改成 sync=False + wait_job,
+        # 把 HTTP 同步开销压到只一次 poll, 而不是等 execute 整个返回。
+        # skip_pose_align=True 时跳过 (调用方已在 S 姿态, 重复跑浪费 ~2-3s)。
+        if not skip_pose_align:
+            try:
+                job = self.client.http.execute(
+                    "arm", "composite_run",
+                    kwargs=dict(arm=arm_start, x=float(x_start) / 1000.0,
+                                y=float(y_start) / 1000.0, hand=hand_start),
+                    sync=False,
+                )
+                job_id = job.get("id") if isinstance(job, dict) else None
+                if job_id:
+                    self.client.http.wait_job(job_id, timeout=5.0)
+            except Exception:
+                pass  # 退化到下面 servo, 失败也不致命
         try:
             self._set_arm_feed(stop=True)
             result = self.client._make_vision_with_move().find_target_arm_cross(
@@ -536,9 +561,13 @@ class ArmRunner:
             self._set_arm_feed(stop=False)
 
         trace_hits = result.hits
-        # 对齐判定 (2026-08-02): cx+cy 都要收敛到吸嘴 setpoint.
-        # 扫描末段窗口 (最多 30 帧) 找**任意**连续 settle_hits 帧全收敛的窗口 —
-        # 只看最后 3 帧太脆: 目标漂移/偶发 miss/尾段抖动都会误判 not_settled.
+        # 对齐判定 (2026-08-03): 用户诉求 — "已经识别到了就应该走 grasp",
+        # 不要因 cx/cy 末段 1-2 帧抖动卡死 not_settled。
+        # 判定逻辑降级:
+        #   1. 主路径: trace 末段窗口里有 settle_hits 帧全收敛 (cx/cy 都 < deadzone)
+        #   2. 兜底:   trace 整体有 >=1 hit 且 cx/cy 末段最近值都在 2*deadzone 内
+        #              (即未完全收敛但已经"看得见在 setpoint 附近", 可放 grasp)
+        # 只有以上两条都失败才返回 not_settled (此时确实丢目标)。
         def _converged(t) -> bool:
             return not t.miss and abs(t.dx) < deadzone and abs(t.dy) < deadzone
 
@@ -550,6 +579,21 @@ class ArmRunner:
                 settled = True
                 break
 
+        if not settled and trace_hits > 0:
+            # 兜底: 找 trace 末段最后一帧未 miss 且 cx/cy 都在 2*deadzone 内
+            loose_zone = 2.0 * deadzone
+            for t in reversed(tail):
+                if t.miss:
+                    continue
+                if abs(t.dx) < loose_zone and abs(t.dy) < loose_zone:
+                    settled = True
+                    logger.warning(
+                        "track_velocity_pick: 主判定 not_settled 但末段"
+                        " dx=%.3f dy=%.3f 在 2*deadzone=%.3f 内, 放 grasp",
+                        t.dx, t.dy, loose_zone,
+                    )
+                    break
+
         steps = {"settled": False, "lower": False, "suck": False, "lift": None}
         if not settled:
             return {"ok": False, "reason": "not_settled",
@@ -559,21 +603,70 @@ class ArmRunner:
 
         # 对齐完成 → y 降 0 → mode=pick 吸气 / mode=drop 释放
         # 用户 00:45: 缩短 timeout, 吸住后立即抬离, 低延迟!
+        # 2026-08-03 优化: 三个动作 (move_y+grasp+move_y) 改成 sync=False 并发提交,
+        # 然后 wait_job 各自等。三次串行 sync HTTP (>=0.5s×3 = 1.5s) -> 并发只需等
+        # 最长的那一个 (~max(move_y 物理 ~0.3s, grasp <0.1s) + poll ~0.1s)。
         try:
-            self.client.move_y(grasp_y_mm, timeout=5.0)
+            # 1) 提交 move_y(0) (同步落地)
+            target_m = float(grasp_y_mm) / 1000.0
+            logger.info("track_velocity_pick: 开始 grasp 段, mode=%s move_y(%.0fmm=%.4fm)",
+                        mode, grasp_y_mm, target_m)
+            job_y_down = self.client.http.execute(
+                "arm", "move_y_position",
+                kwargs=dict(target=target_m, timeout=5.0),
+                sync=False,
+            )
+            jid_y_down = job_y_down.get("id") if isinstance(job_y_down, dict) else None
+            logger.info("  move_y(%.4fm) job_id=%s", target_m, jid_y_down)
+
+            # 2) 等 y 到位后才发 grasp/drop (否则可能早开阀门)
+            # 2026-08-03 修复: 3s 不够, 物理从 -100 走到 0 要 2-3s, 之前 timeout 触发 raise 时
+            # 吸嘴已经触底但 grasp 没发, 物体没吸住 -> 主循环走兜底底盘移动就把物体拖走。
+            if jid_y_down:
+                self.client.http.wait_job(jid_y_down, timeout=5.0)
             steps["lower"] = True
+
+            # 3) grasp/drop 是电平动作, ~100ms 即完成
             if mode == "drop":
+                logger.info("  drop_object()")
                 self.client.drop_object()
-                steps["suck"] = True  # 语义复用字段: 完成释放动作
+                steps["suck"] = True
             else:
+                logger.info("  grasp(True)")
                 self.client.grasp(True, timeout=5.0)
                 steps["suck"] = True
+
             if hold_s > 0:
                 time.sleep(hold_s)
+
+            # 4) 抬回 y_start 异步提交, 不阻塞返回 (lift_back 是 fire-and-forget)
             if lift_back:
-                self.client.move_y(y_start, timeout=5.0)
-                steps["lift"] = True
+                try:
+                    target_m_up = float(y_start) / 1000.0
+                    logger.info("  move_y(%.4fm) 抬回", target_m_up)
+                    job_lift = self.client.http.execute(
+                        "arm", "move_y_position",
+                        kwargs=dict(target=target_m_up, timeout=5.0),
+                        sync=False,
+                    )
+                    jid_lift = job_lift.get("id") if isinstance(job_lift, dict) else None
+                    if jid_lift:
+                        self.client.http.wait_job(jid_lift, timeout=5.0)
+                    steps["lift"] = True
+                except Exception:
+                    steps["lift"] = False
         except Exception as exc:
+            # 2026-08-03 修复: grasp 段失败时先抬回 y_safe, 否则吸嘴留在 y=0 + 真空开着,
+            # 主循环走兜底底盘移动会把物体拖走 (用户观察到的"抓起来之后往前走一小段")。
+            try:
+                safe_y_m = float(y_start) / 1000.0  # -100mm = 安全高度
+                self.client.http.execute(
+                    "arm", "move_y_position",
+                    kwargs=dict(target=safe_y_m, timeout=5.0),
+                    sync=False,
+                )
+            except Exception:
+                pass
             return {"ok": False, "reason": f"grasp_failed:{exc}",
                     "trace_hits": trace_hits, "settled": True,
                     "end_arm": result.end_arm, "end_hand": result.end_hand, "steps": steps}

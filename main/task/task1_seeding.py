@@ -230,6 +230,7 @@ def _pick_at_source(
         settle_hits=1,
         hold_s=0.05,
         lift_back=True,   # 用户 00:45: 吸住后立即抬离! 不然停在 y=0 吸着等, 延迟高
+        skip_pose_align=True,  # 2026-08-03: (1.5) 已切 S 姿态, 跳过 runner 内部的重复 composite_run
     )
     if not result.get("ok"):
         # 用户 00:19: 不要 fallback! 太慢! 直接 raise, 主循环跳过该列
@@ -260,12 +261,13 @@ def _place_at_slot(
     """
     place = cfg["arm_place_pose_T2"]
     # PLACE 工作平面已经在 _parallel_chassis_arm 里并发设好了 (arm/x/y/hand 4 轴 concurrent)
-    # 这里只做: move_y(0) → grasp → move_y(-100), 用 ThreadPoolExecutor 并发 y 下降 + 真空
-    logger.info("[T%d] [B+D] 并发: move_y(-20) + grasp(False) + move_y(-100)", column_idx)
+    # 这里只做: move_y(-20) → grasp(False) → move_y(-40), 用 ThreadPoolExecutor 并发 y 下降 + 真空
+    # 用户 (2026-08-03): "place 之后 y 要上升到 -40! 不然会把圆柱体拖走"
+    logger.info("[T%d] [B+D] 顺序: move_y(-20) + grasp(False) + move_y(-40)", column_idx)
     # move_y 走 _check_safe 不走 _check_y_protected, 可以直接到 -20
     runner.client.move_y(-20.0, timeout=3.0)
     arm_client.grasp(False)
-    runner.client.move_y(-100.0, timeout=3.0)
+    runner.client.move_y(-40.0, timeout=3.0)
 
 
 def _return_to_source_pose(
@@ -490,26 +492,26 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 return 0.0, 0.0
 
         def _chassis_goto(target_x_m: float) -> None:
-            """闭环 chassis 到绝对 x (m). 保留当前 theta, **不校正**, 避免"看起来在转".
+            """闭环 chassis 到绝对 x (m). 用 move_to_position (PID + odom 反馈).
 
-            走 move_to_position (SDK 闭环 PID + odom 反馈). target=[x, y, current_theta]
-            保留当前 theta (不传 0). 用 requests.post 直接打 /v1/execute, 避免
-            api_client.execute_car_action 的 sync 模式双打包问题.
+            2026-08-03: 改回 move_to_position 闭环. 之前用 move_for([dx, 0, 0]) 开环
+            累计 theta 漂移, 3 轮跑完 chassis 偏了 5-10cm 而且朝某个方向旋转.
+            move_to_position([target_x, curr_y, 0]) 强制闭环到世界坐标 + theta=0,
+            SDK 会自己修 theta 漂移.
 
-            用户 (2026-08-02 21:00): "step2 应该是进入 S 姿态, 不是底盘动". 改: 如果
-            |target - curr| < 5cm, 跳过 move_to_position (避免 theta 校正旋转).
+            用户 (2026-08-02 21:00): 如果 |target - curr| < 5cm, 跳过 move_to_position
+            (避免 theta 校正旋转 — 微调底盘时不该转).
             """
             curr_x, curr_y = _odom_curr_x_y()
             if abs(target_x_m - curr_x) < 0.05:
                 logger.info("  底盘已在 %.3f m (距离 target %.3f < 5cm), 跳过移动",
                             curr_x, target_x_m)
                 return
-            # 用户 23:16: move_to_position 走 odom 坐标系, theta≠0 时斜着走.
-            # 改用 move_for([dx, 0, 0]) — 车体坐标系, 永远直走不斜.
-            dx_m = target_x_m - curr_x
-            logger.info("  底盘直走 dx=%.3f m (车体坐标, 不斜)", dx_m)
+            # 闭环: 走到 (target_x, curr_y, 0) — 强制 theta=0 让车头归正.
+            logger.info("  底盘闭环 → (%.3f, %.3f, 0) (move_to_position)",
+                        target_x_m, curr_y)
             arm_client.http.execute_car_action(
-                "move_for", [dx_m, 0.0, 0.0],
+                "move_to_position", [target_x_m, curr_y, 0.0],
                 timeout=chassis_move_timeout, sync=True,
             )
 
@@ -544,7 +546,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
 
-            # (1.5) 切 S 姿态 — 全轴并发, timeout 压到 3s (物理到位只需 ~2s)
+            # (1.5) 切 S 姿态 — 全轴并发, timeout 5s (物理到位 ~3-4s, 之前 3s 不够)
             # 用 sync=False + 手动 poll 避免 504 (track_chassis 后 runtime HTTP 会卡)
             logger.info("  切 S 姿态: arm=-90° x=-80 y=-100 hand=0°")
             job = arm_client.http.execute(
@@ -554,7 +556,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             )
             job_id = job.get("id")
             if job_id:
-                arm_client.http.wait_job(job_id, timeout=3.0)
+                arm_client.http.wait_job(job_id, timeout=5.0)
 
             # (2) 抓 — 优化#5: 超时直接跳过该列, 不走 fallback
             try:
@@ -583,19 +585,47 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
                                          speed=100, timeout=2.0)
             logger.info("  → T%d (label=%s, x=%s) 全并发", slot_idx, label, place_x_override)
+            # 2026-08-03 优化: 并发改成 sync=False, 否则两个 sync HTTP 同时打 /v1/execute
+            # 会让 runtime 队列拥塞 504。
             with ThreadPoolExecutor(max_workers=2) as ex:
                 f_chassis = ex.submit(_chassis_goto, target_t)
-                f_arm = ex.submit(arm_client.composite_run,
-                                  arm=place_arm, x_mm=place_x_override,
-                                  y_mm=-100.0, hand=0.0,
-                                  speed=100, timeout=3.0)
-                f_chassis.result(); f_arm.result()
+                f_arm = ex.submit(arm_client.http.execute,
+                                  "arm", "composite_run",
+                                  kwargs=dict(arm=place_arm, x=place_x_override / 1000.0,
+                                              y=-0.1, hand=0.0, speed=100, timeout=5.0),
+                                  sync=False)
+                f_chassis.result()
+                arm_job = f_arm.result()
+                ajid = arm_job.get("id") if isinstance(arm_job, dict) else None
+                if ajid:
+                    arm_client.http.wait_job(ajid, timeout=5.0)
 
-            # (5) 放: y→-20 + grasp (快!)
-            logger.info("[T%d] place: y→-20 + grasp", slot_idx)
-            arm_client.composite_run(arm=None, x_mm=None, y_mm=-20.0, hand=None,
-                                     speed=100, timeout=3.0)
+            # (5) 放: y→-20 + grasp(False) 释放 + y→-40 抬离!
+            # 用户 (2026-08-03): "place 之后 y 要上升到 -40! 不然会把圆柱体拖走"
+            # 关键协议: 释放后必须立即抬到 y<=-40 才能离开当前列, 否则吸嘴会拖动落地的物体。
+            logger.info("[T%d] place: y→-20 + grasp(False) + y→-40 抬离", slot_idx)
+            # 5a) 下降到 -20 (必须等到位才能释放, 否则 vacuum 开着物体没到位)
+            job1 = arm_client.http.execute(
+                "arm", "composite_run",
+                kwargs=dict(arm=None, x=None, y=-0.02, hand=None, speed=100, timeout=5.0),
+                sync=False,
+            )
+            jid1 = job1.get("id") if isinstance(job1, dict) else None
+            # 2026-08-03: timeout 3→5s. 物理 2-3s 边界, 之前 3s 偶发超时 → grasp 没发
+            # → 主循环走兜底盘 504 timeout.
+            if jid1:
+                arm_client.http.wait_job(jid1, timeout=5.0)
+            # 5b) grasp(False) 释放 — 100ms 即完成
             arm_client.grasp(False)
+            # 5c) 立即抬到 -40 (离开保护区更远, 跨列移动时不拖物体)
+            job2 = arm_client.http.execute(
+                "arm", "composite_run",
+                kwargs=dict(arm=None, x=None, y=-0.04, hand=None, speed=100, timeout=5.0),
+                sync=False,
+            )
+            jid2 = job2.get("id") if isinstance(job2, dict) else None
+            if jid2:
+                arm_client.http.wait_job(jid2, timeout=5.0)
 
             # (6) 优化#3: y抬回 + 底盘移下一列 + 切PLACE对齐 全并发!
             # 用户 00:07: y<-30 才可以并发!
@@ -609,26 +639,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         logger.exception("task1_seeding 失败: %s", exc)
         return {"ok": False, "completed": completed, "error": str(exc)}
 
-    # 用户 22:03: reset 静默运行, 不等它执行完
-    logger.info("task1 完成, 底盘→30 + reset 机械臂 (fire-and-forget)...")
-    try:
-        final_x = align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]]
-        _chassis_goto(final_x)
-        # reset 异步, 不阻塞返回
-        import threading
-        def _bg_reset():
-            try:
-                runner.client.move_y(-100.0, timeout=3.0)
-                arm_client.move_x(0.0, 100.0, 10.0, 15.0)  # v_max=100mm/s
-                runner.client.composite_run(arm=0.0, x_mm=None, y_mm=None, hand=-90.0, speed=100, timeout=15.0)
-                arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
-            except Exception:
-                pass
-        threading.Thread(target=_bg_reset, daemon=True).start()
-        logger.info("  底盘到 %.3f m, reset 后台运行中", final_x)
-    except Exception as exc:
-        logger.warning("  收尾失败 (%s), 跳过", exc)
-
+    # task 业务结束, 机械臂归位交给 orchestrator._schedule_arm_home_reset
+    # (2026-08-03 重构, 不在 task 里做 reset, 边重置边巡航由编排层统一处理).
     return {"ok": True, "completed": completed}
 
 

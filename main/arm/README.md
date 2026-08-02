@@ -185,7 +185,8 @@ main/arm/
 │   └── realtime.py            ← RealtimeLoop: find_target_realtime / find_target_track (WS 推送)
 ├── loops/
 │   ├── __init__.py
-│   └── runner.py              ← ArmRunner：业务编排 + dry-run + 视觉伺服高层 (5 个 method 透传 **kwargs)
+│   ├── runner.py              ← ArmRunner：业务编排 + dry-run + 视觉伺服高层 (track_velocity_pick 等)
+│   └── orch_visual.py         ← VisualOrchestrator：chassis+arm+grasp 一条龙编排（2026-08-02）
 ├── tasks/
 │   ├── __init__.py
 │   ├── go_home.py             ← 回到 y=0, x=0, hand=UP, side=MID
@@ -220,6 +221,185 @@ main/arm/
 1. **首次上电通常不需要手跑 `examples/01_calibrate_origin.py`**：runtime 启动时若 `RAK_CAR_RESET_ARM=1`（默认配置见 `ecosystem.config.js:23`）会自动跑一次 `arm.reset_position` 并把新原点落到 `arm_origin.yaml`。只有 `RAK_CAR_RESET_ARM=0` 且从未手调用过 reset 时，`arm_origin.yaml` 才可能不存在 / 全 0，此时坐标系处于**未标定**状态，软限位使用默认值。手动入口只用于漂移严重 / PID 范围卡死后的恢复。
 2. **`move_xy` / `move_x` / `move_y` 越界直接抛 `ValueError`**：业务层别 try-except 后硬塞，除非你确认软限位该改了。
 3. **业务层只调 `main.arm.*`，不要回退到 `client.call("arm", ...)`**：丢失软限位保护和 S 曲线 dry-run。
+
+## 6. 与底盘协同：视觉追踪（2026-08-02 新增）
+
+arm 任务常需要"先用车载摄像头对齐目标 → 再抓/放"。`main/chassis` 提供了两个追踪入口，
+arm 业务层直接 import 调用即可，不需要知道底盘细节。
+
+---
+
+### 6.1 `track_chassis(target, ...)` —— 底盘快速对齐目标
+
+**把目标 bbox 拉到画面中心，允许底盘水平+前后两自由度运动。**
+
+```python
+from main.chassis import track_chassis, track_trace
+
+# 1. dry-run 确认方向（不下发轮速）
+result = track_chassis(
+    "h_tu_dou",              # 目标 label（任意；water/cylinder_2/h_tu_dou/...）
+    dry_run=True,
+    max_seconds=3.0,
+    on_tick=track_trace(1),
+)
+
+# 2. 方向 OK 后真发车
+result = track_chassis(
+    "h_tu_dou",
+    dry_run=False,
+    max_seconds=15.0,
+    on_tick=track_trace(1),
+)
+print(result.arrived, result.reason, result.frames)
+```
+
+**典型业务流程**：
+
+```python
+from main.chassis import track_chassis, make_align_runner
+from main.arm import ArmClient
+
+arm = ArmClient.connect()
+
+# Step 1: 底盘对齐目标
+r = track_chassis("h_tu_dou", dry_run=False, max_seconds=15.0)
+if not r.arrived:
+    print("底盘对齐失败:", r.reason)
+
+# Step 2: 车已到位，精准 area 微调（仅前进/后退）
+runner = make_align_runner(ref_area=0.04, label="h_tu_dou")
+align_result = runner.run(max_seconds=10.0)
+if not align_result.arrived:
+    print("面积对齐失败:", align_result.reason)
+
+# Step 3: 手臂精准抓取
+arm.move_xy(100, 80)
+arm.grasp(True)
+```
+
+**`track_chassis` 返回值 `TrackChassisResult`**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `arrived` | `bool` | True = 连续 5 帧目标在画面中心 |
+| `reason` | `str` | `arrived` / `timeout` / `no_target` / `watchdog` |
+| `final_frame` | `TrackFrame` | 最后一帧（cx/cy/score/area） |
+| `frames` | `int` | 跑了几帧 |
+| `elapsed_s` | `float` | 实际耗时 |
+
+**方向反了？改 sign 参数，不用动控制律**：
+
+```python
+# 默认（2026-08-02 现场）：sign_vx=-1, sign_vy=+1
+# 换车/摄像头后方向反了？
+track_chassis("h_tu_dou", sign_vx=+1)   # 前后反了：cx 负 → 前进（不倒车）
+track_chassis("h_tu_dou", sign_vy=-1)   # 横向反了：cy 负 → 左移（不右移）
+```
+
+---
+
+### 6.2 `make_align_runner(ref_area, label)` —— 仅前进/后退的面积微调
+
+**用面积（area）控制车的前后距离，适合抓取前精准定位。**
+
+```python
+from main.chassis import make_align_runner
+
+runner = make_align_runner(
+    ref_area=0.04,    # 期望面积（标度阶段记录）
+    label="h_tu_dou",
+)
+result = runner.run(max_seconds=10.0)
+print(result.arrived, result.reason, result.elapsed_s)
+```
+
+**`make_align_runner` 返回值 `AlignRunResult`**：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `arrived` | `bool` | True = 连续 3 帧 area_error 在死区内 |
+| `reason` | `str` | `arrived` / `timeout` / `no_target` |
+| `final_state` | `AlignState` | 最后一帧（area/ref_area/error） |
+| `elapsed_s` | `float` | 实际耗时 |
+
+---
+
+### 6.3 轴映射（2026-08-02 现场标定）
+
+| 画面轴 | 车/臂运动 | 误差正时车/臂动作 |
+| --- | --- | --- |
+| cx（横向）| 车前后（vx）| cx 负（画面左）→ vx 负（倒车）|
+| cy（纵向）| 车横向（vy）| cy 负（画面上）→ vy 正（右移）|
+| cx（横向）| 大臂角度 arm_angle | dx>0 → arm 更负（sign_arm=+1）|
+| cy（纵向）| x 十字位置 | dy>0 → x 往左（sign_x=-1）|
+
+---
+
+### 6.4 `VisualOrchestrator` —— 一条龙编排（2026-08-02 新增）
+
+**chassis 追踪 + arm 4-DOF + 抓取，全自动串联。**
+
+> 详细文档：[main/arm/loops/orch_visual.md](./loops/orch_visual.md)
+
+```python
+from main.arm.loops import VisualOrchestrator
+
+orch = VisualOrchestrator()
+
+# 方式 A：一条龙（Stage1 chassis → Stage2 arm → Stage3 grasp）
+result = orch.track_and_grasp(
+    "h_tu_dou",
+    chassis_max_seconds=15.0,
+    arm_timeout=30.0,
+)
+print(result.arrived_chassis, result.arrived_arm, result.grasp_ok)
+
+# 方式 B：单步用
+orch.chassis_only("h_tu_dou")        # 只 Stage 1 chassis
+orch.arm_only("h_tu_dou")            # 只 Stage 2 arm 4-DOF
+orch.grasp(y_mm=0.0)                # 只 Stage 3 吸气
+```
+
+**流水线**：
+
+```
+Stage 1: track_chassis()         → 目标拉到画面中心（chassis vx/vy）
+Stage 2: track_velocity_pick()    → 臂结构映射，4-DOF 对齐到吸嘴 setpoint
+Stage 3: y 降到 0 → grasp(True) → 吸气
+```
+
+**按场景拆用**：
+
+```python
+# 只做 chassis 追踪（不抓）
+orch.track_and_grasp("h_tu_dou", skip_arm=True, skip_grasp=True)
+
+# chassis 追踪 + arm 对齐，不抓
+orch.track_and_grasp("h_tu_dou", skip_grasp=True)
+
+# 只做 grasp（arm 已经在位）
+orch.grasp(y_mm=0.0)
+
+# Stage 1 dry-run（不发车）
+orch.track_and_grasp("h_tu_dou", chassis_dry_run=True)
+
+# Stage 2 dry-run（不下发 grasp）
+orch.track_and_grasp("h_tu_dou", skip_chassis=True, arm_dry_run=True)
+```
+
+**调试参数**：
+
+| 场景 | 改参数 |
+| --- | --- |
+| chassis 前后方向反了 | `chassis_sign_vx=+1` |
+| chassis 左右方向反了 | `chassis_sign_vy=-1` |
+| arm 大臂旋转反了 | `arm_sign_arm=-1.0` |
+| arm x 十字方向反了 | `arm_sign_x=+1.0` |
+| chassis 收敛太慢 | `chassis_kp=0.30, chassis_v_max=0.18` |
+| arm 对齐震荡 | `arm_gain_arm=0.2, arm_gain_x=0.04` |
+
+---
 
 ## 在哪查 API
 

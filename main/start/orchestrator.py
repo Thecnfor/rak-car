@@ -242,6 +242,10 @@ class Orchestrator:
                     if not ok:
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
                 time.sleep(wp.pause_after_s)
+                # 2026-08-03: 每个任务结束后强制 reset 机械臂到 home 姿态
+                # (x=0, y=-150, arm=+90, hand=90), 边重置边巡航 ——
+                # reset 在后台线程跑, 不阻塞 _resume_lane。
+                self._schedule_arm_home_reset()
                 self._resume_lane(runner)
                 completed.append(wp.name)
         except KeyboardInterrupt:
@@ -393,6 +397,58 @@ class Orchestrator:
                             wp.name, left, right, dis)
                 return
             time.sleep(interval_s)
+
+    # ── 任务后机械臂归位 (2026-08-03) ───────────────────────────
+
+    @staticmethod
+    def _schedule_arm_home_reset() -> None:
+        """每个任务结束后, 把机械臂强制 reset 到 home 姿态。
+
+        home 姿态: x=0, y=-150, arm=+90, hand=90。
+        走后台线程, 不阻塞 orchestrator 主线程 (_resume_lane 继续巡航)。
+        失败 / 超时仅打 warning, 不影响后续任务。
+        """
+        import threading
+
+        def _wait_job_silent(action_name: str, kwargs: dict, wait_s: float) -> bool:
+            """fire-and-forget 提交一个 arm action, 阻塞等到 succeeded 或超时。"""
+            from main.api_client import RuntimeApiClient
+            try:
+                client = RuntimeApiClient()
+                job = client.execute("arm", action_name, kwargs=kwargs, sync=False)
+                jid = job.get("id") if isinstance(job, dict) else None
+                if jid:
+                    client.wait_job(jid, timeout=wait_s)
+                return True
+            except Exception as exc:
+                logger.warning("  [reset] %s 失败: %s", action_name, exc)
+                return False
+
+        def _bg_reset() -> None:
+            try:
+                logger.info("  [arm-home] reset 开始 (后台, 不阻塞巡航)")
+                # 1) y 抬到 -150 (高于保护区的安全高度)
+                _wait_job_silent("composite_run",
+                                 dict(arm=None, x=None, y=-0.15, hand=None,
+                                      speed=100, timeout=5.0),
+                                 wait_s=5.0)
+                # 2) x 编码器归 0
+                _wait_job_silent("move_x_position",
+                                 dict(target=0.0, v_max_mms=100.0,
+                                      out_time=10.0, timeout=15.0),
+                                 wait_s=15.0)
+                # 3) arm=+90° (左边) + hand=+90° (下垂, hand 坐标系 +90 是下垂方向)
+                #    一发 composite_run 并发
+                _wait_job_silent("composite_run",
+                                 dict(arm=90.0, x=None, y=None, hand=90.0,
+                                      speed=100, timeout=15.0),
+                                 wait_s=15.0)
+                logger.info("  [arm-home] reset 完成")
+            except Exception as exc:
+                logger.warning("  [arm-home] reset 失败: %s", exc)
+
+        threading.Thread(target=_bg_reset, daemon=True,
+                         name="arm-home-reset").start()
 
     @staticmethod
     def _run_task(client: RuntimeApiClient, wp: Waypoint) -> bool:

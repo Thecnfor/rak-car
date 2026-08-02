@@ -614,8 +614,10 @@ main/chassis/
 ├── __init__.py               ← 只导出 public API
 ├── api.py                    ← ChassisClient：薄封装 RuntimeApiClient/WS
 ├── state.py                  ← LaneState / OdometryState / WheelsState
+├── state_align.py             ← AlignState：视觉微调状态（area/ref_area/error）
 ├── loops/
 │   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环（支持 pause/resume）
+│   │   ├── visual_track.py    ← track_chassis：通用底盘视觉追踪（两自由度）
 │   └── safety.py             ← EmergencyWatchdog / LostLineDetector
 ├── controllers/
 │   ├── base.py               ← OuterLoop ABC + WheelSmoother + mecanum_inverse helper
@@ -648,3 +650,222 @@ main/chassis/
 - 全部接口速查：[main/API_INDEX.md](../API_INDEX.md)
 - Runtime 服务端 lane_state / WS push：[runtime/VISION_API.md](../../runtime/VISION_API.md)
 - 出问题了看：[debug-controller-download-stuck.md](../../debug-controller-download-stuck.md)、[debug-runtime-init-queue.md](../../debug-runtime-init-queue.md)
+---
+
+## 13. 视觉微调与视觉追踪（2026-08-02 新增）
+
+`main/chassis/` 提供两套视觉对齐工具，都走 cam2 `task_feed` 缓存（`/v1/realtime/vision/task`，10Hz+），
+**不下发任何 arm 指令**，只控底盘。
+
+---
+
+### 13.1 `track_chassis(...)` —— 通用底盘视觉追踪（两自由度）
+
+**把目标 bbox 中心拉到画面指定位置（默认画面中心），允许底盘水平+前后两自由度运动。**
+
+> 适用于：车还没到位时，先用底盘快速对齐目标。
+
+**核心概念**：
+
+- **画面 cx**（横向） ↔ **车前后（vx）**：cx 负（画面左/靠前）→ vx 负（后退）
+- **画面 cy**（纵向） ↔ **车横向（vy）**：cy 负（画面上）→ vy 正（右移）
+- **wz = 0**，全程不旋转
+
+**轴符号开关**（换车/换摄像头方向反了，不需要动控制律核心）：
+
+```python
+track_chassis("h_tu_dou")                        # 默认 sign_vx=-1, sign_vy=+1（2026-08-02 现场标定）
+track_chassis("h_tu_dou", sign_vx=+1)             # 前后方向反了：cx 负 → 前进（不倒车）
+track_chassis("h_tu_dou", sign_vy=-1)             # 横向方向反了：cy 负 → 左移（不右移）
+```
+
+**一行调用**：
+
+```python
+from main.chassis import track_chassis, track_trace
+
+result = track_chassis(
+    "h_tu_dou",                        # 目标（字符串/列表；water/cylinder_2/任意 label）
+    on_tick=track_trace(1),            # 每帧打一行
+    max_seconds=10.0,                  # 超时时间
+    dry_run=True,                      # True=只看方向不下发轮速；False=真发车
+)
+print(result.arrived, result.reason, "frames:", result.frames)
+```
+
+**任选目标**：
+
+```python
+track_chassis("water")                         # water 组（water/water_l1/l2/l3 任一）
+track_chassis("cylinder_2")                   # 单 label
+track_chassis(["h_tu_dou", "yue_li"])        # 列表任一匹配
+track_chassis("h_tu_dou", setpoint_cxcy=(-0.1, 0.2))  # 非中心对齐
+```
+
+**参数表（2026-08-02 现场稳档默认值）**：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `target` | `"h_tu_dou"` | 目标 label（字符串/列表） |
+| `sign_vx` | `-1` | 画面 x ↔ 车前后符号（cx 负 → vx 负 = 后退） |
+| `sign_vy` | `+1` | 画面 y ↔ 车横向符号（cy 负 → vy 正 = 右移） |
+| `kp` | `0.20` | 比例增益（纯 P，稳档防振荡） |
+| `v_max` | `0.12 m/s` | 速度上限（绝对值） |
+| `v_slew` | `0.02` | 每帧最多 ±0.02 m/s（20Hz = 0.4m/s²，不会爆冲） |
+| `deadband` | `0.08` | cx/cy 误差都 < 死区 → 判到带内 |
+| `hold_frames` | `5` | 连续 5 帧带内 → `arrived=True` |
+| `max_lost_frames` | `60` | 连续丢 60 帧（≈3s@20Hz）→ 停 |
+| `watchdog_ms` | `2000` | task_feed 2s 没刷 → 停 |
+| `hz` | `20` | 主循环频率 |
+| `dry_run` | `False` | True 时只跑控制律不下发轮速 |
+
+**返回 `TrackChassisResult`**：
+
+```python
+@dataclass
+class TrackChassisResult:
+    arrived: bool                        # True = 连续 5 帧在死区内
+    reason: str                         # arrived / timeout / no_target / watchdog
+    final_frame: Optional[TrackFrame]   # 最后一帧（cx/cy/err/vx/vy/label/score/area）
+    frames: int                         # 跑了几帧
+    elapsed_s: float                    # 实际耗时（秒）
+```
+
+**`TrackFrame` 字段**：
+
+```python
+@dataclass
+class TrackFrame:
+    target_found: bool        # True = 视野内看到目标
+    label: Optional[str]     # 检测到的 label
+    cx: Optional[float]     # bbox 中心 x（归一化，-1~+1）
+    cy: Optional[float]      # bbox 中心 y（归一化，-1~+1）
+    area: Optional[float]     # bbox 面积（w×h）
+    score: Optional[float]    # 检测置信度
+    cx_err: Optional[float]  # setpoint_cx - cx（画面左/右误差）
+    cy_err: Optional[float]  # setpoint_cy - cy（画面上/下误差）
+    vx: Optional[float]      # 本帧下发的前后速度
+    vy: Optional[float]      # 本帧下发的横向速度
+```
+
+**`expand_label_set`**：把组名展开成 label 集合（"water" → {water, water_l1, l2, l3}）
+
+```python
+from main.chassis import expand_label_set
+labels = expand_label_set("water")  # {"water","water_l1","water_l2","water_l3"}
+```
+
+---
+
+### 13.2 `make_align_runner(...)` / `subscribe_visual_align(...)` —— 视觉微调（仅前进/后退）
+
+**用面积（area）控制车的前后距离，目标 bbox 大到 ref_area 时停止。**
+
+> 适用于：车基本到位后，精准对齐到抓取/放置距离。
+
+**原理**：area 越大 = 目标越近。车往前走 → area 增大 → 误差减小 → 收敛。
+
+```python
+from main.chassis import make_align_runner, align_trace, AlignRunResult
+
+runner = make_align_runner(
+    ref_area=0.04,          # 期望面积（标度阶段把目标对齐到 y=-0.1 高度时记录）
+    label="h_tu_dou",        # 目标 label（None = 面积最大）
+)
+result = runner.run(max_seconds=10.0)   # 阻塞直到 arrived / timeout / 停止
+```
+
+**返回 `AlignRunResult`**：
+
+```python
+@dataclass
+class AlignRunResult:
+    arrived: bool              # True = 连续 3 帧 area_error 在死区内
+    reason: str               # arrived / timeout / stopped / watchdog / no_target
+    final_state: Optional[AlignState]  # 最后一帧
+    elapsed_s: float
+    frames: int
+```
+
+**收敛检测（2026-08-02 快档）**：
+
+- 连续 **3 帧** `|area_error| < 0.005` → `arrived=True`
+- **5 帧启动保护区**：前 5 帧不参与计数（避免假阳性）
+- 目标丢失 / 出死区 → 计数器清零
+
+**快档默认参数（2026-08-02 现场）**：
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `kp` | `1.5` | 比例增益（area_error 量级 ~0~0.1） |
+| `v_max` | `0.35 m/s` | 速度上限（绝对值） |
+| `deadband` | `0.005` | area 死区 |
+| `smoother.max_abs` | `0.40` | 单轮 |v| 上限 |
+| `smoother.max_accel` | `0.15` | 每帧最多加 0.15 m/s |
+| `smoother.max_decel` | `0.25` | 每帧最多减 0.25 m/s |
+
+**控制律输出**：`[vx, vx, vx, vx]` — 4 轮全等 vx，**直接下发绕过 IK**，确保不准左右不准旋转。
+
+---
+
+### 13.3 典型使用场景
+
+```
+车未到位时:  track_chassis("h_tu_dou", dry_run=False)  → 把目标拉到画面中心
+车基本到位后: make_align_runner(ref_area=0.04).run()    → area 对齐到抓取距离
+车已对准后:  go_grasp()  (arm 吸盘抓取)
+```
+
+---
+
+### 13.4 真机调试命令
+
+```bash
+# ============ 1. dry-run 看方向（不发车） ============
+cd /home/xrak/Desktop/rak-car && /usr/bin/python3 << 'PYEOF'
+from main.chassis import track_chassis, track_trace
+r = track_chassis(
+    "h_tu_dou",
+    dry_run=True, max_seconds=3.0,
+    on_tick=track_trace(1),
+)
+print("arrived:", r.arrived, "frames:", r.frames)
+PYEOF
+
+# ============ 2. 真发车（确认方向 OK 后） ============
+cd /home/xrak/Desktop/rak-car && /usr/bin/python3 << 'PYEOF'
+import time
+for i in (3, 2, 1):
+    print(i); time.sleep(1)
+print("GO!")
+from main.chassis import track_chassis, track_trace
+r = track_chassis(
+    "h_tu_dou",
+    dry_run=False, max_seconds=15.0,
+    on_tick=track_trace(1),
+)
+print("arrived:", r.arrived, "reason:", r.reason, "frames:", r.frames)
+PYEOF
+
+# ============ 3. 视觉微调（area 对齐） ============
+cd /home/xrak/Desktop/rak-car && /usr/bin/python3 << 'PYEOF'
+import time
+for i in (3, 2, 1):
+    print(i); time.sleep(1)
+print("GO!")
+from main.chassis import make_align_runner, align_trace
+runner = make_align_runner(ref_area=0.04, label="h_tu_dou")
+result = runner.run(max_seconds=10.0)
+print("arrived:", result.arrived, "reason:", result.reason, "frames:", result.frames)
+PYEOF
+```
+
+---
+
+### 13.5 轴符号调试对照表
+
+| 现场观察到的错误 | 改参数 | 改成 |
+| --- | --- | --- |
+| 画面左/右方向反了 | `sign_vx` | `+1`（cx 负 → 前进）|
+| 画面上/下方向反了 | `sign_vy` | `-1`（cy 负 → 左移）|
+
