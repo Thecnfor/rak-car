@@ -493,42 +493,14 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 logger.info("  底盘已在 %.3f m (距离 target %.3f < 5cm), 跳过移动",
                             curr_x, target_x_m)
                 return
-            # 用户 23:10: 不修 theta! odom theta 是累积误差, 不代表真实朝向.
-            # move_to_position 传当前 theta, 只动 x/y, 不让车转.
-            try:
-                odom = arm_client.http.get("/v1/realtime/odom/state", timeout=3).get("odom_state") or {}
-                cur_theta = float(odom.get("theta", 0.0))
-            except Exception:
-                cur_theta = 0.0
-            logger.info("  闭环底盘移动 odom=%.3f → target=%.3f m (y 锁 %.3f, theta 不动)",
-                        curr_x, target_x_m, curr_y)
-            import requests as _req
-            api_base = getattr(arm_client.http, "settings", None)
-            api_base = api_base.api_base if api_base else "http://192.168.5.230:5050"
-            try:
-                resp = _req.post(
-                    f"{api_base}/v1/execute",
-                    json={
-                        "target": "car",
-                        "name": "move_to_position",
-                        "args": [[target_x_m, curr_y, cur_theta]],   # theta 保持当前值, 不转!
-                        "kwargs": {},
-                        "sync": True,
-                        "timeout": chassis_move_timeout,
-                    },
-                    timeout=chassis_move_timeout + 5,
-                )
-                resp.raise_for_status()
-                job = resp.json().get("job", {})
-                logger.info("  move_to_position: %s", job.get("status"))
-            except Exception as exc:
-                logger.warning("  move_to_position 失败 (%s), 退路: 用 move_for 增量", exc)
-                # 退路: 开环增量 (不如 PID 准, 但至少会动)
-                dx_m = target_x_m - curr_x
-                arm_client.http.execute_car_action(
-                    "move_for", [dx_m, 0.0, 0.0],
-                    timeout=chassis_move_timeout, sync=True,
-                )
+            # 用户 23:16: move_to_position 走 odom 坐标系, theta≠0 时斜着走.
+            # 改用 move_for([dx, 0, 0]) — 车体坐标系, 永远直走不斜.
+            dx_m = target_x_m - curr_x
+            logger.info("  底盘直走 dx=%.3f m (车体坐标, 不斜)", dx_m)
+            arm_client.http.execute_car_action(
+                "move_for", [dx_m, 0.0, 0.0],
+                timeout=chassis_move_timeout, sync=True,
+            )
 
         def _parallel_chassis_arm(target_x_m: Optional[float],
                                  arm_kwargs: dict) -> None:
