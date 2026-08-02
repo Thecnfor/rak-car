@@ -249,8 +249,20 @@ class ClintInterface:
             except Exception as exc:
                 logger.warning("%s try_restart_infer_backend failed: %s", self.name, exc)
 
+        old_client = self.client
+        old_ctx = getattr(old_client, "context", None)
         try:
-            self.client.close()
+            old_client.close()
+        except Exception:
+            pass
+        # 2026-08-03: 旧 context 显式销毁。get_zmp_client 每次 reset 都新建一个
+        # zmq.Context(自带 I/O 线程),旧的不销毁会堆积;MyCar.close 只清理
+        # "当前" client,管不到 reset 换下来的孤儿 context —— GC 若在别的线程
+        # finalize 它们,就是 027c77f 修的 term() 永卡同源问题。socket 已 close,
+        # destroy(linger=0) 立即返回不阻塞。
+        try:
+            if old_ctx is not None and not old_ctx.closed:
+                old_ctx.destroy(linger=0)
         except Exception:
             pass
         self.client = self.get_zmp_client(self.port, self._socket_timeout_ms)
