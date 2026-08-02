@@ -36,7 +36,7 @@ task_cfg:
     spacing_along_row_m: 0.15
 
     arm_pick_pose:
-      x_mm: -100
+      x_mm: -80            # 2026-08-02 21:36 用户: pick 和 S 姿态 x 都是 -80
       arm_angle_deg: -90
       y_mm: 0              # 2026-08-02: 吸取动作位置 (吸嘴触底)
       hand_angle_deg: 0    # 吸取时末端向下
@@ -48,7 +48,7 @@ task_cfg:
       hand_angle_deg: -10
 
     arm_place_pose_T2:
-      x_mm: -250           # 2026-08-02 20:44: 实机标定 (x=-320/-240/-250 都让 marker 留中心; 钉死 -250)
+      x_mm: -260           # 2026-08-02 21:44 用户: place x=-260
       arm_angle_deg: 90    # 大臂指向左侧
       y_mm: 0              # 真到 y=0 释放, 通过临时 hand=-90 (UP) 绕开安全门
       hand_angle_deg: 0     # 用户: pick/place 手爪都该是 0 (place 临时变 -90 是为解锁 y=0)
@@ -61,7 +61,7 @@ task_cfg:
 
     init_y_mm: -100        # 初始化抬升高度 (扫描/伺服的起始高度)
 
-    v_max_arm_lateral_mms: 60
+    v_max_arm_lateral_mms: 80    # 2026-08-02 21:36 用户: x 轴速度上 0.06→0.08 m/s
 
     vacuum_settle_s: 0.5
 

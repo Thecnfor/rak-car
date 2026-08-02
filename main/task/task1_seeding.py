@@ -210,13 +210,13 @@ def _pick_at_source(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
         arm_start=pick_arm_start, hand_start=0.0,
-        timeout=cfg.get("pick_track_timeout_s", 4.0),   # 极限压缩: 8→4s, 超时直接 fallback
+        timeout=cfg.get("pick_track_timeout_s", 3.0),   # 21:36 用户: 快速! 3s 超时直接 fallback
         hz=20.0,
-        gain_arm=1.0, gain_x=0.25,                     # 进一步 +50%, 但配合 deadzone 大
-        deadzone=0.18, max_vel=0.40,                   # 死区 0.18 差不多就锁
+        gain_arm=1.5, gain_x=0.35,                     # 21:36 用户: 灵敏! 快速对齐
+        deadzone=0.10, max_vel=0.50,                   # 死区 0.10 快速锁, max_vel 0.50 快
         settle_hits=1,
-        hold_s=cfg.get("vacuum_settle_s", 0.2),
-        lift_back=False,                                # 不抬回, 让 _place_at_slot 走到 PLACE 立刻 grasp(False), 一次
+        hold_s=cfg.get("vacuum_settle_s", 0.15),
+        lift_back=False,
     )
     if not result.get("ok"):
         # (5) 失败 fallback: 不对齐, 写死下降+吸, 跑完全程
@@ -260,26 +260,12 @@ def _place_at_slot(
       hand 全程 0, 不抬手!
     """
     place = cfg["arm_place_pose_T2"]
-    # (a) 切 PLACE 工作平面 (用 x=-250 钉死, 步 1 align 后 chassis 已经在 PLACE 列, 这里
-    #     composite_run 只动 x 和 y (arm/hand 已就位不重设)).
-    logger.info("[T%d] [A] composite_run PLACE (arm=+90 x=%s y=-100 hand=0°)",
-                column_idx, place["x_mm"])
-    runner.client.composite_run(
-        arm=float(place["arm_angle_deg"]),
-        x_mm=float(place["x_mm"]),
-        y_mm=-100.0,
-        hand=float(place["hand_angle_deg"]),
-        speed=80, timeout=20.0,
-    )
-    # 必要时抬 y (遇到残留低 y 时)
-    state = arm_client.get_state()
-    if state.y_mm > -50:
-        runner.client.move_y(-100.0, timeout=15.0)
-    logger.info("  [B] move_y(0) — 直接到动作平面 (hand=0 保持)")
+    # PLACE 工作平面已经在 _parallel_chassis_arm 里并发设好了 (arm/x/y/hand 4 轴 concurrent)
+    # 这里只做: move_y(0) → grasp → move_y(-100), 用 ThreadPoolExecutor 并发 y 下降 + 真空
+    logger.info("[T%d] [B+D] 并发: move_y(0) + grasp(False) + move_y(-100)", column_idx)
+    # move_y 走 _check_safe 不走 _check_y_protected, 可以直接到 0
     runner.client.move_y(0.0, timeout=15.0)
-    logger.info("  [C] grasp(False) 真空释放")
     arm_client.grasp(False)
-    logger.info("  [D] move_y(-100) 抬回工作平面")
     runner.client.move_y(-100.0, timeout=15.0)
 
 
@@ -547,7 +533,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 if arm_kwargs:
                     logger.info("  发起 arm composite_run: %s", arm_kwargs)
                     tasks.append(ex.submit(arm_client.composite_run,
-                                            speed=80, timeout=15.0, **arm_kwargs))
+                                            speed=100, timeout=15.0, **arm_kwargs))
                 for t in tasks:
                     t.result()
 
@@ -568,11 +554,11 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
 
-            # (1.5) 切 S 姿态 (用户 21:07: step 2 必须先进入 S 姿态再扫 cylinder)
-            logger.info("  切 S 姿态: arm=-90° x=-100 y=-100 hand=0°")
+            # (1.5) 切 S 姿态 (用户 21:36: x=-80, speed=100)
+            logger.info("  切 S 姿态: arm=-90° x=-80 y=-100 hand=0°")
             runner.client.composite_run(
-                arm=-90.0, x_mm=-100.0, y_mm=-100.0, hand=0.0,
-                speed=80, timeout=20.0,
+                arm=-90.0, x_mm=-80.0, y_mm=-100.0, hand=0.0,
+                speed=100, timeout=20.0,
             )
 
             # (2) 抓 (机械臂切 S 姿态 + 智能抓取)
@@ -603,28 +589,32 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # (5) 放 — 简单的 grasp(False), hand 不动
             _place_at_slot(runner, arm_client, client, cfg, slot_idx)
 
-            # (6) 并发: 底盘闭环移到下一源列 + 臂回 S 姿态 (hand=0 保持)
+            # (6) 用户 21:44: place 后不回 S 姿态, 保持 PLACE 姿态直接往前走 + 对齐
             if i + 1 < len(source_position_order):
                 next_col_idx = source_position_order[i + 1]
+                next_source_world = SOURCE_POSITIONS_M[next_col_idx]
+                next_source = align_odom_x + next_source_world
+                logger.info("  底盘 → 下一源列 S%d (world=%.3f → odom %.3f), 保持 PLACE 姿态",
+                            next_col_idx, next_source_world, next_source)
+                _chassis_goto(next_source)
+                # (7) 对齐 (step1): 切 PLACE align 姿态 + track_chassis
+                logger.info("  === 列 %d 完成, 执行 step1 对齐再进下一列 ===", i + 1)
+                _init_step1_place_align(arm_client, cfg)
             else:
-                next_col_idx = source_position_order[0]
-            next_source_world = SOURCE_POSITIONS_M[next_col_idx]
-            next_source = align_odom_x + next_source_world
-            logger.info("  底盘 → 下一源列 S%d (world=%.3f → odom target %.3f) + 臂回 S",
-                        next_col_idx, next_source_world, next_source)
-            _parallel_chassis_arm(
-                target_x_m=next_source,
-                arm_kwargs=dict(
-                    arm=s_arm,
-                    x_mm=s_x_mm,
-                    y_mm=-100.0,
-                    hand=0.0,
-                ),
-            )
+                # 最后一列: 留在 30 位置, 不回 0
+                logger.info("  最后一列完成, 底盘留在 %.3f m", align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]])
 
     except Exception as exc:
         logger.exception("task1_seeding 失败: %s", exc)
         return {"ok": False, "completed": completed, "error": str(exc)}
+
+    # 用户 21:36: 执行完之后 reset 机械臂
+    logger.info("task1 完成, reset 机械臂...")
+    try:
+        arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
+        logger.info("  reset_position 完成")
+    except Exception as exc:
+        logger.warning("  reset_position 失败 (%s), 跳过", exc)
 
     return {"ok": True, "completed": completed}
 
