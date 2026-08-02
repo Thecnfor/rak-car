@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from typing import Any, Dict, List, Optional
 
@@ -167,31 +168,30 @@ def _pick_at_source(
 
     Returns: 抓到的 cylinder label (1/2/3).
     """
+    # 2026-08-02 调优: scan 只要 1 次 (上轮实测 13ms 命中, retries=3 浪费);
+    # backoff_s=0 → 失败立刻 raise, 不睡.
     logger.info("[S%d] 视觉扫描源头 cylinder label", column_idx)
-    label = _scan_cylinder_label(client, list(SOURCE_LABELS))
+    label = _scan_cylinder_label(client, list(SOURCE_LABELS), retries=1, backoff_s=0.0)
     if label is None:
         raise RuntimeError(
             f"S{column_idx} 位置未检测到任何 cylinder ({list(SOURCE_LABELS)})"
         )
     logger.info("  -> 抓到 %s, 智能定位抓取 (arm 控 cx + x 十字控 cy)", label)
 
-    # 2026-08-02: 智能定位抓取 (track_velocity_pick) — find_target_arm_cross 实时追踪.
-    #   吸嘴中心 setpoint 走 per-label 查表 (origin.nozzle_offset_for(label));
-    #   追踪在 y=init_y_mm (-180, 准备高度, 看得清楚) 开始 — 本机械结构实测:
-    #     画面 cx ← arm_angle (吸嘴中心对应 arm≈-97)
-    #     画面 cy ← x 十字位置
-    #   大臂转 + x 十字把目标对准吸嘴中心 → y 降 0 → 吸气 → 抬回.
-    init_y_mm = float(cfg.get("init_y_mm", -180.0))
+    # 2026-08-02 调优: settle_hits 3→1 (去掉最后微调)；hold_s 0.5→0.2 (真空缩短);
+    # pick_track_timeout 25→15 (整体更快 fail); max_vel 0.15 保持稳, 防止过冲.
+    # 高度: y_start 用 init_y_mm (统一到 -100, 不再区分 carry/scan 高低).
+    init_y_mm = float(cfg.get("init_y_mm", -100.0))
     result = runner.track_velocity_pick(
         label,
         x_start=0.0, y_start=init_y_mm,
         arm_start=-90.0, hand_start=0.0,
-        timeout=cfg.get("pick_track_timeout_s", 25.0),
+        timeout=cfg.get("pick_track_timeout_s", 15.0),
         hz=20.0,
         gain_arm=0.4, gain_x=0.08,
         deadzone=0.02, max_vel=0.15,
-        settle_hits=3,
-        hold_s=cfg.get("vacuum_settle_s", 0.5),
+        settle_hits=1,                     # 不要微调, 进死区立即锁
+        hold_s=cfg.get("vacuum_settle_s", 0.2),  # vacuum settle 200ms
         lift_back=True,
     )
     if not result.get("ok"):
@@ -212,13 +212,12 @@ def _place_at_slot(
     """第 i 列: 移到槽列, 扫描 marker, 智能定位对准 (mode=drop), y 降 0 释放."""
     place = cfg["arm_place_pose_T2"]
     marker_label = cfg.get("marker_label", "cylinder_set")
-    carry_y = float(cfg["arm_carry_pose"]["y_mm"])
-    init_y_mm = cfg.get("init_y_mm", -180)
-    # 智能定位起始 y: 需高于 carry_y (留 50mm+ 给追踪移动), 否则推到
-    # [-200,0] 软限外被 _check_safe 拦. 现 max(-180, -100) = -100.
-    servo_start_y = max(init_y_mm, carry_y + 50.0)
+    init_y_mm = cfg.get("init_y_mm", -100.0)
+    # 2026-08-02 调优: Y 高度统一到 init_y_mm (-100). 老公式 max(init, carry+50) 复杂,
+    # 既然 pickup/carry/place/return 全 -100, place servo 起始也直接 init_y_mm.
+    servo_start_y = init_y_mm
 
-    # 1) composite_run 到 place 姿态 (arm=+90, x=-270, y=servo_start, hand=-10)
+    # 1) composite_run 到 place 姿态 (arm=+90, x=-270, y=-100, hand=-10)
     logger.info("[T%d] composite_run 到 place 姿态 (arm=+90°, x=-270, y=%s)",
                 column_idx, servo_start_y)
     runner.client.composite_run(
@@ -229,9 +228,9 @@ def _place_at_slot(
         speed=80, timeout=20.0,
     )
 
-    # 2) 检查 marker 是否可见
+    # 2) 检查 marker 是否可见 (1 retry, 不要 sleep)
     logger.info("  视觉扫描本列 marker label=%s", marker_label)
-    if not _scan_marker_present(client, marker_label):
+    if not _scan_marker_present(client, marker_label, retries=1, backoff_s=0.0):
         raise RuntimeError(
             f"T{column_idx} 位置未检测到 marker {marker_label}"
         )
@@ -247,11 +246,11 @@ def _place_at_slot(
             hand_start=float(place["hand_angle_deg"]),
             grasp_y_mm=0.0,
             mode="drop",
-            timeout=cfg.get("place_track_timeout_s", 20.0),
+            timeout=cfg.get("place_track_timeout_s", 12.0),  # 20→12 更快 fail
             hz=20.0,
             gain_arm=0.4, gain_x=0.08,
             deadzone=0.02, max_vel=0.15,
-            settle_hits=3,
+            settle_hits=1,   # 不要微调, 进死区立即锁
             hold_s=0.0,
             lift_back=False,  # 已在 place 姿态, 不抬回 (后续走 _return_to_source_pose)
         )
@@ -267,8 +266,7 @@ def _place_at_slot(
     runner.client.move_y(0.0, timeout=15.0)
     runner.drop_object()
 
-    # 5) 抬回 carry 高度
-    runner.client.move_y(carry_y, timeout=15.0)
+    # 5) (无 step 5 — 统一 Y 后不需要再抬回 carry 高度)
 
 
 def _return_to_source_pose(
@@ -283,6 +281,39 @@ def _return_to_source_pose(
         y_mm=float(ret["y_mm"]),
         hand=float(ret["hand_angle_deg"]),
         speed=80, timeout=30.0,
+    )
+
+
+# ── Init 两步 (拆出来可独立测) ──────────────────────────────────────────
+
+def _init_step1_reset_x(arm_client: ArmClient, timeout: float = 30.0) -> None:
+    """step 1: X 编码器撞右墙硬限位定原点 (独占).
+
+    RAK_CAR_SKIP_RESET_X=1 时跳过, 用于"已经校准过, 不需要重复撞墙"的场景.
+    """
+    if os.environ.get("RAK_CAR_SKIP_RESET_X"):
+        logger.warning("init step1: RAK_CAR_SKIP_RESET_X=1, 跳过 reset_x (假设 X 编码器已校准)")
+        return
+    logger.info("init step1: X 编码器撞墙校准 (reset_x → right)")
+    arm_client.reset_x(direction="right", timeout=timeout)
+
+
+def _init_step2_s_pose(runner: ArmRunner, cfg: Dict[str, Any], init_y_mm: float) -> None:
+    """step 2: 一次性走完 S 姿态 4 轴 (composite_run 并发).
+
+    composite_run 内部按 (X 收 → 大臂转) 顺序防碰, 4 个目标并发执行.
+    """
+    pick = cfg["arm_pick_pose"]
+    logger.info(
+        "init step2: S 姿态 (composite_run) arm=%s° hand=%s° X=%s mm Y=%s mm",
+        pick["arm_angle_deg"], pick["hand_angle_deg"], pick["x_mm"], init_y_mm,
+    )
+    runner.client.composite_run(
+        arm=float(pick["arm_angle_deg"]),
+        x_mm=float(pick["x_mm"]),
+        y_mm=init_y_mm,
+        hand=float(pick["hand_angle_deg"]),
+        speed=80, timeout=20.0,
     )
 
 
@@ -322,24 +353,10 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
     try:
         # ===== 初始化步骤 1. X 编码器校准 (撞右墙硬限位定原点; 必须独占) =====
-        logger.info("init: X 编码器撞墙校准 (reset_x → right)")
-        arm_client.reset_x(direction="right", timeout=30.0)
+        _init_step1_reset_x(arm_client)
 
         # ===== 初始化步骤 2. 一次性走完 S 姿态 4 轴 (composite_run 并发) =====
-        # composite_run 内部按 (X 收 → 大臂转) 顺序防碰, 4 个目标并发执行.
-        # 省掉原来的 4 个串行调用 (~7s → ~2s), 比赛里每次进 task1 都赚回来.
-        pick = cfg["arm_pick_pose"]
-        logger.info(
-            "init: S 姿态 (composite_run) arm=%s° hand=%s° X=%s mm Y=%s mm",
-            pick["arm_angle_deg"], pick["hand_angle_deg"], pick["x_mm"], init_y_mm,
-        )
-        runner.client.composite_run(
-            arm=float(pick["arm_angle_deg"]),
-            x_mm=float(pick["x_mm"]),
-            y_mm=init_y_mm,
-            hand=float(pick["hand_angle_deg"]),
-            speed=80, timeout=20.0,
-        )
+        _init_step2_s_pose(runner, cfg, init_y_mm)
 
         # ===== 主循环: 按 source_position_order 走底盘列 =====
         source_position_order = cfg["source_position_order"]
@@ -373,9 +390,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # 放
             _place_at_slot(runner, arm_client, client, cfg, slot_idx)
 
-            # 抬回 + 防碰撞归位 S 姿态
-            carry_y = float(cfg["arm_carry_pose"]["y_mm"])
-            runner.move_y(carry_y)
+            # 归位 S 姿态 (composite_run 自动按 X→arm 顺序防碰).
+            # 2026-08-02: 统一 Y 到 -100, 不再单独 move_y(carry_y), 用 return S1 pose 一气呵成.
             _return_to_source_pose(runner, cfg)
 
             last_chassis_col = column_idx
