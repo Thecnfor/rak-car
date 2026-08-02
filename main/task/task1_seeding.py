@@ -321,23 +321,25 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     init_y_mm = cfg.get("init_y_mm", -180)
 
     try:
-        # ===== 初始化步骤 1. X 编码器校准 (撞右墙硬限位定原点) =====
+        # ===== 初始化步骤 1. X 编码器校准 (撞右墙硬限位定原点; 必须独占) =====
         logger.info("init: X 编码器撞墙校准 (reset_x → right)")
         arm_client.reset_x(direction="right", timeout=30.0)
 
-        # ===== 初始化步骤 2. Y 轴抬升到安全初始高度 =====
-        logger.info("init: 抬升 Y 到 %s mm", init_y_mm)
-        runner.move_y(init_y_mm)
-
-        # ===== 初始化步骤 3. 走到 S 姿态 (准备进入第一轮抓取) =====
+        # ===== 初始化步骤 2. 一次性走完 S 姿态 4 轴 (composite_run 并发) =====
+        # composite_run 内部按 (X 收 → 大臂转) 顺序防碰, 4 个目标并发执行.
+        # 省掉原来的 4 个串行调用 (~7s → ~2s), 比赛里每次进 task1 都赚回来.
         pick = cfg["arm_pick_pose"]
         logger.info(
-            "init: S 姿态 arm=%s° hand=%s° X=%s mm Y=%s mm",
+            "init: S 姿态 (composite_run) arm=%s° hand=%s° X=%s mm Y=%s mm",
             pick["arm_angle_deg"], pick["hand_angle_deg"], pick["x_mm"], init_y_mm,
         )
-        arm_client.set_hand_angle(float(pick["hand_angle_deg"]), speed=80, timeout=10.0)
-        runner.set_arm_angle(float(pick["arm_angle_deg"]), speed=80)
-        runner.move_x(float(pick["x_mm"]))
+        runner.client.composite_run(
+            arm=float(pick["arm_angle_deg"]),
+            x_mm=float(pick["x_mm"]),
+            y_mm=init_y_mm,
+            hand=float(pick["hand_angle_deg"]),
+            speed=80, timeout=20.0,
+        )
 
         # ===== 主循环: 按 source_position_order 走底盘列 =====
         source_position_order = cfg["source_position_order"]

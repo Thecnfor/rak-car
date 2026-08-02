@@ -234,10 +234,10 @@ class TestRun(unittest.TestCase):
         self.assertEqual(drop_modes.count("drop"), 3)
         # marker 放置已改用 track_velocity_pick(mode=drop), 不再走 find_target
         self.assertEqual(vision.find_target.call_count, 0)
-        # composite_run 调用: 每列 = place (1×) + return-to-source (1×)
+        # composite_run 调用: init (1×) + 每列 place (1×) + return-to-source (1×)
         # 注: track_velocity_pick 在真实实现中会内调 composite_run, 但 mock bypass 了
-        # 共 3 × 2 = 6 次
-        self.assertEqual(arm_client.composite_run.call_count, 6)
+        # 共 1 + 3 × 2 = 7 次
+        self.assertEqual(arm_client.composite_run.call_count, 7)
 
         # 底盘移动: S1→S2, S2→S3, 结束归位 S1 → 至少 3 次 execute_car_action
         self.assertGreaterEqual(arm_client.http.execute_car_action.call_count, 3)
