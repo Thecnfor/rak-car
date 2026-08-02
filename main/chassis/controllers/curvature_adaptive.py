@@ -10,7 +10,7 @@ from ..config.lane_follow import (
     KAPPA_HARD_CAP,
 )
 from .base import OuterLoop, mecanum_inverse
-omega_gain
+
 
 class CurvatureAdaptiveOuterLoop(OuterLoop):
     def __init__(
