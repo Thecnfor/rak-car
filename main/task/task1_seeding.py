@@ -226,16 +226,12 @@ def _pick_at_source(
             column_idx, result.get('trace_hits'), result.get('end_arm'),
         )
         runner.client.move_y(init_y_mm, timeout=15.0)
-        # hand 保持 0, arm 用 -90 (安全, 不超限位)
-        runner.client.composite_run(
-            arm=-90.0, x_mm=None, y_mm=None, hand=0.0,
-            speed=100, timeout=15.0,
-        )
-        runner.client.move_y(0.0, timeout=15.0)
+        # 用户 22:34: fallback 不动 arm! 保持当前对齐角度, 直接降+吸
+        runner.client.move_y(-20.0, timeout=10.0)
         arm_client.grasp(True)
-        time.sleep(0.2)
-        runner.client.move_y(init_y_mm, timeout=15.0)
-        logger.info("  -> fallback 完成: arm=-90 hand=0 吸嘴在吸")
+        time.sleep(0.15)
+        runner.client.move_y(init_y_mm, timeout=10.0)
+        logger.info("  -> fallback 完成: arm 保持当前角度, hand=0 吸嘴在吸")
     return label
 
 
@@ -412,6 +408,14 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     runner = ArmRunner(arm_client)
 
     completed: List[str] = []
+
+    # 用户 22:28: task1 里程计单独记录, 不依赖全局. 重置 odom 让 align_odom_x 从 0 起算.
+    try:
+        client.execute("car", "reset_position", sync=True, timeout=10.0)
+        logger.info("task1 odom reset: 从 0 起算")
+    except Exception as exc:
+        logger.warning("task1 odom reset 失败 (%s), 用全局值", exc)
+
     # S 姿态 = track_velocity_pick 起始位 (y=-180, 看得清楚)
     init_y_mm = cfg.get("init_y_mm", -180)
 
@@ -485,14 +489,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 logger.info("  底盘已在 %.3f m (距离 target %.3f < 5cm), 跳过移动",
                             curr_x, target_x_m)
                 return
-            # 保留当前 theta, 不校正
-            try:
-                odom = arm_client.http.get("/v1/realtime/odom/state", timeout=3).get("odom_state") or {}
-                cur_theta = float(odom.get("theta", 0.0))
-            except Exception:
-                cur_theta = 0.0
-            logger.info("  闭环底盘移动 odom=%.3f → target=%.3f m (y 锁 %.3f, theta 保持 %.3f)",
-                        curr_x, target_x_m, curr_y, cur_theta)
+            # 用户 22:28: 保证和车道平行 (theta→0), 不然对不齐
+            logger.info("  闭环底盘移动 odom=%.3f → target=%.3f m (y 锁 %.3f, theta→0)",
+                        curr_x, target_x_m, curr_y)
             import requests as _req
             api_base = getattr(arm_client.http, "settings", None)
             api_base = api_base.api_base if api_base else "http://192.168.5.230:5050"
@@ -502,7 +501,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     json={
                         "target": "car",
                         "name": "move_to_position",
-                        "args": [[target_x_m, curr_y, cur_theta]],   # 保留 theta 不校正
+                        "args": [[target_x_m, curr_y, 0.0]],   # theta→0 保持平行
                         "kwargs": {},
                         "sync": True,
                         "timeout": chassis_move_timeout,
@@ -551,6 +550,17 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 _chassis_goto(target_s)
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
+                # 用户 22:28: 第一列也要保证 theta≈0 (和车道平行)
+                try:
+                    odom = arm_client.http.get("/v1/realtime/odom/state", timeout=3).get("odom_state") or {}
+                    th = float(odom.get("theta", 0.0))
+                    if abs(th) > 0.02:
+                        logger.info("  theta=%.3f 偏了, 修正→0", th)
+                        arm_client.http.execute_car_action(
+                            "move_to_position", [curr_x, float(odom.get("y", 0.0)), 0.0],
+                            timeout=10.0, sync=True)
+                except Exception:
+                    pass
 
             # (1.5) 切 S 姿态 — x 用 move_x(v_max=100), arm/y/hand 用 composite_run 并发
             logger.info("  切 S 姿态: arm=-90° x=-80 y=-100 hand=0°")
