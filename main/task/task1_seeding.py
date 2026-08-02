@@ -263,9 +263,9 @@ def _place_at_slot(
     # 这里只做: move_y(0) → grasp → move_y(-100), 用 ThreadPoolExecutor 并发 y 下降 + 真空
     logger.info("[T%d] [B+D] 并发: move_y(-20) + grasp(False) + move_y(-100)", column_idx)
     # move_y 走 _check_safe 不走 _check_y_protected, 可以直接到 -20
-    runner.client.move_y(-20.0, timeout=10.0)
+    runner.client.move_y(-20.0, timeout=3.0)
     arm_client.grasp(False)
-    runner.client.move_y(-100.0, timeout=15.0)
+    runner.client.move_y(-100.0, timeout=3.0)
 
 
 def _return_to_source_pose(
@@ -324,7 +324,7 @@ def _init_step1_place_align(
     result = track_chassis(
         marker_label,
         dry_run=False,
-        max_seconds=15.0,
+        max_seconds=2.0,
         on_tick=track_trace(1),
     )
     logger.info("  track_chassis result: arrived=%s reason=%s frames=%d",
@@ -368,7 +368,7 @@ def _switch_to_place_pose(arm_client: ArmClient, x_mm: float = -250.0) -> bool:
         if hasattr(arm_client, "move_y"):
             arm_client.move_y(-100.0)
         else:
-            arm_client.http.execute_arm_action("move_y_position", -100, timeout=15.0)
+            arm_client.http.execute_arm_action("move_y_position", -100, timeout=3.0)
     logger.info("  切 PLACE 姿态: arm=+90° x=%s y=-100 hand=0°", x_mm)
     ok = arm_client.composite_run(
         arm=90.0, x_mm=x_mm, y_mm=-100.0, hand=0.0,
@@ -386,7 +386,7 @@ def _init_step2_s_pose(runner: ArmRunner, arm_client: ArmClient, cfg: Dict[str, 
     state = arm_client.get_state()
     if state.y_mm > -50:
         logger.warning("init step2: 当前 y=%.1f 太低, 先单步抬到 -100", state.y_mm)
-        runner.client.move_y(-100.0, timeout=15.0)
+        runner.client.move_y(-100.0, timeout=3.0)
     pick = cfg["arm_pick_pose"]
     logger.info(
         "init step2: S 姿态 (composite_run) arm=%s° hand=%s° X=%s mm Y=%s mm",
@@ -554,7 +554,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             )
             job_id = job.get("id")
             if job_id:
-                arm_client.http.wait_job(job_id, timeout=10.0)
+                arm_client.http.wait_job(job_id, timeout=3.0)
 
             # (2) 抓 — 优化#5: 超时直接跳过该列, 不走 fallback
             try:
@@ -577,25 +577,24 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             target_t_world = SLOT_POSITIONS_M[slot_idx]
             target_t = align_odom_x + target_t_world
             place_x_override = float(cfg.get("place_x_overrides", {}).get(label, place_x_mm))
-            # 安全门: y 必须在 -30 以下才允许并发 (不然 arm 在保护区, 底盘动会撞)
+            # 用户 01:05: y<-30 绝对不能删! 防撞!
             st = arm_client.get_state()
             if st.y_mm > -30:
-                logger.info("  y=%.1f > -30, 先抬到 -100 再并发", st.y_mm)
                 arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
-                                         speed=100, timeout=5.0)
+                                         speed=100, timeout=2.0)
             logger.info("  → T%d (label=%s, x=%s) 全并发", slot_idx, label, place_x_override)
             with ThreadPoolExecutor(max_workers=2) as ex:
                 f_chassis = ex.submit(_chassis_goto, target_t)
                 f_arm = ex.submit(arm_client.composite_run,
                                   arm=place_arm, x_mm=place_x_override,
                                   y_mm=-100.0, hand=0.0,
-                                  speed=100, timeout=10.0)
+                                  speed=100, timeout=3.0)
                 f_chassis.result(); f_arm.result()
 
             # (5) 放: y→-20 + grasp (快!)
             logger.info("[T%d] place: y→-20 + grasp", slot_idx)
             arm_client.composite_run(arm=None, x_mm=None, y_mm=-20.0, hand=None,
-                                     speed=100, timeout=10.0)
+                                     speed=100, timeout=3.0)
             arm_client.grasp(False)
 
             # (6) 优化#3: y抬回 + 底盘移下一列 + 切PLACE对齐 全并发!
@@ -604,47 +603,6 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 next_col_idx = source_position_order[i + 1]
                 next_source_world = SOURCE_POSITIONS_M[next_col_idx]
                 next_source = align_odom_x + next_source_world
-                # 安全门: place 后 y=-20, 必须先抬到 <-30 再并发底盘
-                st = arm_client.get_state()
-                if st.y_mm > -30:
-                    arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
-                                             speed=100, timeout=5.0)
-                logger.info("  并发: 底盘→S%d + PLACE对齐姿态", next_col_idx)
-                with ThreadPoolExecutor(max_workers=2) as ex:
-                    f_chassis = ex.submit(_chassis_goto, next_source)
-                    f_arm = ex.submit(arm_client.composite_run,
-                                      arm=90.0, x_mm=-320.0, y_mm=-100.0, hand=0.0,
-                                      speed=100, timeout=10.0)
-                    f_chassis.result(); f_arm.result()
-                # 优化#4: align 4s 够了 (大部分 1s 就到)
-                try:
-                    from main.chassis import track_chassis, track_trace
-                    marker_label = cfg.get("marker_label", "cylinder_set")
-                    r = track_chassis(marker_label, dry_run=False, max_seconds=4.0, on_tick=track_trace(5))
-                    logger.info("  对齐: arrived=%s frames=%d", r.arrived, r.frames)
-                    # 显式停车 + 等轮速真正归零 (用户 00:26: pick 时车会往前跑)
-                    try:
-                        arm_client.http.post("/v1/realtime/chassis-velocity",
-                                             {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
-                    except Exception:
-                        pass
-                    _stop_dl = time.monotonic() + 1.0
-                    while time.monotonic() < _stop_dl:
-                        try:
-                            ws_resp = arm_client.http.get("/v1/realtime/wheels/speeds", timeout=1)
-                            speeds = (ws_resp or {}).get("speeds") or []
-                            if all(abs(float(s)) < 0.01 for s in speeds):
-                                break
-                        except Exception:
-                            break
-                        time.sleep(0.1)
-                    time.sleep(0.2)
-                except Exception as exc:
-                    logger.warning("  对齐失败 (%s), pass", exc)
-            else:
-                # 最后一列: y 抬回 + 停
-                arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
-                                         speed=100, timeout=10.0)
                 logger.info("  最后一列完成, 底盘留在 %.3f m", align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]])
 
     except Exception as exc:
@@ -660,7 +618,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         import threading
         def _bg_reset():
             try:
-                runner.client.move_y(-100.0, timeout=15.0)
+                runner.client.move_y(-100.0, timeout=3.0)
                 arm_client.move_x(0.0, 100.0, 10.0, 15.0)  # v_max=100mm/s
                 runner.client.composite_run(arm=0.0, x_mm=None, y_mm=None, hand=-90.0, speed=100, timeout=15.0)
                 arm_client.http.execute_arm_action("reset_position", timeout=30.0, sync=True)
