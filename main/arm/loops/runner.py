@@ -558,19 +558,20 @@ class ArmRunner:
         steps["settled"] = True
 
         # 对齐完成 → y 降 0 → mode=pick 吸气 / mode=drop 释放
+        # 用户 00:45: 缩短 timeout, 吸住后立即抬离, 低延迟!
         try:
-            self.client.move_y(grasp_y_mm, timeout=20.0)
+            self.client.move_y(grasp_y_mm, timeout=5.0)
             steps["lower"] = True
             if mode == "drop":
                 self.client.drop_object()
                 steps["suck"] = True  # 语义复用字段: 完成释放动作
             else:
-                self.client.grasp(True, timeout=20.0)
+                self.client.grasp(True, timeout=5.0)
                 steps["suck"] = True
             if hold_s > 0:
                 time.sleep(hold_s)
             if lift_back:
-                self.client.move_y(y_start, timeout=20.0)
+                self.client.move_y(y_start, timeout=5.0)
                 steps["lift"] = True
         except Exception as exc:
             return {"ok": False, "reason": f"grasp_failed:{exc}",

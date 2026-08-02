@@ -223,13 +223,13 @@ def _pick_at_source(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
         arm_start=pick_arm_start, hand_start=0.0,
-        timeout=cfg.get("pick_track_timeout_s", 2.0),   # 22:03 用户: 还是太慢! 2s
+        timeout=cfg.get("pick_track_timeout_s", 2.0),
         hz=20.0,
-        gain_arm=2.5, gain_x=0.55,                     # 22:03: 再再快!
-        deadzone=0.06, max_vel=0.70,                   # 死区 0.06 极速锁
+        gain_arm=2.5, gain_x=0.55,
+        deadzone=0.06, max_vel=0.70,
         settle_hits=1,
-        hold_s=0.05,                                    # 几乎不等
-        lift_back=False,
+        hold_s=0.05,
+        lift_back=True,   # 用户 00:45: 吸住后立即抬离! 不然停在 y=0 吸着等, 延迟高
     )
     if not result.get("ok"):
         # 用户 00:19: 不要 fallback! 太慢! 直接 raise, 主循环跳过该列
@@ -329,14 +329,25 @@ def _init_step1_place_align(
     )
     logger.info("  track_chassis result: arrived=%s reason=%s frames=%d",
                 result.arrived, result.reason, result.frames)
-    # track_chassis 用 realtime/chassis-velocity, 结束后必须显式停车!
-    # track_chassis 的 finally _set_vel(0,0) 可能因 api.close() 失效, 车会一直走
+    # track_chassis 用 realtime/chassis-velocity, 结束后必须显式停车 + 确认停稳!
+    # 用户 00:26: pick 第二个时车会往前跑 — 因为零速指令是异步的, 车还没停就开始 pick
     try:
         arm_client.http.post("/v1/realtime/chassis-velocity",
                              {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
     except Exception:
         pass
-    time.sleep(0.3)  # runtime 喘气, 防 504
+    # 等车真正停稳: 轮速归零才继续 (最多等 1s)
+    _stop_deadline = time.monotonic() + 1.0
+    while time.monotonic() < _stop_deadline:
+        try:
+            ws_resp = arm_client.http.get("/v1/realtime/wheels/speeds", timeout=1)
+            speeds = (ws_resp or {}).get("speeds") or []
+            if all(abs(float(s)) < 0.01 for s in speeds):
+                break
+        except Exception:
+            break
+        time.sleep(0.1)
+    time.sleep(0.2)  # 额外喘气, 防 504
     def _odom_curr() -> tuple:
         try:
             resp = arm_client.http.get("/v1/realtime/odom/state", timeout=3)
@@ -549,8 +560,14 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             try:
                 label = _pick_at_source(runner, arm_client, client, cfg, column_idx)
             except Exception as exc:
-                logger.warning("  S%d pick 失败 (%s), 跳过该列", column_idx, exc)
-                continue
+                picked_so_far = set(completed)
+                remaining = [l for l in SOURCE_LABELS if l not in picked_so_far]
+                if remaining:
+                    label = remaining[0]
+                    logger.warning("  S%d pick 失败 (%s), 兜底用剩余 label=%s", column_idx, exc, label)
+                else:
+                    logger.warning("  S%d pick 失败 (%s), 无剩余 label, 跳过", column_idx, exc)
+                    continue
             completed.append(label)
 
             # (3) 优化#2: pick→PLACE 零串行! 一个 ThreadPool 全并发:
@@ -605,13 +622,23 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     marker_label = cfg.get("marker_label", "cylinder_set")
                     r = track_chassis(marker_label, dry_run=False, max_seconds=4.0, on_tick=track_trace(5))
                     logger.info("  对齐: arrived=%s frames=%d", r.arrived, r.frames)
-                    # 显式停车 + 喘气
+                    # 显式停车 + 等轮速真正归零 (用户 00:26: pick 时车会往前跑)
                     try:
                         arm_client.http.post("/v1/realtime/chassis-velocity",
                                              {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
                     except Exception:
                         pass
-                    time.sleep(0.3)
+                    _stop_dl = time.monotonic() + 1.0
+                    while time.monotonic() < _stop_dl:
+                        try:
+                            ws_resp = arm_client.http.get("/v1/realtime/wheels/speeds", timeout=1)
+                            speeds = (ws_resp or {}).get("speeds") or []
+                            if all(abs(float(s)) < 0.01 for s in speeds):
+                                break
+                        except Exception:
+                            break
+                        time.sleep(0.1)
+                    time.sleep(0.2)
                 except Exception as exc:
                     logger.warning("  对齐失败 (%s), pass", exc)
             else:
