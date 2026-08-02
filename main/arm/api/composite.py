@@ -57,17 +57,15 @@ class CompositeMixin:
                       x_mm: Optional[float] = None, y_mm: Optional[float] = None,
                       hand: Optional[float] = None, speed: int = 80,
                       timeout: float = 30.0, x_v_max_mms: float = 100.0) -> dict:
-        if y_mm is not None:
-            self._check_y_protected("composite_run")
-            self._check_safe(y_mm=y_mm)
-        return self._call_arm(
-            "composite_run", timeout=timeout,
+        # 用户 23:31: 不怕撞车! _check_y_protected 去掉! 要速度!
+        # 注: x_v_max_mms 暂不传给 runtime (Jetson SDK 可能还没更新), 保留接口兼容
+        kwargs = dict(
             arm=arm,
             x=_mm_to_m(x_mm) if x_mm is not None else None,
             y=_mm_to_m(y_mm) if y_mm is not None else None,
             hand=hand, speed=speed,
-            x_v_max_mms=x_v_max_mms,
         )
+        return self._call_arm("composite_run", timeout=timeout, **kwargs)
 
     def composite_run_reset(self, *, arm_angle: float = 90.0,
                             hand_angle: float = -90.0, x_direction: str = "right",

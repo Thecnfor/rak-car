@@ -232,19 +232,11 @@ def _pick_at_source(
         lift_back=False,
     )
     if not result.get("ok"):
-        # (5) 失败 fallback: 不对齐, 写死下降+吸, 跑完全程
-        # 用户 21:51: hand 保持 0 (不变 90), arm 不超限位 (用 -90 安全值)
-        logger.warning(
-            "[S%d] pick servo 未收敛 (trace_hits=%s end_arm=%s) → fallback 写死 pick",
-            column_idx, result.get('trace_hits'), result.get('end_arm'),
+        # 用户 00:19: 不要 fallback! 太慢! 直接 raise, 主循环跳过该列
+        raise RuntimeError(
+            f"S{column_idx} pick 未收敛 (trace_hits={result.get('trace_hits')}, "
+            f"end_arm={result.get('end_arm')})"
         )
-        runner.client.move_y(init_y_mm, timeout=15.0)
-        # 用户 22:34: fallback 不动 arm! 保持当前对齐角度, 直接降+吸
-        runner.client.move_y(-20.0, timeout=10.0)
-        arm_client.grasp(True)
-        time.sleep(0.15)
-        runner.client.move_y(init_y_mm, timeout=10.0)
-        logger.info("  -> fallback 完成: arm 保持当前角度, hand=0 吸嘴在吸")
     return label
 
 
@@ -337,6 +329,14 @@ def _init_step1_place_align(
     )
     logger.info("  track_chassis result: arrived=%s reason=%s frames=%d",
                 result.arrived, result.reason, result.frames)
+    # track_chassis 用 realtime/chassis-velocity, 结束后必须显式停车!
+    # track_chassis 的 finally _set_vel(0,0) 可能因 api.close() 失效, 车会一直走
+    try:
+        arm_client.http.post("/v1/realtime/chassis-velocity",
+                             {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
+    except Exception:
+        pass
+    time.sleep(0.3)  # runtime 喘气, 防 504
     def _odom_curr() -> tuple:
         try:
             resp = arm_client.http.get("/v1/realtime/odom/state", timeout=3)
@@ -533,67 +533,91 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
 
-            # (1.5) 切 S 姿态 — x 用 move_x(v_max=100), arm/y/hand 用 composite_run 并发
+            # (1.5) 切 S 姿态 — 全轴并发, timeout 压到 3s (物理到位只需 ~2s)
+            # 用 sync=False + 手动 poll 避免 504 (track_chassis 后 runtime HTTP 会卡)
             logger.info("  切 S 姿态: arm=-90° x=-80 y=-100 hand=0°")
-            with ThreadPoolExecutor(max_workers=2) as ex:
-                f_x = ex.submit(arm_client.move_x, -80.0, 100.0, 10.0, 15.0)  # v_max=100mm/s!
-                f_ah = ex.submit(arm_client.composite_run,
-                                 arm=-90.0, x_mm=None, y_mm=-100.0, hand=0.0,
-                                 speed=100, timeout=15.0)
-                f_x.result(); f_ah.result()
+            job = arm_client.http.execute(
+                "arm", "composite_run",
+                kwargs={"arm": -90.0, "x": -0.08, "y": -0.1, "hand": 0.0, "speed": 100, "timeout": 5},
+                sync=False,
+            )
+            job_id = job.get("id")
+            if job_id:
+                arm_client.http.wait_job(job_id, timeout=10.0)
 
-            # (2) 抓
-            label = _pick_at_source(runner, arm_client, client, cfg, column_idx)
+            # (2) 抓 — 优化#5: 超时直接跳过该列, 不走 fallback
+            try:
+                label = _pick_at_source(runner, arm_client, client, cfg, column_idx)
+            except Exception as exc:
+                logger.warning("  S%d pick 失败 (%s), 跳过该列", column_idx, exc)
+                continue
             completed.append(label)
 
-            # (3) 用户 22:47: pick 后先抬 y, 再动底盘! 不然推倒种子
-            runner.client.move_y(-100.0, timeout=10.0)
-            # 确保 hand=0 (用户 22:47: hand 必须是 0 才抓得住)
-            arm_client.composite_run(arm=None, x_mm=None, y_mm=None, hand=0.0,
-                                     speed=100, timeout=5.0)
-
-            # (4) 底盘移T + 切PLACE姿态 并发 (y 已抬好, 安全)
+            # (3) 优化#2: pick→PLACE 零串行! 一个 ThreadPool 全并发:
+            #     y抬 + 底盘移T + arm切PLACE + x到place位
+            # 用户 00:07: 唯一条件 — y<-30 才可以并发移动底盘和机械臂!
             slot_idx = int(target_slot_map[label])
             target_t_world = SLOT_POSITIONS_M[slot_idx]
             target_t = align_odom_x + target_t_world
-            logger.info("  → T%d (label=%s, x=%s) 并发: 底盘 + PLACE姿态",
-                        slot_idx, label, place_x_mm)
-            with ThreadPoolExecutor(max_workers=3) as ex:
+            place_x_override = float(cfg.get("place_x_overrides", {}).get(label, place_x_mm))
+            # 安全门: y 必须在 -30 以下才允许并发 (不然 arm 在保护区, 底盘动会撞)
+            st = arm_client.get_state()
+            if st.y_mm > -30:
+                logger.info("  y=%.1f > -30, 先抬到 -100 再并发", st.y_mm)
+                arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
+                                         speed=100, timeout=5.0)
+            logger.info("  → T%d (label=%s, x=%s) 全并发", slot_idx, label, place_x_override)
+            with ThreadPoolExecutor(max_workers=2) as ex:
                 f_chassis = ex.submit(_chassis_goto, target_t)
-                f_x = ex.submit(arm_client.move_x, place_x_mm, 100.0, 10.0, 15.0)
-                f_ah = ex.submit(arm_client.composite_run,
-                                  arm=place_arm, x_mm=None,
-                                  y_mm=None, hand=0.0,
-                                  speed=100, timeout=15.0)
-                f_chassis.result(); f_x.result(); f_ah.result()
+                f_arm = ex.submit(arm_client.composite_run,
+                                  arm=place_arm, x_mm=place_x_override,
+                                  y_mm=-100.0, hand=0.0,
+                                  speed=100, timeout=10.0)
+                f_chassis.result(); f_arm.result()
 
-            # (5) 放: y→-20 → grasp → y→-100 (用户 22:08: 先抬y再动底盘, 不推倒种子!)
-            logger.info("[T%d] place: y→-20 + grasp + y→-100", slot_idx)
-            runner.client.move_y(-20.0, timeout=10.0)
+            # (5) 放: y→-20 + grasp (快!)
+            logger.info("[T%d] place: y→-20 + grasp", slot_idx)
+            arm_client.composite_run(arm=None, x_mm=None, y_mm=-20.0, hand=None,
+                                     speed=100, timeout=10.0)
             arm_client.grasp(False)
-            runner.client.move_y(-100.0, timeout=10.0)   # 必须先抬y!
 
-            # (6) 下一列: 底盘移动 + 切PLACE对齐姿态 并发 (y已抬好, 不会推倒)
+            # (6) 优化#3: y抬回 + 底盘移下一列 + 切PLACE对齐 全并发!
+            # 用户 00:07: y<-30 才可以并发!
             if i + 1 < len(source_position_order):
                 next_col_idx = source_position_order[i + 1]
                 next_source_world = SOURCE_POSITIONS_M[next_col_idx]
                 next_source = align_odom_x + next_source_world
-                logger.info("  底盘→S%d + 切PLACE对齐(x快)", next_col_idx)
-                with ThreadPoolExecutor(max_workers=3) as ex:
+                # 安全门: place 后 y=-20, 必须先抬到 <-30 再并发底盘
+                st = arm_client.get_state()
+                if st.y_mm > -30:
+                    arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
+                                             speed=100, timeout=5.0)
+                logger.info("  并发: 底盘→S%d + PLACE对齐姿态", next_col_idx)
+                with ThreadPoolExecutor(max_workers=2) as ex:
                     f_chassis = ex.submit(_chassis_goto, next_source)
-                    f_x = ex.submit(arm_client.move_x, -320.0, 100.0, 10.0, 15.0)
-                    f_ah = ex.submit(arm_client.composite_run,
-                                      arm=90.0, x_mm=None, y_mm=None, hand=0.0,
-                                      speed=100, timeout=15.0)
-                    f_chassis.result(); f_x.result(); f_ah.result()
+                    f_arm = ex.submit(arm_client.composite_run,
+                                      arm=90.0, x_mm=-320.0, y_mm=-100.0, hand=0.0,
+                                      speed=100, timeout=10.0)
+                    f_chassis.result(); f_arm.result()
+                # 优化#4: align 4s 够了 (大部分 1s 就到)
                 try:
                     from main.chassis import track_chassis, track_trace
                     marker_label = cfg.get("marker_label", "cylinder_set")
-                    r = track_chassis(marker_label, dry_run=False, max_seconds=8.0, on_tick=track_trace(5))
+                    r = track_chassis(marker_label, dry_run=False, max_seconds=4.0, on_tick=track_trace(5))
                     logger.info("  对齐: arrived=%s frames=%d", r.arrived, r.frames)
+                    # 显式停车 + 喘气
+                    try:
+                        arm_client.http.post("/v1/realtime/chassis-velocity",
+                                             {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
+                    except Exception:
+                        pass
+                    time.sleep(0.3)
                 except Exception as exc:
                     logger.warning("  对齐失败 (%s), pass", exc)
             else:
+                # 最后一列: y 抬回 + 停
+                arm_client.composite_run(arm=None, x_mm=None, y_mm=-100.0, hand=None,
+                                         speed=100, timeout=10.0)
                 logger.info("  最后一列完成, 底盘留在 %.3f m", align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]])
 
     except Exception as exc:
