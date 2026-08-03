@@ -98,8 +98,10 @@ DEFAULT_MAX_SECONDS: float = 180.0
 DEFAULT_TRACK_MAX_SECONDS: float = 12.0
 """单球底盘视觉伺服收敛预算 (s)。超时但目标仍在画面 → 照样试抓 (臂伺服补残差)。"""
 
-DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 3
-"""连续 pick 失败超过此数 → 退出 (单个球抓不起不应拖垮全场)。"""
+DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
+"""连续 pick 失败超过此数 → 退出 (单个球抓不起不应拖垮全场)。
+2026-08-03 现场: 失败一次就退出, 避免 'P 姿态 → creep → track → pick 失败 →
+恢复 P 姿态 → creep → track → pick 失败' 的无限循环。"""
 
 DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM
 """放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。
@@ -494,10 +496,13 @@ def step_target4(
                 n_consecutive_failures += 1
                 print(f"  [{LOG_PREFIX}] ❌ 抓取失败 ({res['error']}); "
                       f"连续 {n_consecutive_failures} 次")
-                if n_consecutive_failures > max_consecutive_pick_failures:
+                # 2026-08-03 现场: pick 失败后下一轮又 goto_pose_p → creep → track → pick,
+                # 但 vision 阈值/PID 还没调通时, 每球都失败会无限循环在 '恢复P → 找球 →
+                # 抓 → 失败 → 恢复P'。失败一次就退出, 避免循环浪费现场时间。
+                if n_consecutive_failures >= max_consecutive_pick_failures:
                     final_reason = "pick_error_exceeded"
-                    print(f"  [{LOG_PREFIX}] ❌ 连续失败超过 "
-                          f"{max_consecutive_pick_failures}, 退出")
+                    print(f"  [{LOG_PREFIX}] ❌ 连续失败达到 "
+                          f"{max_consecutive_pick_failures}, 退出循环")
                     break
         else:
             # while-else: 没 break = picks 达到 max_picks
