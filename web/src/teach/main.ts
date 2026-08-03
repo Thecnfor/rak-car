@@ -36,6 +36,7 @@ const poseMsg = $("poseMsg")!;
 // ---------- 状态 ----------
 interface Pose { name: string; x_mm: number; y_mm: number; arm: number; hand: number; ts: number }
 const POSES_KEY = "rakcar.poses";
+let poses: Pose[] = loadPoses();
 // 舵机目标角基准。空闲时持续从 arm_feed 强同步（大臂=总线舵机实测回读，
 // 手爪=runtime 最后指令值 _hand_angle_last），按住 QERF 期间用本地积分、
 // 松手回归 feed —— 无论谁动过臂（任务/别的客户端/上次会话），积分起点
