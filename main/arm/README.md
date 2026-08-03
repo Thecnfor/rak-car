@@ -2,21 +2,22 @@
 
 > 这份文档只回答一件事：**业务层调机械臂需要知道哪些 API、怎么搭起来**。
 > 完整 API 总表见 [main/API_INDEX.md](../API_INDEX.md) 和本目录下 [ARM_API.md](./ARM_API.md)，本文件不再重复。
-> 10 行起步见 [main/QUICKSTART.md §4](../QUICKSTART.md#4-跑一个机械臂动作业务层-10-行) + [arm/QUICKSTART.md](./QUICKSTART.md)。
+> 视觉伺服一页纸见 [VISUAL_SERVO_QUICKREF.md](./VISUAL_SERVO_QUICKREF.md)，实机 checklist 见 [TEST_PREFLIGHT.md](./TEST_PREFLIGHT.md)。
 
 ## 一句话定位
 
 `main/arm/` = **机械臂业务子包**：业务层不需要知道 y 是步进电机 / x 是带编码器直流电机 / 手爪是 PWM 舵机 / 磁感在哪个端口，**只看到 (x_mm, y_mm, side, hand) 4 个字段** + 一组 high-level 动作。
 
-底层不动（`arm_base.py` / `runtime/core/actions.py` / 14 个 `arm.*` action 名字全部保留），上层在这里加：
+底层不动（`arm_base.py` / `runtime/core/actions.py` / 21 个 `arm.*` action 名字全部保留），上层在这里加：
 
 - `ArmClient`：薄封装 `RuntimeApiClient` / `RuntimeWsClient`
 - `ArmState`：业务位姿（mm + 枚举）
 - `TrajectoryGenerator`：双轴 S 曲线同步发生器（dry-run）
-- `OriginCalibrator`：调车端 `arm.reset_position` 重新触底定原点（写 `arm_origin.yaml`）
-- `ArmRunner`：业务编排入口
-- `tasks/`：高层组合（go_home / pick_left / pick_right / release）
-- `examples/`：4 个起步脚本
+- `OriginCalibrator` / `run_calibrator`：调车端 `arm.reset_position` 重新触底定原点（写 `arm_origin.yaml`）
+- `ArmRunner`：业务编排入口（含 `track_velocity_pick` 视觉伺服主力方法）
+- `vision/`：`ArmVisionClient`（ServoLoop + RealtimeLoop + VelocityLoop）
+- `loops/orch_visual.py`：`VisualOrchestrator`（chassis→arm→grasp 一条龙，见 [loops/orch_visual.md](./loops/orch_visual.md)）
+- `examples/`：8 个真机脚本（05–12，视觉伺服/速度模式/抓取）
 
 ## 坐标系约定
 
@@ -56,7 +57,9 @@
 | `RAK_CAR_SERVER_ORIGIN` | runtime HTTP 地址 | `http://127.0.0.1` |
 | `RAK_CAR_RESET_ARM` | runtime 启动时是否自动跑一次 `arm.reset_position` 重新定原点 | `0`（部署用 `ecosystem.config.js:23` 设成 `1`） |
 
-> `RAK_CAR_RESET_ARM=1` 时，runtime 会在 auto-init 阶段调一次 `arm.reset_position`（y 触底 + x 撞墙），并把当前编码器值落到 `arm_origin.yaml`。业务层看到 `arm_origin.yaml` 已存在且 `y_origin_m / x_origin_m` 非 0，即可认为首次定原点已完成，**不需要**手跑 `examples/01_calibrate_origin.py`。
+> `RAK_CAR_RESET_ARM=1` 时，runtime 会在 auto-init 阶段调一次 `arm.reset_position`（hand=UP + arm=MID + y 触底），并把当前编码器值落到 `arm_origin.yaml`。业务层看到 `arm_origin.yaml` 已存在且 `y_origin_m / x_origin_m` 非 0，即可认为首次定原点已完成。`arm_origin.yaml` 不存在也不会卡死——runtime 用默认软限位（仅 y 软上限），下次 reset 后覆盖。
+>
+> 只有机械臂"漂移严重 / PID 范围卡死 / 编码器读数明显不对"时才手动重定：`python3 -c "from main.arm.origin import run_calibrator; run_calibrator('left')"`（或 `ArmClient.reset_origin(x_wall="left")`）。
 
 ## 10 行起步
 
@@ -65,33 +68,40 @@ from main.arm import ArmClient, ArmRunner
 
 client = ArmClient.connect()              # 默认走 env: RAK_CAR_SERVER_ORIGIN
 runner = ArmRunner(client)
-runner.move_xy(100.0, 80.0)               # 双轴同步
-runner.set_side("LEFT")
-runner.move_xy(120.0, 40.0)
-runner.grasp(True)
+runner.move_xy(100.0, -80.0)              # 双轴同步（y 负 = 向上）
+runner.set_arm_angle(-90.0)               # 大臂角度（度）
+runner.move_xy(120.0, -40.0)
+runner.grasp(True)                        # 吸盘抓
+runner.go_home()                          # 回原点
 ```
 
-完整示例在 [examples/](./examples/)：
+真机示例在 [examples/](./examples/)（05–12；旧 01–04 已删）：
 
 | 文件 | 用途 |
 | --- | --- |
-| [examples/01_calibrate_origin.py](./examples/01_calibrate_origin.py) | 触发车端 `arm.reset_position` 重新定原点（漂移后手调用） |
-| [examples/02_trajectory_preview.py](./examples/02_trajectory_preview.py) | 不下硬件，只算 S 曲线 |
-| [examples/03_move_xy_basic.py](./examples/03_move_xy_basic.py) | 双轴同步移动 + dry-run |
-| [examples/04_grasp_template.py](./examples/04_grasp_template.py) | 完整 pick-and-place |
+| [05_visual_servo_smoke.py](./examples/05_visual_servo_smoke.py) | 视觉伺服真机 smoke（TEST_PREFLIGHT §8 门槛） |
+| [06_track_yellow_ball.py](./examples/06_track_yellow_ball.py) | 位置环追踪黄球 |
+| [07_velocity_track_yellow_ball.py](./examples/07_velocity_track_yellow_ball.py) | 速度模式追踪（推荐） |
+| [08_servo4_track.py](./examples/08_servo4_track.py) | 4-DOF 速度伺服 |
+| [09_depth_check.py](./examples/09_depth_check.py) | 深度估计校验 |
+| [10_nozzle_align.py](./examples/10_nozzle_align.py) | 吸嘴对准 |
+| [11_grasp.py](./examples/11_grasp.py) | 抓取模板 |
+| [12_vision_pick_water.py](./examples/12_vision_pick_water.py) | 视觉抓水瓶全流程 |
 
 ## 机械臂业务 API 子集
 
 | 用途 | 接口 | 推荐方式 | 推荐频率 |
 | --- | --- | --- | --- |
-| **重新定原点**（漂移后手调用） | `main.arm.OriginCalibrator` | `examples/01_calibrate_origin.py` | 漂移 / 换电池 |
+| **重新定原点**（漂移后手调用） | `main.arm.run_calibrator(x_wall)` | `ArmClient.reset_origin(x_wall="left")` | 漂移 / 换电池 |
 | **主动 reset 原点** | `arm.reset_origin(x_wall)` | `ArmClient.reset_origin(x_wall="left")` | 需要时 |
 | **双轴同步移动** | `arm.goto_position` | `ArmClient.move_xy(x_mm, y_mm)` / `ArmRunner.move_xy(...)` | 业务流 |
 | **单轴移动** | `arm.move_x_position` / `arm.move_y_position` | `ArmClient.move_x/move_y` | 业务流 |
-| **一次设位姿** | `arm.set_arm_pose` | `ArmClient.set_pose(x_mm, y_mm, side, hand)` | 业务流 |
-| **大臂方向** | `arm.set_arm_angle` | `ArmClient.set_side("LEFT"/"MID"/"RIGHT")` | 业务流 |
-| **手爪角度** | `arm.set_hand_angle` | `ArmClient.set_hand("UP"/"MID"/"DOWN")` | 业务流 |
+| **一次设 x/y** | `arm.set_arm_pose` | `ArmClient.set_pose(x_mm, y_mm)`（None=不动；side/hand 参数 2026-07-16 已删） | 业务流 |
+| **任意子集姿态一步到位** | `arm.*` 并行 | `ArmClient.composite_run(arm=, x_mm=, y_mm=, hand=)` | 业务流 |
+| **大臂角度** | `arm.set_arm_angle` | `ArmClient.set_arm_angle(angle)` / `ArmRunner.set_arm_angle(...)` | 业务流 |
+| **手爪角度** | `arm.set_hand_angle` | `ArmClient.set_hand_angle(angle)` | 业务流 |
 | **吸盘抓取/释放** | `arm.grasp` | `ArmClient.grasp(True/False)` | 业务流 |
+| **视觉伺服对准+吸** | task_feed 30Hz 缓存 | `ArmRunner.track_velocity_pick(label)` | task1/2/4/5 主力 |
 | **读位姿** | `arm.x_get_position` / `arm.y_get_position` / `car.get_arm_state` | `ArmClient.get_state()` | 任意 |
 | **读机械臂状态** | `car.get_arm_state` | `ArmClient.get_state()` | 任意 |
 | **S 曲线 dry-run** | `main.arm.trajectory.TrajectoryGenerator` | `ArmRunner.move_xy(...)` 内部调用 | 自动 |
@@ -104,9 +114,10 @@ runner.grasp(True)
 - **超时**：默认 `max(5.0, plan.T * 2.0 + 1.0)` 秒。
 - **会拦**：超出 `soft_*` 软限位时**直接抛 `ValueError`**，不下发到硬件。
 
-### 2. `set_pose(x_mm=None, y_mm=None, side=None, hand=None)`
+### 2. `set_pose(x_mm=None, y_mm=None, timeout=30.0)`
 
-- **任意参数为 `None` 表示不动**（避免 "我只想转 side 结果把 x 推回去了"）。
+- **任意参数为 `None` 表示不动**（避免 "我只想动 y 结果把 x 推回去了"）。
+- side/hand 参数 2026-07-16 已删；大臂/手爪单独走 `set_arm_angle` / `set_hand_angle`。
 - **底层**：调 `arm.set_arm_pose`；`None` 会被服务端丢掉。
 - **会拦**：超出软限位 → 抛 `ValueError`。
 
@@ -161,10 +172,12 @@ main/arm/
 ├── README.md                  ← 你正在看
 ├── __init__.py
 ├── ARM_API.md                 ← 业务层机械臂 API 速查
-├── QUICKSTART.md              ← 10 行起步
+├── VISUAL_SERVO_QUICKREF.md   ← 视觉伺服一页纸
+├── TEST_PREFLIGHT.md          ← 真机测试前 checklist
 ├── state.py                   ← ArmState / ArmOrigin dataclass
 ├── trajectory.py              ← TrajectoryGenerator：双轴同步 S 曲线（纯 Python）
-├── origin.py                  ← OriginCalibrator：调车端 reset_position 重新定原点
+├── origin.py                  ← OriginCalibrator / run_calibrator：定原点
+├── labels.py                  ← Label / LABELS / LABEL_GROUPS
 ├── arm_origin.yaml            ← 业务坐标系软限位 + 标注（gitignore）
 ├── api/                       ← ArmClient 8 mixin + 1 聚合 (2026-08-01 重整)
 │   ├── __init__.py            ← ArmClient 聚合, MRO = (Safety, Motion, Setters, Composite, Reset, Storage, StateIO, VisServo)
@@ -176,29 +189,21 @@ main/arm/
 │   ├── storage.py             ← StorageMixin: 存储仓舵机
 │   ├── state_io.py            ← StateIOMixin: get_state / emergency_stop / ping
 │   └── vis_servo.py           ← VisServoMixin: vision 懒属性 + _make_vision_with_move
-├── vision/                    ← ArmVisionClient 5 模块 + 1 聚合 (2026-08-01 重整)
-│   ├── __init__.py            ← ArmVisionClient 聚合, MRO = (ServoLoop, RealtimeLoop) + compute_depth
+├── vision/                    ← ArmVisionClient: ServoLoop + RealtimeLoop + VelocityLoop
+│   ├── __init__.py            ← ArmVisionClient 聚合
 │   ├── types.py               ← BBoxNorm / BBoxPixels / Detection / ServoTrace / ServoResult
 │   ├── parsers.py             ← _parse_cache / _parse_sync
 │   ├── selector.py            ← SelectionStrategy / TargetSelector
 │   ├── servo.py               ← ServoLoop: find_target (PID+depth+4DOF) + find_target_legacy (纯 P)
-│   └── realtime.py            ← RealtimeLoop: find_target_realtime / find_target_track (WS 推送)
+│   ├── realtime.py            ← RealtimeLoop: find_target_realtime / find_target_track (WS 推送)
+│   └── velocity.py            ← VelocityLoop: /v1/realtime/arm-velocity 速度模式
 ├── loops/
 │   ├── __init__.py
 │   ├── runner.py              ← ArmRunner：业务编排 + dry-run + 视觉伺服高层 (track_velocity_pick 等)
-│   └── orch_visual.py         ← VisualOrchestrator：chassis+arm+grasp 一条龙编排（2026-08-02）
-├── tasks/
-│   ├── __init__.py
-│   ├── go_home.py             ← 回到 y=0, x=0, hand=UP, side=MID
-│   ├── pick_left.py           ← 左侧抓取
-│   ├── pick_right.py          ← 右侧抓取
-│   └── release.py             ← 释放
-└── examples/
-    ├── __init__.py
-    ├── 01_calibrate_origin.py
-    ├── 02_trajectory_preview.py
-    ├── 03_move_xy_basic.py
-    └── 04_grasp_template.py
+│   └── orch_visual.py         ← VisualOrchestrator：chassis+arm+grasp 一条龙编排（2026-08-02）+ orch_visual.md
+├── each_task/                 ← task4/task5 业务脚本（活）；task1/2/6/7 步骤脚本（未接线，见 ../task/README.md）
+├── tests/                     ← 141 个离线单测（stdlib unittest）
+└── examples/                  ← 05–12 真机脚本（01–04 已删）
 
 ## 内部架构 (2026-08-01 重整)
 
@@ -214,198 +219,28 @@ main/arm/
 4. **4 自由度策略** (大偏移 `|dx_norm|>0.3` 触发 `on_strategic_4dof("arm_rotate", det)` 回调, 业务层 hook 在回调里调 `composite_run(arm=...)` 转大臂)
 
 8 类 label `real_height_m` 已填值 (`cylinder_*=0.10` / `ball_*=0.06` / `h_dou_jiao=0.20` / `h_fan_qie=0.07` / `h_qing_jiao=0.10` / `h_tu_dou=0.08` / `animal=0.30` / `water=0.15`); 其它 label 留 0.0 走 fallback.
-```
 
 ## 三条红线
 
-1. **首次上电通常不需要手跑 `examples/01_calibrate_origin.py`**：runtime 启动时若 `RAK_CAR_RESET_ARM=1`（默认配置见 `ecosystem.config.js:23`）会自动跑一次 `arm.reset_position` 并把新原点落到 `arm_origin.yaml`。只有 `RAK_CAR_RESET_ARM=0` 且从未手调用过 reset 时，`arm_origin.yaml` 才可能不存在 / 全 0，此时坐标系处于**未标定**状态，软限位使用默认值。手动入口只用于漂移严重 / PID 范围卡死后的恢复。
+1. **首次上电通常不需要手动定原点**：runtime 启动时若 `RAK_CAR_RESET_ARM=1`（默认配置见 `ecosystem.config.js:23`）会自动跑一次 `arm.reset_position` 并把新原点落到 `arm_origin.yaml`。只有 `RAK_CAR_RESET_ARM=0` 且从未手调用过 reset 时，`arm_origin.yaml` 才可能不存在 / 全 0，此时坐标系处于**未标定**状态，软限位使用默认值。手动入口（`run_calibrator` / `ArmClient.reset_origin`）只用于漂移严重 / PID 范围卡死后的恢复。
 2. **`move_xy` / `move_x` / `move_y` 越界直接抛 `ValueError`**：业务层别 try-except 后硬塞，除非你确认软限位该改了。
 3. **业务层只调 `main.arm.*`，不要回退到 `client.call("arm", ...)`**：丢失软限位保护和 S 曲线 dry-run。
 
-## 6. 与底盘协同：视觉追踪（2026-08-02 新增）
+## 6. 与底盘协同：视觉追踪
 
-arm 任务常需要"先用车载摄像头对齐目标 → 再抓/放"。`main/chassis` 提供了两个追踪入口，
-arm 业务层直接 import 调用即可，不需要知道底盘细节。
+arm 任务常需要"先用车载摄像头对齐目标 → 再抓/放"。入口都在 `main.chassis`，直接 import 即用：
 
----
+- `track_chassis(target, ...)` —— 底盘把目标 bbox 拉到画面中心（vx/vy 两自由度）。完整参数/返回值/调方向 → [../chassis/README.md §13](../chassis/README.md)。
+- `make_align_runner(ref_area, label).run(...)` —— 按检测面积只做前进/后退的精准微调（task5 料箱对齐在用）。
+- `VisualOrchestrator.track_and_grasp(label)` —— chassis→arm→grasp 一条龙；轴映射现场标定表 → [loops/orch_visual.md](./loops/orch_visual.md)。
 
-### 6.1 `track_chassis(target, ...)` —— 底盘快速对齐目标
-
-**把目标 bbox 拉到画面中心，允许底盘水平+前后两自由度运动。**
-
-```python
-from main.chassis import track_chassis, track_trace
-
-# 1. dry-run 确认方向（不下发轮速）
-result = track_chassis(
-    "h_tu_dou",              # 目标 label（任意；water/cylinder_2/h_tu_dou/...）
-    dry_run=True,
-    max_seconds=3.0,
-    on_tick=track_trace(1),
-)
-
-# 2. 方向 OK 后真发车
-result = track_chassis(
-    "h_tu_dou",
-    dry_run=False,
-    max_seconds=15.0,
-    on_tick=track_trace(1),
-)
-print(result.arrived, result.reason, result.frames)
-```
-
-**典型业务流程**：
-
-```python
-from main.chassis import track_chassis, make_align_runner
-from main.arm import ArmClient
-
-arm = ArmClient.connect()
-
-# Step 1: 底盘对齐目标
-r = track_chassis("h_tu_dou", dry_run=False, max_seconds=15.0)
-if not r.arrived:
-    print("底盘对齐失败:", r.reason)
-
-# Step 2: 车已到位，精准 area 微调（仅前进/后退）
-runner = make_align_runner(ref_area=0.04, label="h_tu_dou")
-align_result = runner.run(max_seconds=10.0)
-if not align_result.arrived:
-    print("面积对齐失败:", align_result.reason)
-
-# Step 3: 手臂精准抓取
-arm.move_xy(100, 80)
-arm.grasp(True)
-```
-
-**`track_chassis` 返回值 `TrackChassisResult`**：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `arrived` | `bool` | True = 连续 5 帧目标在画面中心 |
-| `reason` | `str` | `arrived` / `timeout` / `no_target` / `watchdog` |
-| `final_frame` | `TrackFrame` | 最后一帧（cx/cy/score/area） |
-| `frames` | `int` | 跑了几帧 |
-| `elapsed_s` | `float` | 实际耗时 |
-
-**方向反了？改 sign 参数，不用动控制律**：
-
-```python
-# 默认（2026-08-02 现场）：sign_vx=-1, sign_vy=+1
-# 换车/摄像头后方向反了？
-track_chassis("h_tu_dou", sign_vx=+1)   # 前后反了：cx 负 → 前进（不倒车）
-track_chassis("h_tu_dou", sign_vy=-1)   # 横向反了：cy 负 → 左移（不右移）
-```
-
----
-
-### 6.2 `make_align_runner(ref_area, label)` —— 仅前进/后退的面积微调
-
-**用面积（area）控制车的前后距离，适合抓取前精准定位。**
-
-```python
-from main.chassis import make_align_runner
-
-runner = make_align_runner(
-    ref_area=0.04,    # 期望面积（标度阶段记录）
-    label="h_tu_dou",
-)
-result = runner.run(max_seconds=10.0)
-print(result.arrived, result.reason, result.elapsed_s)
-```
-
-**`make_align_runner` 返回值 `AlignRunResult`**：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `arrived` | `bool` | True = 连续 3 帧 area_error 在死区内 |
-| `reason` | `str` | `arrived` / `timeout` / `no_target` |
-| `final_state` | `AlignState` | 最后一帧（area/ref_area/error） |
-| `elapsed_s` | `float` | 实际耗时 |
-
----
-
-### 6.3 轴映射（2026-08-02 现场标定）
-
-| 画面轴 | 车/臂运动 | 误差正时车/臂动作 |
-| --- | --- | --- |
-| cx（横向）| 车前后（vx）| cx 负（画面左）→ vx 负（倒车）|
-| cy（纵向）| 车横向（vy）| cy 负（画面上）→ vy 正（右移）|
-| cx（横向）| 大臂角度 arm_angle | dx>0 → arm 更负（sign_arm=+1）|
-| cy（纵向）| x 十字位置 | dy>0 → x 往左（sign_x=-1）|
-
----
-
-### 6.4 `VisualOrchestrator` —— 一条龙编排（2026-08-02 新增）
-
-**chassis 追踪 + arm 4-DOF + 抓取，全自动串联。**
-
-> 详细文档：[main/arm/loops/orch_visual.md](./loops/orch_visual.md)
-
-```python
-from main.arm.loops import VisualOrchestrator
-
-orch = VisualOrchestrator()
-
-# 方式 A：一条龙（Stage1 chassis → Stage2 arm → Stage3 grasp）
-result = orch.track_and_grasp(
-    "h_tu_dou",
-    chassis_max_seconds=15.0,
-    arm_timeout=30.0,
-)
-print(result.arrived_chassis, result.arrived_arm, result.grasp_ok)
-
-# 方式 B：单步用
-orch.chassis_only("h_tu_dou")        # 只 Stage 1 chassis
-orch.arm_only("h_tu_dou")            # 只 Stage 2 arm 4-DOF
-orch.grasp(y_mm=0.0)                # 只 Stage 3 吸气
-```
-
-**流水线**：
-
-```
-Stage 1: track_chassis()         → 目标拉到画面中心（chassis vx/vy）
-Stage 2: track_velocity_pick()    → 臂结构映射，4-DOF 对齐到吸嘴 setpoint
-Stage 3: y 降到 0 → grasp(True) → 吸气
-```
-
-**按场景拆用**：
-
-```python
-# 只做 chassis 追踪（不抓）
-orch.track_and_grasp("h_tu_dou", skip_arm=True, skip_grasp=True)
-
-# chassis 追踪 + arm 对齐，不抓
-orch.track_and_grasp("h_tu_dou", skip_grasp=True)
-
-# 只做 grasp（arm 已经在位）
-orch.grasp(y_mm=0.0)
-
-# Stage 1 dry-run（不发车）
-orch.track_and_grasp("h_tu_dou", chassis_dry_run=True)
-
-# Stage 2 dry-run（不下发 grasp）
-orch.track_and_grasp("h_tu_dou", skip_chassis=True, arm_dry_run=True)
-```
-
-**调试参数**：
-
-| 场景 | 改参数 |
-| --- | --- |
-| chassis 前后方向反了 | `chassis_sign_vx=+1` |
-| chassis 左右方向反了 | `chassis_sign_vy=-1` |
-| arm 大臂旋转反了 | `arm_sign_arm=-1.0` |
-| arm x 十字方向反了 | `arm_sign_x=+1.0` |
-| chassis 收敛太慢 | `chassis_kp=0.30, chassis_v_max=0.18` |
-| arm 对齐震荡 | `arm_gain_arm=0.2, arm_gain_x=0.04` |
-
----
+一行 dry-run 验证方向（不下发轮速）：`track_chassis("h_tu_dou", dry_run=True, max_seconds=3.0)`。
 
 ## 在哪查 API
 
 - 机械臂专用接口子集：本文档（上面那张表）
 - 业务侧便捷 API：[ARM_API.md](./ARM_API.md)
-- 10 行起步：[QUICKSTART.md](./QUICKSTART.md)
+- 视觉伺服一页纸：[VISUAL_SERVO_QUICKREF.md](./VISUAL_SERVO_QUICKREF.md)；chassis→arm 标定：[loops/orch_visual.md](./loops/orch_visual.md)
 - 全部接口速查：[main/API_INDEX.md](../API_INDEX.md)
 - 底层细节：[smartcar/whalesbot/vehicle/arm/arm_base.py](../../smartcar/whalesbot/vehicle/arm/arm_base.py)
 - 急停 / 复位：`/v1/control/reset-stop`（[API_INDEX.md §4](../API_INDEX.md#4-control系统控制)）

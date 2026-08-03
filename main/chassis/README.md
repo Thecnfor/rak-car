@@ -611,30 +611,38 @@ finally:
 ```
 main/chassis/
 ├── README.md                 ← 你正在看
-├── __init__.py               ← 只导出 public API
+├── __init__.py               ← 一键入口：get_odometry / subscribe_lane_state / subscribe_visual_align + 全部 public 导出
 ├── api.py                    ← ChassisClient：薄封装 RuntimeApiClient/WS
-├── state.py                  ← LaneState / OdometryState / WheelsState
-├── state_align.py             ← AlignState：视觉微调状态（area/ref_area/error）
-├── loops/
-│   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环（支持 pause/resume）
-│   │   ├── visual_track.py    ← track_chassis：通用底盘视觉追踪（两自由度）
-│   └── safety.py             ← EmergencyWatchdog / LostLineDetector
+├── state.py                  ← LaneState / OdometryState / WheelsState / IrState
+├── state_align.py            ← AlignState：视觉微调状态（area/ref_area/error）+ select_target
+├── heading.py                ← HeadingEstimator / TrackMap：航迹推算
 ├── controllers/
 │   ├── base.py               ← OuterLoop ABC + WheelSmoother + mecanum_inverse helper
 │   ├── p_controller.py       ← POuterLoop
 │   ├── stanley.py            ← StanleyOuterLoop
-│   └── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应，主力）
-├── config/                   ← 调参 profile（所有默认值与工厂方法）+ magic-number 集中点
-│   └── lane_follow.py        ← LaneFollowProfile + LANE_FOLLOW / LANE_FOLLOW_SLOW + ControllerType
-├── loops/                    ← 兜底 + 循环 + 每帧 trace
-│   ├── closed_loop.py        ← DoubleLoopRunner
+│   ├── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应，主力）
+│   ├── straight.py           ← StraightOuterLoop
+│   ├── visual_align.py       ← VisualAlignOuterLoop（面积对准）
+│   ├── calibration.py        ← ErrorCalibrator
+│   └── odom_turn.py          ← OdomTurnPID + wrap_pi
+├── loops/
+│   ├── closed_loop.py        ← DoubleLoopRunner：50Hz 外环主循环（支持 pause/resume）
+│   ├── visual_track.py       ← track_chassis：通用底盘视觉追踪（两自由度）
+│   ├── visual_align.py       ← VisualAlignRunner / make_align_runner
 │   ├── safety.py             ← EmergencyWatchdog / LostLineDetector
-│   └── telemetry.py          ← lane_trace（on_tick 工厂）
+│   ├── telemetry.py          ← lane_trace（on_tick 工厂）
+│   └── tui.py                ← 外环 TUI 调试面板（--tui）
+├── config/
+│   └── lane_follow.py        ← LaneFollowProfile + LANE_FOLLOW / LANE_FOLLOW_SLOW + ControllerType
 ├── cli/                      ← 可执行入口（argparse + __main__）
-│   └── run_lane_follow.py
+│   ├── run_lane_follow.py
+│   ├── read_ir.py
+│   ├── diag_lane_error.py
+│   └── track_water.py
 └── tasks/                    ← 一次性/低层数据读取
     ├── read_ir.py            ← 一次性读红外
     ├── read_dis.py           ← 持续读累计距离（自带 TUI __main__）
+    ├── read_heading.py       ← 航向记录
     └── monitor_ir.py         ← 持续读红外 + 阈值命中回调
 ```
 
@@ -649,12 +657,12 @@ main/chassis/
 - 底盘专用接口子集：本文档
 - 全部接口速查：[main/API_INDEX.md](../API_INDEX.md)
 - Runtime 服务端 lane_state / WS push：[runtime/VISION_API.md](../../runtime/VISION_API.md)
-- 出问题了看：[debug-controller-download-stuck.md](../../debug-controller-download-stuck.md)、[debug-runtime-init-queue.md](../../debug-runtime-init-queue.md)
+- 出问题了看：`.dbg/` 目录（环境快照 + Trae 结构化日志，见根 CLAUDE.md「Debug instrumentation」）
 ---
 
 ## 13. 视觉微调与视觉追踪（2026-08-02 新增）
 
-`main/chassis/` 提供两套视觉对齐工具，都走 cam2 `task_feed` 缓存（`/v1/realtime/vision/task`，10Hz+），
+`main/chassis/` 提供两套视觉对齐工具，都走 cam2 `task_feed` 缓存（`/v1/realtime/vision/task`，默认 30Hz），
 **不下发任何 arm 指令**，只控底盘。
 
 ---

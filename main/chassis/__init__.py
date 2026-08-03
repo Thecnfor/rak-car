@@ -174,7 +174,7 @@ def subscribe_visual_align(
     参数：
         ref_area   - 期望面积(标度阶段记录后填入)。``None`` → 控制器永远零速,安全默认。
         label      - 优先选这个 label 的目标;``None`` 时取面积最大。
-        hz         - 循环频率(默认 20Hz;task_feed 默认 10Hz,20Hz 足够且不浪费算力)。
+        hz         - 循环频率(默认 20Hz;task_feed 默认 30Hz,20Hz 足够且不浪费算力)。
         kp         - 比例增益(m/s 每单位 area_error)。
         v_max      - 单向速度上限(绝对值),只动前后,默认 0.20 m/s。
         deadband   - area_error 死区,小于此值视为 0,防止抖动。
@@ -202,7 +202,42 @@ def subscribe_visual_align(
     runner.run(max_seconds=30.0 if max_seconds is None else max_seconds)
 
 __all__ = [
+    # --- 一键入口（写 task 优先用这些，见 main/README.md 速查表） ---
     "get_odometry",                # 读底盘里程计 (x, y, theta)
+    "subscribe_lane_state",        # 一键巡线：profile → outer/smoother → DoubleLoopRunner
+    "subscribe_visual_align",      # 一键面积视觉对准：只前进/后退到 ref_area
+    # --- client / 状态 ---
+    "ChassisClient",               # 薄封装 RuntimeApiClient/WS；move_for 是唯一合法平移
+    "LaneState",                   # lane_feed 缓存帧
+    "AlignState",                  # 视觉微调状态（area/ref_area/error）
+    "select_target",               # 按 label/面积选检测目标
+    # --- 控制器 ---
+    "OuterLoop",                   # 外环 ABC
+    "WheelSmoother",               # 轮速软化
+    "POuterLoop",
+    "StanleyOuterLoop",
+    "CurvatureAdaptiveOuterLoop",  # 循迹主力
+    "StraightOuterLoop",
+    "VisualAlignOuterLoop",        # 面积对准控制器
+    "ErrorCalibrator",
+    "OdomTurnPID",
+    "wrap_pi",
+    # --- 循环 / 安全 / 遥测 ---
+    "DoubleLoopRunner",            # 50Hz 外环主循环（orchestrator 在用）
+    "EmergencyWatchdog",
+    "LostLineDetector",
+    "lane_trace",                  # 循迹每帧 trace 回调工厂
+    # --- 视觉追踪（task 在用） ---
+    "track_chassis",               # 底盘把目标拉画面中心（task1/2/4）
+    "TrackChassisResult",
+    "TrackFrame",
+    "expand_label_set",
+    "track_trace",
+    "VisualAlignRunner",
+    "make_align_runner",           # 面积对准 runner 工厂（task5）
+    "align_trace",
+    "AlignConvergenceDetector",
+    "AlignRunResult",
     # --- 航向估计 / 赛道剖面 ---
     "read_heading",                # 实时轮询航向传感器，每帧调 on_tick
     "HeadingTickCallback",         # 航向每帧回调类型
@@ -210,4 +245,16 @@ __all__ = [
     "HeadingEstimator",            # 航向估计器：融合原始航向 + 速度门控 + 漂移校正
     "HeadingState",                # 航向估计器实时状态（航向角 / 累计距离 / 赛道标记）
     "TrackMap",                    # 赛道地图：起终点 + 弯道区间 + 方向表
+    # --- 低层读取任务 ---
+    "monitor_ir",
+    "IRAlertCallback",
+    "IRTickCallback",
+    "read_dis",
+    "DisTickCallback",
+    "read_ir",
+    # --- 调参 profile ---
+    "LANE_FOLLOW",
+    "LANE_FOLLOW_SLOW",
+    "ControllerType",
+    "LaneFollowProfile",
 ]

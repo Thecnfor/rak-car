@@ -16,7 +16,7 @@
 
 | 量 | 单位 | 语义 |
 | --- | --- | --- |
-| `x_mm` | mm | 水平位移，**reset_x 撞墙=0**，远离为正。**x 轴软限位 [x_min_m, x_max_m]** 由 `arm_cfg.yaml` 配置（2026-08-01：`x_min_m=-0.32` / `x_max_m=0.22`，即 0~-320mm + 0~+220mm）；业务层 `_check_safe` 不校验 x；物理墙 ≈ 0.34m 由 `reset_x` 撞墙 calibrate 兜底 |
+| `x_mm` | mm | 水平位移，**reset_x 撞墙=0**，远离为正。**x 轴业务软限位已取消**（2026-07-16，`ArmOrigin.soft_x_min_m/max_m` 恒 None）；业务层 `_check_safe` 不校验 x；物理墙 ≈ 0.34m，由 `reset_x` 撞墙 calibrate 兜底 |
 | `y_mm` | mm | 垂直位移，**触底=0**。`y<0` 向上（远离触底），`y>0` 向下（被安全门拦） |
 | `side` | enum | `LEFT` / `MID` / `RIGHT` —— 大臂总线舵机 |
 | `hand` | enum | `UP` / `MID` / `DOWN` —— 手爪 PWM 舵机 |
@@ -109,8 +109,8 @@ class ArmState:
     y_origin_valid: bool # 来自 car.get_arm_state.y_limit
     x_origin_valid: bool # 恒为 False（车端没暴露）
     soft_y_max_mm: float  # 默认 200
-    soft_x_min_mm: float  # 默认 -320（v3 双边）
-    soft_x_max_mm: float  # 默认 320
+    soft_x_min_mm: float  # 恒 None（x 软限位已取消，2026-07-16）
+    soft_x_max_mm: float  # 恒 None
     raw_x_m: float
     raw_y_m: float
     arm_angle: int | None
@@ -158,7 +158,7 @@ http = RuntimeApiClient()
 origin = OriginCalibrator(http).run(x_wall="left")
 # 走 arm.reset_position（车端 y 触底 + x 撞墙）→ 读 y_get_position / x_get_position
 # → 把当前编码器值作为新原点写到 arm_origin.yaml
-# 写盘用的 soft_* 默认值 = state.ArmOrigin 默认值（200 / -320 / +320 mm），不再覆盖成 v1 单边值
+# 写盘用的 soft_* 默认值 = state.ArmOrigin 默认值（soft_y_max=200 mm；soft_x 恒 None，已取消）
 ```
 
 什么时候用：
@@ -166,19 +166,14 @@ origin = OriginCalibrator(http).run(x_wall="left")
 | 场景 | 用法 |
 | --- | --- |
 | 首次上电 | **不需要手动调** —— runtime 启动时若 `RAK_CAR_RESET_ARM=1` 会自动跑一次 |
-| 漂移严重 / PID 卡死 / 编码器读数明显不对 | 手跑 `examples/01_calibrate_origin.py left`（或 `right`） |
+| 漂移严重 / PID 卡死 / 编码器读数明显不对 | `ArmClient.reset_origin(x_wall="left")`（或 python 调 `main.arm.origin.run_calibrator`） |
 | 业务代码里临时复位 | `ArmClient.reset_origin(x_wall="left")` |
 
 > 历史说明：旧版 `OriginCalibrator` 需要在车端按 4 键（1=y 下，3=y 上，2=x 左，4=x 右）手动 jog，再 `1+3` 同时按 1 秒保存 —— **该流程已删除**。当前实现直接下发一次 `arm.reset_position`，由车端 PID 闭环完成触底 / 撞墙，不再监听任何按键。
 
 ### 1.6 `examples/`
 
-| 文件 | 用途 |
-| --- | --- |
-| `examples/01_calibrate_origin.py` | 触发车端 `arm.reset_position` 重新定原点 |
-| `examples/02_trajectory_preview.py` | 不下硬件，只算 S 曲线 |
-| `examples/03_move_xy_basic.py` | 双轴同步移动 + dry-run |
-| `examples/04_grasp_template.py` | 完整 pick-and-place |
+真机脚本 05–12（旧 01–04 已删）：视觉伺服 smoke / 位置环 / 速度环 / 4-DOF / 深度校验 / 吸嘴对准 / 抓取 / 视觉抓水瓶。清单及用途见 [README.md「10 行起步」](./README.md#10-行起步)。
 
 ### 1.7 `TrajectoryGenerator`（S 曲线 dry-run）
 
@@ -218,7 +213,7 @@ class TrajectoryPlan:
 
 | 需求 | 接口 |
 | --- | --- |
-| 首次上电定原点 | 不用手动 —— runtime 默认 init 跑 `reset_all`（**大臂+手爪+x 并行 → y 串行**，2026-07-16 起）。漂移后再手跑 `examples/01_calibrate_origin.py` |
+| 首次上电定原点 | 不用手动 —— runtime 默认 init 跑 `reset_position`（`RAK_CAR_RESET_ARM=1` 时；2026-07-31 起不再默认 `reset_all`，见 §5）。漂移后 `ArmClient.reset_origin(x_wall)` 手动重定 |
 | 之后重置原点 | `ArmClient.reset_origin("left")`（仅 y 触底定原点，x 固定 0） |
 | 只重置 y | `ArmClient.reset_y()` / `ArmRunner.reset_y()` |
 | 只重置 x（撞墙） | `ArmClient.reset_x(direction="right")`（**opt-in**，2026-07-16 恢复，详见 §9） |
@@ -234,13 +229,13 @@ class TrajectoryPlan:
 | 读位姿 | `ArmClient.get_state()` |
 | 读 y/x（20Hz，**不抢 car_lock**） | `RuntimeApiClient.get_arm_state()` 或 WS `subscribe_arm_state`（§2.3） |
 | 算 S 曲线（不下发） | `TrajectoryGenerator().plan_xy(...)` |
-| 完整 pick-and-place | `examples/04_grasp_template.py` |
+| 完整 pick-and-place | `examples/11_grasp.py` / `examples/12_vision_pick_water.py` |
 
 ---
 
 ## 2. runtime HTTP / WS 端点
 
-> runtime 在 `runtime/api/routes.py` 暴露。**业务层一般不要直调**，通过 `main.api_client.RuntimeApiClient` / `main.ws_client.RuntimeWsClient` 转。
+> runtime 在 `runtime/api/routers/` 暴露。**业务层一般不要直调**，通过 `main.api_client.RuntimeApiClient` / `main.ws_client.RuntimeWsClient` 转。
 
 ### 2.1 执行动作（car_lock 同步路径，进 job_queue）
 
@@ -261,7 +256,7 @@ curl -X POST http://192.168.6.231:5050/v1/execute \
   -d '{"target":"car","name":"get_arm_state","args":[],"kwargs":{}}'
 ```
 
-可用 `target`：`task` / `car` / `arm` / `system`。完整 action 列表见 §3。
+可用 `target`：`car` / `arm` / `system`（`task` target 已删）。完整 action 列表见 §3。
 
 ### 2.2 实时臂位 HTTP 端点（meta_lock 路径，**不抢 car_lock**）
 
@@ -365,7 +360,7 @@ WS   /v1/ws
 - **init 时自动启**：`runtime _create_car_locked` 默认起 `arm_feed`（20Hz），除非 `arm_feed 启动失败` 才会缺失
 - **disconnect 自动清理**：WS 断连时 `arm_push_task` 自动 cancel
 
-> 当前 `arm_feed` 没有运行时启停 HTTP 端点（也没有 arm action），业务层不需要手动管。如果想观察是否在跑：看 `arm_state.active=True` / `mode="arm_feed"`。
+> `arm_feed` 可经 `/v1/execute` action `start_arm_feed` / `stop_arm_feed` 运行时启停（视觉伺服前需 `stop_arm_feed(force=True)` 释放串口，见 TEST_PREFLIGHT §3）。观察是否在跑：看 `arm_state.active=True` / `mode="arm_feed"`。
 
 ---
 
@@ -422,7 +417,7 @@ http.execute_car_action("get_arm_state", timeout=10)
 http.create_job("arm", "goto_position", args=[], kwargs={"x": 0.1, "y": 0.04})
 ```
 
-完整 HTTP/WS 接口和错误码见 [main/API.md](../API.md)。
+完整 HTTP/WS 接口和错误码见 [main/API_INDEX.md](../API_INDEX.md)。
 
 ---
 
@@ -639,9 +634,11 @@ while 没超时:
 
 **返回**：`dict {"x": bool, "arm": bool, "hand": bool, "y": bool}`
 
-### 9.3 init 默认走 reset_all
+### 9.3 init 与 reset_all 的关系
 
-`_create_car_locked(reset_arm=False)` 默认分支改调 `reset_all`（2026-07-16）。完整复位：
+**当前 init 流程不再默认调 `reset_all`**（2026-07-31 改回）：auto-init 走 `reset_position`（y 触底）+ 条件性 `reset_x`，见 §5。`reset_all` / `composite_run_reset` 是**业务层 opt-in** 入口。
+
+`reset_all` 内部时序（手动调用时）：
 
 ```
 [并行]  set_arm_angle(0)
@@ -651,9 +648,7 @@ while 没超时:
         reset_y()   ← 串行，触底定绝对零点
 ```
 
-`reset_arm=True` 仍走 `reset_position`（仅 `reset_y`，不含 x 撞墙）向后兼容。
-
-`auto_init_kwargs` 默认 `reset_arm=True`，后台 retry 不撞墙。
+> 历史：2026-07-16 曾让 init 默认走 `reset_all`，因 x 撞墙 PM2 风险 + 多入口混乱，2026-07-31 改回。
 
 ### 9.4 与视觉闭环的关系
 
@@ -779,10 +774,10 @@ origin = ArmOrigin(step_loss_y_mm=2.0, step_loss_x_mm=5.0)  # 默认
 
 - 子包总览：[README.md](./README.md)
 - 10 行起步：[QUICKSTART.md](./QUICKSTART.md)
-- 业务 API 总览（包含 chassis）：[../API.md](../API.md)
+- 业务 API 总览（包含 chassis）：[../API_INDEX.md](../API_INDEX.md)
 - runtime 端点：[../../runtime/README.md](../../runtime/README.md) · [../../runtime/VISION_API.md](../../runtime/VISION_API.md)
 - SDK 注释：[../../smartcar/whalesbot/vehicle/arm/arm_base.py](../../smartcar/whalesbot/vehicle/arm/arm_base.py)
-- 软件急停 / `reset_y` 找底方向 / HTTP 急停端点：[SOFTWARE_ESTOP.md](./SOFTWARE_ESTOP.md)
+- 软件急停 / `reset_y` 找底方向 / HTTP 急停端点：本文 §8 + [../API_INDEX.md §4](../API_INDEX.md#4-control系统控制)
 
 ### 10.7 实时版本（WS push，2026-07-31）
 
@@ -813,4 +808,4 @@ job = runner.pick_by_vision_realtime(
 - HTTP：主动 GET 30Hz 轮询（适合简单场景、调试）
 - WS：服务端推送 30Hz（适合实时伺服、生产）
 
-详见 [VISION_REALTIME_DESIGN.md](./VISION_REALTIME_DESIGN.md)。
+算法概述见 [VISUAL_SERVO_QUICKREF.md](./VISUAL_SERVO_QUICKREF.md)。

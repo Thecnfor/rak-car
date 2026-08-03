@@ -65,7 +65,7 @@ WS 推送订阅：`subscribe_lane` / `subscribe_arm_state` / `subscribe_task_det
 | GET | `/v1/vision/lane/state` | — | **推荐**：读 lane_feed 守护线程缓存（默认 50Hz） |
 | GET | `/v1/vision/lane/preview.jpg?cam_id=cam1` | — | cam1 + `d_e/d_a` overlay 一次性 JPEG |
 | POST | `/v1/vision/task` | car_queue, sync | 单次 cam2 目标检测（5-15s 阻塞） |
-| GET | `/v1/realtime/vision/task` | — | **推荐**：读 task_feed 守护线程缓存（默认 10Hz） |
+| GET | `/v1/realtime/vision/task` | — | **推荐**：读 task_feed 守护线程缓存（默认 30Hz） |
 | GET | `/v1/vision/task/preview.jpg?cam_id=cam2` | — | cam2 + bbox overlay 一次性 JPEG |
 | POST | `/v1/vision/ocr` | car_queue, sync | cam2 + OCR（label=`order` / `name`） |
 | GET | `/v1/vision/models` | — | 模型清单（含类别标签） |
@@ -74,7 +74,7 @@ WS 推送订阅：`subscribe_lane` / `subscribe_arm_state` / `subscribe_task_det
 
 ```python
 client.realtime_lane_state()        # 外环 50Hz 轮询
-client.get_task_state()             # 边走边看 10Hz
+client.get_task_state()             # 边走边看 30Hz
 client.execute_car_action("get_detection_results", sync=True, timeout=20,
                           sort_pos=[0,0], limit_x=1, limit_y=1)
 ```
@@ -193,7 +193,7 @@ client.cancel_job(job_id)
 | GET | `/v1/realtime/arm/state` | arm_feed / 20Hz | `y_m`, `x_m`, `y_mm`, `x_mm`, `ref_encoder`, `active` |
 | GET | `/v1/realtime/ir/state` | ir_feed / 50Hz | `active`, `mode`, `left`, `right`, `updated_at` |
 | GET | `/v1/realtime/odom/state` | odom_feed / 50Hz | `active`, `mode`, `x`, `y`, `theta`, `distance`, `updated_at` |
-| GET | `/v1/realtime/vision/task` | task_feed / 10Hz | `active`, `mode`, `detections`, `count`, `updated_at` |
+| GET | `/v1/realtime/vision/task` | task_feed / 30Hz | `active`, `mode`, `detections`, `count`, `updated_at` |
 
 **Python**：
 
@@ -248,6 +248,7 @@ client.get_odom_state()           # 里程计
 | `reset_position` | y 触底 + x 撞墙，**首次定原点** |
 | `reset_y` / `reset_x` / `reset_all` | 单/双轴 opt-in 复位 |
 | `composite_pick` / `composite_release` / `composite_go_home` | PR#13 复合动作（2-3 路电机真并发） |
+| `composite_run` / `composite_run_reset` | 任意子集姿态一步到位（task 主力）/ 复合复位 |
 | `set_arm_pose` / `set_arm_angle` / `set_hand_angle` | 一次/单次位姿 |
 | `move_x_position` / `move_y_position` / `goto_position` / `go_for` | 单/双轴位移 |
 | `x_speed` / `y_speed` | 速度模式 |
@@ -287,7 +288,7 @@ client.get_odom_state()           # 里程计
 | --- | --- | --- | --- |
 | `subscribe_lane` | `lane_state` | 50Hz | 同 `/v1/realtime/lane/state` |
 | `subscribe_arm_state` | `arm_state` | 20Hz | 同 `/v1/realtime/arm/state` |
-| `subscribe_task_detection` | `task_state` | 10Hz | 同 `/v1/realtime/vision/task` |
+| `subscribe_task_detection` | `task_state` | 30Hz | 同 `/v1/realtime/vision/task` |
 | `subscribe_ir` | `ir_state` | 50Hz | 左右 IR 距离 |
 | `subscribe_odom` | `odom_state` | 50Hz | 底盘里程计 |
 
