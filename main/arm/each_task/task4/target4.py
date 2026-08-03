@@ -76,7 +76,9 @@ from main.arm import (  # noqa: E402
     ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
 )
 from main.arm.each_task.common import (  # noqa: E402
-    goto_pose_p, POSE_P_X_MM, POSE_P_GRAB_Y_MM, POSE_P_ARM_DEG, POSE_P_HAND_DEG,
+    goto_pose_p,
+    POSE_P_X_MM, POSE_P_Y_MM,
+    POSE_P_GRAB_Y_MM, POSE_P_ARM_DEG, POSE_P_HAND_DEG,
 )
 from main.chassis import track_chassis  # noqa: E402
 
@@ -373,20 +375,25 @@ def _pick_and_store(
     bin_x = BIN_X_MM[color]
 
     # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
-    #    ⚠️ 2026-08-03 现场 (用户): track_velocity_pick 默认 arm_start=-90 / hand_start=0
-    #    是 task1 init 姿态 (吸嘴朝前), task4 抓球姿态是 arm=+90° (大臂抓球位)
-    #    + hand=0° (朝下) —— 必须显式传 arm_start=90 / hand_start=0, 否则
-    #    默认值会把吸嘴反向朝天挡住 vision。
+    #    2026-08-03 现场 (用户): track_velocity_pick 默认 grasp_y=0 (触底) 会撞坏,
+    #    y=-20 才抓到球; lift_back=True 会把球带着走掉。
+    #    改: grasp_y_mm=-20 + lift_back=False, 业务层自己管抬回。
     print(f"  [{LOG_PREFIX}] [0/3] track_velocity_pick(label={label!r}, "
-          f"arm_start=90, hand_start=0, grasp_y={POSE_P_GRAB_Y_MM})")
+          f"arm_start=90, hand_start=0, grasp_y=-20, lift_back=False)")
     try:
         pick_res = runner.track_velocity_pick(
             label,
             skip_pose_align=True,
             arm_start=POSE_P_ARM_DEG,  # 90° 抓球大臂位
             hand_start=POSE_P_HAND_DEG,  # 0° 朝下
-            grasp_y_mm=POSE_P_GRAB_Y_MM,
+            grasp_y_mm=-20.0,  # 球高度 (4cm 球, 抓球位 ≈ -20mm)
             timeout=pick_timeout_s,
+            deadzone=0.05,
+            settle_hits=2,
+            max_vel=0.20,
+            gain_arm=0.5,
+            gain_x=0.10,
+            lift_back=False,  # 不让 track_velocity_pick 抬回, 业务层管
         )
         if not pick_res.get("ok"):
             return {"ok": False,
@@ -396,26 +403,29 @@ def _pick_and_store(
                 "error": f"track_velocity_pick: {type(e).__name__}: {str(e)[:120]}"}
 
     try:
-        # 1. 升 y (出保护区) ∥ 横移到 bin 上方
+        # 1. 升 y (出保护区 + 离地) ∥ 横移到 bin 上方
         print(f"  [{LOG_PREFIX}] [1/3] composite_run(y={Y_TRANSIT_MM} ∥ x={bin_x}) "
               f"→ bin 高位")
         arm_client.composite_run(
             y_mm=Y_TRANSIT_MM, x_mm=bin_x, speed=80, timeout=30.0,
         )
-        # 2. y 降到 Y_PUT_MM → grasp(False)
+        # 2. y 降到 Y_PUT_MM → grasp(False) 放球
         print(f"  [{LOG_PREFIX}] [2/3] composite_run(y={Y_PUT_MM}) → grasp(False)")
         arm_client.composite_run(
             y_mm=Y_PUT_MM, speed=80, timeout=30.0,
         )
         runner.grasp(False, timeout=10.0)
-        time.sleep(0.2)
-        # 3. 恢复到识别位姿 (return_x_mm = POSE_P_X = -300)
+        time.sleep(0.3)  # 让球稳定掉进 bin
+        # 3. 恢复到 P 姿态 (识别位姿: y=POSE_P_Y, x=return_x_mm)
+        #    Y_TRANSIT→Y_FINAL 实际就是 P 姿态的 y (用户的 P 姿态 y=POSE_P_Y=-120)
+        #    Y_FINAL_MM=-120 是回 P 姿态 y, Y_TRANSIT=-190 是中间过渡高度
+        #    (track 后 y 在 -20 抓球位 → 先升到 -190 出 bin 区, 再横移, 再降到 -120)
         if return_x_mm is not None:
             arm_client.composite_run(
-                y_mm=Y_FINAL_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
+                y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
             )
         else:
-            arm_client.composite_run(y_mm=Y_FINAL_MM, speed=80, timeout=30.0)
+            arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
                 "error": f"pick_and_store: {type(e).__name__}: {str(e)[:120]}"}
