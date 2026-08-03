@@ -36,16 +36,19 @@ const poseMsg = $("poseMsg")!;
 // ---------- 状态 ----------
 interface Pose { name: string; x_mm: number; y_mm: number; arm: number; hand: number; ts: number }
 const POSES_KEY = "rakcar.poses";
-let poses: Pose[] = loadPoses();
-
-// 舵机指令角（前端维护；init/reset 后默认复位位）
-let armCmd = 90;    // 大臂 +90 = 复位位
-let handCmd = -90;  // 手爪 -90 = UP
+// 舵机目标角基准。空闲时持续从 arm_feed 强同步（大臂=总线舵机实测回读，
+// 手爪=runtime 最后指令值 _hand_angle_last），按住 QERF 期间用本地积分、
+// 松手回归 feed —— 无论谁动过臂（任务/别的客户端/上次会话），积分起点
+// 都是真实位置，不再假定复位位。
+let armCmd = 90;    // 首帧 feed 到达前的兜底
+let handCmd = -90;
 let estopped = false;
 let graspOn = false;
 // 舵机长按点动角速度 (°/s)，100ms tick 积分成目标角连续下发（舵机是位置控制，
 // 目标角连续追 = 平滑转动）。Q/E 大臂、R/F 手爪，松手即停。
 const SERVO_JOG_DEG_PER_S = 20;
+// 舵机点动键：按住期间本地积分、不同步 feed
+const SERVO_AXES = ["q", "e", "r", "f"];
 
 function loadPoses(): Pose[] {
   try { return JSON.parse(localStorage.getItem(POSES_KEY) || "[]") as Pose[]; }
@@ -65,9 +68,14 @@ async function pollState() {
     connText.textContent = fresh ? "连接: ok" : "arm_feed 不新鲜";
     posX.textContent = fmt(st.x_mm, 1);
     posY.textContent = fmt(st.y_mm, 1);
-    // 2026-08-04：大臂角走 arm_feed 总线回读实测；手爪 PWM 无回读用指令值。
     armAng.textContent = fmt(st.arm_angle ?? armCmd, 0);
     handAng.textContent = fmt(st.hand_angle ?? handCmd, 0);
+    // 强同步：没在按舵机键时，把积分基准拉回真实状态。
+    // 按住期间不同步 —— feed 的实测值滞后于目标角，同步会让积分爬行。
+    if (!SERVO_AXES.some((k) => axes.has(k))) {
+      if (typeof st.arm_angle === "number") armCmd = st.arm_angle;
+      if (typeof st.hand_angle === "number") handCmd = st.hand_angle;
+    }
   } catch {
     connDot.className = "dot err";
     connText.textContent = "连接: err";
@@ -229,7 +237,7 @@ btnGoHome.addEventListener("click", async () => {
   btnGoHome.disabled = true;
   try {
     assertJobOk(await api.executeArm("composite_go_home"), "go_home");
-    armCmd = 90; handCmd = -90;  // go_home 回复位位
+    armCmd = 0; handCmd = -90;  // composite_go_home 默认 arm=0/hand=-90
   } catch (e) {
     alert((e as Error).message);
   } finally {
