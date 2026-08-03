@@ -167,6 +167,9 @@ class TestSerialEngineCore(unittest.TestCase):
         self.engine.attach(_FakeSerial(), self.dev)
 
     def tearDown(self):
+        # detach 先排空未完成的 job（transport 错误返回）,再 shutdown。
+        # 否则残留 job 会吃掉下一个测试排队的应答（测试间状态泄漏）。
+        self.engine.detach()
         self.engine.shutdown()
 
     def _wait(self, job, timeout=2.0):
@@ -289,6 +292,7 @@ class TestSerialWrapEnginePath(unittest.TestCase):
         self.dev = FakeMC602Dev()
 
     def tearDown(self):
+        self.sw.engine.detach()
         self.sw.engine.shutdown()
 
     def test_engine_path_success(self):
@@ -308,9 +312,11 @@ class TestSerialWrapEnginePath(unittest.TestCase):
         with self.assertRaises(ControllerNotReadyError):
             self.sw.get_anwser(b"\x02\x01\x10")
 
-    def test_mc601_sync_fallback(self):
-        """mc601 设备不进引擎，走旧同步路径。"""
-        dev = FakeMC602Dev(name="mc601")
+    def test_unknown_device_sync_fallback(self):
+        """非 mc602 设备（名字不认识）不进引擎，走旧同步路径。
+        （2026-08-03 前此测试是 mc601 降级；MC601 协议类已删除,
+        用 unknown 设备名覆盖同一条降级分支。）"""
+        dev = FakeMC602Dev(name="unknown_dev")
         dev.queue_response(b"\x77\x68\x03\x00\x02\x67\x0A")
         _attach(self.sw, dev)
         self.assertFalse(self.sw.engine.is_attached())

@@ -10,7 +10,6 @@ from serial.tools import list_ports
 
 from runtime.hardware.controller_recover import (
     boot_ping,
-    ping_mc601,
     ping_mc602,
 )
 
@@ -116,15 +115,7 @@ def probe_port_mode(port_name, debug_hook=None):
                     detail="mc602 program 握手成功",
                     program_seen=True,
                 )
-            if ping_mc601(serial_obj):
-                return ControllerProbeResult(
-                    ready=True,
-                    port=port_name,
-                    controller="mc601",
-                    mode="program",
-                    detail="mc601 program 握手成功",
-                    program_seen=True,
-                )
+
             serial_obj.baudrate = 1000000
             ok, _frame = boot_ping(serial_obj)
             if ok:

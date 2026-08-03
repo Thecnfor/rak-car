@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .protocol import ping_mc601_mode, ping_program_mode
+from .protocol import ping_program_mode
 from .serial_utils import list_candidate_ports, open_serial
 
 
@@ -19,9 +19,7 @@ def probe_port(port_name: str) -> dict:
             if ping_program_mode(serial_obj):
                 result.update({"ready": True, "controller": "mc602", "mode": "program", "detail": "MC602 program 握手成功"})
                 return result
-            if ping_mc601_mode(serial_obj):
-                result.update({"ready": True, "controller": "mc601", "mode": "program", "detail": "MC601 program 握手成功"})
-                return result
+
     except Exception as exc:
         result["detail"] = f"串口探测失败: {exc}"
     return result

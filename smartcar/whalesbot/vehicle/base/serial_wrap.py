@@ -66,7 +66,7 @@ PRIORITY_NORMAL = 1
 PRIORITY_READ = 2
 
 # io 线程空闲时的唤醒间隔（队列空且无共享读在飞）
-_ENGINE_IDLE_SLEEP = 0.0005
+_ENGINE_IDLE_SLEEP = 0.01
 
 
 class SerialEngineJob:
@@ -86,7 +86,7 @@ class SerialEngineJob:
 
     def __init__(self, kind, payload, time_out, priority=PRIORITY_NORMAL,
                  coalesce_key=None, share_key=None):
-        self.kind = kind            # "mc602" / "mc602_wireness" / "call"
+        self.kind = kind            # "mc602" / "call"
         self.payload = payload      # bytes（帧载荷）；kind="call" 时是 fn(serial, dev)
         self.time_out = float(time_out)
         self.priority = priority
@@ -117,10 +117,15 @@ class SerialEngine:
         self._pending = []          # heapq: (priority, seq, job)
         self._coalesce_groups = {}  # coalesce_key -> [job, ...]（写合并：整组等最新帧应答）
         self._inflight = {}         # share_key -> [job, ...]（读共享：在飞物理帧）
-        self._pending_lock = threading.Lock()
+        # RLock：attach/detach 换引用可能触发 GC finalizer（pyserial 对象析构
+        # 链会回调 close → detach 重入）。非重入锁会让重入死锁在自己手里
+        # （2026-08-03 晚实测的测试挂死根因）。RLock + 换引用放锁外双保险。
+        self._pending_lock = threading.RLock()
         # 运行态由 SerialWrap 在 self.lock 内写入、io 线程快照读取
         self._attached = False
-        self._dev_kind = None       # "mc602" / "mc602_wireness" / None
+        self._dev_kind = None       # "mc602" / None（MC602 USB 有线是唯一通信路径）
+        self._serial = None
+        self._dev = None
         self._thread = None
         self._stop_event = threading.Event()
         self._idle = threading.Event()  # io 线程无活可干时置位（quiesce 用）
@@ -130,12 +135,21 @@ class SerialEngine:
             "timeouts": 0, "errors": 0,
         }
 
-    # ---------- 生命周期 ----------
-
     def start(self):
-        if self._thread is not None:
-            return
+        """幂等 + 可重启：io 线程死了（shutdown 后/极端恢复路径）允许重建。
+        先清 stop_event 再起线程;旧线程尸体先 join 收掉,避免双线程并发持 fd。
+        注意:生产路径上引擎随模块 import 启动、永不 shutdown（detach 不等于
+        shutdown）,重启分支只服务测试与极端场景。"""
         self._stop_event.clear()
+        old = self._thread
+        if old is not None:
+            if old.is_alive():
+                return
+            try:
+                old.join(timeout=0.5)
+            except Exception:
+                pass
+        self._idle.set()
         self._thread = Thread(target=self._io_loop, name="serial-engine", daemon=True)
         self._thread.start()
 
@@ -144,33 +158,46 @@ class SerialEngine:
         self._wake()
 
     def attach(self, serial_obj, dev):
-        """连接建立后由 SerialWrap 在 self.lock 内调用。"""
+        """连接建立后由 SerialWrap 在 self.lock 内调用。
+        内部先 start()（幂等/可重启）,保证 io 线程活着——shutdown 后重建的
+        SerialWrap（测试/极端恢复路径）也能直接 attach。
+
+        注意：旧引用（_serial/_dev）先抓到局部变量、锁外再释放,避免换引用时
+        GC finalizer 在持锁区间内回调 close → detach 重入死锁。"""
+        if ENGINE_ENABLED:
+            self.start()
         kind = None
         if dev is not None:
             name = str(getattr(dev, "name", "")).lower()
-            if "wireness" in name:
-                kind = "mc602_wireness"
-            elif "mc602" in name:
+            if "mc602" in name:
                 kind = "mc602"
+        old_serial = self._serial
+        old_dev = self._dev
         with self._pending_lock:
             self._attached = kind is not None
             self._dev_kind = kind
             self._serial = serial_obj
             self._dev = dev
         self._wake()
+        # 锁外释放旧引用：这里的 GC 重入 detach 是安全的（锁是 RLock,
+        # 且此时状态一致：要么 detach 干净地拆掉刚装的状态,要么快速返回）。
+        del old_serial, old_dev
 
     def detach(self):
         """recovery / close 前由 SerialWrap 在 self.lock 内调用。
         顺序：① 置 _attached=False 挡住新提交；② quiesce 等 io 线程跑完
         当前帧（fd 随后可能被 close,不能让 io 线程还在读写）；③ 清空队列，
-        所有未完成 job 以 transport 错误结束，避免调用方挂死。"""
+        所有未完成 job 以 transport 错误结束，避免调用方挂死。
+
+        关键细节：引用清理（_serial/_dev/_inflight）必须放在 _pending_lock
+        **之外** —— 置 None 可能触发 GC finalizer（例如 pyserial 的
+        __del__ → close → 本方法重入）,若在锁内置空会让重入的 detach
+        死锁在同一把非重入锁上。"""
         with self._pending_lock:
             self._attached = False
-        self.quiesce(timeout=1.5)
+        self.quiesce(timeout=2.0)
         with self._pending_lock:
             self._dev_kind = None
-            self._serial = None
-            self._dev = None
             pending = [job for _, _, job in self._pending]
             self._pending = []
             self._coalesce_groups.clear()
@@ -178,11 +205,17 @@ class SerialEngine:
             for jobs in self._inflight.values():
                 inflight.extend(jobs)
             self._inflight.clear()
+        # 锁外置空：这里的引用释放可能触发 GC,允许重入 detach（此时
+        # _attached 已是 False,重入只会快速返回,不会死锁）。
+        self._serial = None
+        self._dev = None
         for job in pending + inflight:
             job.done(error="transport")
 
-    def quiesce(self, timeout=1.5):
-        """等 io 线程把手头帧跑完（空闲）。recovery 关 fd 前必须调。"""
+    def quiesce(self, timeout=2.0):
+        """等 io 线程把手头帧跑完（空闲）。recovery 关 fd 前必须调。
+        2s 上限覆盖 ServoBus 1s 超时帧；超时后 detach 仍会继续（在飞帧的
+        残局由 pyserial 关 fd 后的异常路径收敛,job 已按 transport 失败返回）。"""
         return self._idle.wait(timeout)
 
     def call_on_io_thread(self, fn, time_out, priority=PRIORITY_URGENT):
@@ -355,52 +388,12 @@ class SerialEngine:
 
 
 
-# ============================================================
-# SerialEngine（串口 I/O 引擎）
-# ------------------------------------------------------------
-# 旧模型：调用方持 SerialWrap.lock 阻塞 write+read（一问一答），
-#   50Hz 轮速下发 / odom 读 / arm PID 互相在同一把锁上排队，
-#   每次 round-trip 5-20ms，50Hz 预算被吃光。
-# 新模型：串口 fd 由唯一 io 线程（SerialEngine）持有；
-#   所有设备调用 = submit(帧) → 等自己的 Event。引擎提供：
-#     1) 写合并：同一 coalesce_key 在队列里只保留最新一帧
-#        （轮速 50Hz 突发下发不再堆积物理帧）；
-#     2) 读共享：同一 share_key 的并发请求只打一个物理读帧，
-#        结果广播（encoder 查询不再各自打一遍）；
-#     3) 优先级：URGENT（急停/零速）插队，NORMAL 次之，READ 最低；
-#     4) 帧超时：引擎内部按 time_out 控制，调用方只等 event。
-# 兼容：SerialWrap.get_anwser 默认走引擎；引擎不可用（未连接 /
-#   RAK_CAR_SERIAL_ENGINE=0）时自动降级为旧的 lock + 同步 round-trip。
-# ============================================================
-
-import threading as _threading
-
-ENGINE_ENABLED = os.environ.get("RAK_CAR_SERIAL_ENGINE", "1") not in {"0", "false", "False"}
-
-# 优先级（数字越小越先出队）
-PRIORITY_URGENT = 0
-PRIORITY_NORMAL = 1
-PRIORITY_READ   = 2
-
-# io 线程空闲时的唤醒间隔（队列空且无共享读在飞）
-_ENGINE_IDLE_SLEEP = 0.0005
-
-# 急停/零速帧前缀集合（命令前2字节），命中的走 PRIORITY_URGENT
-# MC602 停止帧：速度全零（0x02 0x03 轮速指令 + 后续全0）
-# 这里只放最高优先级的前缀；不认识的默认 PRIORITY_NORMAL
-_URGENT_CMD_PREFIXES: frozenset = frozenset()  # 可由上层 set_urgent_prefixes() 扩展
-
-
-def set_urgent_prefixes(prefixes):
-    """运行时注册急停帧前缀（bytes 对象集合）。由 mc602_ctl2.py 调用。"""
-    global _URGENT_CMD_PREFIXES
-    _URGENT_CMD_PREFIXES = frozenset(prefixes)
-
-
-# 模块级单例引擎（SerialWrap.__init__ 时 attach，recovery 时 detach+attach）
-_serial_engine: SerialEngine = SerialEngine()
-_serial_engine.start()
-
+# 模块级单例引擎：全进程一个 io 线程持串口 fd。SerialWrap 实例通过
+# self.engine 引用它（recovery detach/attach 都在同一个实例上）。
+# 2026-08-03 晚 merge 曾在此处混入第二份引擎定义 + 第二个 io 线程,已清除。
+_serial_engine = SerialEngine()
+if ENGINE_ENABLED:
+    _serial_engine.start()
 
 def _notify_runtime_session(method_name, detail=None):
     try:
@@ -444,10 +437,10 @@ class SerialWrap(serial.Serial):
         super(SerialWrap, self).__init__(port=None, baudrate=115200, bytesize=serial.EIGHTBITS, parity=serial.PARITY_NONE, \
                                          stopbits=serial.STOPBITS_ONE, timeout=0.03, xonxoff=False, rtscts=False, \
                                          dsrdtr=False)
-        mc601 = MC601()
+        # 2026-08-03：MC601 / MC602Wireness 协议类整体删除——全进程只支持
+        # MC602 USB 有线一条通信路径（用户确认）。
         mc602_usb = MC602()
-        mc602_wireness = MC602Wireness()
-        self.dev_list:List[CotrollerInfo] = [mc601, mc602_usb, mc602_wireness]
+        self.dev_list:List[CotrollerInfo] = [mc602_usb]
         self.dev = None
         self.connect_flag = False
 
@@ -458,9 +451,9 @@ class SerialWrap(serial.Serial):
         self.timeout = 0.01
         # 2026-08-03：串口 I/O 引擎（单 io 线程 + 帧队列 + 写合并/读共享）。
         # get_anwser 优先走引擎；RAK_CAR_SERIAL_ENGINE=0 可整体退回旧同步路径。
-        self.engine = SerialEngine()
-        if ENGINE_ENABLED:
-            self.engine.start()
+        # 全进程共用模块级单例 _serial_engine（同一条串口只能有一个 io 线程持 fd）；
+        # 2026-08-03 晚 merge 曾在这里另建过第二个引擎实例（两条 io 线程抢 fd）,已清除。
+        self.engine = _serial_engine
         # note_io_success 通知节流：引擎路径上每帧都回调会让 controller_session
         # 的 RLock 被 200+ 帧/s 抢爆。改成 0.5s 间隔推送状态（心跳另有 1Hz ping）。
         self._last_session_notify_at = 0.0
@@ -474,16 +467,12 @@ class SerialWrap(serial.Serial):
         self.timeout = 0.1
 
     def _close_locked(self):
-        # 先让引擎解除绑定，排空在飞帧，再关物理 fd
-        if ENGINE_ENABLED and _serial_engine is not None:
+        # 先让引擎解除绑定、排空在飞帧，再关物理 fd
+        if ENGINE_ENABLED:
             try:
                 _serial_engine.detach()
             except Exception:
                 pass
-        try:
-            self.engine.detach()
-        except Exception:
-            pass
         try:
             if self.is_open:
                 super(SerialWrap, self).close()
@@ -535,7 +524,7 @@ class SerialWrap(serial.Serial):
                 disable_usb_autosuspend_for_tty(self.port)
         except Exception as exc:
             logger.debug("disable_usb_autosuspend_for_tty({}) 兜底失败: {}".format(self.port, exc))
-        # 引擎接管 fd（mc602 / mc602_wireness）；mc601 走旧同步路径
+        # 引擎接管 fd（MC602 USB 有线）
         try:
             self.engine.attach(self, ctl_dev)
         except Exception as exc:
@@ -578,8 +567,6 @@ class SerialWrap(serial.Serial):
 
     def _engine_kind_for(self, dev):
         name = str(getattr(dev, "name", "")).lower()
-        if "wireness" in name:
-            return "mc602_wireness"
         if "mc602" in name:
             return "mc602"
         return None
@@ -601,7 +588,7 @@ class SerialWrap(serial.Serial):
     def get_anwser(self, cmd:bytes, time_out=0.1, priority=None,
                    coalesce_key=None, share_key=None)->bytes:
         """一问一答。默认走 SerialEngine（单 io 线程 + 写合并 + 读共享）；
-        引擎不可用（未连接 / 禁用 / mc601 / 未启动）时降级为旧 lock 同步路径。
+        引擎不可用（未连接 / 禁用 / 未启动）时降级为旧 lock 同步路径。
 
         新增可选参数（全部向后兼容,不传 = 旧行为）：
           priority     PRIORITY_URGENT/NORMAL/READ（默认 NORMAL）
@@ -709,8 +696,12 @@ class SerialWrap(serial.Serial):
     def set_port(self, port):
         if self.connect_flag:
             self.close()
-            self.connect_flag = False
         self.port = port
+
+    def close(self):
+        """任何直接 close（MC602.download_bin 进 bootloader、外部调用）都必须先
+        detach 引擎：io 线程不能继续读写一个即将被关掉的 fd。幂等安全。"""
+        self._close_locked()
         
     def open(self):
         try:
@@ -775,55 +766,7 @@ class SerialWrap(serial.Serial):
             while True:
                 time.sleep(1)
 
-class MC601(CotrollerInfo):
-    def __init__(self, baudrate=380400, timeout=0.1, mode="USB") -> None:
-        super().__init__(baudrate, timeout, mode)
-        self.name = "mc601"
-        self.header = bytes.fromhex('77 68')
-        self.tail = bytes.fromhex('0A')
 
-    def send_cmd(self, serial_obj:SerialWrap, cmd:bytes):
-        # cmd_len = len(cmd).to_bytes(1, 'big')
-        # # 加入头尾数据帧
-        # cmd_all = self.header + cmd_len + cmd + self.tail
-        # serial_obj.write(cmd_all)
-        serial_obj.write(cmd)
-
-    def get_anwser(self, serial_obj:SerialWrap, time_out=0.05):
-        time_start = time.time()
-        dst_len = 0
-        res = serial_obj.read(3)
-        if len(res) != 3:
-            return None
-        # 总帧长
-        dst_len = res[2] + 7
-        # 获取剩余数据
-        res = res + serial_obj.read(dst_len-3)
-        # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-        while True:
-            if time.time() - time_start > time_out:
-                return None
-            # data = res[3:-1]
-            
-            if len(res) == dst_len:
-                if res[0] == self.header[0] and res[-1] == self.tail[0]:
-                    # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-                    return res
-                else:
-                    return None
-            res = res + serial_obj.read(dst_len - len(res))
-    
-    def ping_rx(self, serial_obj:SerialWrap, time_out=0.05):
-        time_start = time.time()
-        while time.time() - time_start < time_out:
-            serial_obj.reset_buffer()
-            self.send_cmd(serial_obj, bytes.fromhex('77 68 04 00 01 CA 01 0A'))
-            res = self.get_anwser(serial_obj, 0.03)
-            if res is not None:
-                # 关闭mc601省电模式
-                self.send_cmd(serial_obj, bytes.fromhex('77 68 03 00 02 67 0A'))
-                return True
-        
 class MC602(CotrollerInfo):
     def __init__(self, baudrate=1000000, timeout=0.1, mode="USB") -> None:
         super().__init__(baudrate, timeout, mode)
@@ -836,12 +779,9 @@ class MC602(CotrollerInfo):
         # 加入头尾数据帧
         cmd_all = self.header + cmd_len + cmd + self.tail
         serial_obj.write(cmd_all)
-        # logger.info("send cmd:\'{}\'".format(cmd_all.hex(' ')))
+        # logger.info("send cmd: '{}'".format(cmd_all.hex(' ')))
 
     def get_anwser(self, serial_obj:SerialWrap, time_out=0.2):
-        # time.sleep(0.1)
-        # res = serial_obj.read(2)
-        # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
         time_start = time.time()
         dst_len = 0
         res = serial_obj.read(3)
@@ -854,8 +794,6 @@ class MC602(CotrollerInfo):
         while True:
             if time.time() - time_start > time_out:
                 return None
-            # data = res[3:-1]
-            # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
             if len(res) == dst_len:
                 if res[0] == self.header[0] and res[-1] == self.tail[0]:
                     return res[3:-1]
@@ -863,10 +801,8 @@ class MC602(CotrollerInfo):
                     return None
             res = res + serial_obj.read(dst_len - len(res))
 
-    
     def ping_rx(self, serial_obj:SerialWrap, time_out=0.05):
         time_start = time.time()
-
         while time.time() - time_start < time_out:
             serial_obj.reset_buffer()
             self.send_cmd(serial_obj, bytes.fromhex('02 01 10'))
@@ -880,7 +816,6 @@ class MC602(CotrollerInfo):
         serial_obj.write(bytes.fromhex('55 AA 00 01 08 00 00 F7'))
         time.sleep(0.01)
         ret = serial_obj.read(10)
-        # print(ret.hex())
         if ret == bytes.fromhex('66 BB 01 01 0A 00 5A 02 00 76'):
             is_mc602 = True
             logger.info("is mc602")
@@ -929,66 +864,6 @@ class MC602(CotrollerInfo):
                     except Exception:
                         pass
                     time.sleep(0.2)
-        return False
-    
-class MC602Wireness(CotrollerInfo):
-    def __init__(self, baudrate=115200, timeout=0.2, mode="Wireness") -> None:
-        super().__init__(baudrate, timeout, mode)
-        self.name = "mc602_wireness"
-        self.header = bytes.fromhex('FE')
-        self.header_escape = bytes.fromhex('FE FC')
-        self.tail = bytes.fromhex('FF')
-        self.tail_escape = bytes.fromhex('FE FD')
-        self.port_src = bytes.fromhex('90')
-        self.port_dst = bytes.fromhex('91')
-        self.target_id = bytes.fromhex('5D 3D')
-
-    def set_target_id(self, target_id:bytes):
-        self.target_id = target_id
-
-    def send_cmd(self, serial_obj:SerialWrap, cmd:bytes):
-        cmd_len = (len(cmd) + 4).to_bytes(1, 'big')
-        # 端口地址数据组合
-        cmd_data = self.port_src + self.port_dst + self.target_id + cmd
-        # 转义处理
-        cmd_data_escape = cmd_data.replace(self.header, self.header_escape).replace(self.tail, self.tail_escape)
-        # 加入头尾数据帧
-        cmd_all = self.header + cmd_len + cmd_data_escape + self.tail
-        serial_obj.write(cmd_all)
-        # logger.info("send cmd:\'{}\'".format(cmd_all.hex(' ')))
-
-    def get_anwser(self, serial_obj:SerialWrap, time_out=0.15):
-        # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-        time_start = time.time()
-        res = b''
-        while True:
-            if time.time() - time_start > time_out:
-                logger.error("get_anwser timeout {}".format(res.hex(' ')))
-                return None
-            res = serial_obj.read(2)
-            if len(res) == 2:
-                break
-        dst_len = res[1] + 3
-        res = res + serial_obj.read(dst_len - 2)
-        # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-        while True:
-            if time.time() - time_start > time_out:
-                return None
-            # logger.info("get_anwser:\'{}\'".format(res.hex(' ')))
-            res = res.replace(self.header_escape, self.header).replace(self.tail_escape, self.tail)
-            rx_len = len(res)
-            if rx_len == dst_len:
-                if res[0] == self.header[0] and res[-1] == self.tail[0]:
-                    return res[6:-1]
-            res = res + serial_obj.read(dst_len - len(res))
-    
-    def ping_rx(self, serial_obj:SerialWrap, time_out=0.3):
-        self.send_cmd(serial_obj, bytes.fromhex('02 01 10'))
-        # serial_obj.flush()   # 直到发送完毕
-        # time.sleep(0.01)
-        ret = self.get_anwser(serial_obj, time_out)
-        if ret is not None:
-            return True
         return False
 
 serial_wrap = SerialWrap()

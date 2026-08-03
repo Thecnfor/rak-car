@@ -75,7 +75,11 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
 from main.arm import (  # noqa: E402
     ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
 )
-from main.arm.each_task.common import goto_pose_p, POSE_P_X_MM, POSE_P_GRAB_Y_MM  # noqa: E402
+from main.arm.each_task.common import (  # noqa: E402
+    goto_pose_p,
+    POSE_P_X_MM, POSE_P_Y_MM,
+    POSE_P_GRAB_Y_MM, POSE_P_ARM_DEG, POSE_P_HAND_DEG,
+)
 from main.chassis import track_chassis  # noqa: E402
 
 
@@ -371,43 +375,66 @@ def _pick_and_store(
     bin_x = BIN_X_MM[color]
 
     # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
-    print(f"  [{LOG_PREFIX}] [0/3] track_velocity_pick(label={label!r}, "
-          f"skip_pose_align=True, grasp_y={POSE_P_GRAB_Y_MM})")
+    #    2026-08-03 现场 (用户): track_velocity_pick 默认 arm_start=-90 是 task1 init,
+    #    任务4 要传 arm=+90; grasp_y=-20 才抓到 (球心高度); lift_back=True 会把球带着跑,
+    #    业务层管抬回。
+    #    find_target_arm_cross 不接受 sign_y (sign_y 只在 find_target_4dof),
+    #    用 task1 同款参数 + sign_x=-1 + sign_arm=+1 默认就行。
+    print(f"  [{LOG_PREFIX}] [0/3] find_target_arm_cross(label={label!r}, "
+          f"arm_start=90, hand_start=0)")
+    sx, sy = runner._resolve_nozzle_setpoint(None, None, label=label) or (0.0, 0.0)
+    selector = TargetSelector.for_label(
+        label, strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
+    )
     try:
-        pick_res = runner.track_velocity_pick(
-            label,
-            skip_pose_align=True,
-            grasp_y_mm=POSE_P_GRAB_Y_MM,
-            timeout=pick_timeout_s,
+        result = runner.client._make_vision_with_move().find_target_arm_cross(
+            label, timeout=min(pick_timeout_s, 6.0), hz=20,
+            gain_arm=2.5, gain_x=0.55,
+            deadzone=0.06, max_vel=0.70,
+            arm_start=POSE_P_ARM_DEG,  # +90
+            # 2026-08-03 (用户): task4 arm=+90 与 task1 arm=-90 差 180° 旋转,
+            # 视野坐标反向 → x 物理方向也要反过来。task1 默认 sign_x=-1,
+            # task4 用 sign_x=+1。
+            sign_arm=1.0, sign_x=+1.0,
+            setpoint_x_norm=sx, setpoint_y_norm=sy,
+            selector=selector,
         )
-        if not pick_res.get("ok"):
-            return {"ok": False,
-                    "error": f"track_velocity_pick: {pick_res.get('reason')}"}
     except Exception as e:
         return {"ok": False,
-                "error": f"track_velocity_pick: {type(e).__name__}: {str(e)[:120]}"}
+                "error": f"find_target_arm_cross: {type(e).__name__}: {str(e)[:120]}"}
+    if result.hits <= 0:
+        return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
+    print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
+
+    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球, 然后抬回 P 姿态)
+    print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
+    arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
+    runner.grasp(True, timeout=5.0)
+    time.sleep(1.0)  # 让真空建立
+    print(f"  [{LOG_PREFIX}] 抬回 P 姿态 y={POSE_P_Y_MM}")
+    arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=10.0)
 
     try:
-        # 1. 升 y (出保护区) ∥ 横移到 bin 上方
+        # 1. 升 y (出保护区 + 离地) ∥ 横移到 bin 上方
         print(f"  [{LOG_PREFIX}] [1/3] composite_run(y={Y_TRANSIT_MM} ∥ x={bin_x}) "
               f"→ bin 高位")
         arm_client.composite_run(
             y_mm=Y_TRANSIT_MM, x_mm=bin_x, speed=80, timeout=30.0,
         )
-        # 2. y 降到 Y_PUT_MM → grasp(False)
+        # 2. y 降到 Y_PUT_MM → grasp(False) 放球
         print(f"  [{LOG_PREFIX}] [2/3] composite_run(y={Y_PUT_MM}) → grasp(False)")
         arm_client.composite_run(
             y_mm=Y_PUT_MM, speed=80, timeout=30.0,
         )
         runner.grasp(False, timeout=10.0)
-        time.sleep(0.2)
-        # 3. 恢复到识别位姿 (return_x_mm = POSE_P_X = -300)
+        time.sleep(0.3)  # 让球稳定掉进 bin
+        # 3. 恢复到 P 姿态 (识别位姿: y=POSE_P_Y, x=return_x_mm)
         if return_x_mm is not None:
             arm_client.composite_run(
-                y_mm=Y_FINAL_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
+                y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
             )
         else:
-            arm_client.composite_run(y_mm=Y_FINAL_MM, speed=80, timeout=30.0)
+            arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
                 "error": f"pick_and_store: {type(e).__name__}: {str(e)[:120]}"}

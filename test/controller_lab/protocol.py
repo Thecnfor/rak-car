@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from .constants import MC601_BAUDRATE, MC601_PING_FRAME, MC602_BAUDRATE, PROGRAM_FRAME_HEAD, PROGRAM_FRAME_TAIL, PROGRAM_PING_PAYLOAD
+from .constants import MC602_BAUDRATE, PROGRAM_FRAME_HEAD, PROGRAM_FRAME_TAIL, PROGRAM_PING_PAYLOAD
 from .serial_utils import read_exact
 
 
@@ -43,21 +43,5 @@ def ping_program_mode(serial_obj, timeout_s: float = 0.05) -> bool:
     return False
 
 
-def ping_mc601_mode(serial_obj, timeout_s: float = 0.05) -> bool:
-    deadline = time.time() + timeout_s
-    serial_obj.baudrate = MC601_BAUDRATE
-    while time.time() < deadline:
-        try:
-            serial_obj.reset_input_buffer()
-            serial_obj.reset_output_buffer()
-            serial_obj.write(MC601_PING_FRAME)
-            head = read_exact(serial_obj, 3, 0.03)
-            frame_len = head[2] + 7
-            body = read_exact(serial_obj, frame_len - 3, 0.03)
-            frame = head + body
-            if frame[:2] == PROGRAM_FRAME_HEAD and frame[-1:] == PROGRAM_FRAME_TAIL:
-                return True
-        except Exception:
-            continue
-    return False
+
 
