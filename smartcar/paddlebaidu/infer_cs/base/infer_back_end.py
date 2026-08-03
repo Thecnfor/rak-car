@@ -24,7 +24,7 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 
 # 导入infer_front中的函数
 from smartcar.paddlebaidu.infer_cs.base.infer_front import get_yaml, get_path_relative
-from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco
+from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco, LaneBlendInfer
 # from smartcar.whalesbot.tools.tools_class import get_yaml
 
 # #region debug-point A:infer-backend-startup
