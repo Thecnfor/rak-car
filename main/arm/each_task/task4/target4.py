@@ -113,6 +113,106 @@ DEFAULT_PICK_TIMEOUT_S: float = 60.0
 CREEP_POLL_HZ: float = 10.0
 """creep 期间 fetch_balls 轮询频率。"""
 
+# ---- 后台保前移线程 (P姿态+creep 并发) ----
+
+class _CreepThread:
+    """后台线程保底盘前移 + 主线程摆臂。
+
+    设计 (2026-08-03 现场决定):
+      - 后台线程持续下发 vx=creep_speed, 同时 10Hz 轮询 fetch_balls
+      - 见球 → 自己写 0 速 + 抛 ball_event
+      - 主线程 wait_for_ball() 阻塞等 ball_event 或超时
+      - 主线程 stop_and_join() 兜底清场
+      - finally 里 _set_chassis_vel(0) 保速度一定清零
+    """
+    def __init__(self, http_client, *, speed_mps: float, max_distance_m: float,
+                 poll_hz: float = CREEP_POLL_HZ):
+        import threading
+        self.http = http_client
+        self.speed_mps = speed_mps
+        self.max_distance_m = max_distance_m
+        self.poll_hz = poll_hz
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="task4-creep")
+        self._stop_event = threading.Event()
+        self.ball_event = threading.Event()
+        self.distance_m = 0.0
+        self.elapsed_s = 0.0
+        self.balls = None
+        self._t0 = 0.0
+
+    def start(self) -> None:
+        self._t0 = time.monotonic()
+        self._thread.start()
+
+    def _loop(self) -> None:
+        period = 1.0 / max(self.poll_hz, 1.0)
+        t0 = time.monotonic()
+        dist = 0.0
+        try:
+            while not self._stop_event.is_set():
+                # 1. 下发前移速度
+                try:
+                    self.http.post(
+                        "/v1/realtime/chassis-velocity",
+                        {"vx": float(self.speed_mps), "vy": 0.0, "wz": 0.0},
+                        timeout=1.0,
+                    )
+                except Exception:
+                    pass
+                time.sleep(period)
+                dist += self.speed_mps * period
+                self.distance_m = dist
+                self.elapsed_s = time.monotonic() - t0
+                # 2. 距离预算耗尽就停
+                if dist >= self.max_distance_m:
+                    break
+                # 3. fetch_balls 轮询, 见球 → 标记 + 停
+                try:
+                    balls = target2.fetch_balls(
+                        self.http, color_filter=None, debug=False,
+                    )
+                    if any(b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
+                           for b in balls):
+                        self.balls = balls
+                        self.ball_event.set()
+                        break
+                except Exception:
+                    pass
+        finally:
+            # 兜底清场: 速度一定清零
+            try:
+                self.http.post(
+                    "/v1/realtime/chassis-velocity",
+                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
+
+    def wait_for_ball(self, timeout_s: float) -> dict:
+        """阻塞等见球, 见球或超时返回。"""
+        got = self.ball_event.wait(timeout=timeout_s)
+        return {
+            "balls": self.balls if got else None,
+            "distance_m": self.distance_m,
+            "elapsed_s": self.elapsed_s,
+        }
+
+    def stop_and_join(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+        # 兜底: 如果线程因为异常没走 finally, 再清一次速度
+        try:
+            self.http.post(
+                "/v1/realtime/chassis-velocity",
+                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                timeout=1.0,
+            )
+        except Exception:
+            pass
+
 # ---- 放 bin 参数 (沿用 P1 版, 现场已调) ----
 
 BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -65.0}
@@ -385,7 +485,12 @@ def step_target4(
         elif do_prep and dry_run:
             print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 target1 (避免误触硬件)")
 
-        # ---- 2. 主循环: creep → track → pick → store ----
+        # ---- 2. 主循环: P姿态+creep 并发 → 见球 → 抓取 → 放仓 → 循环 ----
+        #    2026-08-03 现场 (用户拍板):
+        #      a) P 姿态 + creep 并发 (背景线程保前移, 主线程摆臂)
+        #      b) 见球 → creep 停 → track → pick → 放仓固定两位置
+        #      c) 再恢复 P 姿态 + creep 继续, 循环到 8 球
+        #      d) 失败一次就退出, 不死循环
         ball_idx = 0
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
@@ -407,32 +512,35 @@ def step_target4(
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
-            # 2.0 恢复 P 姿态 (每轮开头兜底, 不依赖上一次循环的成功)
-            #    2026-08-03 现场决定: P 姿态是 task4 单一参考姿态,
-            #    寻路 / 检测 / 抓取之间都先回这里再继续。
+            # 2.0 P 姿态 + creep 并发:
+            #    - 后台线程保前移 (chassis-velocity realtime 通道, 见球或超时即停)
+            #    - 主线程同步摆臂到 P 姿态 (composite_run)
+            #    - 见球 → 主线程通知后台停 → 等后台清理
+            creep_thread = _CreepThread(
+                http_client, speed_mps=creep_speed_mps,
+                max_distance_m=remaining_m,
+                poll_hz=CREEP_POLL_HZ,
+            )
+            creep_thread.start()
             if not dry_run:
                 try:
-                    goto_pose_p(arm_client, runner, log_prefix=f"{LOG_PREFIX}/球{ball_idx}")
+                    goto_pose_p(arm_client, runner,
+                                log_prefix=f"{LOG_PREFIX}/球{ball_idx}")
                 except Exception as e:
                     print(f"  [{LOG_PREFIX}] ⚠️ 恢复 P 姿态失败: "
                           f"{type(e).__name__}: {str(e)[:120]}, 继续")
+            else:
+                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 P 姿态")
 
-            # 2.1 creep 搜索 (慢速前移直到见球)
-            print(f"  [{LOG_PREFIX}] 🔍 creep 搜索 ({creep_speed_mps:.2f} m/s, "
-                  f"≤{remaining_m:.2f}m)")
-            creep = _creep_search(
-                http_client,
-                speed_mps=creep_speed_mps,
-                max_distance_m=remaining_m,
-                max_seconds_s=max(1.0, max_seconds - elapsed),
-                dry_run=dry_run,
-                debug=debug_recognition,
-            )
-            total_creep_m += creep["distance_m"]
-            print(f"  [{LOG_PREFIX}] creep 结束: 前移 {creep['distance_m']:.3f}m "
-                  f"/ {creep['elapsed_s']:.1f}s → "
-                  f"{'见球' if creep['balls'] is not None else '未见球'}")
-            if creep["balls"] is None:
+            # 2.1 等后台见球 / 见 ball 见 fetch_balls 触发停 + 累计前移记账
+            creep_res = creep_thread.wait_for_ball(
+                timeout_s=max(1.0, max_seconds - elapsed))
+            creep_thread.stop_and_join()
+            total_creep_m += creep_res["distance_m"]
+            print(f"  [{LOG_PREFIX}] creep 结束: 前移 {creep_res['distance_m']:.3f}m "
+                  f"/ {creep_res['elapsed_s']:.1f}s → "
+                  f"{'见球' if creep_res['balls'] is not None else '未见球'}")
+            if creep_res["balls"] is None:
                 final_reason = "zone_cleared"
                 print(f"  [{LOG_PREFIX}] 🏁 前移预算内未见球, 视作采区走完")
                 break
