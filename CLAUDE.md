@@ -8,9 +8,16 @@ Competition code for the 百度智能车 (Baidu Smartcar) 2026 智慧农业 (sma
 
 ## Branches (check before reading)
 
-- **`main`** — runtime FastAPI service (car-side, `runtime/`) + HTTP/WS business client (`main/`) + the `run.py` mission orchestrator. The legacy Python monolith was deleted in commit `c23c871`. **You are here.** This file documents `main`.
+- **`main`** — runtime FastAPI service (car-side, `runtime/`) + HTTP/WS business client (`main/`) + the `run.py` mission orchestrator. The legacy Python monolith was deleted in commit `c23c871`. **You are here.** This file documents `main`. **All active work happens on `main`**; feature branches get merged back here quickly (e.g. `worktree-task4-pose-p` was merged in `9f5cf38`).
 - **`develop/ros2-sidecar`** — a ROS2 experiment with a different top level (`ros2_ws/`, `urdf/`, `config_sensors.yml`). The Python-monolith docs do **not** apply there.
-- **`feat/chassis-p0-mecanum-8.10`** / **`legacy/main`** / **`local-snapshot-0712`** — work-in-progress and historical branches; do not target unless the user says so.
+- **`feat/chassis-p0-mecanum-8.10`** / **`legacy/main`** / **`local-snapshot-0712`** — historical branches; do not target unless the user says so.
+
+## Before you start coding
+
+1. Read `MEMORY.md` for active constraints — especially the odom-`move_for`-only rule ([[project-odom-selfconsistent-movefor]]) and any OPEN runtime bugs (e.g. chassis realtime-velocity no-motion).
+2. Glance at `.remember/recent.md` for the latest in-flight work / context the user just touched.
+3. Confirm the env vars you assume match `ecosystem.config.js` — the doc table below lists defaults; production overrides win.
+4. Jetson connection: **IP only, never the `orin` alias** ([[project-jetson-ip-only]]). Current reachable IP lives in [[jetson-runtime-host-current]], not in this file.
 
 ## Three entry points
 
@@ -48,12 +55,12 @@ pm2 logs rak-car-api
 pm2 restart rak-car-api                     # after pulling new code
 ```
 
-Default URLs (override via env vars — see "Config surface" below):
-- API: `http://192.168.6.231:5050`
-- FastAPI docs: `http://192.168.6.231:5050/docs`
-- Stream page: `http://192.168.6.231:5050/stream/`
-- cam1 MJPEG: `http://192.168.6.231:5050/video_feed/cam1`
-- cam2 MJPEG: `http://192.168.6.231:5050/video_feed/cam2`
+Default URLs (override via env vars — see "Config surface" below). **The reachable Jetson IP changes frequently — do NOT hardcode `192.168.6.231` in scripts.** Read [[jetson-runtime-host-current]] from MEMORY.md before writing any URL.
+- API: `http://<JETSON_IP>:5050`
+- FastAPI docs: `http://<JETSON_IP>:5050/docs`
+- Stream page: `http://<JETSON_IP>:5050/stream/`
+- cam1 MJPEG: `http://<JETSON_IP>:5050/video_feed/cam1`
+- cam2 MJPEG: `http://<JETSON_IP>:5050/video_feed/cam2`
 
 The runtime's job is to:
 - Hold a single `MyCar()` instance; access is serialized by the two-tier `_ref_lock` / `_realtime_gate` model (the old `car_lock` is a `RuntimeError`-raising property — see "Runtime concurrency model" below).
@@ -85,6 +92,35 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission
 | `main/test/` | 离线硬件冒烟脚本（arm / storage / x / 循迹），**非正式测试**，绕过 runtime 直接打硬件；改动 main/ 任务前先在这里验证 | — |
 
 The two base clients — `RuntimeApiClient` (HTTP, `main/api_client.py`) and `RuntimeWsClient` (WebSocket, `main/ws_client.py`) — are used by all subpackages. Full action surface and parameters: [main/API_INDEX.md](./main/API_INDEX.md)（HTTP / WS / 客户端方法权威速查，含 runtime `core/actions.py` 注册表）；5-minute onboarding: [main/QUICKSTART.md](./main/QUICKSTART.md). The older `API.md` / `API_REFERENCE.md` / `CAPABILITY_LIST.md` / `BUSINESS_API_GUIDE.md` referenced in some docs are gone — `API_INDEX.md` replaced them.
+
+## Daily operations
+
+```bash
+# --- Runtime service (on Jetson, via PM2) ---
+pm2 start ecosystem.config.js           # production daemon → name "rak-car-api"
+pm2 restart rak-car-api                 # after pulling new code
+pm2 logs rak-car-api --lines 200
+pm2 status                              # uptime + RSS
+# Quick liveness probe (current reachable IP lives in MEMORY.md, not here):
+curl -s http://<JETSON_IP>:5050/health
+
+# --- Mission ---
+python run.py                           # full mission via main.start.orchestrator
+python run.py --task 4                  # single task: lane → trigger → run → stop
+python run.py --lane-hz 30              # slower outer loop for tuning
+
+# --- Unit tests (stdlib unittest, offline, no hardware) ---
+/usr/bin/python3 -m unittest discover -s main/arm/tests -p 'test_*.py'
+/usr/bin/python3 -m unittest discover -s main/task/tests -p 'test_*.py'
+# Single file:
+/usr/bin/python3 -m unittest main.arm.tests.test_vision_find_target -v
+
+# --- Dependency installs ---
+/usr/bin/python3 -m pip install -r runtime/requirements.txt     # runtime (FastAPI, pyudev)
+/usr/bin/python3 -m pip install -r main/requirements.txt       # business client
+```
+
+**No `make`/`tox`/`poetry`/`pytest` in this repo.** Tests use stdlib `unittest`, deps are plain `pip` + `requirements.txt`. There's no linter configured — code style lives in the surrounding files (Chinese docstrings, named-args conventions, aggregator + mixin splits).
 
 ## Visual servo (机械臂视觉伺服, `main/arm/vision/`)
 
@@ -175,12 +211,15 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 | `RAK_CAR_INFER_READY_TIMEOUT` | `45` | Max seconds to wait for a backend before failing health |
 | `RAK_CAR_INFER_HEALTH_TIMEOUT` | `2.0` | Per-call timeout used by `/v1/health` when probing inference |
 | `RAK_INFER_EAGER_MODELS` | `lane` | Comma-separated model names that pre-load at startup. Default only `lane` (others lazy-loaded on first call) |
-| `RAK_INFER_IDLE_UNLOAD_SECONDS` | `300` | Idle threshold for the backend's LRU unload loop; models not called within this window are dropped |
+| `RAK_INFER_IDLE_UNLOAD_SECONDS` | `300` (doc default; **production sets `60`** in `ecosystem.config.js` for Jetson's 4GB RAM) | Idle threshold for the backend's LRU unload loop; models not called within this window are dropped |
 | `RAK_INFER_FRAME_TIMEOUT_S` | `5.0` | Per-frame inference timeout. `image` request exceeding this returns `[]` instead of blocking the REP loop |
 | `RAK_INFER_RSS_LIMIT_MB` | `1200` | Backend-process RSS soft cap; passed through for monitoring |
 | `RAK_INFER_OOM_POLICY` | `drop_oldest` | OOM unload policy: `drop_oldest` (LRU) / `drop_ocr` / `none` |
 | `RAK_CAR_MEMORY_PRESSURE_MB` | `1500` | runtime RSS threshold that triggers feed-degrade (ir→odom→arm→task, lane is never degraded) |
 | `RAK_CAR_RSS_LIMIT_MB` | `1800` | runtime RSS hard limit; `>95%` also drops MJPEG quality (80→60) and resolution (×0.5) |
+| `RAK_CAR_RESET_X_VELOCITY` | unset (doc); `0.04` in production | X-axis reset velocity used on `RAK_CAR_RESET_ARM` init |
+
+**Production overrides win.** The values in `ecosystem.config.js` are what the car actually runs under; this table documents the library defaults. Also: `ecosystem.config.js` sets `max_memory_restart: "1200M"` — PM2 force-restarts the daemon if RSS exceeds 1.2GB (the runtime parent only; `infer_back_end.py` subprocess is not covered).
 
 ## Conventions and gotchas
 
@@ -213,6 +252,8 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 ## Debug instrumentation
 
 `.dbg/` contains environment snapshots and structured logs from the most recent debug sessions (`.env` files and Trae-format `.ndjson` traces). They are committed so a future session can resume the same line of investigation (the latest session, `.dbg/mc602-download-stuck.*`, has no root-level note). When you open a new debug session, mirror this layout: a `debug-<short-slug>.md` at the repo root and matching `.dbg/<short-slug>.{env,ndjson}` artefacts. `runtime/services/runtime_service.py` already emits debug points under `DEBUG_SERVER_URL` / `TRAE_DEBUG_API_URL`; check for them before adding new ones.
+
+`.remember/` (separate, also gitignored-friendly) is the **daily-notes buffer**: `now.md` (in-progress), `today-*.md` (daily), `recent.md` (7-day rolling), `archive.md` and `archive-YYYY-MM-DD*.md` (older). The SessionStart hook injects `now.md` + `recent.md`; on questions that reach past those, grep the rotated archives yourself.
 
 ## Submission intake
 
