@@ -43,11 +43,86 @@ DEFAULT_KICK_SLEEP_S: float = 0.2
 # 2026-07-30 现场实测: low_tower.py 第一轮 move_x overshoot 100mm 撞到 -278.5。
 # 留 20mm 余量定 -300。如下次换场地 / 换 arm, 重新撞墙反推。
 
-DEFAULT_WALL_MM: float = -300.0
-"""x 物理墙位置 (mm, 负值方向)。"""
+DEFAULT_WALL_MM: float = -295.0
+"""x 物理墙位置 (mm, 负值方向)。
+2026-08-03 P 姿态 POSE_P_X_MM=-300 实测撞墙 (x=-290.2 距墙 -300 还有 9.8mm 即 wall_hit),
+留 5mm 余量。"""
 
-DEFAULT_WALL_TOL_MM: float = 30.0
-"""距墙 < 此值视为 wall_hit, 立即 break (不等 stall 计数器)。"""
+DEFAULT_WALL_TOL_MM: float = 60.0
+"""距墙 < 此值视为 wall_hit, 立即 break (不等 stall 计数器)。
+2026-08-03 P 姿态 POSE_P_X_MM=-300 实测撞墙到 -290.2mm, 距 wall_mm=-295 还有 9.8mm。
+放宽容差到 60mm 容忍这种 '差一点点但到不了' 的情况, 让 move_x 走 wall_hit 后抛
+RuntimeError 而不是反复 stall 探测。"""
+
+
+# ============================================================================
+# P 姿态 (Pose-P) —— task4 标准采收/检测姿态
+# ============================================================================
+# 2026-08-03 现场标定 (下位机 reset 后): 球在画面中心 + 侧摄能稳定看到球
+# 区间内的统一姿态。所有 task4 寻路 / 检测 / 抓取之间都恢复到这里。
+
+POSE_P_Y_MM: float = -200.0
+"""P 姿态 y (mm)。"""
+
+POSE_P_X_MM: float = -300.0
+"""P 姿态 x (mm)。"""
+
+POSE_P_ARM_DEG: float = 90.0
+"""P 姿态大臂角度 (°, MID / 复位位, 业务硬限上界)。"""
+
+POSE_P_HAND_DEG: float = 0.0
+"""P 姿态手爪角度 (°, DOWN, 需先 arm >= +30° 出联动保护区)。"""
+
+POSE_P_GRAB_Y_MM: float = -160.0
+"""P 姿态下抓球 y (mm, 4cm 球球心高度)。"""
+
+# ponytail: POSE_P 是 task4 单一真相源, 不要在 target4/target1 等其他文件里硬编
+# 同一组数字, 一律 from main.arm.each_task.common import POSE_P_*
+
+
+def goto_pose_p(client, runner, *, log_prefix: str = "[goto_pose_p]") -> dict:
+    """恢复臂到 P 姿态 (Pose-P): y=POSE_P_Y → composite_run(arm/hand) → x=POSE_P_X。
+
+    复用 move_x_hard_reach 的 split + reset_x 撞墙兜底 (belt-slip 修复后稳)。
+    composite_run 走 4 电机 ThreadPoolExecutor 并行, arm/hand/y 同步摆位。
+
+    Args:
+        client: ArmClient
+        runner: ArmRunner (保留参数兼容性, 当前未直接用)
+        log_prefix: 打印前缀
+
+    Returns:
+        dict 含 ``actual_y_mm``, ``actual_x_mm`` (从 realtime 读真值)。
+        任何内部异常向上抛 (业务层决定是否退化)。
+    """
+    print(f"\n========== {log_prefix} 恢复 P 姿态 "
+          f"(composite_run 4 轴同步: y={POSE_P_Y_MM} → x={POSE_P_X_MM} "
+          f"arm={POSE_P_ARM_DEG}°/hand={POSE_P_HAND_DEG}°) ==========")
+    # 1. composite_run 4 轴同步到位姿 (arm/x/y/hand 一次下发, ThreadPoolExecutor 并行)
+    #    不调 move_x_hard_reach / belt-slip / wall_hit —— SDK composite_run 自带 x/y PID 闭环,
+    #    belt-slip 修复是 SDK 内部的事, 业务层不该自己再叠一层。
+    client.composite_run(
+        arm=POSE_P_ARM_DEG,
+        x_mm=POSE_P_X_MM,
+        y_mm=POSE_P_Y_MM,
+        hand=POSE_P_HAND_DEG,
+        speed=80,
+        timeout=30.0,
+    )
+    actual_y = None
+    try:
+        st = client.http.get_arm_state()
+        y_st = st.get("arm_state", {}) if isinstance(st, dict) else {}
+        actual_y = y_st.get("y_mm")
+    except Exception:
+        actual_y = None
+    actual_x = client._read_x_mm_realtime()
+    print(f"========== {log_prefix} 完成 "
+          f"(realtime y={actual_y}mm x={actual_x}mm) ==========\n")
+    return {
+        "actual_y_mm": actual_y,
+        "actual_x_mm": actual_x,
+    }
 
 DEFAULT_OVERSHOOT_RATIO: float = 1.5
 """overshoot 判定: 单轮 step > |初始 delta| × 此值 → 标记 overshoot。"""
