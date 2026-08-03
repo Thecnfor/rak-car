@@ -122,17 +122,23 @@ class VelocityLoop:
         return post
 
     def _run_velocity(self, label: str, *, timeout: float, hz: float,
-                      ws, step_fn, selector=None) -> List[VelocityTrace]:
+                      ws, step_fn, selector=None,
+                      settle_frames: Optional[int] = None,
+                      settle_tol: float = 0.04) -> List[VelocityTrace]:
         """共享 velocity 核心: WS 订阅 → 每帧 step_fn(t, pick) → 超时/订阅退出.
 
         step_fn(t, pick) 负责算速度 + 发命令 + 返回 VelocityTrace;
         pick 为 None 表示该帧检测丢失 (step_fn 内部处理停)。
         selector (可选): 多目标选择器, 传入后用 selector.matches + apply_strategy;
         否则默认 label 过滤 + HIGHEST_SCORE。
+
+        settle_frames (可选, 2026-08-04): 连续 N 帧 |dx|,|dy| < settle_tol → 提前
+        收敛退出 (不用等满 timeout)。None = 关闭 (保持旧行为, 跑满 timeout)。
         """
         t0 = time.time()
         trace: List[VelocityTrace] = []
         done = threading.Event()
+        settle_count = [0]  # 连续收敛帧计数 (闭包内可变)
 
         def _on_push(raw: dict) -> None:
             if done.is_set():
@@ -165,7 +171,16 @@ class VelocityLoop:
                     if d.label == label and (d.score or 0.0) > best:
                         best = d.score or 0.0
                         pick = d
-            trace.append(step_fn(time.time() - t0, pick))
+            tr = step_fn(time.time() - t0, pick)
+            trace.append(tr)
+            # 2026-08-04: 收敛提前退出 (settle_frames 开启时)
+            if settle_frames is not None:
+                if (not tr.miss) and abs(tr.dx) < settle_tol and abs(tr.dy) < settle_tol:
+                    settle_count[0] += 1
+                    if settle_count[0] >= settle_frames:
+                        done.set()
+                else:
+                    settle_count[0] = 0
 
         stop_sub = ws.subscribe_task_detection(_on_push, hz=hz)
         try:
@@ -284,6 +299,8 @@ class VelocityLoop:
                               setpoint_y_norm: float = 0.0,
                               sign_arm: float = 1.0, sign_x: float = -1.0,
                               selector=None,
+                              settle_frames: Optional[int] = None,
+                              settle_tol: float = 0.04,
                               post_fn: Optional[Callable] = None,
                               ws=None) -> VelocityResult:
         """机械臂专用追踪 (2026-08-02 实机标定): 大臂控 cx + x 十字控 cy.
@@ -328,7 +345,9 @@ class VelocityLoop:
         t0 = time.time()
         try:
             trace = self._run_velocity(label, timeout=timeout, hz=hz, ws=ws,
-                                      step_fn=step, selector=selector)
+                                      step_fn=step, selector=selector,
+                                      settle_frames=settle_frames,
+                                      settle_tol=settle_tol)
         finally:
             _try_post(post_fn, x_vel=0.0, y_vel=0.0)
         return _summarize(label, trace, time.time() - t0, arm_target, None)

@@ -397,7 +397,11 @@ def _pick_and_store(
     )
     try:
         result = runner.client._make_vision_with_move().find_target_arm_cross(
-            label, timeout=min(pick_timeout_s, 6.0), hz=20,
+            label, timeout=min(pick_timeout_s, 5.0), hz=20,
+            # 2026-08-04 (用户: 压缩延迟快速收敛, 第 2 个对齐):
+            #   收敛提前退出 — 连续 3 帧 |dx|,|dy|<0.04 即停, 不等满 timeout。
+            #   单测里球 ~2.5s 就收敛, 之前却傻等满 6s。现在收敛即走。
+            settle_frames=3, settle_tol=0.04,
             # 2026-08-04 现场 (单测): task1 默认 gain_x=0.55 太激进,
             # 4s 内 x 走了 62mm 过头。task4 改:
             #   gain_x  0.55 → 0.10
