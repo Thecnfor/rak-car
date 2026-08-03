@@ -623,6 +623,7 @@ main/chassis/
 │   ├── curvature_adaptive.py ← CurvatureAdaptiveOuterLoop（弧度偏差自适应，主力）
 │   ├── straight.py           ← StraightOuterLoop
 │   ├── visual_align.py       ← VisualAlignOuterLoop（面积对准）
+│   ├── orthogonal.py         ← OrthogonalOuterLoop（直角修正）
 │   ├── calibration.py        ← ErrorCalibrator
 │   └── odom_turn.py          ← OdomTurnPID + wrap_pi
 ├── loops/
@@ -639,6 +640,10 @@ main/chassis/
 │   ├── read_ir.py
 │   ├── diag_lane_error.py
 │   └── track_water.py
+├── tests/                    ← 离线单测（stdlib unittest）
+│   ├── test_visual_track.py / test_visual_align.py   ← 视觉追踪/对准
+│   ├── test_straight_follow.py / test_curvature_lookahead.py ← 控制律
+│   ├── test_mecanum_inverse.py / test_error_calibration.py / test_heading.py
 └── tasks/                    ← 一次性/低层数据读取
     ├── read_ir.py            ← 一次性读红外
     ├── read_dis.py           ← 持续读累计距离（自带 TUI __main__）
