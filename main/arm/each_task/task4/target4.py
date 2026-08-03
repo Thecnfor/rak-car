@@ -410,29 +410,6 @@ def _pick_and_store(
         return {"ok": False,
                 "error": f"pick_and_store: {type(e).__name__}: {str(e)[:120]}"}
     return {"ok": True, "error": None}
-        )
-    except Exception as e:
-        return {"ok": False,
-                "error": f"pick_vision: {type(e).__name__}: {str(e)[:120]}"}
-
-    try:
-        # 抬升 + 横移到 bin 上方 (并行)
-        arm_client.composite_run(y_mm=Y_TRANSIT_MM, x_mm=bin_x, speed=80, timeout=30.0)
-        # 降到放球位 → 放气
-        runner.move_y(Y_PUT_MM)
-        runner.grasp(False, timeout=10.0)
-        time.sleep(0.2)  # 球稳定掉进 bin
-        # 回识别位姿 (y + x 并行)
-        if return_x_mm is not None:
-            arm_client.composite_run(
-                y_mm=Y_FINAL_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
-            )
-        else:
-            runner.move_y(Y_FINAL_MM)
-    except Exception as e:
-        return {"ok": False,
-                "error": f"store: {type(e).__name__}: {str(e)[:120]}"}
-    return {"ok": True, "error": None}
 
 
 # ---------- 核心 step ----------
