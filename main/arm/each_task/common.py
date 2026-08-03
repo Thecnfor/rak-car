@@ -56,10 +56,10 @@ DEFAULT_WALL_TOL_MM: float = 30.0
 # 2026-08-03 现场标定 (下位机 reset 后): 球在画面中心 + 侧摄能稳定看到球
 # 区间内的统一姿态。所有 task4 寻路 / 检测 / 抓取之间都恢复到这里。
 
-POSE_P_Y_MM: float = -100.0
+POSE_P_Y_MM: float = -200.0
 """P 姿态 y (mm)。"""
 
-POSE_P_X_MM: float = -270.0
+POSE_P_X_MM: float = -300.0
 """P 姿态 x (mm)。"""
 
 POSE_P_ARM_DEG: float = 90.0
