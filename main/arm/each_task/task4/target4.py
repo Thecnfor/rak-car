@@ -62,6 +62,7 @@ try:  # noqa: E402
         LOG_PREFIX_TASK4,
         COLOR_BLUE, COLOR_YELLOW,
         GRASP_HOLD_S,
+        STORAGE_OPEN_ANGLE_DEG, STORAGE_CLOSE_ANGLE_DEG, STORAGE_OPEN_SPEED,
     )
 except ImportError:  # pragma: no cover —— 直接 python target4.py 时无包上下文
     from main.arm.each_task.task4 import (  # type: ignore # noqa: E402
@@ -70,6 +71,7 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
     from main.arm.each_task.task4.constants import (  # type: ignore # noqa: E402
         LOG_PREFIX_TASK4, COLOR_BLUE, COLOR_YELLOW,
         GRASP_HOLD_S,
+        STORAGE_OPEN_ANGLE_DEG, STORAGE_CLOSE_ANGLE_DEG, STORAGE_OPEN_SPEED,
     )
 
 from main.arm import (  # noqa: E402
@@ -146,6 +148,7 @@ class _CreepThread:
         self.distance_m = 0.0
         self.elapsed_s = 0.0
         self.balls = None
+        self.found_ball = False   # 2026-08-04: 见球退出 → 不零速, 交给 track_chassis
         self._t0 = 0.0
 
     def start(self) -> None:
@@ -182,20 +185,24 @@ class _CreepThread:
                     if any(b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
                            for b in balls):
                         self.balls = balls
+                        self.found_ball = True
                         self.ball_event.set()
                         break
                 except Exception:
                     pass
         finally:
-            # 兜底清场: 速度一定清零
-            try:
-                self.http.post(
-                    "/v1/realtime/chassis-velocity",
-                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                    timeout=1.0,
-                )
-            except Exception:
-                pass
+            # 2026-08-04 (用户: 看见球别停一下): 见球退出 → 不零速, 保持 creep
+            #   前移交给 track_chassis 无缝接管 (track_chassis finally 自己零速)。
+            #   只有未见球 (预算耗尽/被叫停) 才零速 —— 那条路没有接管者。
+            if not self.found_ball:
+                try:
+                    self.http.post(
+                        "/v1/realtime/chassis-velocity",
+                        {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                        timeout=1.0,
+                    )
+                except Exception:
+                    pass
 
     def wait_for_ball(self, timeout_s: float) -> dict:
         """阻塞等见球, 见球或超时返回。"""
@@ -207,18 +214,21 @@ class _CreepThread:
         }
 
     def stop_and_join(self) -> None:
+        # 2026-08-04: 零速交给 _loop 的 finally (见球不零速/未见球零速), 这里不再
+        #   冗余二次 POST (省一次 HTTP往返 ≈0.2s)。仅 set+join; 若 join 超时线程
+        #   仍活着 (异常未走 finally) 才兜底零速。
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
-        # 兜底: 如果线程因为异常没走 finally, 再清一次速度
-        try:
-            self.http.post(
-                "/v1/realtime/chassis-velocity",
-                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                timeout=1.0,
-            )
-        except Exception:
-            pass
+        if self._thread.is_alive():
+            try:
+                self.http.post(
+                    "/v1/realtime/chassis-velocity",
+                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
 
 # ---- 放 bin 参数 (沿用 P1 版, 现场已调) ----
 
@@ -542,6 +552,18 @@ def step_target4(
     t_start = time.monotonic()
 
     try:
+        # ---- 0. 打开存储仓 (2026-08-04 用户: task4 开始开仓, 结束关仓) ----
+        #    纯舵机动作 (set_storage_angle 75°), 不碰臂/底盘, 边采边存常开。
+        if not dry_run:
+            try:
+                print(f"  [{LOG_PREFIX}] 打开存储仓 (angle={STORAGE_OPEN_ANGLE_DEG}°)")
+                arm_client.set_storage_angle(
+                    STORAGE_OPEN_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] ⚠️ 开仓失败 ({type(e).__name__}: {str(e)[:80]}), 继续")
+        else:
+            print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过开仓")
+
         # ---- 1. 准备位姿: 已删 ----
         #    2026-08-04 (用户): 开头那个 target1 准备位姿 (~8s) 是冗余 legacy —
         #    主循环第一球立刻 goto_pose_p 覆盖它。P 姿态才是真正的搜索姿态。
@@ -696,6 +718,13 @@ def step_target4(
                 _dipan._stop_chassis_quietly(http_client)
             except Exception:
                 pass
+            # ---- 关闭存储仓 (2026-08-04 用户: task4 结束关仓) ----
+            try:
+                print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")
+                arm_client.set_storage_angle(
+                    STORAGE_CLOSE_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] ⚠️ 关仓失败 ({type(e).__name__}: {str(e)[:80]})")
 
     elapsed = time.monotonic() - t_start
     print(f"\n========== {LOG_PREFIX} 完成 ==========")
