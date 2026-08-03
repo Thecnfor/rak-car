@@ -442,39 +442,32 @@ def _pick_and_store(
     runner.grasp(True, timeout=5.0)
     time.sleep(0.3)  # 让真空建立
 
-    # 0.6 抬 y=-40 (出保护区 + 抬一点缓冲, 球出吸嘴正下方, 防横移拖飞)
-    #    2026-08-04 (用户): grasp 后 y=-40, 然后同步到 bin 位置 (y=-60 ∥ x=bin),
-    #    再 y=-30 + grasp(False) 放下, 最后回 P + creep。
-    print(f"  [{LOG_PREFIX}] 中间姿态 y=-40")
-    arm_client.composite_run(y_mm=-40.0, speed=80, timeout=10.0)
+    # 0.6 抬 y=-140 (2026-08-04 用户: -40→-140, 很必要 —— 把球抬高防横移拖飞)
+    print(f"  [{LOG_PREFIX}] 中间姿态 y=-140 (抬球)")
+    arm_client.composite_run(y_mm=-140.0, speed=80, timeout=10.0)
 
-    # 1+2+3+4 全部后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
-    #    - bin 上方 (y=-60 ∥ x=bin, 4 轴并发, y=-60 在 bin 开门 y gate [-205,-145] 上方)
-    #    - 落下放球 (y=-30, grasp(False))
-    #    - 回 P 姿态 (y=-120 ∥ x=return, 4 轴并发)
+    # 后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
+    #    - 移到 bin 上方 (保持 -140 高位 ∥ x=bin)
+    #    - 降到 y=-120 + grasp(False) 放球 (2026-08-04 用户: -30→-120)
+    #    - 不回 P (2026-08-04 用户): 下一球 goto_pose_p 统一回, 避免重复移动。
+    #      ⚠️ 返回的线程须由调用方在下一轮 goto_pose_p 前 join, 防臂命令竞争。
     import threading
     def _bg_release():
         try:
-            # bin 上方
-            arm_client.composite_run(
-                y_mm=-60.0, x_mm=bin_x, speed=80, timeout=30.0,
-            )
-            # 落到 bin 放仓位 + grasp(False)
-            arm_client.composite_run(y_mm=-30.0, speed=80, timeout=10.0)
+            # 移到 bin 上方 (保持 -140 高位横移)
+            arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
+            # 降到 bin 开口 y=-120 + grasp(False) 放球
+            arm_client.composite_run(y_mm=-120.0, speed=80, timeout=10.0)
             runner.grasp(False, timeout=5.0)
             time.sleep(0.2)
-            # 回 P 姿态
-            if return_x_mm is not None:
-                arm_client.composite_run(
-                    y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
-                )
-            else:
-                arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
+            # 不回 P —— 下一球 goto_pose_p 统一回
         except Exception as e:
             print(f"  [{LOG_PREFIX}] [bg_release] FAIL: {type(e).__name__}: {e}")
 
-    threading.Thread(target=_bg_release, daemon=True, name="task4-release").start()
-    return {"ok": True, "error": None}
+    release_thread = threading.Thread(target=_bg_release, daemon=True,
+                                      name="task4-release")
+    release_thread.start()
+    return {"ok": True, "error": None, "release_thread": release_thread}
 
 
 # ---------- 核心 step ----------
@@ -576,6 +569,7 @@ def step_target4(
         #      c) 再恢复 P 姿态 + creep 继续, 循环到 8 球
         #      d) 失败一次就退出, 不死循环
         ball_idx = 0
+        release_thread = None  # 2026-08-04: 上一球放仓后台线程, 回P前需 join
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
             if elapsed >= max_seconds:
@@ -606,6 +600,11 @@ def step_target4(
                 poll_hz=CREEP_POLL_HZ,
             )
             creep_thread.start()
+            # 2026-08-04: 先等上一球放仓后台线程结束, 再回 P 姿态 ——
+            #   放仓线程不回 P, 由这里统一回; 不 join 会与其臂命令竞争。
+            #   (chassis 的 creep 已在上面 start, join 期间底盘照常前移不浪费时间)
+            if release_thread is not None and release_thread.is_alive():
+                release_thread.join(timeout=15.0)
             if not dry_run:
                 try:
                     goto_pose_p(arm_client, runner,
@@ -680,6 +679,7 @@ def step_target4(
                 return_x_mm=return_x_mm,
                 pick_timeout_s=pick_timeout_s,
             )
+            release_thread = res.get("release_thread")  # 记录放仓线程, 下轮回P前 join
             history.append({"ball": ball_idx,
                             "action": "picked" if res["ok"] else "pick_failed",
                             "color": color, "error": res["error"]})
@@ -718,6 +718,9 @@ def step_target4(
                 _dipan._stop_chassis_quietly(http_client)
             except Exception:
                 pass
+            # 2026-08-04: 最后一球的放仓线程收尾, 再关仓 (防臂还在动就关舵机)
+            if release_thread is not None and release_thread.is_alive():
+                release_thread.join(timeout=15.0)
             # ---- 关闭存储仓 (2026-08-04 用户: task4 结束关仓) ----
             try:
                 print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")

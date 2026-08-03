@@ -11,4 +11,5 @@
 - jobs:       /v1/jobs*、/v1/execute、/v1/control/*
 - ws:         /v1/ws
 - legacy:     /api/*（旧前缀兼容面）
+- web_console: /console/*（web/ 构建产物静态站）
 """

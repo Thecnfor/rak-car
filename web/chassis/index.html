@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>底盘调试 · RAK-CAR</title>
+</head>
+<body>
+  <div class="statusbar">
+    <span class="brand">RAK-CAR 底盘调试</span>
+    <a class="nav-link" href="../monitor/">监控台</a>
+    <a class="nav-link" href="../teach/">示教器</a>
+    <a class="nav-link active" href="./">底盘</a>
+    <span class="sep">|</span>
+    <span>
+      <span class="dot" id="connDot"></span>
+      <span id="connText">连接: --</span>
+    </span>
+    <span class="dim">
+      x=<b id="odomX">--</b>m
+      y=<b id="odomY">--</b>m
+      θ=<b id="odomT">--</b>rad
+      里程=<b id="odomD">--</b>m
+    </span>
+    <span class="dim">
+      IR左=<b id="irL">--</b>
+      IR右=<b id="irR">--</b>
+    </span>
+    <span class="statusbar-spacer"></span>
+    <button id="btnEstop" class="danger estop">软急停</button>
+    <button id="btnEstopClear" disabled>解除急停</button>
+  </div>
+
+  <div class="chassis-grid">
+    <!-- 左列：里程计轨迹 + 前摄 -->
+    <div class="left-col">
+      <div class="panel">
+        <h3>里程计轨迹 (odom x/y/θ)</h3>
+        <canvas id="trajCanvas" width="640" height="420"></canvas>
+        <div class="btn-row">
+          <button id="btnClearTrace">清空轨迹</button>
+          <button id="btnZeroOdom">里程计清零</button>
+          <span class="dim" id="trajInfo"></span>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>cam1 / front</h3>
+        <div class="cam-wrap">
+          <img id="cam1Img" src="/video_feed/cam1" alt="front camera">
+          <label class="overlay-toggle">
+            <input type="checkbox" id="laneOverlay"> lane overlay
+          </label>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右列：点动 + 遥测 -->
+    <div class="right-col">
+      <div class="panel">
+        <h3>底盘点动（速度直发 · 松手即停）</h3>
+        <div class="jog-keys">
+          <div class="krow">
+            <span class="keycap">W</span> 前进 +vx
+            <span class="keycap">S</span> 后退 −vx
+            <span class="keycap">A</span> 左移 +vy
+            <span class="keycap">D</span> 右移 −vy
+          </div>
+          <div class="krow">
+            <span class="keycap">Q</span> 逆时针 +wz
+            <span class="keycap">E</span> 顺时针 −wz
+          </div>
+        </div>
+        <div class="slider-row">
+          <span>平移速度</span>
+          <input type="range" id="jogLin" min="5" max="50" step="5" value="15">
+          <b id="jogLinLabel">0.15 m/s</b>
+        </div>
+        <div class="slider-row">
+          <span>旋转速度</span>
+          <input type="range" id="jogAng" min="2" max="15" step="1" value="5">
+          <b id="jogAngLabel">0.5 rad/s</b>
+        </div>
+        <div class="warn-line">⚠ 点动直发轮速，不走里程计闭环；松手/失焦自动停</div>
+        <div class="btn-row">
+          <button id="btnStop">全停 (0,0,0)</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>车道状态 (lane_feed 50Hz 缓存)</h3>
+        <table>
+          <tbody>
+            <tr><td>mode</td><td class="num" id="laneMode">--</td><td>active</td><td class="num" id="laneActive">--</td></tr>
+            <tr><td>error_y</td><td class="num" id="laneEy">--</td><td>error_angle</td><td class="num" id="laneEa">--</td></tr>
+            <tr><td>forward</td><td class="num" id="laneVf">--</td><td>lateral</td><td class="num" id="laneVl">--</td></tr>
+            <tr><td>angular</td><td class="num" id="laneVa">--</td><td>distance</td><td class="num" id="laneDist">--</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <h3>轮编码器 (rad 累计)</h3>
+        <table>
+          <tbody>
+            <tr><td>LF</td><td class="num" id="enc0">--</td><td>RF</td><td class="num" id="enc1">--</td></tr>
+            <tr><td>LR</td><td class="num" id="enc2">--</td><td>RR</td><td class="num" id="enc3">--</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="../src/chassis/main.ts"></script>
+</body>
+</html>

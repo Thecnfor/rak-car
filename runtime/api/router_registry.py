@@ -16,7 +16,7 @@ except ModuleNotFoundError as exc:  # pragma: no cover
         "/home/jetson/workspace/rak-car/runtime/requirements.txt"
     ) from exc
 
-from .routers import jobs, keypress, legacy, realtime, stream, system, vision, ws
+from .routers import jobs, keypress, legacy, realtime, stream, system, vision, web_console, ws
 from .routers._helpers import get_public_links
 
 __all__ = ["create_legacy_router", "create_runtime_router", "get_public_links"]
@@ -28,7 +28,8 @@ def create_runtime_router(service, camera_stream_service):
     # 无前缀资源：摄像头推流 + 按键转发
     router.include_router(stream.build_stream_router(camera_stream_service))
     router.include_router(keypress.build_keypress_router(camera_stream_service))
-
+    # 工程化控制台静态站（web/ 构建产物 → runtime/static_web/）
+    router.include_router(web_console.build_web_console_router())
     # /v1 前缀资源
     router.include_router(system.build_system_router(service))
     router.include_router(vision.build_vision_router(service, camera_stream_service))

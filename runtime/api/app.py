@@ -87,6 +87,10 @@ def create_app():
     app.include_router(create_runtime_router(service, camera_stream_service))
     app.add_middleware(NoStoreMiddleware)
     app.include_router(create_legacy_router(service))
+    # 工程化控制台静态站：StaticFiles 必须直接 app.mount（老 starlette 的
+    # include_router 不携带 Mount，见 routers/web_console.py 模块 docstring）
+    from .routers.web_console import mount_web_console
+    mount_web_console(app)
     return app
 
 
