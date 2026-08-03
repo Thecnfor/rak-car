@@ -375,37 +375,43 @@ def _pick_and_store(
     bin_x = BIN_X_MM[color]
 
     # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
-    #    2026-08-03 现场 (用户): track_velocity_pick 默认 grasp_y=0 (触底) 会撞坏,
-    #    y=-20 才抓到球; lift_back=True 会把球带着走掉。
-    #    改: grasp_y_mm=-20 + lift_back=False, 业务层自己管抬回。
-    print(f"  [{LOG_PREFIX}] [0/3] track_velocity_pick(label={label!r}, "
-          f"arm_start=90, hand_start=0, grasp_y=-20, lift_back=False)")
+    #    2026-08-03 现场:
+    #      - track_velocity_pick 默认 arm_start=-90 是 task1 init, 任务4 要传 arm=+90
+    #      - grasp_y=-20 才抓到 (球心高度)
+    #      - lift_back=True 会把球带着跑, 业务层管抬回
+    #      - sign_y 默认 +1 在 task1 (y=-180 视野) 正确, task4 (y=-120 视野) 方向反了
+    #        → 直接调底层 find_target_arm_cross (暴露 sign_y 形参), 不用 track_velocity_pick
+    print(f"  [{LOG_PREFIX}] [0/3] find_target_arm_cross(label={label!r}, "
+          f"arm_start=90, hand_start=0, sign_y=-1)")
+    sx, sy = runner._resolve_nozzle_setpoint(None, None, label=label) or (0.0, 0.0)
+    selector = TargetSelector.for_label(
+        label, strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
+    )
     try:
-        pick_res = runner.track_velocity_pick(
-            label,
-            skip_pose_align=True,
-            arm_start=POSE_P_ARM_DEG,  # 90° 抓球大臂位
-            hand_start=POSE_P_HAND_DEG,  # 0° 朝下
-            grasp_y_mm=-20.0,  # 球高度 (4cm 球, 抓球位 ≈ -20mm)
-            # 2026-08-03 现场: 用 task1_seeding.py 实测的同款 PID 参数
-            # (gain_arm=2.5/gain_x=0.55/max_vel=0.70/timeout=2/settle_hits=1),
-            # 我之前用 gain_arm=0.6/gain_x=0.15 太保守 → ball 在 8s 内离
-            # setpoint 0.26 没收敛。
-            timeout=4.0,
-            hz=20.0,
-            settle_hits=1,
-            deadzone=0.06,
-            max_vel=0.70,
-            gain_arm=2.5,
-            gain_x=0.55,
-            lift_back=False,  # 不让 track_velocity_pick 抬回, 业务层管
+        result = runner.client._make_vision_with_move().find_target_arm_cross(
+            label, timeout=min(pick_timeout_s, 6.0), hz=20,
+            gain_arm=2.5, gain_x=0.55,
+            deadzone=0.06, max_vel=0.70,
+            arm_start=POSE_P_ARM_DEG,  # +90
+            sign_arm=1.0, sign_x=-1.0,
+            sign_y=-1.0,  # task4 视野 (y=-120) 下方向反了
+            setpoint_x_norm=sx, setpoint_y_norm=sy,
+            selector=selector,
         )
-        if not pick_res.get("ok"):
-            return {"ok": False,
-                    "error": f"track_velocity_pick: {pick_res.get('reason')}"}
     except Exception as e:
         return {"ok": False,
-                "error": f"track_velocity_pick: {type(e).__name__}: {str(e)[:120]}"}
+                "error": f"find_target_arm_cross: {type(e).__name__}: {str(e)[:120]}"}
+    if result.hits <= 0:
+        return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
+    print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
+
+    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球, 然后抬回 P 姿态)
+    print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
+    arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
+    runner.grasp(True, timeout=5.0)
+    time.sleep(1.0)  # 让真空建立
+    print(f"  [{LOG_PREFIX}] 抬回 P 姿态 y={POSE_P_Y_MM}")
+    arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=10.0)
 
     try:
         # 1. 升 y (出保护区 + 离地) ∥ 横移到 bin 上方
@@ -422,9 +428,6 @@ def _pick_and_store(
         runner.grasp(False, timeout=10.0)
         time.sleep(0.3)  # 让球稳定掉进 bin
         # 3. 恢复到 P 姿态 (识别位姿: y=POSE_P_Y, x=return_x_mm)
-        #    Y_TRANSIT→Y_FINAL 实际就是 P 姿态的 y (用户的 P 姿态 y=POSE_P_Y=-120)
-        #    Y_FINAL_MM=-120 是回 P 姿态 y, Y_TRANSIT=-190 是中间过渡高度
-        #    (track 后 y 在 -20 抓球位 → 先升到 -190 出 bin 区, 再横移, 再降到 -120)
         if return_x_mm is not None:
             arm_client.composite_run(
                 y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
