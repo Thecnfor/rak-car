@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>智能车监控系统</title>
+  <script type="module" crossorigin src="../assets/monitor-DVhbJAil.js"></script>
+  <link rel="modulepreload" crossorigin href="../assets/base-SdPrOyhu.js">
+  <link rel="stylesheet" crossorigin href="../assets/base-DfDI-Lv3.css">
+  <link rel="stylesheet" crossorigin href="../assets/monitor-Df0hPzhK.css">
+</head>
+<body>
+  <div class="statusbar">
+    <span class="brand">RAK-CAR</span>
+    <a class="nav-link" href="./">监控台</a>
+    <a class="nav-link" href="../teach/">示教器</a>
+    <span>
+      <span class="dot" id="laneDot"></span>
+      <span id="laneText">lane: --</span>
+    </span>
+    <span class="dim">
+      ey=<b id="laneEy">--</b>
+      ea=<b id="laneEa">--</b>
+    </span>
+    <span class="sep">|</span>
+    <span>
+      <span class="dot" id="taskDot"></span>
+      <span id="taskText">task: --</span>
+      <span id="taskCount" class="task-count zero">0</span>
+    </span>
+    <span id="taskLabel" class="task-label"></span>
+    <span id="lastKey" class="key"></span>
+  </div>
+  <div class="streams">
+    <div class="stream-cell">
+      <span class="label">cam1 / front</span>
+      <span class="label" style="left:auto; right:8px; background: rgba(0,80,140,0.55);">
+        <label style="cursor:pointer; user-select:none;">
+          <input type="checkbox" id="laneOverlay" style="vertical-align:middle; margin-right:3px;">
+          lane overlay
+        </label>
+      </span>
+      <img id="cam1Img" src="/video_feed/cam1" alt="front camera">
+    </div>
+    <div class="stream-cell">
+      <span class="label">cam2 / side</span>
+      <span class="label" style="left:auto; right:8px; background: rgba(120,40,140,0.55);">
+        <label style="cursor:pointer; user-select:none;">
+          <input type="checkbox" id="taskOverlay" style="vertical-align:middle; margin-right:3px;">
+          task overlay
+        </label>
+      </span>
+      <img id="cam2Img" src="/video_feed/cam2" alt="side camera">
+    </div>
+  </div>
+</body>
+</html>

@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RAK-CAR Console</title>
+</head>
+<body>
+  <div class="statusbar">
+    <span class="brand">RAK-CAR CONSOLE</span>
+    <span class="dim">工程化控制台入口</span>
+  </div>
+  <div class="home-cards">
+    <a class="card" href="./monitor/">
+      <div class="card-title">📺 监控台</div>
+      <div class="card-desc">cam1/cam2 双流 + lane/task overlay + 状态栏（原 /stream/ 页功能）</div>
+    </a>
+    <a class="card" href="./teach/">
+      <div class="card-title">🕹 示教器</div>
+      <div class="card-desc">键盘点动（WASD/QE/RF，松手即停）· 位姿示教记录 · 一键前往 · 软急停</div>
+    </a>
+  </div>
+  <style>
+    .home-cards { display: flex; gap: 14px; padding: 24px; flex-wrap: wrap; }
+    .card {
+      flex: 1;
+      min-width: 260px;
+      max-width: 420px;
+      background: rgba(20, 25, 35, 0.92);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 10px;
+      padding: 22px;
+      color: #e6f1ff;
+      transition: border-color 0.15s, transform 0.15s;
+    }
+    .card:hover { border-color: rgba(0, 212, 255, 0.5); transform: translateY(-2px); }
+    .card-title { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
+    .card-desc { font-size: 13px; color: #8892b0; line-height: 1.6; }
+  </style>
+</body>
+</html>

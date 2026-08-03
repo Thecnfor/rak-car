@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>示教器 · RAK-CAR</title>
+</head>
+<body>
+  <div class="statusbar">
+    <span class="brand">RAK-CAR 示教器</span>
+    <a class="nav-link" href="../monitor/">监控台</a>
+    <a class="nav-link active" href="./">示教器</a>
+    <span class="sep">|</span>
+    <span>
+      <span class="dot" id="connDot"></span>
+      <span id="connText">连接: --</span>
+    </span>
+    <span class="dim">
+      x=<b id="posX">--</b>mm
+      y=<b id="posY">--</b>mm
+      臂=<b id="armAng">--</b>°
+      爪=<b id="handAng">--</b>°
+    </span>
+    <span class="statusbar-spacer"></span>
+    <button id="btnEstop" class="danger estop">软急停</button>
+    <button id="btnEstopClear" disabled>解除急停</button>
+  </div>
+
+  <div class="teach-grid">
+    <!-- 左：侧摄画面（调位姿时盯着的相机） -->
+    <div class="panel cam-panel">
+      <h3>cam2 / side（点动时观察此画面）</h3>
+      <div class="cam-wrap">
+        <img id="cam2Img" src="/video_feed/cam2" alt="side camera">
+        <label class="overlay-toggle">
+          <input type="checkbox" id="taskOverlay"> task overlay
+        </label>
+      </div>
+    </div>
+
+    <!-- 右：点动 + 位姿库 -->
+    <div class="right-col">
+      <div class="panel">
+        <h3>点动（速度模式 · 松手即停）</h3>
+        <div class="jog-keys">
+          <div class="krow">
+            <span class="keycap">W</span> y↑ (上)
+            <span class="keycap">S</span> y↓ (下)
+            <span class="keycap">A</span> x← (左)
+            <span class="keycap">D</span> x→ (右)
+          </div>
+          <div class="krow">
+            <span class="keycap">Q</span> 大臂 −5°
+            <span class="keycap">E</span> 大臂 +5°
+            <span class="keycap">R</span> 手爪 −5°
+            <span class="keycap">F</span> 手爪 +5°
+          </div>
+        </div>
+        <div class="slider-row">
+          <span>点动速度</span>
+          <input type="range" id="jogSpeed" min="1" max="8" step="1" value="3">
+          <b id="jogSpeedLabel">0.03 m/s</b>
+        </div>
+        <div class="warn-line">⚠ x 轴无软限位：点动时盯紧机械臂行程，失焦/松手自动停</div>
+        <div class="btn-row">
+          <button id="btnGoHome">归位 (composite_go_home)</button>
+          <button id="btnZeroAll">全停 (velocity 0)</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h3>位姿库（localStorage 持久化）</h3>
+        <div class="btn-row">
+          <input type="text" id="poseName" placeholder="位姿名，如 task1_seed_1" size="20">
+          <button id="btnTeach" class="primary">示教当前位姿</button>
+        </div>
+        <table id="poseTable">
+          <thead>
+            <tr><th>名称</th><th>x_mm</th><th>y_mm</th><th>臂°</th><th>爪°</th><th></th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="btn-row">
+          <button id="btnExport">导出 JSON</button>
+          <button id="btnImport">导入 JSON</button>
+          <input type="file" id="importFile" accept="application/json" style="display:none">
+          <span id="poseMsg" class="dim"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="../src/teach/main.ts"></script>
+</body>
+</html>
