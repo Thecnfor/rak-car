@@ -183,6 +183,9 @@ class Orchestrator:
         # 用 LANE_FOLLOW profile 装配 DoubleLoopRunner（#1）
         # —— 不再自己 new CurvatureAdaptiveOuterLoop + WheelSmoother。
         profile = LANE_FOLLOW
+        # 弯道阶梯转弯常开（巡线段随时可能遇弯）：CurveDetector 识别 →
+        # StaircaseTurn θ 闭环 45→90→120°，lane 回正后交还 outer。
+        from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -190,6 +193,8 @@ class Orchestrator:
             watchdog_ms=profile.watchdog_ms,
             lost_line_ms=profile.lost_line_ms,
             smoother=profile.build_smoother(),
+            turn=StaircaseTurn(),
+            detector=CurveDetector(),
         )
 
         # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）
