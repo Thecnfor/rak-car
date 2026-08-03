@@ -529,13 +529,10 @@ def step_target4(
     t_start = time.monotonic()
 
     try:
-        # ---- 1. 准备位姿 (target1) ----
-        if do_prep and not dry_run:
-            print(f"\n--- [{LOG_PREFIX}] 准备位姿: target1 ---")
-            prep_res = target1.step_target1(arm_client, runner)
-            print(f"  [{LOG_PREFIX}] target1 完成: {prep_res}")
-        elif do_prep and dry_run:
-            print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 target1 (避免误触硬件)")
+        # ---- 1. 准备位姿: 已删 ----
+        #    2026-08-04 (用户): 开头那个 target1 准备位姿 (~8s) 是冗余 legacy —
+        #    主循环第一球立刻 goto_pose_p 覆盖它。P 姿态才是真正的搜索姿态。
+        #    直接从 P 姿态开始 creep, 省 ~8s。
 
         # ---- 2. 主循环: P姿态+creep 并发 → 见球 → 抓取 → 放仓 → 循环 ----
         #    2026-08-03 现场 (用户拍板):
