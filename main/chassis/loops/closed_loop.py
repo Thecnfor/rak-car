@@ -11,11 +11,12 @@ from typing import Callable, List, Optional, TYPE_CHECKING
 
 from .safety import EmergencyWatchdog, LostLineDetector
 from ..api import ChassisClient
-from ..state import LaneState
+from ..state import LaneState, OdometryState
 from ..controllers.base import OuterLoop, WheelSmoother
 
 if TYPE_CHECKING:
     from ..controllers.calibration import ErrorCalibrator
+    from ..controllers.odom_turn import CurveDetector, StaircaseTurn
 
 
 class DoubleLoopRunner:
@@ -49,11 +50,18 @@ class DoubleLoopRunner:
         on_tick: Optional[Callable[[LaneState, List[float]], None]] = None,
         smoother: Optional[WheelSmoother] = None,
         calibrator: Optional["ErrorCalibrator"] = None,
+        turn: Optional["StaircaseTurn"] = None,
+        detector: Optional["CurveDetector"] = None,
     ) -> None:
         self.api = api
         self.outer = outer
         self.hz = float(hz)
         self.dt = 1.0 / max(self.hz, 1.0)
+        # 弯道阶梯转弯（可选，--turn 启用）：CurveDetector 识别弯道后由 StaircaseTurn
+        # 接管输出（θ 闭环纯旋转），回正后交还 outer。都传或都不传；None = 纯巡线，
+        # 行为与旧版完全一致。
+        self.turn = turn
+        self.detector = detector
         # 两个兜底各自可关：传 None 就不挂
         # - watchdog_ms=None：不因 lane_state 过期急停
         # - lost_line_ms=None：不因误差齐 0 急停（笔直居中的路段本来就会齐 0）
@@ -134,6 +142,37 @@ class DoubleLoopRunner:
                 pass
         return state
 
+    def _sense_odom(self) -> Optional[OdometryState]:
+        """读里程计缓存（fast-path，<2ms）。转弯才用，失败返回 None。"""
+        try:
+            return self.api.get_odometry_state()
+        except Exception:
+            return None
+
+    def _compute_raw(self, state: LaneState) -> List[float]:
+        """算控制律原始 4 轮速：转弯中走 StaircaseTurn，否则走 outer。
+
+        转弯中 blind 阶段 lane 不新鲜，watchdog/lost_line 由 run() 跳过。"""
+        # 转弯进行中：θ 闭环纯旋转
+        if self.turn is not None and self.turn.active:
+            odom = self._sense_odom()
+            theta = odom.theta if odom is not None else None
+            if theta is None:
+                return [0.0, 0.0, 0.0, 0.0]  # odom 缺失：零速等下一帧
+            omega, _phase = self.turn.step(theta, self.dt, state)
+            return self.turn.wheels(omega)
+        # 巡线：识别到弯道 → 启动阶梯转弯
+        if self.detector is not None:
+            d = self.detector.update(state)
+            if d is not None and self.turn is not None:
+                odom = self._sense_odom()
+                theta = odom.theta if odom is not None else None
+                if theta is not None:
+                    self.turn.start(theta, d, self.detector.entry_sign)
+                    omega, _phase = self.turn.step(theta, self.dt, state)
+                    return self.turn.wheels(omega)
+        return self.outer.step(state, self.dt)
+
     def run(self, max_seconds: float = 30.0) -> None:
         """阻塞：每 ~dt 跑一次外环 + 下发；任何异常路径都会 zero out 退出。
 
@@ -172,16 +211,25 @@ class DoubleLoopRunner:
                 if now > deadline:
                     break
                 state = self._sense()
-                # 兜底项各自可关：传 None = 不挂这个检查
-                if self.watchdog and self.watchdog.should_stop(state):
+                # 转弯进行中：盲转阶段 lane 不新鲜 / 误差齐 0，跳过 watchdog /
+                # lost_line 兜底（否则急停打断转弯）。
+                turning = self.turn is not None and self.turn.active
+                if not turning:
+                    # 兜底项各自可关：传 None = 不挂这个检查
+                    if self.watchdog and self.watchdog.should_stop(state):
+                        if not self.dry_run:
+                            self.api.emergency_stop()
+                        break
+                    if self.lost_line and self.lost_line.should_alert(state):
+                        if not self.dry_run:
+                            self.api.emergency_stop()
+                        break
+                raw = self._compute_raw(state)
+                if self.turn is not None and self.turn.phase == "fail":
+                    # 120° 仍不回正：判定跑偏，停车退出
                     if not self.dry_run:
                         self.api.emergency_stop()
                     break
-                if self.lost_line and self.lost_line.should_alert(state):
-                    if not self.dry_run:
-                        self.api.emergency_stop()
-                    break
-                raw = self.outer.step(state, self.dt)
                 safe = self.smoother.step(raw)
                 if not self.dry_run:
                     try:

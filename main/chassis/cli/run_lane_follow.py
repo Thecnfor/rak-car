@@ -188,6 +188,12 @@ def main(argv: list[str] | None = None) -> None:
         "--sign-theta", type=float, default=1.0,
         help="ω 方向，+1 = error_angle>0(车头偏右) 逆时针左转回正；实车反了改 -1。"
     )
+    parser.add_argument(
+        "--turn", action="store_true",
+        help="接弯道阶梯转弯：CurveDetector(|error_angle|>20° 持续 5 帧)识别弯道 →\n"
+             "StaircaseTurn θ 闭环 45→90→120° 连续转，lane 回正后交还直道巡航。\n"
+             "转弯底层在 controllers/odom_turn.py。"
+    )
     args = parser.parse_args(argv)
 
     profile = _build_profile(args)
@@ -243,6 +249,14 @@ def main(argv: list[str] | None = None) -> None:
         cal_kwargs["ema_alpha"] = args.error_ema_alpha
     calibrator = ErrorCalibrator(**cal_kwargs) if cal_kwargs else None
 
+    # 弯道阶梯转弯：detector 识别 → turn 接管（纯旋转）→ 回正交还 outer
+    turn = detector = None
+    if args.turn:
+        from ..controllers.odom_turn import CurveDetector, StaircaseTurn
+
+        detector = CurveDetector()
+        turn = StaircaseTurn()
+
     use_tui = bool(args.tui) and not args.straight_follow
     if use_tui:
         # rich 是可选依赖，只在 --tui 时才 import；普通巡线不需要装 rich。
@@ -263,6 +277,8 @@ def main(argv: list[str] | None = None) -> None:
         smoother=smoother,
         on_tick=None if use_tui else runner_on_tick,
         calibrator=calibrator,
+        turn=turn,
+        detector=detector,
     )
     try:
         if use_tui:
