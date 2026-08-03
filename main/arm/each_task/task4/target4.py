@@ -75,7 +75,7 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
 from main.arm import (  # noqa: E402
     ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
 )
-from main.arm.each_task.common import goto_pose_p, POSE_P_X_MM  # noqa: E402
+from main.arm.each_task.common import goto_pose_p, POSE_P_X_MM, POSE_P_GRAB_Y_MM  # noqa: E402
 from main.chassis import track_chassis  # noqa: E402
 
 
