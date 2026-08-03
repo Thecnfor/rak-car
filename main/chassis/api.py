@@ -68,20 +68,24 @@ class ChassisClient:
 
     def move_for(
         self,
-        dx_m: float,
+        dx_m: float = 0.0,
+        dy_m: float = 0.0,
         timeout: float = 30.0,
         max_velocity_ms: float = 0.20,
     ) -> dict:
         """底盘相对位移 move_for (sync 阻塞到位后返回)。
 
         dx_m>0 前进 / <0 后退 (车体本地 x 偏移, 单位 m)。
+        dy_m 是车体本地 y 偏移 (横移, 单位 m), 符号与 vy 一致:
+            error_y>0 (目标在右) → dy_m<0 左移回中。
         走 runtime CAR_ACTIONS["move_for"] → 车端 car.move_for, 一次性位置闭环,
-        走完自动停。返回 /v1/execute 同步 job dict (status/result/error)。
+        走完自动停。theta_offset 恒 0 —— 直道回正不旋转, 保持 odom theta 为 0。
+        返回 /v1/execute 同步 job dict (status/result/error)。
 
         Raises:
             RuntimeError: move_for job 失败 (status != succeeded)。
         """
-        offset = [float(dx_m), 0.0, 0.0]  # [x_offset, y_offset, theta_offset] 单位 m
+        offset = [float(dx_m), float(dy_m), 0.0]  # [x_offset, y_offset, theta_offset] 单位 m
         job = self.http.execute_car_action(
             "move_for",
             offset,

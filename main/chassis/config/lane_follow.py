@@ -95,7 +95,12 @@ class LaneFollowProfile:
         )
 
     def tuned(self, **overrides) -> "LaneFollowProfile":
-        """临时改几个参数跑一把：``LANE_FOLLOW.tuned(v_max=0.2, ki_y=0.0)``。"""
+        """临时改几个 profile 自有字段跑一把：``LANE_FOLLOW.tuned(hz=20.0, wheel_max_abs=0.5)``。
+
+        只能覆盖循环节律 / 下发软化 / controller_type。
+        控制器增益（v_max / kp_y / ki_y …）不在这里——直接构造
+        ``CurvatureAdaptiveOuterLoop(...)`` 并传给 ``subscribe_lane_state(outer=...)``。
+        """
         return replace(self, **overrides)
 
 

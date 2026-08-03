@@ -4,13 +4,14 @@
 用法：
     python3 -m main.chassis.cli.run_lane_follow
     python3 -m main.chassis.cli.run_lane_follow --dry-run --max-seconds 5
-    python3 -m main.chassis.cli.run_lane_follow --profile slow --tune v_max=0.2 --tune ki_y=0.0
+    python3 -m main.chassis.cli.run_lane_follow --profile slow --tune hz=30 --tune wheel_max_abs=0.5
     python3 -m main.chassis.cli.run_lane_follow --no-trace --controller stanley
 """
 from __future__ import annotations
 
 import argparse
 import inspect
+from dataclasses import fields
 
 from ..api import ChassisClient
 from ..config.lane_follow import (
@@ -59,9 +60,16 @@ def _build_profile(args: argparse.Namespace) -> LaneFollowProfile:
     if args.controller:
         base = base.tuned(controller_type=ControllerType(args.controller))
 
-    # --tune 走 dataclasses.replace（frozen dataclass），任意字段都能覆盖
+    # --tune 走 dataclasses.replace（frozen dataclass），只认 profile 自有字段
     tune = _parse_kv_pairs(args.tune)
     if tune:
+        _valid = {f.name for f in fields(LaneFollowProfile)}
+        _bad = set(tune) - _valid
+        if _bad:
+            raise SystemExit(
+                f"--tune 字段不存在: {sorted(_bad)}（合法: {sorted(_valid)}）\n"
+                "控制器增益（v_max/kp_y…）不在 profile，走构造 CurvatureAdaptiveOuterLoop"
+            )
         base = base.tuned(**tune)
     return base
 
@@ -132,6 +140,32 @@ def main(argv: list[str] | None = None) -> None:
         help="误差 EMA 平滑系数 (0,1]，None=不平滑。越小越信任历史、越稳；\n"
              "太大等于没滤。建议 0.2~0.5。"
     )
+    parser.add_argument(
+        "--straight-follow", action="store_true",
+        help="切到直道逻辑：vx 定速巡航 + vy 横移回正正交合成（十字正交分解，\n"
+             "odom theta 保持 0）。弯道里程计 90° 转弯后续接回。\n"
+             "默认关 = 走原 50Hz 速度环。"
+    )
+    parser.add_argument(
+        "--vx-cruise", type=float, default=0.25,
+        help="直道巡航前向速度 (m/s)，默认 0.25。"
+    )
+    parser.add_argument(
+        "--deadband-y", type=float, default=0.01,
+        help="y 回正死区 (m，标定后)。|error_y| 超过才启动 vy 横移，默认 0.01。"
+    )
+    parser.add_argument(
+        "--kp-y", type=float, default=0.2,
+        help="vy 横移通道比例增益 (m/s 每米误差)。横移回正与 vx 巡航正交合成。"
+    )
+    parser.add_argument(
+        "--sign-y", type=float, default=-1.0,
+        help="y 回正方向，-1 = error_y>0(目标在右) 左移回中；实车反了改 +1。"
+    )
+    parser.add_argument(
+        "--strafe-v", type=float, default=0.05,
+        help="|vy| 横移速度上限 (m/s)，默认 0.05。"
+    )
     args = parser.parse_args(argv)
 
     profile = _build_profile(args)
@@ -148,6 +182,18 @@ def main(argv: list[str] | None = None) -> None:
         pass
 
     outer = profile.build_outer()
+    # 直道逻辑：StraightOuterLoop 自己就是控制律（vx 巡航 + vy 横移正交回正），
+    # 复走 DoubleLoopRunner 的软化 / 标定 / 暂停流程。
+    if args.straight_follow:
+        from ..controllers.straight import StraightOuterLoop
+
+        outer = StraightOuterLoop(
+            vx_cruise=args.vx_cruise,
+            deadband_y=args.deadband_y,
+            kp_y=args.kp_y,
+            sign_y=args.sign_y,
+            strafe_v=args.strafe_v,
+        )
     # --vx-target 只作用在有 vx_target 字段的控制器（OrthogonalOuterLoop 等），
     # 用来从"原地水平稳定（vx=0）"切到"正交巡航"。其他 outer 没有这个字段
     # 也没关系，跳过即可。
@@ -169,7 +215,7 @@ def main(argv: list[str] | None = None) -> None:
         cal_kwargs["ema_alpha"] = args.error_ema_alpha
     calibrator = ErrorCalibrator(**cal_kwargs) if cal_kwargs else None
 
-    use_tui = bool(args.tui)
+    use_tui = bool(args.tui) and not args.straight_follow
     if use_tui:
         # rich 是可选依赖，只在 --tui 时才 import；普通巡线不需要装 rich。
         from ..loops.tui import lane_tui

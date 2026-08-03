@@ -12,6 +12,7 @@ from .controllers.p_controller import POuterLoop
 from .controllers.stanley import StanleyOuterLoop
 from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 from .controllers.calibration import ErrorCalibrator
+from .controllers.odom_turn import OdomTurnPID, wrap_pi
 from .controllers.visual_align import VisualAlignOuterLoop
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
@@ -30,6 +31,7 @@ from .loops.visual_track import (
     expand_label_set,
     track_trace,
 )
+from .controllers.straight import StraightOuterLoop
 from .heading import HeadingEstimator, HeadingState, TrackMap
 from .tasks.monitor_ir import monitor_ir, IRAlertCallback, IRTickCallback
 from .tasks.read_dis import read_dis, DisTickCallback
@@ -38,9 +40,27 @@ from .tasks.read_ir import read_ir
 from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, ControllerType, LaneFollowProfile
 
 
+_client: Optional[ChassisClient] = None
+
+
+def get_odometry() -> tuple[float, float, float]:
+    """读底盘里程计 (x, y, theta)，单位 m / m / rad。模块级持有 ChassisClient 实例复用。
+
+    用法::
+
+        from main.chassis import get_odometry
+        x, y, theta = get_odometry()
+    """
+    global _client
+    if _client is None:
+        _client = ChassisClient.connect()
+    return _client.get_odometry()
+
+
 def subscribe_lane_state(
     *,
     profile: LaneFollowProfile = LANE_FOLLOW,
+    outer: Optional[OuterLoop] = None,
     hz: Optional[float] = None,
     max_seconds: Optional[float] = None,
     dry_run: bool = False,
@@ -61,11 +81,17 @@ def subscribe_lane_state(
 
     用法::
 
-        from main.chassis import subscribe_lane_state, LANE_FOLLOW
-        subscribe_lane_state(profile=LANE_FOLLOW.tuned(v_max=0.2), max_seconds=10.0)
+        from main.chassis import subscribe_lane_state
+        from main.chassis.controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
+        subscribe_lane_state(
+            outer=CurvatureAdaptiveOuterLoop(v_max=0.2, kp_y=0.5),
+            max_seconds=10.0,
+        )
 
     参数：
-        profile    - 调参 profile，默认 LANE_FOLLOW
+        profile    - 调参 profile（循环节律 / 下发软化），默认 LANE_FOLLOW
+        outer      - 自构造外环，如 ``CurvatureAdaptiveOuterLoop(v_max=..., kp_y=...)``；
+                     传了就用它调控制器增益，否则 ``profile.build_outer()``
         hz         - 循环频率，默认用 profile.hz
         max_seconds - 最大运行时间，默认用 profile.max_seconds
         dry_run    - True 时只跑控制律不下发轮速
@@ -80,7 +106,8 @@ def subscribe_lane_state(
     except Exception:
         pass
 
-    outer = profile.build_outer()
+    if outer is None:
+        outer = profile.build_outer()
     smoother = profile.build_smoother()
 
     if on_tick is None and with_trace:
@@ -175,6 +202,7 @@ def subscribe_visual_align(
     runner.run(max_seconds=30.0 if max_seconds is None else max_seconds)
 
 __all__ = [
+    "get_odometry",                # 读底盘里程计 (x, y, theta)
     # --- 航向估计 / 赛道剖面 ---
     "read_heading",                # 实时轮询航向传感器，每帧调 on_tick
     "HeadingTickCallback",         # 航向每帧回调类型
