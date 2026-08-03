@@ -186,7 +186,6 @@ def run(client: ArmClient, runner: ArmRunner,
         "y_mm": y_mm,
         "y_down_mm": y_down_mm,
         "hand_deg": hand_deg,
-        "hand_deg": hand_deg,
     }
 
 

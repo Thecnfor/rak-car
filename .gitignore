@@ -125,6 +125,9 @@ ENV/
 env.bak/
 venv.bak/
 
+# 现场调参留的临时备份文件 (如 task4 的 .target4_v*.bak)
+*.bak
+
 # Spyder project settings
 .spyderproject
 .spyproject

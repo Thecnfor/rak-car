@@ -30,8 +30,10 @@ from .loops.visual_track import (
     expand_label_set,
     track_trace,
 )
+from .heading import HeadingEstimator, HeadingState, TrackMap
 from .tasks.monitor_ir import monitor_ir, IRAlertCallback, IRTickCallback
 from .tasks.read_dis import read_dis, DisTickCallback
+from .tasks.read_heading import read_heading, record_track_profile, HeadingTickCallback
 from .tasks.read_ir import read_ir
 from .config import LANE_FOLLOW, LANE_FOLLOW_SLOW, ControllerType, LaneFollowProfile
 
@@ -173,49 +175,11 @@ def subscribe_visual_align(
     runner.run(max_seconds=30.0 if max_seconds is None else max_seconds)
 
 __all__ = [
-    # --- 一键装配函数 ---
-    "subscribe_lane_state",        # 巡线外环一键装配：profile → outer/smoother → DoubleLoopRunner
-    "subscribe_visual_align",      # 视觉微调一键装配：只前后微调，把目标面积拉到 ref_area
-    "track_chassis",               # 通用底盘视觉追踪：把 target bbox 中心拉到 setpoint_cxcy
-    # --- API / 状态视图 ---
-    "ChassisClient",               # 底盘专用 HTTP client
-    "LaneState",                   # lane 误差缓存视图（/v1/vision/lane/state）
-    "AlignState",                  # 视觉微调外环状态：当前帧选中目标 + ref_area 误差
-    "select_target",               # 从 task detections 列表里选一个目标
-    # --- 外环控制律 ---
-    "OuterLoop",                   # 外环控制律接口（ABC）
-    "WheelSmoother",               # 4 轮目标线速度软化器：饱和 + slew rate 限幅
-    "POuterLoop",                  # 外环 = P：error_y 直给 vy，error_angle 进 omega
-    "StanleyOuterLoop",            # Stanley 控制律（参考实现，需按场地再调）
-    "CurvatureAdaptiveOuterLoop",  # 曲率自适应控制律（当前默认调参对象）
-    "ErrorCalibrator",             # error_y / error_angle 的标定 + 去抖
-    "VisualAlignOuterLoop",        # 视觉微调控制律：只前进/后退
-    # --- 闭环 runner / 安全 / 遥测 ---
-    "DoubleLoopRunner",            # 双环 runner：外环在客户端、内环在车端
-    "EmergencyWatchdog",           # lane_state.updated_at 超阈值时报警
-    "LostLineDetector",            # 误差值齐 0 持续 N 帧 → 丢线报警
-    "lane_trace",                  # on_tick 回调：每 N 帧打印 lane 误差 + 4 轮速
-    # --- 视觉微调 runner 族 ---
-    "VisualAlignRunner",           # 视觉微调 runner：只动 vx，可判收敛（与 DoubleLoopRunner 同构）
-    "AlignConvergenceDetector",    # 连续 N 帧 |area_error| < tol 视为到达
-    "AlignRunResult",              # VisualAlignRunner.run() 的返回结果
-    "align_trace",                 # on_tick 回调：每 N 帧打印对齐信息
-    "make_align_runner",           # 一键构造快档视觉微调 runner（主入口）
-    # --- 视觉追踪 runner 族 ---
-    "TrackChassisResult",          # track_chassis 的返回结果
-    "TrackFrame",                  # 一帧追踪状态（传给 on_tick / 放在结果里）
-    "expand_label_set",            # 把目标 label(s) 展开成匹配集合
-    "track_trace",                 # on_tick 回调：每 N 帧打印一行追踪信息
-    # --- 配置 ---
-    "LaneFollowProfile",           # 巡线外环全部可调量（字段语义见 curvature_adaptive.py 等）
-    "ControllerType",              # profile 支持的控制律枚举（build_outer 按此分发）
-    "LANE_FOLLOW",                 # 默认巡线 profile
-    "LANE_FOLLOW_SLOW",            # 慢速巡线 profile（hz=20）
-    # --- 红外 / 里程计任务 ---
-    "monitor_ir",                  # 持续采样 IR，命中阈值时调 on_alert
-    "IRAlertCallback",             # IR 告警回调类型
-    "IRTickCallback",              # IR 每帧采样回调类型
-    "read_dis",                    # 实时轮询里程计累计距离，每帧调 on_tick
-    "DisTickCallback",             # 里程计每帧回调类型
-    "read_ir",                     # 读取 IR 距离传感器（用户视角左/右，底层已调换）
+    # --- 航向估计 / 赛道剖面 ---
+    "read_heading",                # 实时轮询航向传感器，每帧调 on_tick
+    "HeadingTickCallback",         # 航向每帧回调类型
+    "record_track_profile",        # 根据航向/速度记录赛道剖面（起终点 + 弯道标记）
+    "HeadingEstimator",            # 航向估计器：融合原始航向 + 速度门控 + 漂移校正
+    "HeadingState",                # 航向估计器实时状态（航向角 / 累计距离 / 赛道标记）
+    "TrackMap",                    # 赛道地图：起终点 + 弯道区间 + 方向表
 ]

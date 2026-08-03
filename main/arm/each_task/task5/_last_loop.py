@@ -84,6 +84,12 @@ def run_last_loop(
     area_min: float = 0.10,
     area_max: float = 0.24,
     aspect_tol: float = 0.8,
+    vision: bool = False,
+    grasp_y_mm: float = None,
+    vision_fallback: bool = True,
+    sign_arm: float = 1.0,
+    sign_x: float = -1.0,
+    vision_timeout: float = 20.0,
 ) -> dict:
     """prep_pose → 检测 → 循环调 test_run_fn 的统一骨架。
 
@@ -147,12 +153,25 @@ def run_last_loop(
         }
 
     # ---- 阶段 2..N: 循环调 test_run_fn ----
+    # 2026-08-03: test_run_fn = pick_and_place 薄 wrapper, 接受视觉闭环参数。
+    # vision=False 时 kwargs 全走默认 → 行为与旧版完全一致。
+    vision_kwargs = {}
+    if vision:
+        vision_kwargs["vision"] = True
+        vision_kwargs["vision_fallback"] = vision_fallback
+        vision_kwargs["sign_arm"] = sign_arm
+        vision_kwargs["sign_x"] = sign_x
+        vision_kwargs["vision_timeout"] = vision_timeout
+        if grasp_y_mm is not None:
+            vision_kwargs["grasp_y_mm"] = grasp_y_mm
+
     rounds_results: list = []
     for r in range(1, n_rounds + 1):
         print(f"\n----- {log_prefix} [轮 {r}/{n_rounds}] -----")
-        print(f"  调 {test_log_prefix}.run(hold_s={hold_s:.1f})")
+        print(f"  调 {test_log_prefix}.run(hold_s={hold_s:.1f}"
+              f"{', vision=True' if vision else ''})")
         try:
-            r_res = test_run_fn(client, runner, hold_s=hold_s)
+            r_res = test_run_fn(client, runner, hold_s=hold_s, **vision_kwargs)
             rounds_results.append({"round": r, "ok": True, "result": r_res})
             print(f"  [轮 {r}/{n_rounds}] OK")
         except Exception as e:
@@ -226,6 +245,21 @@ def build_last_parser(log_prefix: str,
                    help="宽高比容差 |aspect-1|≤tol (默认 = target_*.DETECT_ASPECT_TOL)")
     p.add_argument("--no-prep", action="store_true", dest="no_prep",
                    help="跳过检测前的摆臂 (默认开: 仿 target_* 5 步前 4 步)")
+    # ---- 2026-08-03 新增: 视觉闭环取球 (透传给 test_run_fn / pick_and_place) ----
+    p.add_argument("--vision", action="store_true",
+                   help="启用视觉闭环取球 (track_velocity_pick); "
+                        "⚠️ sign 参数是 task1 姿态标定值, task5 位姿首跑先确认方向")
+    p.add_argument("--grasp-y", type=float, default=None, dest="grasp_y",
+                   help="视觉模式吸气 y (mm); 不传用 pick_and_place 默认 (-70, 不下探)")
+    p.add_argument("--no-vision-fallback", dest="vision_fallback", action="store_false",
+                   help="视觉失败不回退开环盲吸 (默认回退)")
+    p.add_argument("--sign-arm", type=float, default=1.0, dest="sign_arm",
+                   help="视觉伺服大臂轴符号 (±1, 现场标定)")
+    p.add_argument("--sign-x", type=float, default=-1.0, dest="sign_x",
+                   help="视觉伺服 x 轴符号 (±1, 现场标定)")
+    p.add_argument("--vision-timeout", type=float, default=20.0,
+                   dest="vision_timeout", help="视觉伺服总超时 (秒)")
+    p.set_defaults(vision_fallback=True)
     return p
 
 
@@ -282,6 +316,13 @@ def main_with_args(args: argparse.Namespace,
         area_min=_resolve(args, "area_min", target_module, "DETECT_AREA_MIN"),
         area_max=_resolve(args, "area_max", target_module, "DETECT_AREA_MAX"),
         aspect_tol=_resolve(args, "aspect_tol", target_module, "DETECT_ASPECT_TOL"),
+        # 2026-08-03: 视觉闭环取球参数透传 (vision=False 时全走默认, 行为不变)
+        vision=getattr(args, "vision", False),
+        grasp_y_mm=getattr(args, "grasp_y", None),
+        vision_fallback=getattr(args, "vision_fallback", True),
+        sign_arm=getattr(args, "sign_arm", 1.0),
+        sign_x=getattr(args, "sign_x", -1.0),
+        vision_timeout=getattr(args, "vision_timeout", 20.0),
     )
     elapsed = time.perf_counter() - t_total_start
     print(f"========== {log_prefix} 总耗时: {elapsed:.3f} s ==========")

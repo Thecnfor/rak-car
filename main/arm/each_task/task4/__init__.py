@@ -11,24 +11,28 @@ PPT Slide 9:
     任务4 业务层只确保"颜色对得上 bin", 不参与分拣评分。
   - 用户决策：边采边存（采一个 → 直接放对应 bin，不在臂上累积）。
 
-子模块（执行顺序 a → b1→b2→b3 循环 → c):
+子模块（执行顺序 a → (b1→b2→b3→b4)×N, 预算式收尾):
 
   ┌────────────────────────────────────────────────────────────────────┐
-  │ a_approach        底盘进采收区 + 摆可采姿态 (y 出保护区 / hand DOWN)│
+  │ a_approach        target1 起手: composite_run(arm=90°/y=-133/hand=0°) ∥ + x=-260│
   │   ↓                                                                   │
-  │ b1_detect_fruit   侧摄 task_feed 扫球 + 过滤 + 选 next target       │
+  │ b1_creep_search   慢速前移 (realtime 速度 0.045m/s) + 10Hz fetch_balls, 见球即停│
   │   ↓                                                                   │
-  │ b2_pick_fruit     move_x → move_y → grasp → move_y 抬回 (-190)      │
+  │ b2_track_chassis  track_chassis select_mode="leftmost", 最左球拉到画面中心│
   │   ↓                                                                   │
-  │ b3_store_fruit    按 color 入仓 (蓝 x=0 / 黄 x=-65, belt-slip 分段) │
+  │ b3_pick_fruit     move_to_vision_target(hand=0°, 防手爪挡侧摄) 吸嘴中心对准 → 吸│
   │   ↓                                                                   │
-  │ c_finish          reset_y + 回 init + 清 task4_target_latest.json   │
+  │ b4_store_fruit    composite_run (抬 y=-190 ∥ 移 bin 蓝0/黄-65) → y=-155 → 放气│
+  │   ↓                                                                   │
+  │ 收尾              creep 预算 0.8m / picks 8 / 总时 180s 任一命中 → summary│
   └────────────────────────────────────────────────────────────────────┘
 
 跑法:
-    python -m main.arm.each_task.task4.run_full                # 全流程
-    python -m main.arm.each_task.task4.run_full --dry 1        # 只跑 1 个循环
-    python -m main.arm.each_task.task4.run_full --max-rounds 3 # 最多 3 轮
+    python -m main.arm.each_task.task4.target4                 # 真跑 (默认预算: creep 0.8m / picks 8 / 180s)
+    python -m main.arm.each_task.task4.target4 --dry-run       # 只打印不动硬件
+    python -m main.arm.each_task.task4.target4 --max-picks 3   # 最多抓 3 个
+    python -m main.arm.each_task.task4.target4 --no-prep       # 跳过 target1 起手 (假设已在位姿)
+    # orchestrator 全流程走 main/task/task4_harvest.py → step_target4 (run.py --task 4)
 
 辅助/历史文件（保留勿删）:
   - target_test.py   侧摄 task_feed 冒烟（b1 复用 fetch_balls/save_latest）⚠️ 已删,
@@ -38,20 +42,25 @@ PPT Slide 9:
   - test_yellow.py   入仓位姿子工具 (x=-65 / y=-150) ⚠️ belt-slip; 开仓见 open_storage.py
   - open_storage.py  单职责开仓模块 (2026-07-31 简化: 不再读 y 不动 y,
                      调用方自己把 y 摆到 [-205, -145] 区间, 本脚本只下舵机)
-  - target1.py       用户指定目标位姿 (y=-195→arm=+90°→hand=0°→x=-260), 含
-                      belt-slip 分段兜底 ⚠️ x 超物理墙
-  - target2.py       侧摄识别球类 (蓝/黄) + 返回归一化坐标; 替代旧 target_test.py
-                      的 fetch_balls/save_latest; 支持 --once / --loop / --color / --save
+  - target1.py       起手势 (y=-133; composite_run arm=+90°/hand=0° 并行 → x=-260
+                      hard_reach) ⚠️ x 超物理墙 (-119.5mm), 有 reset_x 撞墙兜底
+  - target2.py       侧摄识别球类 (蓝/黄) + 返回归一化坐标; 支持 --once / --loop /
+                      --color / --save / --debug; 2026-08-01 删 BALL_VERIFIED_*
+                      位姿验证 (位姿偏移下误伤过滤)
   - x_to_zero.py     x 撞墙回 0 (跟 task5/get_blue.py 同款, 走底层 reset_x + probe_time=0.3)
-  - pick_up_blue.py  抓蓝球序列 (9 步: 记+吸+抓+抬+移 bin(0)+放+释+定 y+回抓取位)
-                     v6 加回抓取位 (默认 -260 = target1 抓取位)
-  - pick_up_yellow.py 抓黄球序列 (跟 pick_up_blue 同 9 步, 唯一区别: 步骤 5 移 -65)
-  - dipan.py         底盘单步直行 (默认 80mm, sync 阻塞到完成; 走 car.move_for)
-  - target4.py       target1 起手 + 循环 7 次 (底盘前移 80mm → 识别 → 抓球),
-                     2026-07-31 重写替代 v7 状态机 (用户原话 "识别到就停")
+  - pick_up_blue.py  抓蓝球序列 (独立调试工具; 主流程已走 target4 内置
+                     pick_by_vision + composite_run); 2026-08: 步骤 4+5/8+9
+                     改 composite_run 并行
+  - pick_up_yellow.py 抓黄球序列 (同 pick_up_blue, 唯一区别: 步骤 5 移 -65)
+  - dipan.py         底盘工具: step_chassis_forward 单步直行 (旧离散步进工具) +
+                     _stop_chassis_quietly 停车兜底 (target4 finally 复用)
+  - target4.py       主流程 (2026-08-03 底盘视觉伺服版): target1 起手 +
+                     (creep 慢速搜索 → track_chassis 最左球定位 → pick_by_vision
+                     吸嘴中心抓 → composite_run 放 bin) ×N, 预算式收尾;
+                     orchestrator 入口 main/task/task4_harvest.py
 
 约束要点（详见 main/arm/ARM_API.md）:
-  - 业务层禁改 smartcar / runtime / car_wrap_2026
+  - 业务层禁改 smartcar / runtime
   - 一律走 _read_x_mm_realtime() 读 x (x_get_position 坏, §11)
   - 开仓 75° 必在 y ∈ [-205, -145] mm (§6.3 Round 15)
   - belt-slip: 单次 x 行程 24-46mm, 跨 bin 必分段 (§7.2.1)

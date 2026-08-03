@@ -3,7 +3,7 @@
 """任务四: 作物抓取 (收割).
 
 实际业务逻辑委托至: main.arm.each_task.task4.target4.step_target4
-(约 4642 行, 移植自 am 分支).
+(移植自 am 分支; 2026-08 P1 重写为 pick_by_vision 视觉伺服 + composite_run 并行放 bin).
 
 完整业务流程概览:
   1. 摆臂到初始姿态 target1 (Y=-133, 大臂=+90°, 手爪=0°)

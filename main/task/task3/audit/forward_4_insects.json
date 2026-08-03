@@ -1,0 +1,70 @@
+{
+  "config": {
+    "token": null,
+    "max_travel": 1.5,
+    "dy": 0.1,
+    "max_insects": 4,
+    "min_score": 0.5,
+    "cooldown": 8.0,
+    "llm_timeout": 8.0,
+    "crop_padding": 0.2,
+    "streamer": null,
+    "save": "audit/forward_4_insects.json"
+  },
+  "traveled_m": 0.4,
+  "insects_by_order": [
+    {
+      "order": 1,
+      "first_seen_at_seg": 2,
+      "first_seen_traveled_m": 0.1,
+      "xc": 0.654,
+      "yc": 0.075,
+      "score": 0.959,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "蜜蜂属于有益动物",
+      "llm_ms": 2467
+    },
+    {
+      "order": 2,
+      "first_seen_at_seg": 3,
+      "first_seen_traveled_m": 0.2,
+      "xc": 0.106,
+      "yc": 0.091,
+      "score": 0.95,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "蜜蜂属于有益动物",
+      "llm_ms": 2939
+    },
+    {
+      "order": 3,
+      "first_seen_at_seg": 4,
+      "first_seen_traveled_m": 0.3,
+      "xc": -0.454,
+      "yc": 0.099,
+      "score": 0.949,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "图像中显示出一只蜜蜂",
+      "llm_ms": 2035
+    },
+    {
+      "order": 4,
+      "first_seen_at_seg": 4,
+      "first_seen_traveled_m": 0.3,
+      "xc": 0.507,
+      "yc": 0.058,
+      "score": 0.93,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "瓢虫属于有益动物",
+      "llm_ms": 1918
+    }
+  ],
+  "summary": {
+    "pest": 0,
+    "beneficial": 4,
+    "unknown": 0
+  }
+}

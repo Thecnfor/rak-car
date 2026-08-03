@@ -1,0 +1,50 @@
+{
+  "config": {
+    "token": null,
+    "y_min": -0.16,
+    "y_max": 0.16,
+    "y_step": 0.04,
+    "x_pos": 0.0,
+    "target_count": 4,
+    "max_rounds": 3,
+    "center_tol": 0.08,
+    "min_score": 0.5,
+    "merge_dist": 0.18,
+    "merge_window": 8.0,
+    "llm_timeout": 8.0,
+    "crop_padding": 0.2,
+    "settle": 0.4,
+    "streamer": null,
+    "save": "audit/scan_4_boards.json"
+  },
+  "sweep_rounds": 1,
+  "records": [
+    {
+      "order": 1,
+      "xc": 0.531,
+      "yc": 0.144,
+      "score": 0.909,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 2000,
+      "y_at_found": -0.144
+    },
+    {
+      "order": 2,
+      "xc": 0.546,
+      "yc": -0.06,
+      "score": 0.94,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1882,
+      "y_at_found": -0.088
+    }
+  ],
+  "summary": {
+    "pest": 0,
+    "beneficial": 2,
+    "unknown": 0
+  }
+}

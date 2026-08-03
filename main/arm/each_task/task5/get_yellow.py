@@ -61,6 +61,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
+from main.arm.each_task.common import move_x_with_split  # noqa: E402
 
 
 # ---------- 目标位姿常量 (内联, 不依赖 constants.py) ----------
@@ -69,86 +70,25 @@ LOG_PREFIX: str = "[task5/get_yellow]"
 
 GET_YELLOW_X_MM: float = -68.0
 """取黄 x (mm)。68mm 跨 belt-slip 单次有效行程 (24-46mm, §7.2.1),
-走 _move_x_with_split (test_x_to_150.py 模式) 分段 + 卡住 kick。"""
-
-# belt-slip 安全 move_x 参数 (test_x_to_150.py 模式, ARM_API §7.2.1+§11)
-MOVE_X_TOL_MM: float = 5.0          # 到位容差 (realtime 抖动 <1mm, 放宽给 PID 余量)
-MOVE_X_V_MAX_MMS: float = 30.0      # 业务限速 (2026-07-22 限速透传 bug 修复后定档 30)
-MOVE_X_MAX_ROUNDS: int = 12         # 最多尝试轮数
-MOVE_X_STALL_MM: float = 3.0        # 本轮位移 < 此值视为卡住 (疑似打滑)
-MOVE_X_MAX_STALL_ROUNDS: int = 3    # 连续卡住这么多轮 → 放弃
-MOVE_X_KICK_SLEEP_S: float = 0.2    # kick: 停一下让同步带齿重新咬合
+走 _move_x_with_split (common.move_x_with_split) 分段 + 卡住 kick。
+(2026-08-03: belt-slip 参数不再内联, 全走 common 默认值, 数值与旧版一致。)"""
 
 
-# ---------- belt-slip 安全 move_x (内联, 走 test_x_to_150.py 模式) ----------
+# ---------- belt-slip 安全 move_x (抽离到 main.arm.each_task.common) ----------
 
+# 2026-08-03: 原来这里有一份内联 _move_x_with_split (旧版, 无 wall_hit / overshoot),
+# 与 high_tower / low_tower / target 一样抽到 common。本地保留同名薄 wrapper →
+# 兼容 run() 内部调用 + 历史 log 习惯, 同时自动获得 wall_hit / overshoot 增强。
 def _move_x_with_split(client: ArmClient, runner: ArmRunner,
                        target_x_mm: float) -> dict:
-    """belt-slip 安全 move_x —— 走 test_x_to_150.py 模式:
-    每轮 move_x(target, v_max_mms) 直调底层 (绕开 ArmRunner.move_x, 那个不透传 v_max_mms),
-    然后 realtime 读真值; 卡住 → kick 停一下让带重咬合; 连续 N 轮无进展 → 放弃。
+    """薄 wrapper: 透传 common.move_x_with_split, 注入 LOG_PREFIX。
 
-    runner 参数保留 (上游 run() 调用兼容), 本函数内未使用。
-
-    Returns:
-        {"target_x": float, "actual_x": float, "segments": int, "reached": bool}
+    见 main/arm/each_task/common.py:move_x_with_split 完整 docstring。
     """
-    # 读基准
-    x0 = client._read_x_mm_realtime()
-    if x0 is None:
-        raise RuntimeError("realtime x_mm 读不到 (arm_feed 未启 / realtime 不可用)")
-    delta = target_x_mm - x0
-
-    if abs(delta) <= MOVE_X_TOL_MM:
-        print(f"  {LOG_PREFIX} move_x({target_x_mm}mm)  已在容差内 (x0={x0:+.1f}mm), 跳过")
-        return {"target_x": target_x_mm, "actual_x": x0, "segments": 0, "reached": True}
-
-    print(f"  {LOG_PREFIX} move_x({target_x_mm}mm)  距 {delta:+.1f}mm  "
-          f"v_max={MOVE_X_V_MAX_MMS:.0f}mm/s  TOL=±{MOVE_X_TOL_MM:.0f}mm  "
-          f"reach+stall 模式 (test_x_to_150.py 同款)")
-
-    x_prev = x0
-    stall_rounds = 0
-    steps = 0
-    reached = False
-    x_final = x0
-
-    for rnd in range(1, MOVE_X_MAX_ROUNDS + 1):
-        try:
-            client.move_x(x_mm=target_x_mm, v_max_mms=MOVE_X_V_MAX_MMS)
-            x_now = client._read_x_mm_realtime()
-            if x_now is None:
-                raise RuntimeError("realtime x_mm 读不到")
-        except Exception as e:
-            print(f"  {LOG_PREFIX} [FAIL] 轮{rnd:2d}  {type(e).__name__}: {str(e)[:80]}")
-            break
-
-        step = x_now - x_prev
-        err = x_now - target_x_mm
-        steps += 1
-        x_prev = x_now
-        x_final = x_now
-        print(f"  {LOG_PREFIX} 轮{rnd:2d}  x={x_now:+7.1f}mm  本轮走={step:+6.1f}mm  "
-              f"距目标={err:+6.1f}mm")
-
-        if abs(err) < MOVE_X_TOL_MM:
-            reached = True
-            break
-
-        if abs(step) < MOVE_X_STALL_MM:
-            stall_rounds += 1
-            print(f"         [SLIP] 本轮几乎没动, kick 停 {MOVE_X_KICK_SLEEP_S}s 让同步带重咬合 "
-                  f"(连续卡住 {stall_rounds}/{MOVE_X_MAX_STALL_ROUNDS})")
-            if stall_rounds >= MOVE_X_MAX_STALL_ROUNDS:
-                print(f"         [ABORT] 连续 {MOVE_X_MAX_STALL_ROUNDS} 轮无进展, "
-                      f"撞墙/带打滑治不动, 放弃")
-                break
-            client.stop_x_speed_safety()
-            time.sleep(MOVE_X_KICK_SLEEP_S)
-        else:
-            stall_rounds = 0
-
-    return {"target_x": target_x_mm, "actual_x": x_final, "segments": steps, "reached": reached}
+    return move_x_with_split(
+        client, runner, target_x_mm,
+        log_prefix=LOG_PREFIX,
+    )
 
 GET_YELLOW_ARM_DEG: float = 85.0
 """大臂角度 (2026-07-29 用户从 -6° 改为 85°)。

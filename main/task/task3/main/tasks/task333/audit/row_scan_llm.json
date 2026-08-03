@@ -1,0 +1,34 @@
+{
+  "config": {
+    "dy": 0.04,
+    "max_travel": 1.5,
+    "target_count": 4,
+    "tol_x": 0.1,
+    "unlock_x": 0.45,
+    "min_score": 0.7,
+    "crop_padding": 0.1,
+    "direction": "forward = car.move_for([+dx, 0, 0])"
+  },
+  "init_odom": [
+    2.8959100246429443,
+    0.06455706059932709,
+    0.022166196256875992
+  ],
+  "init_arm": {
+    "y_m": -0.0001375000000000126,
+    "x_m": 0.0007939942558656116,
+    "ref_encoder": 0.15195000000000003
+  },
+  "found": [],
+  "skipped_beneficial": [],
+  "skipped_llm_failed": [
+    {
+      "seg_idx": 23,
+      "xc": -0.009615384615384616,
+      "score": 0.9411726593971252,
+      "reason": "unparseable LLM output: <think>\nThe user wants us to act as an animal recognition expert, and they ask us to analyze an image (though no image is provided). Actually, the user didn't provide any image. They want us to output"
+    }
+  ],
+  "traveled_m": 1.5,
+  "complete": false
+}

@@ -1,0 +1,309 @@
+{
+  "config": {
+    "token": null,
+    "max_travel": 1.5,
+    "dy": 0.1,
+    "min_score": 0.5,
+    "cooldown": 8.0,
+    "llm_timeout": 8.0,
+    "crop_padding": 0.2,
+    "no_llm": false,
+    "streamer": null,
+    "save": "audit/forward_1_5m_scan.json"
+  },
+  "traveled_m": 1.0,
+  "insects": [
+    {
+      "seg_idx": 1,
+      "traveled_m": 0.0,
+      "xc": 0.74,
+      "yc": 0.776,
+      "score": 0.796,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 2121
+    },
+    {
+      "seg_idx": 2,
+      "traveled_m": 0.1,
+      "xc": 0.538,
+      "yc": 0.606,
+      "score": 0.916,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1539
+    },
+    {
+      "seg_idx": 3,
+      "traveled_m": 0.2,
+      "xc": 0.255,
+      "yc": 0.438,
+      "score": 0.931,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1632
+    },
+    {
+      "seg_idx": 3,
+      "traveled_m": 0.2,
+      "xc": 0.728,
+      "yc": 0.442,
+      "score": 0.908,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "瓢虫属于有益动物",
+      "llm_ms": 1858
+    },
+    {
+      "seg_idx": 4,
+      "traveled_m": 0.3,
+      "xc": 0.007,
+      "yc": 0.49,
+      "score": 0.925,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1484
+    },
+    {
+      "seg_idx": 4,
+      "traveled_m": 0.3,
+      "xc": 0.471,
+      "yc": 0.495,
+      "score": 0.914,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "瓢虫属于益虫",
+      "llm_ms": 2704
+    },
+    {
+      "seg_idx": 4,
+      "traveled_m": 0.3,
+      "xc": 0.925,
+      "yc": 0.517,
+      "score": 0.606,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 2082
+    },
+    {
+      "seg_idx": 5,
+      "traveled_m": 0.4,
+      "xc": -0.243,
+      "yc": 0.404,
+      "score": 0.935,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1972
+    },
+    {
+      "seg_idx": 5,
+      "traveled_m": 0.4,
+      "xc": 0.692,
+      "yc": 0.435,
+      "score": 0.932,
+      "label_cn": "害虫",
+      "label_en": "PEST",
+      "analysis": "图像中含有蝗虫",
+      "llm_ms": 2097
+    },
+    {
+      "seg_idx": 5,
+      "traveled_m": 0.4,
+      "xc": 0.195,
+      "yc": 0.406,
+      "score": 0.931,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "瓢虫是有益动物",
+      "llm_ms": 1683
+    },
+    {
+      "seg_idx": 6,
+      "traveled_m": 0.5,
+      "xc": -0.084,
+      "yc": 0.413,
+      "score": 0.928,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1894
+    },
+    {
+      "seg_idx": 6,
+      "traveled_m": 0.5,
+      "xc": -0.505,
+      "yc": 0.409,
+      "score": 0.923,
+      "label_cn": "未识别",
+      "label_en": "UNKNOWN",
+      "analysis": "unparseable LLM output: ```json\n{\"result\": 0, \"analysis\": \"图像中主体是金鱼并非农田动物\"} \n//或{ \"result\": 1,\"analysis\": \"未识别出动物\"}等类似无目标识别情况也可，根据实际对图片理解判定\n",
+      "llm_ms": 2675
+    },
+    {
+      "seg_idx": 6,
+      "traveled_m": 0.5,
+      "xc": 0.382,
+      "yc": 0.433,
+      "score": 0.92,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 2088
+    },
+    {
+      "seg_idx": 6,
+      "traveled_m": 0.5,
+      "xc": 0.865,
+      "yc": 0.433,
+      "score": 0.91,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 2207
+    },
+    {
+      "seg_idx": 7,
+      "traveled_m": 0.6,
+      "xc": 0.106,
+      "yc": 0.428,
+      "score": 0.943,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1764
+    },
+    {
+      "seg_idx": 7,
+      "traveled_m": 0.6,
+      "xc": 0.596,
+      "yc": 0.43,
+      "score": 0.94,
+      "label_cn": "害虫",
+      "label_en": "PEST",
+      "analysis": "图片中的动物是蝗虫，属于有害害虫",
+      "llm_ms": 2309
+    },
+    {
+      "seg_idx": 7,
+      "traveled_m": 0.6,
+      "xc": -0.334,
+      "yc": 0.406,
+      "score": 0.922,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 2058
+    },
+    {
+      "seg_idx": 7,
+      "traveled_m": 0.6,
+      "xc": -0.731,
+      "yc": 0.406,
+      "score": 0.909,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1853
+    },
+    {
+      "seg_idx": 8,
+      "traveled_m": 0.7,
+      "xc": -0.185,
+      "yc": 0.433,
+      "score": 0.931,
+      "label_cn": "害虫",
+      "label_en": "PEST",
+      "analysis": "图像模糊无法准确识别但形似蝗虫类有害害虫",
+      "llm_ms": 1779
+    },
+    {
+      "seg_idx": 8,
+      "traveled_m": 0.7,
+      "xc": 0.286,
+      "yc": 0.43,
+      "score": 0.928,
+      "label_cn": "害虫",
+      "label_en": "PEST",
+      "analysis": "图像中是蝗虫属于有害害虫",
+      "llm_ms": 1853
+    },
+    {
+      "seg_idx": 8,
+      "traveled_m": 0.7,
+      "xc": -0.591,
+      "yc": 0.413,
+      "score": 0.889,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "瓢虫是有益动物",
+      "llm_ms": 1646
+    },
+    {
+      "seg_idx": 9,
+      "traveled_m": 0.8,
+      "xc": -0.017,
+      "yc": 0.43,
+      "score": 0.923,
+      "label_cn": "害虫",
+      "label_en": "PEST",
+      "analysis": "图像中是蝗虫，属于有害害虫",
+      "llm_ms": 1962
+    },
+    {
+      "seg_idx": 9,
+      "traveled_m": 0.8,
+      "xc": -0.469,
+      "yc": 0.442,
+      "score": 0.902,
+      "label_cn": "未识别",
+      "label_en": "UNKNOWN",
+      "analysis": "unparseable LLM output: 作为一个人工智能语言模型，我还没学习如何回答这个问题，您可以向我问一些其它的问题，我会尽力帮您解决的。",
+      "llm_ms": 584
+    },
+    {
+      "seg_idx": 9,
+      "traveled_m": 0.8,
+      "xc": -0.858,
+      "yc": 0.418,
+      "score": 0.759,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1494
+    },
+    {
+      "seg_idx": 10,
+      "traveled_m": 0.9,
+      "xc": -0.308,
+      "yc": 0.445,
+      "score": 0.93,
+      "label_cn": "害虫",
+      "label_en": "PEST",
+      "analysis": "图像中是蝗虫，属于有害害虫",
+      "llm_ms": 2604
+    },
+    {
+      "seg_idx": 10,
+      "traveled_m": 0.9,
+      "xc": -0.743,
+      "yc": 0.454,
+      "score": 0.889,
+      "label_cn": "益虫",
+      "label_en": "BENEFICIAL",
+      "analysis": "未识别出动物",
+      "llm_ms": 1676
+    }
+  ],
+  "summary": {
+    "total": 26,
+    "pest": 6,
+    "beneficial": 18,
+    "unknown": 2
+  }
+}

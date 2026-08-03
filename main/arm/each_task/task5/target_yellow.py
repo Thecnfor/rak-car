@@ -33,15 +33,15 @@
   - 单帧可能空 (球没进画面 / task_feed 刚起), 故按 `DETECT_HZ` 轮询到
     `DETECT_TIMEOUT_S` 为止, 拿到球就立刻返回。
 
-⚠️⚠️ **`verify_target1_pose` 必须是 False**:
-  - `task4/constants.py` 的 `BALL_VERIFIED_*` 是在 **task4 的 target1.py 位姿**
-    (y=-150 / x=-260 / arm=+90 / hand=0) 下实测标定的 7 项范围。
-  - **本文件位姿完全不同** (y=-200 / x=-40), 球在画面里的 cx/cy/大小都不一样。
-    开这个验证 = 每个球都被判越界过滤掉, 永远返回 0 个球。
-  - 故本脚本硬编码 `verify_target1_pose=False`, 且**不提供打开的 CLI 开关**。
-    若将来要给本位姿做同款基线, 请新标一套专属常量, 不要复用 task4 的。
-  - (参数名里的 "target1" 是 task4 那边的历史命名, 与本文件旧名 target1.py
-    无关 —— 改名后已无混淆, 但参数名属 task4, 不动。)
+⚠️⚠️ **BALL_VERIFIED_* 验证层已删除 (2026-08-01)**:
+  - `task4/target2.py` 的 `fetch_balls()` 曾有 `verify_target1_pose` 参数: task4
+    target1.py 位姿 (y=-150 / x=-260 / arm=+90 / hand=0) 标定的 7 项范围验证
+    (BALL_VERIFIED_*)。
+  - 本文件位姿完全不同 (y=-200 / x=-40), 当年硬编码 False 防止球被越界误伤光。
+  - task4 2026-08-01 重写时整个验证层已删 (位姿偏移下连 task4 自己的球都被误伤),
+    现在只剩 score + aspect + area 三层基线过滤。本文件直接复用基线过滤,
+    阈值传自己的 DETECT_*。
+  - 将来若要给本位姿加位姿专属几何基线, 请新标一套专属常量, 不要复用 task4 旧值。
 
 ⚠️ **顺序沿用 get_blue / get_yellow 的既定套路** (y → x → 大臂 → 手爪):
   - 第 1 步 move_y 走步进电机, **不过 y 保护区** (api.py:372-373 注释:
@@ -199,9 +199,9 @@ def detect_balls(client: ArmClient,
     TARGET_* 默认值 —— 那套是近景标定的, 会把本位姿的球全筛光 (2026-07-29
     实测: area 0.148~0.168 vs task4 下限 0.20, 三球全丢)。详见常量区注释。
 
-    ⚠️ `verify_target1_pose=False` 写死: BALL_VERIFIED_* 是 **task4** 的
-    target1 位姿 (y=-150/x=-260) 标定的, 本文件是 task5 的 target_yellow
-    (y=-200/x=-68), 位姿不同, 开了会把所有球误伤过滤光。详见模块 docstring。
+    ⚠️ 2026-08-01: task4 已删 BALL_VERIFIED_* 验证层 (verify_target1_pose 参数
+    不存在了), fetch_balls 只剩 score/aspect/area 三层基线过滤。位姿差异问题
+    由本文件传自己的 DETECT_* 阈值解决 (近景标定值不可复用)。
 
     纯只读: 不动机械臂。任何异常都只 warn + 返回 [], 不抛 (摆位已成功,
     不该因为看不到球把整个脚本判失败)。
@@ -241,8 +241,6 @@ def detect_balls(client: ArmClient,
                 area_min=area_min,
                 area_max=area_max,
                 aspect_tol=aspect_tol,
-                # ⚠️ 必须 False, 见上文 docstring —— 那是 task4 位姿的基线
-                verify_target1_pose=False,
             )
         except Exception as e:
             print(f"  {LOG_PREFIX} [WARN] fetch_balls 异常: "

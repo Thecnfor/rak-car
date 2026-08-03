@@ -121,24 +121,14 @@ def step_target1(client: ArmClient, runner: ArmRunner,
         print(f"  ⚠️⚠️ 2026-07-31 实测更差: motor 实际只走到 ≈ -80mm (belt-slip 等),"
               f" 不到物理墙 -119.5mm。trust 模式不报 stall, 业务层看不见。"
               f" 代码保持 -260 是用户决定, 等硬件修复后再真到位。")
-    print(f"  目标: y={y_mm}mm → arm={arm_deg}° → hand={hand_deg}° → x={x_mm}mm (最后动)")
+    print(f"  目标: composite_run(arm={arm_deg}°, y={y_mm}mm, hand={hand_deg}°) 并行 → x={x_mm}mm")
 
-    # 1. y 出保护区
-    print(f"  [1/4] move_y({y_mm}mm)  出 y 保护区 [0,-30]")
-    runner.move_y(y_mm, timeout=30.0)
+    # 1. y/arm/hand 并行摆位姿 (composite_run: ThreadPoolExecutor 4 电机并行, 省 ~2s)
+    #    arm=+90° 在复位安全带 (>= +30°), y 保护区检查自动放行, 并行安全。
+    print(f"  [1/2] composite_run(arm={arm_deg}°, y={y_mm}mm, hand={hand_deg}°)  并行摆位姿")
+    client.composite_run(arm=arm_deg, y_mm=y_mm, hand=hand_deg, speed=80, timeout=30.0)
 
-    # 2. 大臂 MID / 复位位 (init 例外位, 保护区允许)
-    print(f"  [2/4] set_arm_angle({arm_deg}°)  MID / 复位位 (init 例外位)")
-    client.set_arm_angle(arm_deg, speed=80, timeout=10.0)
-
-    # 3. 手爪 DOWN —— arm=+90° 已在复位安全带 (>= +30°), api.py:432-435 自动跳过 y 保护区拦截
-    print(f"  [3/4] 手爪 → {hand_deg}° (DOWN, arm={arm_deg}° 复位位, 保护区允许)")
-    client._call_arm(
-        "set_hand_angle", timeout=10.0, sync=True,
-        angle=hand_deg, speed=80,
-    )
-
-    # 4. x (方案 B: hard_reach 模式 = split + reset_x 撞墙兜底; 放在最后, 摆好姿态再横移)
+    # 2. x (方案 B: hard_reach 模式 = split + reset_x 撞墙兜底; 放在最后, 摆好姿态再横移)
     #    ⚠️ 2026-07-31 v6+++: 用户确认 belt-slip 修复, 但 x 物理墙 ≈ -119.5mm, target=-260 必撞墙。
     #    走 move_x_hard_reach: 先 split 试一次, 没到位就 reset_x 撞墙重置编码器零点,
     #    再 split 一次。belt-slip 修复后 reset_x 撞墙应该稳, belt-slip 复发抛 RuntimeError。
@@ -146,7 +136,7 @@ def step_target1(client: ArmClient, runner: ArmRunner,
     #    2026-08-01: hard_reach 现在内置 FUSE-rescue (FUSE 触发时先 reset_x 再抛),
     #               这里仍然 catch RuntimeError 作**最后兜底** —— 让 target1 不因
     #               单次 x 失败整个崩, 退化到 "y/arm/hand 摆好 + x 留在当前位置" 继续。
-    print(f"  [4/4] move_x({x_mm}mm)  hard_reach 模式 "
+    print(f"  [2/2] move_x({x_mm}mm)  hard_reach 模式 "
           f"(split + reset_x 撞墙兜底, belt-slip 修复后)")
     x_info: dict = {"target_x": x_mm, "actual_x": None, "final_x": None,
                     "residual_mm": None, "segments": 0, "reached": False,

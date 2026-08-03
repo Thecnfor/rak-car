@@ -11,18 +11,17 @@
   6. y 到 -155 (放球位, 命中开仓 y gate 上界)
   7. 放气
   8. y 到 -133 (最终位, 等下一阶段 target 识别)
-  9. **移 x 到 RETURN_X_MM (默认 -260 = target1.py 抓取位)** —— 走 trust 模式
+  9. **移 x 到 RETURN_X_MM (默认 -260 = target1.py 抓取位)** —— 与步骤 8 composite_run 并行
 
 ⚠️ **跟 pick_up_blue.py v6 的区别**:
-   - 唯一区别: **步骤 5** 走 move_x_trust(-65) 而不是 move_x_trust(0)
-     (黄 bin 在 x=-65, 蓝 bin 在 x=0, 见 constants.YELLOW_BIN_X_MM / BLUE_BIN_X_MM)
-   - 其他步骤 1-4, 6-9 完全一致 (吸气窗口 / y 值序列 / trust 模式 / 回抓取位)
+   - 唯一区别: **步骤 5** x 移 -65 (黄 bin) 而不是 0 (蓝 bin)
+     (见 constants.YELLOW_BIN_X_MM / BLUE_BIN_X_MM)
+   - 其他步骤 1-4, 6-9 完全一致 (吸气窗口 / y 值序列 / composite 并行 / 回抓取位)
 
 ⚠️ **跟 pick_up_blue.py 共享的设计**:
-   - 走 common.move_x_trust 而非 client.move_x —— belt-slip + stall 检测会让短距
-     move_x 反复触发 stall kick (已知现场问题, 见 memory/x-axis-belt-slip)。
-     trust 模式绕过 stall 检测, 信任 motor PID 内部闭环 (move_x 是绝对位置指令,
-     api.py:418)。
+   - 2026-08 改写: 步骤 4+5 (y 抬升 ∥ x 横移) / 8+9 (y 最终位 ∥ x 回抓取位)
+     改 composite_run 并行, x 仍是绝对位置指令。belt-slip + stall 现场史
+     见 memory/x-axis-belt-slip。
    - grasp 必须走 runner.grasp (ArmRunner 封装), 不可走 _call_arm 直调
      (ARM_API §10: kwargs 透传到 arm_base.grasp TypeError 静默失败)
    - v6 加回抓取位步骤 9 —— 用户痛点: v5 删回位后 x 不回抓取位
@@ -57,7 +56,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
-from main.arm.each_task import common  # noqa: E402
 
 
 # ---------- 步骤参数 ----------
@@ -176,24 +174,9 @@ def step_pick_up_yellow(
     print(f"  [arm]   move_y({Y_PICK_MM:+.0f})                     下到抓球位")
     runner.move_y(Y_PICK_MM)
 
-    # 4. y 到 -190 (中转位, 持球抬升)
-    print(f"  [arm]   move_y({Y_TRANSIT_MM:+.0f})                   抬到中转位 (持球)")
-    runner.move_y(Y_TRANSIT_MM)
-
-    # 5. 移 x 到 -65 (黄色 bin 正上方) —— 走 trust 模式 move_x
-    #    ⚠️ **跟 pick_up_blue 唯一区别**: 这里是 -65 (黄 bin), pick_up_blue 是 0 (蓝 bin)
-    move_x_to_bin_result = common.move_x_trust(
-        client, runner,
-        target_x_mm=X_BIN_MM,
-        log_prefix="[pick_up_yellow -> bin]",
-        v_max_mms=MOVE_X_V_MAX_MMS,
-    )
-    x_after_bin = move_x_to_bin_result["actual_x"]
-    print(f"  [arm]   move_x -> bin (-65 黄) 完成, x = {x_after_bin}, "
-          f"result={move_x_to_bin_result['result']!r}")
-    # ⚠️ 不验证 x 是否真到位 (trust 模式, 马达 stall 业务层看不见)
-    #    已知现场马达短距 move_x 经常 stall (实际不动), 但 move_x 是绝对位置指令,
-    #    motor 内部闭环准, 下一次 move_x 从真实位置出发。
+    # 4+5. y 抬到中转位 + x 移到黄 bin (composite_run 并行, 省 ~1s)
+    print(f"  [arm]   composite_run(y={Y_TRANSIT_MM:+.0f}, x={X_BIN_MM:+.0f})  抬升+横移并行")
+    client.composite_run(y_mm=Y_TRANSIT_MM, x_mm=X_BIN_MM, speed=80, timeout=30.0)
 
     # 6. y 到 -155 (放球位, 命中开仓 y gate 上界)
     print(f"  [arm]   move_y({Y_PUT_MM:+.0f})                     降到放球位 (命中开仓 y gate 上界)")
@@ -208,47 +191,22 @@ def step_pick_up_yellow(
           f"球稳定进 bin")
     time.sleep(GRASP_HOLD_AFTER_OFF_S)
 
-    # 8. y 到 -133 (最终位, 等下一阶段 target 识别)
-    print(f"  [arm]   move_y({Y_FINAL_MM:+.0f})                     升到最终位 (target 识别 y)")
-    runner.move_y(Y_FINAL_MM)
-
-    # 9. (v6 同 pick_up_blue) 移 x 回到抓取位 (默认 -260 = target1.py 抓取位)
-    #    ⚠️ 走 trust 模式 move_x_trust —— 绝对位置指令, motor 内部闭环,
-    #       不依赖 realtime 读数飘, 不 stall kick。
-    #    关键: 跟 v4 失败案例的关键区别是 **不走 reset_x**, 直接 move_x(绝对位置)。
-    move_x_to_return_result: Optional[dict] = None
-    x_after_return: Optional[float] = None
+    # 8+9. y 到最终位 + x 回抓取位 (composite_run 并行, 省 ~1s)
     if return_x_mm is not None:
-        print(f"  [arm]   move_x({return_x_mm:+.0f}mm)  回抓取位 "
-              f"(trust 模式, 绝对位置指令)")
-        move_x_to_return_result = common.move_x_trust(
-            client, runner,
-            target_x_mm=return_x_mm,
-            log_prefix="[pick_up_yellow -> return]",
-            v_max_mms=MOVE_X_V_MAX_MMS,
-        )
-        x_after_return = move_x_to_return_result["actual_x"]
-        print(f"  [arm]   move_x -> return 完成, x = {x_after_return}, "
-              f"result={move_x_to_return_result['result']!r}")
-        if move_x_to_return_result["result"] == "trust_failed":
-            print(f"  [WARN]  回抓取位失败 (motor 无响应), x 留在当前位置"
-                  f" (已知 stall, 下一阶段 target1/target4 自己会再移 x)")
+        print(f"  [arm]   composite_run(y={Y_FINAL_MM:+.0f}, x={return_x_mm:+.0f})  回最终位+回抓取位并行")
+        client.composite_run(y_mm=Y_FINAL_MM, x_mm=return_x_mm, speed=80, timeout=30.0)
     else:
-        print("  [skip]  return_x_mm is None, 跳过回 x 步骤 (v5 行为兼容)")
+        print(f"  [arm]   move_y({Y_FINAL_MM:+.0f})  升到最终位 (return_x_mm=None, 跳过回 x)")
+        runner.move_y(Y_FINAL_MM)
 
-    print("=== [pick_up_yellow] 完成 "
-          f"(记 + 吸 + 抓 + 抬 + 移 bin(-65) + 放 + 释 + 定 y + 回抓取位) ===\n")
+    print("=== [pick_up_yellow] 完成 ===\n")
     return {
         "ok": True,
-        "x_initial_mm": x_initial,        # 仅日志
-        "x_after_bin_mm": x_after_bin,    # 仅日志 (目标 -65)
-        "x_after_return_mm": x_after_return,    # 仅日志
+        "x_initial_mm": x_initial,
         "y_pick_mm": Y_PICK_MM,
         "y_transit_mm": Y_TRANSIT_MM,
         "y_put_mm": Y_PUT_MM,
         "y_final_mm": Y_FINAL_MM,
-        "move_x_to_bin_result": move_x_to_bin_result,
-        "move_x_to_return_result": move_x_to_return_result,
         "return_x_mm": return_x_mm,
         "grasp": "picked_placed",
     }

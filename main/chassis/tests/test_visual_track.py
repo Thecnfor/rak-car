@@ -6,6 +6,7 @@
   - track_chassis：到达 3 帧死区后 returned arrived=True
   - track_chassis：丢失目标超时返回 no_target
   - track_chassis：画面中心最近策略 vs 最大面积策略
+  - track_chassis：leftmost 策略 (min cx / 平局大面积 / label 过滤 / 双球端到端)
   - track_chassis：默认 target 是 h_tu_dou (2026-08-02)
 """
 import unittest
@@ -97,6 +98,34 @@ class TestSelectTarget(unittest.TestCase):
         dets = [_d(label="x")]
         self.assertIsNone(_select_target(dets, {"water"}, (0.0, 0.0)))
 
+    def test_leftmost_prefers_min_cx(self):
+        # 2026-08-03: task4 采收选画面最左球 (cx 最小); 不匹配 label 的更左也不算
+        dets = [
+            _d(label="ball_yellow", cx=0.3, cy=0.0),
+            _d(label="ball_blue", cx=-0.4, cy=0.1),
+            _d(label="ball_blue", cx=0.1, cy=-0.2),
+            _d(label="other", cx=-0.9, cy=0.0),
+        ]
+        chosen = _select_target(
+            dets, {"ball_blue", "ball_yellow"}, (0.0, 0.0), "leftmost")
+        self.assertIsNotNone(chosen)
+        self.assertAlmostEqual(chosen["bbox_norm"]["cx"], -0.4)
+        self.assertEqual(chosen["label"], "ball_blue")
+
+    def test_leftmost_tie_prefers_larger_area(self):
+        dets = [
+            _d(label="ball_blue", cx=-0.2, cy=0.0, w=0.1, h=0.1),
+            _d(label="ball_yellow", cx=-0.2, cy=0.05, w=0.3, h=0.3),
+        ]
+        chosen = _select_target(
+            dets, {"ball_blue", "ball_yellow"}, (0.0, 0.0), "leftmost")
+        self.assertEqual(chosen["label"], "ball_yellow")
+
+    def test_leftmost_no_match_returns_none(self):
+        dets = [_d(label="x", cx=-0.5)]
+        self.assertIsNone(
+            _select_target(dets, {"ball_blue"}, (0.0, 0.0), "leftmost"))
+
 
 def _steady_payloads(cx, cy, n=200, label="h_tu_dou"):
     """n 帧都停在 (cx, cy) 不动。"""
@@ -154,6 +183,35 @@ class TestTrackChassis(unittest.TestCase):
             max_lost_frames=50, dry_run=True,
         )
         self.assertTrue(result.arrived)
+
+    def test_leftmost_mode_tracks_min_cx_ball(self):
+        """双球场景: leftmost 全程锁定画面最左 (cx 最小) 那颗。
+
+        前半黄球 cx=0.4 / 蓝球 cx=-0.3 → 锁蓝; 后半蓝球被拉到 0.0
+        (黄球仍 0.4) → 死区到达, final_frame.label 必须是 ball_blue。
+        """
+        payloads = [
+            {"task_state": {"active": True, "detections": [
+                _d(label="ball_yellow", cx=0.4, cy=0.0),
+                _d(label="ball_blue", cx=-0.3, cy=0.0),
+            ]}}
+            for _ in range(10)
+        ] + [
+            {"task_state": {"active": True, "detections": [
+                _d(label="ball_yellow", cx=0.4, cy=0.0),
+                _d(label="ball_blue", cx=0.0, cy=0.0),
+            ]}}
+            for _ in range(50)
+        ]
+        api = _make_mock_api(payloads)
+        result = track_chassis(
+            ["ball_blue", "ball_yellow"], api=api, select_mode="leftmost",
+            hz=200, max_seconds=3.0,
+            kp=0.50, v_max=0.25, deadband=0.08, hold_frames=3,
+            max_lost_frames=50, dry_run=True,
+        )
+        self.assertTrue(result.arrived, result)
+        self.assertEqual(result.final_frame.label, "ball_blue")
 
     def test_sign_vx_sign_vy_accepted(self):
         """sign_vx=+1 / sign_vy=-1 参数能被接受（2026-08-02 现场可调方向开关）。"""

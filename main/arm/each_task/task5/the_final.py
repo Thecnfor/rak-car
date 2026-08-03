@@ -6,7 +6,10 @@
   2. **同色球进高仓**:
      - A = blue   → ``last_blue_to_high.main()``
      - A = yellow → ``last_yellow_to_high.main()``
-  3. **底盘后撤 165mm**: ``dipan._run(client, dist_mm=-165.0)``
+  3. **底盘到 LOW 仓取位** (2026-08-03 起两档):
+     - ``--align-area`` 传了 → 视觉闭环对仓 (main.chassis.make_align_runner,
+       按 bbox 面积前后微调; 需现场标定 ref_area), 失败回退开环
+     - 默认 → 开环后撤 165mm: ``dipan._run(client, dist_mm=-165.0)``
   4. **反色球进 LOW 仓**:
      - A = blue   → ``last_yellow_to_low.main()``   (高仓是蓝 → LOW 仓放黄)
      - A = yellow → ``last_blue_to_low.main()``     (高仓是黄 → LOW 仓放蓝)
@@ -94,16 +97,46 @@ def step2_high(client: ArmClient, runner: ArmRunner, color_a: str, args) -> int:
     return EXIT_BAD_COLOR
 
 
-def step3_back(client: ArmClient, dist_mm: float = BACK_DIST_MM) -> dict:
-    """阶段 3: 底盘后撤 dist_mm mm。复用 dipan._run。"""
-    print(f"\n========== {LOG_PREFIX} [3/4] 底盘后撤 {abs(dist_mm):.0f}mm ==========")
+def step3_back(client: ArmClient, dist_mm: float = BACK_DIST_MM,
+               align_area: float = None, align_label: str = None,
+               align_max_s: float = 15.0) -> dict:
+    """阶段 3: 底盘到 LOW 仓取位。
+
+    两种模式 (2026-08-03):
+      1. align_area 传了 → **视觉闭环对仓**: make_align_runner(ref_area=align_area)
+         按目标 bbox 面积前后微调 (main.chassis 新方法, 只动 vx 不横移不旋转)。
+         到位 → 完成; 失败 (no_target / watchdog / 超时) → 回退开环后撤。
+      2. align_area=None (默认) → 开环后撤 dist_mm mm (dipan._run, 旧行为)。
+
+    ⚠️ align_area 需**现场标定**: 手动把车摆到理想放料位, 读一帧
+       GET /v1/realtime/vision/task 里目标 bbox 的 width*height 填进来。
+       align_label=None 时取画面面积最大目标。
+    """
+    if align_area is not None:
+        print(f"\n========== {LOG_PREFIX} [3/4] 视觉闭环对仓 "
+              f"(ref_area={align_area}, label={align_label}, ≤{align_max_s}s) ==========")
+        try:
+            from main.chassis import make_align_runner  # 局部 import, 不开环时零依赖
+            runner = make_align_runner(ref_area=align_area, label=align_label)
+            result = runner.run(max_seconds=align_max_s)
+            print(f"  {LOG_PREFIX} 视觉对仓结果: arrived={result.arrived} "
+                  f"reason={result.reason} frames={result.frames} "
+                  f"elapsed={result.elapsed_s:.1f}s")
+            if result.arrived:
+                return {"mode": "vision_align", "arrived": True,
+                        "reason": result.reason}
+            print(f"  [WARN] 视觉对仓未到位 (reason={result.reason}), 回退开环后撤")
+        except Exception as e:
+            print(f"  [WARN] 视觉对仓异常: {type(e).__name__}: {e}, 回退开环后撤")
+
+    print(f"\n========== {LOG_PREFIX} [3/4] 底盘开环后撤 {abs(dist_mm):.0f}mm ==========")
     print(f"  走 dipan._run(client, dist_mm={dist_mm}) "
           f"(max_velocity=0.10 m/s, timeout=20.0s)")
     job = dipan_module._run(
         client, dist_mm=dist_mm, max_velocity_ms=0.10, timeout=20.0,
     )
     print(f"  {LOG_PREFIX} 后撤完成")
-    return job
+    return {"mode": "open_loop", "job": job}
 
 
 def step4_low(client: ArmClient, runner: ArmRunner, color_a: str, args) -> int:
@@ -155,6 +188,19 @@ def _build_last_argv(args) -> list:
         argv += ["--area-max", str(args.area_max)]
     if args.aspect_tol is not None:
         argv += ["--aspect-tol", str(args.aspect_tol)]
+    # 2026-08-03: 视觉闭环取球参数透传给 last_* (再透传 test_run_fn / pick_and_place)
+    if getattr(args, "vision", False):
+        argv += ["--vision"]
+        if getattr(args, "grasp_y", None) is not None:
+            argv += ["--grasp-y", str(args.grasp_y)]
+        if not getattr(args, "vision_fallback", True):
+            argv += ["--no-vision-fallback"]
+        if getattr(args, "sign_arm", 1.0) != 1.0:
+            argv += ["--sign-arm", str(args.sign_arm)]
+        if getattr(args, "sign_x", -1.0) != -1.0:
+            argv += ["--sign-x", str(args.sign_x)]
+        if getattr(args, "vision_timeout", 20.0) != 20.0:
+            argv += ["--vision-timeout", str(args.vision_timeout)]
     return argv
 
 
@@ -196,6 +242,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--aspect-tol", type=float, default=None,
                    dest="aspect_tol",
                    help="last_* 识别宽高比容差 |aspect-1|≤tol")
+    # ---- 2026-08-03 新增: 视觉闭环取球 (透传 last_* → test_run_fn) ----
+    p.add_argument("--vision", action="store_true",
+                   help="启用视觉闭环取球 (track_velocity_pick); "
+                        "⚠️ sign 是 task1 姿态标定值, task5 位姿首跑先确认方向")
+    p.add_argument("--grasp-y", type=float, default=None, dest="grasp_y",
+                   help="视觉模式吸气 y (mm); 不传用 pick_and_place 默认 (-70)")
+    p.add_argument("--no-vision-fallback", dest="vision_fallback", action="store_false",
+                   help="视觉失败不回退开环盲吸 (默认回退)")
+    p.add_argument("--sign-arm", type=float, default=1.0, dest="sign_arm",
+                   help="视觉伺服大臂轴符号 (±1, 现场标定)")
+    p.add_argument("--sign-x", type=float, default=-1.0, dest="sign_x",
+                   help="视觉伺服 x 轴符号 (±1, 现场标定)")
+    p.add_argument("--vision-timeout", type=float, default=20.0,
+                   dest="vision_timeout", help="视觉伺服总超时 (秒)")
+    # ---- 2026-08-03 新增: 阶段 3 视觉闭环对仓 (make_align_runner) ----
+    p.add_argument("--align-area", type=float, default=None, dest="align_area",
+                   help="阶段 3 视觉对仓参考面积 (现场标定); 传了则优先视觉闭环, "
+                        "失败回退开环后撤; 不传走开环后撤 (旧行为)")
+    p.add_argument("--align-label", default=None, dest="align_label",
+                   help="视觉对仓目标 label; 不传取画面面积最大目标")
+    p.add_argument("--align-max-s", type=float, default=15.0, dest="align_max_s",
+                   help="视觉对仓最长时长 (秒)")
+    p.set_defaults(vision_fallback=True)
     return p
 
 

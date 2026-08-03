@@ -1,43 +1,16 @@
-"""task5 / test2_from_blue_to_high —— 整合冒烟脚本 (蓝→高位仓)。
+"""task5 / test2_from_blue_to_high —— 蓝球 → 高位仓 (薄 wrapper)。
 
-吸气逻辑 (跟 test1 同款 v5, 用户 2026-07-23 第五次明确):
-  - 起点: get_blue 完成 → move_y(-70) 后立即 grasp(True) 吸气
-  - 吸气保持 5s (sleep 5s, 用户指定), 默认可用 --hold 改
-  - high_tower 期间持续吸气 (4 步, 期间吸盘一直吸住)
-  - 终点: high_tower 完成 → move_x(-160) 后 grasp(False) 放气
+(2026-08-03 重构: 主体抽到 pick_and_place.py, 本文件只保留接线 + CLI 兼容。)
 
-流程 (5 阶段, **吸气包住 high_tower + 前面 5s 独立保持 + 末尾归零**):
-  阶段 1: get_blue.py 取蓝位姿 (5 步: y=-130 → reset_x(撞墙, direction=right) → arm=85° → hand=0°(底层直调) → y=-70)
-  阶段 2: grasp(True) 吸气 + sleep(5s) 独立保持 (吸盘在 y=-70 高位, 吸空气; 若想吸球
-          需在 get_blue 完成后加一个 move_y 下探贴球动作, 当前流程未做)
-  阶段 3: high_tower 4 步 (move_y(-180) → set_arm_angle(+90°) → set_hand_angle(-90°) → move_x(-160) 分段),
-          期间吸盘持续吸气
-  阶段 4: grasp(False) 放气 (high_tower 跑完, x=-160 后立刻放)
-  阶段 5: reset_x 撞墙归零 (x=-160 → 撞取蓝墙 → x=0; 兜底防止下轮 x 飘读, 2026-07-24 加)
-
-⚠️ **关键时序演进 (跟 test1 v5 同步, 2026-07-23 第五次修正)**:
-  - v1 (错误): get_blue → grasp(60s 吸气+放气) → high_tower
-  - v2 (错误): get_blue → grasp(True) → high_tower → sleep(60s) → grasp(False)
-  - v3 (逻辑对):  get_blue → grasp(True) → high_tower → grasp(False)  # 立刻放气
-  - v4 (标注):  显式吸气窗口 = [get_blue 完成, high_tower 完成]
-  - **v5 (当前, 2026-07-23 用户第五次要求)**: 在 grasp(True) 之后、high_tower 之前加
-    sleep(5s) 独立保持; 总吸气时长 = 5s + high_tower 跑完耗时 (~9-13s)
-  - **v6 (2026-07-24 末尾加归零)**: high_tower → grasp(False) 之后, 跑一次 reset_x
-    撞取蓝墙归零 (x=-160 → x=0)。防止下一轮 get_* 进来时 x 飘读 (calibrate 框架坏)。
-
-⚠️ **跟 test1 差异**:
-  - 取物: get_yellow (move_x -68) → **get_blue (reset_x 撞墙 direction=right)**
-  - 其他 (吸气逻辑/high_tower/y 抬回位 -70/大臂 85°) 跟 test1 一致
-
-⚠️ **吸气期间吸盘位姿**: sleep(5s) 时吸盘在 (y=-70, x=0, hand=DOWN), 离地高度待实测 (y 已改 -70),
-   没贴球; 若要真吸球, 在 grasp(True) 之前先 move_y(球位, 比如 -15)。
-
-⚠️ **不动原文件**: get_blue.py / high_tower.py 一字未改, 只 import 它们的 run() 函数。
+接线:
+  - pick : get_blue.run   (y=-130 → reset_x 撞墙 x=0 → arm=85° → hand=0° → y=-70)
+  - tower: high_tower.run (y=-180 → arm=90° → hand=-90° → x=-160)
+  - label: ball_blue (仅 --vision 模式用)
 
 跑法:
-    python main/arm/each_task/task5/test2_from_blue_to_high.py            # 默认 hold 5s
+    python main/arm/each_task/task5/test2_from_blue_to_high.py            # 开环 (旧行为)
     python main/arm/each_task/task5/test2_from_blue_to_high.py --hold 10  # 改保持秒
-    python main/arm/each_task/task5/test2_from_blue_to_high.py --hold 0   # 跳过保持 (退化为 v3)
+    python main/arm/each_task/task5/test2_from_blue_to_high.py --vision   # 视觉闭环取球
 """
 from __future__ import annotations
 
@@ -51,124 +24,47 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
-
-# 复用原脚本的 run() (别名避免重名); 原文件没改
 from main.arm.each_task.task5.get_blue import run as get_blue_run  # noqa: E402
 from main.arm.each_task.task5.high_tower import run as high_tower_run  # noqa: E402
+from main.arm.each_task.task5.pick_and_place import (  # noqa: E402
+    run_pick_and_place, build_pick_place_parser,
+    GRASP_HOLD_S_DEFAULT, DEFAULT_GRASP_Y_MM,
+)
 
 
 LOG_PREFIX: str = "[task5/test2_from_blue_to_high]"
 
-GRASP_HOLD_S_DEFAULT: float = 5.0
-"""吸气独立保持秒数 (用户 2026-07-23 要求 5s)。在 grasp(True) 之后, high_tower 之前执行。
-设 0 可跳过保持 (退化为 v3 逻辑)。"""
-
-# reset_x 撞墙定原点参数 (内联, 跟 get_blue.py 的 _reset_x_wall 同款, ARM_API §9.2)
-RESET_X_DIRECTION: str = "right"
-"""终点 reset_x 方向: high_tower 在 x 负向 (HIGH_TOWER_X_MM mm, 2026-07-30 = -160),
-取蓝墙在 x 增大方向 (get_blue.py 测试结论 2026-07-22), 故走 right (正速度)
-撞取蓝墙 → 撞到点定义为 x=0。"""
-
-RESET_X_VELOCITY_MMS: float = 50.0
-"""撞墙速度 (mm/s)。§9.2 建议 50mm/s 比 wrapper 默认 20 稳。"""
-
-RESET_X_PROBE_TIME: float = 0.3
-"""arm_base.py 默认值: probe_time=0 在 '车刚好在 selected 方向的墙上' 场景下
-会立即误判 stall → calibrate 失败/撞错位置。留 0.3 让反向探针先验证 motor 工作。"""
-
-RESET_X_TIMEOUT: float = 30.0
-
-
-# ---------- reset_x 撞墙 (内联, 跟 get_blue.py 的 _reset_x_wall 同款) ----------
-
-def _reset_x_wall(client: ArmClient) -> dict:
-    """撞墙定 x 原点, 一步到位。绕过 ArmClient.reset_x wrapper (不透传 probe_time),
-    直调底层 action (ARM_API §9.2 推荐)。
-
-    Returns:
-        {"reset": job dict, "x_mm_after": float | None}
-    """
-    print(f"  {LOG_PREFIX} reset_x(direction={RESET_X_DIRECTION}, v={RESET_X_VELOCITY_MMS}mm/s, "
-          f"probe_time={RESET_X_PROBE_TIME})  撞墙一步到位")
-    job = client._call_arm(
-        "reset_x", timeout=RESET_X_TIMEOUT, sync=True,
-        direction=RESET_X_DIRECTION,
-        reset_velocity=RESET_X_VELOCITY_MMS / 1000.0,  # m/s
-        probe_time=RESET_X_PROBE_TIME,
-    )
-    x_after = client._read_x_mm_realtime()
-    print(f"  {LOG_PREFIX} reset_x 完成, realtime x={x_after}")
-    return {"reset": job, "x_mm_after": x_after}
+VISION_LABEL: str = "ball_blue"
+"""--vision 模式的视觉伺服 label (labels.py 20 项之一)。"""
 
 
 def run(client: ArmClient, runner: ArmRunner,
-        hold_s: float = GRASP_HOLD_S_DEFAULT) -> dict:
-    """整合 4 阶段: get_blue → grasp(True) → sleep(hold_s) → high_tower → grasp(False)
-
-    ⚠️ 吸气逻辑 (跟 test1 同款 v5):
-      - 起点: get_blue 完成 → move_y(-70) 后 grasp(True) 吸气
-      - 独立保持: sleep(hold_s) 秒 — 期间吸盘在 (y=-70, x=0, hand=DOWN) 持续吸气
-      - 持续期间: high_tower 4 步 — 期间吸盘持续吸气
-      - 终点: high_tower 完成 → grasp(False) 放气
-      - 总吸气时长 = hold_s + high_tower 跑完耗时 (~9-13s 默认)
-
-    Returns:
-        {"ok": True, "phases": list[str], "grasp_window": str, "hold_s": float}
-    """
-    print(f"\n========== {LOG_PREFIX} run ==========")
-    print(f"  吸气窗口: get_blue 完成 (y=-70) → sleep({hold_s:.1f}s) → high_tower 完成 (x=-160)")
-    print(f"  流程: get_blue → grasp(True) → sleep({hold_s:.1f}s) → high_tower(吸) → grasp(False)")
-    print(f"  总吸气时长: {hold_s:.1f}s + high_tower(~4-8s) = ~{hold_s + 4:.1f}-{hold_s + 8:.1f}s")
-
-    # 阶段 1: 取蓝位姿 (5 步) —— 吸盘摆到 DOWN 朝下取物位, **吸气前**
-    get_blue_run(client, runner)
-    print(f"  >>> get_blue 完成, y=-70 已就位 <<< 吸气开始触发点")
-
-    # 阶段 2: 吸气 + 独立保持 hold_s 秒 (吸盘位姿不动, 持续吸气)
-    print(f"\n----- {LOG_PREFIX} [阶段 2/4] grasp(True) + sleep({hold_s:.1f}s) -----")
-    print(f"  [1] grasp(True)   吸气开始")
-    runner.grasp(True, timeout=10.0)
-    if hold_s > 0.0:
-        print(f"  [2] sleep({hold_s:.1f}s)  吸气独立保持 ({hold_s:.1f}s, 吸盘位姿不动)")
-        time.sleep(hold_s)
-    else:
-        print(f"  [2] hold_s=0, 跳过独立保持, 立刻调 high_tower")
-
-    # 阶段 3: high_tower 4 步, 期间吸盘持续吸气
-    print(f"\n----- {LOG_PREFIX} [阶段 3/4] high_tower(期间持续吸) -----")
-    print(f"  [3] high_tower(4 步)  期间吸盘持续吸气")
-    high_tower_run(client, runner)
-    print(f"  >>> high_tower 完成, x=-160 已就位 <<< 吸气结束触发点")
-
-    # 阶段 4: 放气 (high_tower 跑完立刻放, 不再 sleep)
-    print(f"\n----- {LOG_PREFIX} [阶段 4/5] grasp(False) -----")
-    print(f"  [4] grasp(False)  放气")
-    runner.grasp(False, timeout=10.0)
-
-    # 阶段 5: x 轴归零 (reset_x 撞墙, 球已放出, 不用保持)
-    print(f"\n----- {LOG_PREFIX} [阶段 5/5] reset_x 撞墙归零 -----")
-    print(f"  [5] reset_x(direction={RESET_X_DIRECTION})  从 x=-160 撞取蓝墙 → x=0")
-    x_reset = _reset_x_wall(client)
-    print(f"  >>> reset_x 完成, realtime x={x_reset['x_mm_after']}mm <<<")
-
-    print(f"\n========== {LOG_PREFIX} 完成 (5 阶段) ==========\n")
-    return {
-        "ok": True,
-        "phases": ["get_blue", "grasp+sleep", "high_tower", "release", "reset_x"],
-        "grasp_window": f"get_blue_complete(y=-70) → sleep({hold_s:.1f}s) → high_tower_complete(x=-160)",
-        "hold_s": hold_s,
-        "x_reset": x_reset,
-    }
+        hold_s: float = GRASP_HOLD_S_DEFAULT,
+        vision: bool = False,
+        grasp_y_mm: float = DEFAULT_GRASP_Y_MM,
+        vision_fallback: bool = True,
+        sign_arm: float = 1.0,
+        sign_x: float = -1.0,
+        vision_timeout: float = 20.0) -> dict:
+    """蓝球 → 高位仓。详见 pick_and_place.run_pick_and_place。"""
+    return run_pick_and_place(
+        client, runner,
+        log_prefix=LOG_PREFIX,
+        pick_fn=get_blue_run, pick_name="get_blue",
+        tower_fn=high_tower_run, tower_name="high_tower",
+        vision=vision, vision_label=VISION_LABEL,
+        grasp_y_mm=grasp_y_mm,
+        hold_s=hold_s,
+        vision_fallback=vision_fallback,
+        sign_arm=sign_arm, sign_x=sign_x,
+        vision_timeout=vision_timeout,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="task5 test2: get_blue -> grasp+hold+sleep -> high_tower -> release (蓝→高位仓, 吸气包住 high_tower, 5s 独立保持)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    return build_pick_place_parser(
+        "task5 test2: get_blue -> 取球(开环盲吸/--vision 视觉闭环) -> high_tower -> release"
     )
-    p.add_argument("--hold", type=float, default=GRASP_HOLD_S_DEFAULT,
-                   help="吸气独立保持秒数 (默认 5.0, 设 0 跳过, 退化为 v3 逻辑)")
-    return p
 
 
 def main(argv=None) -> int:
@@ -176,7 +72,13 @@ def main(argv=None) -> int:
     client = ArmClient.connect()
     runner = ArmRunner(client)
     t_total_start = time.perf_counter()
-    run(client, runner, hold_s=args.hold)
+    run(client, runner,
+        hold_s=args.hold,
+        vision=args.vision,
+        grasp_y_mm=args.grasp_y,
+        vision_fallback=args.vision_fallback,
+        sign_arm=args.sign_arm, sign_x=args.sign_x,
+        vision_timeout=args.vision_timeout)
     elapsed = time.perf_counter() - t_total_start
     print(f"========== {LOG_PREFIX} 总耗时: {elapsed:.3f} s ==========")
     return 0
