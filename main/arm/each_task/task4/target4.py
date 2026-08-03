@@ -389,8 +389,15 @@ def _pick_and_store(
     try:
         result = runner.client._make_vision_with_move().find_target_arm_cross(
             label, timeout=min(pick_timeout_s, 6.0), hz=20,
-            gain_arm=2.5, gain_x=0.55,
-            deadzone=0.06, max_vel=0.70,
+            # 2026-08-04 现场 (单测): task1 默认 gain_x=0.55 太激进,
+            # 4s 内 x 走了 62mm 过头。task4 改:
+            #   gain_x  0.55 → 0.10
+            #   gain_arm 2.5 → 1.5
+            #   max_vel 0.70 → 0.15
+            #   deadzone 0.06 → 0.04
+            # 实测 4s 内 ball 从 dy=+0.61 收敛到 dy=+0.008 (误差 < 1% 视野)。
+            gain_arm=1.5, gain_x=0.10,
+            deadzone=0.04, max_vel=0.15,
             arm_start=POSE_P_ARM_DEG,  # +90
             # 2026-08-03 (用户): task4 arm=+90 与 task1 arm=-90 差 180° 旋转,
             # 视野坐标反向 → x 物理方向也要反过来。task1 默认 sign_x=-1,
