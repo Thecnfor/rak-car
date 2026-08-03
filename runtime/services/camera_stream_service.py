@@ -1080,10 +1080,11 @@ class CameraStreamService:
             "y_mm": None,        # 业务(mm)
             "x_mm": None,        # 业务(mm)
             "ref_encoder": None, # 丢步核对 ref
+            "arm_angle": None,   # 大臂实测角(°), 总线舵机回读; 回读失败降级指令值
+            "hand_angle": None,  # 手爪指令角(°), PWM 写-only 无回读
             "updated_at": None,
         }
 
-    # === 左右 IR 距离缓存（供 /v1/realtime/ir/state 与 WS subscribe_ir 推送） ===
     def _default_ir_state(self):
         return {
             "active": False,

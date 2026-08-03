@@ -14,6 +14,7 @@ export default defineConfig({
         main: resolve(__dirname, "index.html"),
         monitor: resolve(__dirname, "monitor/index.html"),
         teach: resolve(__dirname, "teach/index.html"),
+        chassis: resolve(__dirname, "chassis/index.html"),
       },
     },
   },

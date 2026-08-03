@@ -319,6 +319,18 @@ class FeedsMixin:
                             y_mm = (y_m * 1000.0) if y_m is not None else None
                             x_mm = (x_m * 1000.0) if x_m is not None else None
                             ref = getattr(self.arm, "_y_ref_encoder_at_zero", None)
+                            # 2026-08-04：示教器要实时角度。大臂是总线舵机可回读
+                            # (read_angle 走 SerialEngine read 共享, 20Hz 安全);
+                            # 手爪是 PWM 写-only 无回读, 给指令值 _hand_angle_last。
+                            # 回读失败不拖累 x/y 主路径, 降级为指令值。
+                            arm_angle = None
+                            try:
+                                arm_angle = float(self.arm.arm_servo.read_angle())
+                            except Exception:
+                                arm_angle = None
+                            if arm_angle is None:
+                                arm_angle = getattr(self.arm, "_arm_angle_last", None)
+                            hand_angle = getattr(self.arm, "_hand_angle_last", None)
                             health["ok_count"] += 1
                             health["last_ok_at"] = time.time()
                             health["last_err"] = None
@@ -329,6 +341,8 @@ class FeedsMixin:
                                     y_m=y_m, x_m=x_m,
                                     y_mm=y_mm, x_mm=x_mm,
                                     ref_encoder=ref,
+                                    arm_angle=arm_angle,
+                                    hand_angle=hand_angle,
                                 )
                         except Exception as exc:
                             health["err_count"] += 1

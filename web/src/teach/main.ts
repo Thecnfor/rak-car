@@ -59,8 +59,9 @@ async function pollState() {
     connText.textContent = fresh ? "连接: ok" : "arm_feed 不新鲜";
     posX.textContent = fmt(st.x_mm, 1);
     posY.textContent = fmt(st.y_mm, 1);
-    armAng.textContent = armCmd.toFixed(0);
-    handAng.textContent = handCmd.toFixed(0);
+    // 2026-08-04：大臂角走 arm_feed 总线回读实测；手爪 PWM 无回读用指令值。
+    armAng.textContent = fmt(st.arm_angle ?? armCmd, 0);
+    handAng.textContent = fmt(st.hand_angle ?? handCmd, 0);
   } catch {
     connDot.className = "dot err";
     connText.textContent = "连接: err";
