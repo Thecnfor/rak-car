@@ -211,6 +211,11 @@ class Camera:
         if self.cap is not None and self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+            # 2026-08-03：协商 30Hz。MJPEG @ 640x480 UVC 标准支持 30fps；
+            # SP2812 在 Jetson xHCI USB2.0 480M hub 下两路均能拉到 30Hz
+            # （按 50KB/帧 MJPEG 估算每路 ~94Mbps，远低于 480Mbps 总带宽）。
+            # CAP_PROP_FPS 在某些驱动上写不进去（仍返回旧值），因此只设不读。
+            self.cap.set(cv2.CAP_PROP_FPS, 30)
             # 兜底：启动时主动关 autosuspend（udev 不生效时的兜底）
             disable_usb_autosuspend_for(self.src)
 
@@ -389,6 +394,8 @@ class Camera:
             return
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        # 2026-08-03：分辨率改了之后 UVC 协商会重置 fps，重新拉一下
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
 
     def read(self):
         while self.frame is None:

@@ -85,7 +85,7 @@ class CameraStreamService:
         "cam2": "dataset/image_set_object/runtime_capture",
     }
 
-    def __init__(self, runtime_service, fps=20, quality=80):
+    def __init__(self, runtime_service, fps=30, quality=80):
         self.runtime_service = runtime_service
         self.fps = max(float(fps), 1.0)
         self.quality = int(quality)

@@ -76,38 +76,129 @@ class FeedsMixin:
     def _lane_feed_inner_loop(
         self, stop_event, period, get_frame, norm_id, feed_infer, set_state, health
     ):
-        """lane_feed 单次"健康循环"。外层 while True + try/except 包住,任何崩溃都不允许守护线程死亡。"""
+        """lane_feed 单次"健康循环"。外层 while True + try/except 包住,任何崩溃都不允许守护线程死亡。
+
+        2026-08-03 异步流水线改造:旧版本 "取帧→同步 get_infer→写状态" 三步串行,
+        单次推理慢时整条链路停摆,实测 lane_feed 长期只跑到 ~1.66Hz 而非目标 20-50Hz。
+
+        新版本 "取最新帧(丢弃过时)→非阻塞 send→非阻塞 poll 拿旧结果→有结果写状态":
+          - 抓帧永远跟得上 period(50ms / 20ms)
+          - 推理在飞时只用最新的帧(快路径下推理 8ms 也只丢 1 帧)
+          - 推理慢(如 GC / 偶发卡顿)也不会把采样率拉到 500ms+
+          - 维持 backoff 健康统计 + outer while 兜底不变
+        """
+        import zmq
         backoff = 1
         max_backoff = 20  # 20 * period = 1s @ period=50ms
+        inflight_inflight = False  # 当前是否有未返回的推理请求
+        inflight_started_at = 0.0
+        inflight_timeout_s = max(0.5, period * 10)  # 推理超时 = 10 个 period
+        last_send_at = 0.0
+        socket_lock = getattr(feed_infer, "_socket_lock", None)
         while not stop_event.is_set():
             health["last_iter_at"] = time.time()
             health["iter_count"] += 1
             try:
+                # ---- 1) 非阻塞 poll:拿上次 inflight 推理的应答 ----
+                if inflight_inflight:
+                    sock = getattr(feed_infer, "client", None)
+                    if sock is not None:
+                        recv_done = False
+                        recv_result = None
+                        if socket_lock is not None:
+                            with socket_lock:
+                                try:
+                                    result_bytes = sock.recv(zmq.NOBLOCK)
+                                    recv_done = True
+                                except zmq.error.Again:
+                                    recv_done = False
+                        else:
+                            try:
+                                result_bytes = sock.recv(zmq.NOBLOCK)
+                                recv_done = True
+                            except zmq.error.Again:
+                                recv_done = False
+                        if recv_done:
+                            try:
+                                import json as _json
+                                recv_result = _json.loads(result_bytes)
+                            except Exception:
+                                recv_result = result_bytes
+                            inflight_inflight = False
+                            if isinstance(recv_result, (list, tuple)) and len(recv_result) >= 2:
+                                error_y = float(recv_result[0])
+                                error_angle = float(recv_result[1])
+                                backoff = 1
+                                health["ok_count"] += 1
+                                health["last_ok_at"] = time.time()
+                                health["last_err"] = None
+                                if set_state is not None:
+                                    set_state(
+                                        active=True,
+                                        mode="external_feed",
+                                        error_y=error_y,
+                                        error_angle=error_angle,
+                                        forward_speed=None,
+                                        lateral_speed=None,
+                                        angular_speed=None,
+                                        distance=self.get_distance(),
+                                    )
+                        else:
+                            # 没应答,看是否超时
+                            if time.time() - inflight_started_at > inflight_timeout_s:
+                                inflight_inflight = False
+                                health["err_count"] += 1
+                                health["last_err"] = "lane_infer_timeout(>{}s)".format(inflight_timeout_s)
+                                health["last_err_at"] = time.time()
+                                if health["err_count"] <= 5 or health["err_count"] % 20 == 0:
+                                    logger.warning("lane_feed: infer timeout, drop inflight")
+
+                # ---- 2) 取最新帧(同步但只读共享 buffer,极快) ----
                 img = get_frame(norm_id) if get_frame is not None else None
                 if img is None:
                     if stop_event.wait(period):
                         return
                     continue
-                result = feed_infer.get_infer(img)
-                if not isinstance(result, (list, tuple)) or len(result) < 2:
-                    raise RuntimeError("lane feed: unexpected result shape %r" % (result,))
-                error_y = float(result[0])
-                error_angle = float(result[1])
-                backoff = 1
-                health["ok_count"] += 1
-                health["last_ok_at"] = time.time()
-                health["last_err"] = None
-                if set_state is not None:
-                    set_state(
-                        active=True,
-                        mode="external_feed",
-                        error_y=error_y,
-                        error_angle=error_angle,
-                        forward_speed=None,
-                        lateral_speed=None,
-                        angular_speed=None,
-                        distance=self.get_distance(),
-                    )
+
+                # ---- 3) 没有 inflight 时 → 非阻塞 send 一次 ----
+                if not inflight_inflight:
+                    sock = getattr(feed_infer, "client", None)
+                    if sock is not None:
+                        send_done = False
+                        if socket_lock is not None:
+                            with socket_lock:
+                                try:
+                                    sock.send(img, flags=zmq.NOBLOCK)
+                                    send_done = True
+                                except zmq.error.Again:
+                                    send_done = False
+                        else:
+                            try:
+                                sock.send(img, flags=zmq.NOBLOCK)
+                                send_done = True
+                            except zmq.error.Again:
+                                send_done = False
+                        if send_done:
+                            inflight_inflight = True
+                            inflight_started_at = time.time()
+                            last_send_at = inflight_started_at
+                        # send 失败:本帧丢,下次再试
+                    else:
+                        # 兜底:用 ClintInterface.get_infer(同步) — fallback
+                        result = feed_infer.get_infer(img)
+                        if isinstance(result, (list, tuple)) and len(result) >= 2:
+                            health["ok_count"] += 1
+                            health["last_ok_at"] = time.time()
+                            if set_state is not None:
+                                set_state(
+                                    active=True, mode="external_feed",
+                                    error_y=float(result[0]),
+                                    error_angle=float(result[1]),
+                                    forward_speed=None, lateral_speed=None,
+                                    angular_speed=None,
+                                    distance=self.get_distance(),
+                                )
+                # 否则:本帧被丢(已有 in-flight,等下次再送) — 防止堆积
             except Exception as exc:
                 wait_s = min(period * backoff, period * max_backoff)
                 health["err_count"] += 1
@@ -119,6 +210,7 @@ class FeedsMixin:
                         health["err_count"], backoff, wait_s, exc,
                     )
                 backoff = min(backoff * 2, max_backoff)
+                inflight_inflight = False
                 if set_state is not None:
                     try:
                         set_state(
@@ -137,6 +229,7 @@ class FeedsMixin:
                 if stop_event.wait(wait_s):
                     return
                 continue
+            # 节奏 sleep:取帧与 inflight poll 都很轻,period 控制频率
             if stop_event.wait(period):
                 return
 
