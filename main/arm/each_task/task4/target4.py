@@ -419,6 +419,14 @@ def _pick_and_store(
     runner.grasp(True, timeout=5.0)
     time.sleep(0.5)  # 让真空建立
 
+    # 0.6 先 x 上升到 -30 (出 bin 区 + 球出吸嘴下方), 再开始同步 bin 动作
+    #    2026-08-04 (用户): 抓球后直接 composite_run(y=bin,x=bin_x) 可能球卡在吸嘴
+    #    下方被横移拖飞, 先抬升 x 到中间 (-30) 球出吸嘴正下方再放仓。
+    print(f"  [{LOG_PREFIX}] 中间姿态 x=-30 + 抬升 y={Y_TRANSIT_MM}")
+    arm_client.composite_run(
+        y_mm=Y_TRANSIT_MM, x_mm=-30.0, speed=80, timeout=30.0,
+    )
+
     # 1. 一步到 bin 放仓位 (4 轴并发, 没有中间过渡姿态)
     print(f"  [{LOG_PREFIX}] composite_run(y={Y_PUT_MM} ∥ x={bin_x}) → bin 放仓位")
     arm_client.composite_run(
