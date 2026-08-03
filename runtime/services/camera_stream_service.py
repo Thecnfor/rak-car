@@ -196,6 +196,16 @@ class CameraStreamService:
                     "usb_autosuspend": usb_power["autosuspend"],
                     "usb_power_warn": usb_power["warn"],
                 }
+        # 2026-08-03: 上报**实际协商 fps**(而非 service 期望 fps)。
+        # Camera 类协商后会写 self._negotiated_fps(读回 CAP_PROP_FPS);
+        # 若协商失败/被驱动忽略,字段为 0 → 健康端会显示 "negotiated=0"
+        # 便于一眼区分 "30 是 service 期望" vs "30 是真实"。
+        negotiated_fps = {}
+        for cam_id, cam in self.cameras.items():
+            try:
+                negotiated_fps[cam_id] = float(getattr(cam, "_negotiated_fps", 0.0) or 0.0)
+            except Exception:
+                negotiated_fps[cam_id] = 0.0
         return {
             "status": "running" if self.running else "stopped",
             "active_cams": active_cams,
@@ -203,6 +213,7 @@ class CameraStreamService:
             "quality": self.quality,
             "stale_timeout": self.stale_timeout,
             "cameras": cameras,
+            "negotiated_fps": negotiated_fps,
         }
 
     @staticmethod
