@@ -22,7 +22,9 @@ const taskOverlay = $("taskOverlay") as HTMLInputElement;
 const jogSpeed = $("jogSpeed") as HTMLInputElement;
 const jogSpeedLabel = $("jogSpeedLabel")!;
 const btnGoHome = $("btnGoHome") as HTMLButtonElement;
+const btnGrasp = $("btnGrasp") as HTMLButtonElement;
 const btnZeroAll = $("btnZeroAll") as HTMLButtonElement;
+const detTableBody = document.querySelector("#detTable tbody")!;
 const poseName = $("poseName") as HTMLInputElement;
 const btnTeach = $("btnTeach") as HTMLButtonElement;
 const poseTableBody = document.querySelector("#poseTable tbody")!;
@@ -35,11 +37,19 @@ const poseMsg = $("poseMsg")!;
 interface Pose { name: string; x_mm: number; y_mm: number; arm: number; hand: number; ts: number }
 const POSES_KEY = "rakcar.poses";
 let poses: Pose[] = loadPoses();
-
-// 舵机指令角（前端维护；init/reset 后默认复位位）
-let armCmd = 90;    // 大臂 +90 = 复位位
-let handCmd = -90;  // 手爪 -90 = UP
+// 舵机目标角基准。空闲时持续从 arm_feed 强同步（大臂=总线舵机实测回读，
+// 手爪=runtime 最后指令值 _hand_angle_last），按住 QERF 期间用本地积分、
+// 松手回归 feed —— 无论谁动过臂（任务/别的客户端/上次会话），积分起点
+// 都是真实位置，不再假定复位位。
+let armCmd = 90;    // 首帧 feed 到达前的兜底
+let handCmd = -90;
 let estopped = false;
+let graspOn = false;
+// 舵机长按点动角速度 (°/s)，100ms tick 积分成目标角连续下发（舵机是位置控制，
+// 目标角连续追 = 平滑转动）。Q/E 大臂、R/F 手爪，松手即停。
+const SERVO_JOG_DEG_PER_S = 20;
+// 舵机点动键：按住期间本地积分、不同步 feed
+const SERVO_AXES = ["q", "e", "r", "f"];
 
 function loadPoses(): Pose[] {
   try { return JSON.parse(localStorage.getItem(POSES_KEY) || "[]") as Pose[]; }
@@ -59,9 +69,14 @@ async function pollState() {
     connText.textContent = fresh ? "连接: ok" : "arm_feed 不新鲜";
     posX.textContent = fmt(st.x_mm, 1);
     posY.textContent = fmt(st.y_mm, 1);
-    // 2026-08-04：大臂角走 arm_feed 总线回读实测；手爪 PWM 无回读用指令值。
     armAng.textContent = fmt(st.arm_angle ?? armCmd, 0);
     handAng.textContent = fmt(st.hand_angle ?? handCmd, 0);
+    // 强同步：没在按舵机键时，把积分基准拉回真实状态。
+    // 按住期间不同步 —— feed 的实测值滞后于目标角，同步会让积分爬行。
+    if (!SERVO_AXES.some((k) => axes.has(k))) {
+      if (typeof st.arm_angle === "number") armCmd = st.arm_angle;
+      if (typeof st.hand_angle === "number") handCmd = st.hand_angle;
+    }
   } catch {
     connDot.className = "dot err";
     connText.textContent = "连接: err";
@@ -98,23 +113,36 @@ jogSpeed.addEventListener("input", () => {
 });
 jogSpeedLabel.textContent = jogVelocity().toFixed(2) + " m/s";
 
-async function sendJog() {
+async function jogTick() {
   if (estopped) return;  // 急停后不发速度（runtime 也会 409 拒）
+  // x/y 速度模式
   const v = jogVelocity();
   let xVel = 0, yVel = 0;
   if (axes.has("a")) xVel -= v;
   if (axes.has("d")) xVel += v;
   if (axes.has("w")) yVel -= v;  // y 负 = 向上
   if (axes.has("s")) yVel += v;
+  // 舵机长按：目标角连续积分（位置控制舵机追目标角 = 平滑转动）
+  const step = SERVO_JOG_DEG_PER_S * 0.1;
+  let armDelta = 0, handDelta = 0;
+  if (axes.has("q")) armDelta -= step;
+  if (axes.has("e")) armDelta += step;
+  if (axes.has("r")) handDelta -= step;
+  if (axes.has("f")) handDelta += step;
+  if (armDelta !== 0) armCmd = Math.max(-150, Math.min(90, armCmd + armDelta));
+  if (handDelta !== 0) handCmd = Math.max(-90, Math.min(0, handCmd + handDelta));
+  const payload: Record<string, number> = { x_vel: xVel, y_vel: yVel };
+  if (armDelta !== 0) payload.arm_angle = Math.round(armCmd * 10) / 10;
+  if (handDelta !== 0) payload.hand_angle = Math.round(handCmd * 10) / 10;
   try {
-    await api.armVelocity({ x_vel: xVel, y_vel: yVel });
+    await api.armVelocity(payload);
   } catch { /* 连接抖动：下个 tick 重试；急停后 409 属预期 */ }
 }
 
 function startJog() {
   if (jogTimer) return;
-  jogTimer = window.setInterval(sendJog, 100);
-  sendJog();
+  jogTimer = window.setInterval(jogTick, 100);
+  jogTick();
 }
 function stopJog(hard = false) {
   axes.clear();
@@ -123,17 +151,7 @@ function stopJog(hard = false) {
   api.armVelocity({ x_vel: 0, y_vel: 0 }).catch(() => undefined);
 }
 
-function servoStep(axis: "arm" | "hand", delta: number) {
-  if (estopped) return;
-  if (axis === "arm") {
-    armCmd = Math.max(-150, Math.min(90, armCmd + delta));
-    api.armVelocity({ arm_angle: armCmd }).catch(() => undefined);
-  } else {
-    handCmd = Math.max(-90, Math.min(0, handCmd + delta));
-    api.armVelocity({ hand_angle: handCmd }).catch(() => undefined);
-  }
-}
-const KEY_AXIS: Record<string, string> = { w: "w", s: "s", a: "a", d: "d" };
+const KEY_AXIS: Record<string, true> = { w: true, s: true, a: true, d: true, q: true, e: true, r: true, f: true };
 const keycaps = new Map<string, HTMLElement>();
 document.querySelectorAll<HTMLElement>(".keycap").forEach((el) => {
   keycaps.set(el.textContent!.trim().toLowerCase(), el);
@@ -148,10 +166,7 @@ document.addEventListener("keydown", (ev) => {
     keycaps.get(k)?.classList.add("pressed");
     startJog();
     ev.preventDefault();
-  } else if (k === "q") { servoStep("arm", -5); keyPress(k); ev.preventDefault(); }
-  else if (k === "e") { servoStep("arm", +5); keyPress(k); ev.preventDefault(); }
-  else if (k === "r") { servoStep("hand", -5); keyPress(k); ev.preventDefault(); }
-  else if (k === "f") { servoStep("hand", +5); keyPress(k); ev.preventDefault(); }
+  }
 });
 document.addEventListener("keyup", (ev) => {
   const k = ev.key.toLowerCase();
@@ -161,30 +176,90 @@ document.addEventListener("keyup", (ev) => {
     if (axes.size === 0) stopJog();
   }
 });
-function keyPress(k: string) {
-  const el = keycaps.get(k);
-  if (!el) return;
-  el.classList.add("pressed");
-  window.setTimeout(() => el.classList.remove("pressed"), 180);
-}
 // 失焦/切页 = 安全第一，立即全停
 window.addEventListener("blur", () => stopJog());
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopJog(); });
+
+// ---------- task 检测目标实时坐标（task_feed 缓存，10Hz） ----------
+async function pollDets() {
+  try {
+    const d = (await api.taskState()) as Record<string, any>;
+    const st = d.task_state || {};
+    const dets = (st.detections || []) as Array<Record<string, any>>;
+    detTableBody.innerHTML = "";
+    const top = dets.slice().sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8);
+    for (const det of top) {
+      const bn = det.bbox_norm || {};
+      const tr = document.createElement("tr");
+      const cells = [
+        String(det.label ?? det.cls_id ?? "?"),
+        typeof det.score === "number" ? det.score.toFixed(2) : "--",
+        fmt(bn.x_center, 3),
+        fmt(bn.y_center, 3),
+        fmt(bn.width, 3),
+        fmt(bn.height, 3),
+      ];
+      for (const t of cells) {
+        const td = document.createElement("td");
+        td.textContent = t;
+        td.className = "num";
+        tr.appendChild(td);
+      }
+      detTableBody.appendChild(tr);
+    }
+    if (!top.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 6;
+      td.className = "dim";
+      td.textContent = "无检测（task_feed 空）";
+      tr.appendChild(td);
+      detTableBody.appendChild(tr);
+    }
+  } catch { /* 静默 */ }
+}
+window.setInterval(pollDets, 100);
+pollDets();
 
 btnZeroAll.addEventListener("click", () => {
   stopJog();
   api.armVelocity({ x_vel: 0, y_vel: 0 }).catch(() => undefined);
 });
 
+/** sync execute 返回 {ok, job}；job.status 必须 succeeded，否则抛带 error 的错。 */
+function assertJobOk(d: Record<string, unknown>, label: string) {
+  const job = (d.job ?? {}) as Record<string, unknown>;
+  if (job.status !== "succeeded") {
+    throw new Error(label + " 失败: " + String(job.error ?? job.status ?? "unknown"));
+  }
+}
+
 btnGoHome.addEventListener("click", async () => {
   btnGoHome.disabled = true;
   try {
-    await api.executeArm("composite_go_home", {});
-    armCmd = 90; handCmd = -90;  // go_home 回复位位
+    assertJobOk(await api.executeArm("composite_go_home"), "go_home");
+    armCmd = 0; handCmd = -90;  // composite_go_home 默认 arm=0/hand=-90
   } catch (e) {
-    alert("go_home 失败: " + (e as Error).message);
+    alert((e as Error).message);
   } finally {
     btnGoHome.disabled = false;
+  }
+});
+
+// 吸盘开关：grasp(bool) 走 job_queue，sync 等完成
+btnGrasp.addEventListener("click", async () => {
+  if (estopped) return;
+  btnGrasp.disabled = true;
+  const next = !graspOn;
+  try {
+    assertJobOk(await api.executeArm("grasp", { value: next }), "吸盘");
+    graspOn = next;
+    btnGrasp.textContent = "吸盘: " + (graspOn ? "开" : "关");
+    btnGrasp.classList.toggle("primary", graspOn);
+  } catch (e) {
+    alert((e as Error).message);
+  } finally {
+    btnGrasp.disabled = false;
   }
 });
 
@@ -257,13 +332,13 @@ async function gotoPose(p: Pose, btn: HTMLButtonElement) {
   const old = btn.textContent;
   btn.textContent = "运动中…";
   try {
-    // composite_run: x/y 单位米（SDK 口径），arm/hand 单位度
-    await api.executeArm("composite_run", {
+    // composite_run: x/y 单位米（SDK 口径），arm/hand 单位度；参数走 kwargs
+    assertJobOk(await api.executeArm("composite_run", {
       x: p.x_mm / 1000,
       y: p.y_mm / 1000,
       arm: p.arm,
       hand: p.hand,
-    });
+    }), "前往位姿");
     armCmd = p.arm;
     handCmd = p.hand;
   } catch (e) {

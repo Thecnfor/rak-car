@@ -125,6 +125,12 @@ def build_realtime_router(service):
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router_v1.get("/realtime/chassis/command")
+    def v1_realtime_chassis_command():
+        """调试/UI 用：最后一次底盘三速指令（外环或 web 点动下发），
+        替代 lane_state 里从未被填的 forward/lateral/angular 字段。"""
+        return {"ok": True, "chassis_command": service.get_chassis_command()}
+
     @router_v1.post("/realtime/arm-velocity")
     def v1_realtime_arm_velocity(payload: dict = Body(default={})):
         """arm 4-DOF 直发 — 绕开 arm_queue, 供视觉伺服连续追踪。

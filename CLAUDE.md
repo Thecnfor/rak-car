@@ -67,8 +67,8 @@ The runtime's job is to:
 - Run `auto_init` in the background — if the MC602 reboots, runtime rebuilds `MyCar()` automatically (see `RAK_CAR_AUTO_INIT`).
 - Provide a job queue (`/v1/jobs`, `/v1/execute`) so callers don't deadlock against an init in progress.
 - Expose vision results and camera streams without each caller rebuilding the inference backends.
-- **Default-on `lane_feed` daemon (20 Hz)** that keeps `lane_state` fresh for the chassis outer loop — started at init, idempotent on reuse. Toggle via `/v1/execute` actions `start_lane_feed` / `stop_lane_feed`; see `runtime/VISION_API.md` for `/v1/vision/lane` and the lane-overlay stream toggle.
-- **Default-on `arm_feed` daemon (20 Hz)** mirrors the same pattern for the arm: it keeps `arm_state` (y/x position, `ref_encoder`) fresh for UI / debugging. No action-level toggle — read via `GET /v1/realtime/arm/state` or WS `subscribe_arm_state`; see [main/arm/ARM_API.md](./main/arm/ARM_API.md) §2.
+- **Default-on `lane_feed` daemon (50 Hz)** that keeps `lane_state` fresh for the chassis outer loop — started at init, idempotent on reuse. Toggle via `/v1/execute` actions `start_lane_feed` / `stop_lane_feed`; see `runtime/VISION_API.md` for `/v1/vision/lane` and the lane-overlay stream toggle.
+- **Default-on `arm_feed` daemon (20 Hz)** mirrors the same pattern for the arm: it keeps `arm_state` (y/x position, `ref_encoder`) fresh for UI / debugging. Toggle via `/v1/execute` actions `start_arm_feed` / `stop_arm_feed`（视觉伺服前要 `stop_arm_feed(force=True)` 释放串口）; read via `GET /v1/realtime/arm/state` or WS `subscribe_arm_state`; see [main/arm/ARM_API.md](./main/arm/ARM_API.md) §2.
 
 If you only need to drive the car (no internal changes), you should be writing a script in `main/` against `RuntimeApiClient` — **not** importing `MyCar` directly.
 
@@ -85,9 +85,9 @@ python3 /home/jetson/workspace/rak-car/main/car_start_api.py # API-style mission
 
 | 子包 | 用途 | 自己的 doc |
 | --- | --- | --- |
-| `main/arm/` | 机械臂业务：`api/`（ArmClient 聚合 8 个 mixin）、`vision/`（4-DOF 视觉伺服 + depth-aware PID + RealtimeLoop）、ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/`（闭环 + `VisualOrchestrator`）、`each_task/`（task1/2/4/5/6/7 业务逻辑）、`tasks/` 流程、`examples/` 模板、`tests/` 141 单测、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [QUICKSTART.md](./main/arm/QUICKSTART.md) / [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) |
+| `main/arm/` | 机械臂业务：`api/`（ArmClient 聚合 8 个 mixin）、`vision/`（4-DOF 视觉伺服 + depth-aware PID + RealtimeLoop）、ArmRunner + S 曲线 dry-run + 软限位 + OriginCalibrator；`loops/`（闭环 + `VisualOrchestrator`）、`each_task/`（task1/2/4/5/6/7 业务逻辑）、`tasks/` 流程、`examples/` 模板、`tests/` 141 单测、`arm_origin.yaml` 零点标定 | [README.md](./main/arm/README.md) / [ARM_API.md](./main/arm/ARM_API.md) / [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) |
 | `main/chassis/` | 底盘外环：ChassisClient + 50Hz 主循环；`controllers/` (P / Stanley / curvature_adaptive) + `loops/` (closed_loop, safety, telemetry) + `tasks/` (read_ir) + `cli/` (run_lane_follow, read_ir) + `config/` (lane_follow) | [README.md](./main/chassis/README.md) |
-| `main/task/` | 8 任务编排索引：`TASK_RUNNERS = {1..7: run}` + `_config.py`（`load_task_config` 读 `task_config.yml`）；task1/2/6 逻辑在本目录（走 ArmRunner），task4/5 包装 `main/arm/each_task/`，task3/7 抛 `NotImplementedError`（orchestrator 捕获跳过）；`tests/` 14 单测 | [README.md](./main/task/README.md) |
+| `main/task/` | 8 任务编排索引：`TASK_RUNNERS = {1..7: run}` + `_config.py`（`load_task_config` 读 `task_config.yml`）；task1/2/6 逻辑在本目录（走 ArmRunner），task4/5 包装 `main/arm/each_task/`，task3 已实现（subprocess 调 `task3/task3_pipeline.py` 三段式流水线），仅 task7 抛 `NotImplementedError`（orchestrator 捕获跳过）；`tests/` 14 单测 | [README.md](./main/task/README.md) |
 | `main/misc/` | 单文件 mini 任务（射击、边走边打等），每个脚本可直接 `python3` 跑 | [README.md](./main/misc/README.md) |
 | `main/test/` | 离线硬件冒烟脚本（arm / storage / x / 循迹），**非正式测试**，绕过 runtime 直接打硬件；改动 main/ 任务前先在这里验证 | — |
 
@@ -135,9 +135,9 @@ Two closed-loop transports (see [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md
 
 Before a visual-servo run, `stop_arm_feed(force=True)` frees the serial port from the 20 Hz `arm_feed` poll (else its `goto_position` polls starve the queue); restore with `start_arm_feed`.
 
-**`VisualOrchestrator`** (`main/arm/loops/orch_visual.py`, import from `main.arm.loops`) is the combined chassis→arm pick pipeline used by task1 — three stages: ① `track_chassis()` centers the target in frame using the chassis' two velocity DOFs; ② `track_velocity_pick()` aligns the 4-DOF arm onto the suction-nozzle setpoint in velocity mode; ③ y drops to 0 → `grasp(True)`. One-call entry: `track_and_grasp(label, chassis_max_seconds=..., arm_timeout=...)`; stages are also usable individually (`chassis_only` / `arm_only` / `grasp`). The screen-axis → motion sign mapping is field-calibrated in [orch_visual.md](./main/arm/loops/orch_visual.md) (cx→chassis vx/vy, dx→arm_angle, dy→x — read it before flipping any sign).
+**`VisualOrchestrator`** (`main/arm/loops/orch_visual.py`, import from `main.arm.loops`) is the combined chassis→arm pick pipeline — three stages: ① `track_chassis()` centers the target in frame using the chassis' two velocity DOFs; ② `track_velocity_pick()` aligns the 4-DOF arm onto the suction-nozzle setpoint in velocity mode; ③ y drops to 0 → `grasp(True)`. Implemented but **not yet wired into any task** (task1 calls `track_chassis` + `track_velocity_pick` directly). One-call entry: `track_and_grasp(label, chassis_max_seconds=..., arm_timeout=...)`; stages are also usable individually (`chassis_only` / `arm_only` / `grasp`). The screen-axis → motion sign mapping is field-calibrated in [orch_visual.md](./main/arm/loops/orch_visual.md) (cx→chassis vx/vy, dx→arm_angle, dy→x — read it before flipping any sign).
 
-Docs: [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) (1-page) / [VISION_SERVO_DESIGN.md](./main/arm/VISION_SERVO_DESIGN.md) / [VISION_REALTIME_DESIGN.md](./main/arm/VISION_REALTIME_DESIGN.md) / [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md).
+Docs: [VISUAL_SERVO_QUICKREF.md](./main/arm/VISUAL_SERVO_QUICKREF.md) (1-page，唯一概述) / [TEST_PREFLIGHT.md](./main/arm/TEST_PREFLIGHT.md)（早期 DESIGN/PLAN/REALTIME 设计文档已随实现完成删除，git 历史可查）.
 
 ## Big-picture architecture
 
@@ -147,8 +147,8 @@ Three layers, top-down. The names in **bold** are the files you'll touch most.
 
 - **`run.py`** — thin CLI shell (adds repo root to `sys.path`, parses args) delegating to `main.start.orchestrator.Orchestrator`. Flags: `--lane-hz`, `--ir-interval-s`, `--task N` (single-task run: lane-follow to that waypoint → trigger → run → stop).
 - **`main/start/orchestrator.py`** — background thread A: 50 Hz lane-follow outer loop (`main.chassis.loops.closed_loop.DoubleLoopRunner`, pause/resume); thread B: 20 Hz wheel-odometry accumulation; main thread: walks waypoints (loaded from `task_config.yml` `waypoints:`, fallback `DEFAULT_WAYPOINTS`), each waits on an IR + odometry trigger (default AND) → pauses the loop → `main.task.TASK_RUNNERS[task_id](client)` → resumes. Only `main.start` should import this file — it serves `run.py` exclusively.
-- **`main/task/`** — numbered task registry. Each `task{N}_*.py` exposes `run(client=None) -> Dict`; unimplemented tasks (3/7) raise `NotImplementedError`, which the orchestrator catches and skips. Business logic lives in the wrapper itself (task1/2/6, built on `main.arm.ArmRunner` + `composite_pick` / `composite_release` / `composite_run`) or in `main/arm/each_task/` (task4/5). Per-task poses/slots come from `task_config.yml` via `main/task/_config.py::load_task_config()` — **that yaml is the calibration surface when porting to a different venue**, not the task code.
-- task1's vision grasp runs through `VisualOrchestrator` (see "Visual servo" above): chassis track → 4-DOF align → grasp.
+- **`main/task/`** — numbered task registry. Each `task{N}_*.py` exposes `run(client=None) -> Dict`; unimplemented task (7) raises `NotImplementedError`, which the orchestrator catches and skips（task3 已实现：subprocess 薄封装 → `task3/task3_pipeline.py`）. Business logic lives in the wrapper itself (task1/2/6, built on `main.arm.ArmRunner` + `composite_pick` / `composite_release` / `composite_run`) or in `main/arm/each_task/` (task4/5). Per-task poses/slots come from `task_config.yml` via `main/task/_config.py::load_task_config()` — **that yaml is the calibration surface when porting to a different venue**, not the task code.
+- `VisualOrchestrator`（chassis track → 4-DOF align → grasp 一条龙）已实现但当前**无 task 接线**——task1 实际直接调 `track_chassis` + `runner.track_velocity_pick`。新 task 想做全流程闭环可以第一个接它。
 
 The legacy monolith (`car_start_2026.py` / `car_task_function.py` / `car_wrap_2026.py`) was deleted in `c23c871`; the `MyCar(MecanumDriver, *Mixins)` facade now lives only in `runtime/services/my_car/` (§D).
 
@@ -268,7 +268,7 @@ The MC602 periodically reboots; the runtime must rebuild `MyCar()` after each re
 - **Mission layer:** `main/start/orchestrator.py` docstring + `main/task/README.md` + `task_config.yml` comments (the venue-calibration surface).
 - **Runtime HTTP API:** `runtime/README.md` (含并发任务模型、锁层次、双 worker 队列、/v1/execute 异步语义; ⚠️ 其目录清单早于 mixin 拆分, 实际结构见上文 §D), `runtime/STREAM_API.md`, `runtime/VISION_API.md`.
 - **Business client:** `main/README.md`, `main/QUICKSTART.md`, `main/API_INDEX.md`（权威 action / HTTP / WS 速查）.
-- **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/QUICKSTART.md` + `main/arm/TEST_PREFLIGHT.md`（真机测试前检查）; 视觉伺服：`main/arm/VISUAL_SERVO_QUICKREF.md` / `VISION_SERVO_DESIGN.md` / `VISION_SERVO_PLAN.md` / `VISION_REALTIME_DESIGN.md`; chassis→arm 联调流水线：`main/arm/loops/orch_visual.md`; `main/chassis/README.md`; `main/task/README.md`; `main/misc/README.md`.
+- **Business client — subpackages:** `main/arm/README.md` + `main/arm/ARM_API.md` + `main/arm/TEST_PREFLIGHT.md`（真机测试前检查）; 视觉伺服：`main/arm/VISUAL_SERVO_QUICKREF.md`（唯一概述）; chassis→arm 联调流水线：`main/arm/loops/orch_visual.md`; `main/chassis/README.md`; `main/task/README.md`; `main/misc/README.md`.
 - **User-facing intro:** `README.md` (the original competition-tasks overview in Chinese).
 - **Controller lab:** `test/README.md`, `test/OPERATION_GUIDE.md`, `test/PROTOCOL_NOTES.md`.
 - **本地端到端验证脚本：** `main/test/verify_concurrent.py`（gitignored，本地用），跑双线程探针测 lane + arm 并发。

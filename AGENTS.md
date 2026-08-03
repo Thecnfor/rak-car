@@ -121,7 +121,7 @@ GET /v1/health → GET /v1/infer/state → GET /stream/health
 | `config_car.yml` | Cameras, PID, inference ports — chassis/inference calibration |
 | `task_config.yml` | **Venue calibration surface**: per-task arm poses + `waypoints:` list. Port venues by editing this file, never task code |
 | `ecosystem.config.js` | PM2 app definition + all production `RAK_CAR_*` env vars |
-| `CLAUDE.md`, `api.md` | Authoritative conventions; full HTTP/WS/action API reference |
+| `CLAUDE.md`, `main/API_INDEX.md` | Authoritative conventions; full HTTP/WS/action API reference |
 | `runtime/VISION_API.md`, `STREAM_API.md` | Vision + MJPEG endpoint contracts |
 
 ### Key env vars

@@ -60,7 +60,7 @@ curl -s http://$HOST:5050/v1/realtime/lane/state | jq  # 应见 lane_state
 
 ```bash
 curl -X POST $HOST:5050/v1/execute -H 'Content-Type: application/json' \
-     -d '{"target":"arm","name":"start_arm_feed","args":[]}' -d '{"sync": true}'
+     -d '{"target":"arm","name":"start_arm_feed","args":[],"sync":true}'
 ```
 
 ⚠️ **WS push 路径必须先有 `start_task_feed`，否则 `find_target_realtime` 会拿不到数据**（它走 WS 订阅，不是 HTTP 轮询）。
@@ -80,7 +80,7 @@ curl -X POST $HOST:5050/v1/execute -H 'Content-Type: application/json' \
                                  -v
 ```
 
-**预期**：55+ tests, OK.
+**预期**：141 tests（19 个文件）, OK.
 
 🟡 若 `test_vision_realtime_safety` 失败 —— PR#13 修复（`_make_vision_with_move` 必须 wrap `find_target` 和 `find_target_realtime` 两个方法引用，不允许只 wrap 一个）。
 
@@ -236,11 +236,11 @@ for evt, det in events[:5]:
 ```bash
 # 复位
 curl -X POST $HOST:5050/v1/execute -H 'Content-Type: application/json' \
-     -d '{"target":"arm","name":"composite_go_home","args":[]}' -d '{"sync": true}'
+     -d '{"target":"arm","name":"composite_go_home","args":[],"sync":true}'
 
 # 关闭 ws subscriber
 curl -X POST $HOST:5050/v1/execute -H 'Content-Type: application/json' \
-     -d '{"target":"arm","name":"stop_arm_feed","args":[]}' -d '{"sync": true}'
+     -d '{"target":"arm","name":"stop_arm_feed","args":[],"sync":true}'
 
 # 写日志
 echo "$(date -Iseconds) | $(whoami) | VISUAL_SERVO SMOKE PASS" >> .remember/test_log.md
@@ -267,7 +267,7 @@ echo "$(date -Iseconds) | $(whoami) | VISUAL_SERVO SMOKE PASS" >> .remember/test
 □ PM2 online
 □ 4 路 sensor 数值合理
 □ task_feed / lane_feed / arm_feed 全 active
-□ runtime_guard 6 测试全过
+□ runtime_guard 5 测试全过
 □ 05 smoke 4 TP 全过
 □ composite_go_home 复位成功
 □ 后视摄像头拍 1 张,目视检查目标在视野正中
@@ -277,34 +277,12 @@ echo "$(date -Iseconds) | $(whoami) | VISUAL_SERVO SMOKE PASS" >> .remember/test
 
 ---
 
-## 13. 架构约束速查（2026-08-01 真机踩坑总结）
+## 13. 架构约束速查（指针）
 
-### 13.1 arm_queue 积压是"视觉伺服离散/乱跑"的根因 ⚠️
+真机踩坑结论的权威出处已上移，这里只留三条最要命的红线 + 指针：
 
-| 症状 | 根因 | 实测数据 |
-|---|---|---|
-| 视觉伺服"不连续 / 离散" | `find_target_track` 每帧发 HTTP `goto_position` 进 arm_queue | 位置闭环 ~500ms/次,视觉 ~8Hz,命令积压 100+ |
-| "停下来了还在乱跑" | queue 里积压的 `goto_position` 继续依次执行 | 191 个 running/queued 积压 |
-| `goto_position` 504 | arm_feed 20Hz poll 占满 arm_queue | 15 次连续 goto_position 全部 504, 0.5 iter/s |
+1. **位置闭环不适合视觉伺服**：`goto_position` 每步 ~500ms 且进 arm_queue，高频下发必积压（实测 191 个排队）。视觉追踪一律用速度模式 `runner.track_velocity*` / `/v1/realtime/arm-velocity`。详见 CLAUDE.md「Visual servo」段。
+2. **速度模式 x 无软限位**：目标丢失时**调用方必须发 0**，否则一直冲。y 有磁感安全门。
+3. **伺服前 `stop_arm_feed(force=True)`**：释放串口，跑完 `start_arm_feed` 恢复（§3 已列命令）。
 
-**结论**:位置闭环模式 (`goto_position` / `move_x_position`) 天然 ~500ms/步,不适合高频视觉伺服。**视觉伺服必须用速度模式**。
-
-### 13.2 实时速度通道 (`/v1/realtime/arm-velocity`)
-
-| 项 | 值 |
-|---|---|
-| 端点 | `POST /v1/realtime/arm-velocity` |
-| payload | `{"x_vel": 0.0, "y_vel": 0.0}` 单位 m/s;缺省/null = 该轴不动;`0.0` = 显式停 |
-| 实现 | `service.set_arm_velocity()` → `car.arm.x_speed()/y_speed()` 直发, `_realtime_gate` 免 car_lock, 不进 job_queue |
-| 安全 | `y_speed` 内置磁感安全门 + 末段/顶段减速; `x_speed` 有急停门。**x 无软限位,调用方必须在检测丢失时发 0** |
-| 用法 | 见 `main/arm/examples/07_velocity_track_yellow_ball.py` |
-
-### 13.3 arm_feed 让位机制 (可选但推荐)
-
-`stop_arm_feed(force=True)` 释放串口给视觉伺服(降 queue 竞争); 跑完 `start_arm_feed(20Hz)` 恢复。
-安全前提: arm_feed 不被 lane_follow 外环依赖。06/07 脚本已内置该逻辑。
-
-### 13.4 单测覆盖提醒
-
-- `test_vision_track.py` 测 `find_target_track` — 但 track 模式**不写 trace**(`trace=()`),只返回 `iterations`。若需逐帧观测请用 velocity 模式 (07 脚本) 或自写循环。
-- `find_target_realtime` 默认 `on_missing_track="abort"`(5 帧未命中抛错); `find_target_track` 默认 `"wait"`(不抛,等目标回来)。
+详细背景：[VISUAL_SERVO_QUICKREF.md](./VISUAL_SERVO_QUICKREF.md) + CLAUDE.md「Visual servo」。

@@ -4,10 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>示教器 · RAK-CAR</title>
-  <script type="module" crossorigin src="../assets/teach-BexkxzDl.js"></script>
-  <link rel="modulepreload" crossorigin href="../assets/base-CgcSJqTL.js">
+  <script type="module" crossorigin src="../assets/teach-BNAdGjet.js"></script>
+  <link rel="modulepreload" crossorigin href="../assets/base-DPRbPaTn.js">
   <link rel="stylesheet" crossorigin href="../assets/base-DfDI-Lv3.css">
-  <link rel="stylesheet" crossorigin href="../assets/teach-BEVX1L3p.css">
+  <link rel="stylesheet" crossorigin href="../assets/teach-4QPbMr_0.css">
 </head>
 <body>
   <div class="statusbar">
@@ -55,10 +55,10 @@
             <span class="keycap">D</span> x→ (右)
           </div>
           <div class="krow">
-            <span class="keycap">Q</span> 大臂 −5°
-            <span class="keycap">E</span> 大臂 +5°
-            <span class="keycap">R</span> 手爪 −5°
-            <span class="keycap">F</span> 手爪 +5°
+            <span class="keycap">Q</span> 大臂 −（长按）
+            <span class="keycap">E</span> 大臂 +（长按）
+            <span class="keycap">R</span> 手爪 −（长按）
+            <span class="keycap">F</span> 手爪 +（长按）
           </div>
         </div>
         <div class="slider-row">
@@ -69,8 +69,19 @@
         <div class="warn-line">⚠ x 轴无软限位：点动时盯紧机械臂行程，失焦/松手自动停</div>
         <div class="btn-row">
           <button id="btnGoHome">归位 (composite_go_home)</button>
+          <button id="btnGrasp">吸盘: 关</button>
           <button id="btnZeroAll">全停 (velocity 0)</button>
         </div>
+      </div>
+
+      <div class="panel">
+        <h3>task 检测目标（实时坐标）</h3>
+        <table id="detTable">
+          <thead>
+            <tr><th>label</th><th>score</th><th>cx</th><th>cy</th><th>w</th><th>h</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
 
       <div class="panel">

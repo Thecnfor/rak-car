@@ -1,7 +1,7 @@
 # 视觉伺服算法速查（1 页业务版）
 
 > 接手 5 分钟读完。能讲清楚：**算法在做什么、为什么这样做、不能做什么、还能怎么改**。
-> 设计细节看 `VISION_SERVO_DESIGN.md`（32k），分阶段实施计划看 `VISION_SERVO_PLAN.md`（67k）。
+> 本文是视觉伺服的**唯一概述**（早期 DESIGN/PLAN/REALTIME 设计文档已随实现完成而删除，git 历史可查）。
 
 ---
 
@@ -144,7 +144,7 @@ if abs(dx_norm) > arm_dx_threshold_norm:    # 默认 0.3
 /usr/bin/python3 -m unittest discover -s main/arm/tests -p "test_*.py" -v
 ```
 
-**11 个测试，关键 4 个**：
+**19 个测试文件 / 141 用例，关键 4 个**：
 - `test_servo_depth.py` — `compute_depth` 边界（bbox=0、target=0、bbox=None、正常）
 - `test_servo_pid.py` — PID 响应
 - `test_servo_4dof.py` — 急弯策略
@@ -155,7 +155,7 @@ if abs(dx_norm) > arm_dx_threshold_norm:    # 默认 0.3
 | 你想看 | 看哪里 |
 |---|---|
 | 完整业务 API | `ARM_API.md` §0-§10 |
-| 实时 WS 设计 | `VISION_REALTIME_DESIGN.md` |
-| 历史实施计划 | `VISION_SERVO_PLAN.md` |
-| 子包总览 | `README.md` |
-| 10 行上手 | `QUICKSTART.md` |
+| WS 实时推送端点 | `ARM_API.md` §10.7 |
+| chassis→arm 联调标定 | `loops/orch_visual.md` |
+| 子包总览 + 10 行上手 | `README.md` |
+| 实机 checklist | `TEST_PREFLIGHT.md` |
