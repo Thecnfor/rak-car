@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>底盘调试 · RAK-CAR</title>
-  <script type="module" crossorigin src="../assets/chassis-DpiYEnNC.js"></script>
+  <script type="module" crossorigin src="../assets/chassis-DF5ITkPK.js"></script>
   <link rel="modulepreload" crossorigin href="../assets/base-DPRbPaTn.js">
   <link rel="stylesheet" crossorigin href="../assets/base-DfDI-Lv3.css">
   <link rel="stylesheet" crossorigin href="../assets/chassis-Y7666AAo.css">
@@ -78,6 +78,11 @@
           <span>平移速度</span>
           <input type="range" id="jogLin" min="5" max="50" step="5" value="15">
           <b id="jogLinLabel">0.15 m/s</b>
+        </div>
+        <div class="slider-row">
+          <span>旋转速度</span>
+          <input type="range" id="jogAng" min="2" max="15" step="1" value="5">
+          <b id="jogAngLabel">0.5 rad/s</b>
         </div>
         <div class="btn-row">
           <button id="btnStop">全停 (0,0,0)</button>

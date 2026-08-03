@@ -181,6 +181,8 @@ laneOverlay.addEventListener("change", () => {
 
 jogLinLabel.textContent = linV().toFixed(2) + " m/s";
 jogAngLabel.textContent = angV().toFixed(1) + " rad/s";
+jogLin.addEventListener("input", () => { jogLinLabel.textContent = linV().toFixed(2) + " m/s"; });
+jogAng.addEventListener("input", () => { jogAngLabel.textContent = angV().toFixed(1) + " rad/s"; });
 
 // ---------- 底盘点动 ----------
 const axes = new Set<string>();
