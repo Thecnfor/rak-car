@@ -6,6 +6,9 @@
   - error_y 在死区内 → vy=0, 纯巡航轮速
   - vy 超过 strafe_v → 钳位
   - kd_y 阻尼: 误差快速归零时压回 vy（防回正过头 → 回正后重新偏移），首帧不误触发
+  - error_angle 超死区 → ω 视觉航向纠正与 vx/vy 正交合成下发
+  - error_angle 在死区内 → ω=0；ω 超过 omega_max → 钳位
+  - ω 积分: 无误差时指数衰减归 0；sign_theta 翻号 → 旋转方向相反
   - OdomTurnPID: θ_target=θ_start+90°, err>0→ω>0, |err|<2°→done（弯道控制器，后续接回）
 """
 import math
@@ -62,6 +65,61 @@ class TestStraightCorrection(unittest.TestCase):
         composed = outer.step(LaneState(error_y=0.05, error_angle=0.0), 0.05)
         # 首帧无历史 ey → 只有 P 项: vy = +(0.05-0.01) = +0.04
         self.assertAlmostEqual(composed[0], 0.25 + 0.04, places=6)
+
+
+class TestStraightHeadingCorrection(unittest.TestCase):
+    """ω 视觉航向纠正通道（error_angle → ω，取自 orthogonal.py 旋转通道）。"""
+
+    def test_error_angle_over_deadband_rotates_while_cruising(self):
+        outer = StraightOuterLoop(ea_deadband=0.001, kp_theta=2.0, omega_max=0.5)
+        composed = outer.step(LaneState(error_y=0.0, error_angle=0.05), 0.02)
+        # ea=0.05 → dz=0.049, P=2*0.049=0.098, I 首帧≈0.15*0.049*0.02≈0.00015 → ω≈+0.098
+        # 车头偏右(ea>0) → sign_theta=+1 逆时针左转 ω>0; wheel[0] = vx + r*ω
+        omega = (composed[0] - outer.vx_cruise) / outer.r_eff
+        self.assertGreater(omega, 0.0)
+        self.assertLess(omega, 0.5)
+        self.assertEqual(outer.corrections, 0)  # ω 帧不算 vy 横移回正
+
+    def test_error_angle_within_deadband_no_omega(self):
+        outer = StraightOuterLoop(ea_deadband=0.01, kp_theta=2.0)
+        composed = outer.step(LaneState(error_y=0.0, error_angle=0.005), 0.02)
+        # ea 在死区内 → ω=0, 纯巡航: [vx,-vx,-vx,vx]
+        self.assertEqual(composed[0], 0.25)
+        self.assertEqual(composed[1], -0.25)
+
+    def test_omega_clamps_at_omega_max(self):
+        outer = StraightOuterLoop(ea_deadband=0.001, kp_theta=2.0, omega_max=0.2)
+        composed = outer.step(LaneState(error_y=0.0, error_angle=0.5), 0.02)
+        # P=2*0.499=0.998 → 钳在 omega_max=0.2 → wheel[0] = 0.25 + 0.3*0.2
+        self.assertAlmostEqual(composed[0], 0.25 + 0.3 * 0.2, places=6)
+
+    def test_omega_integral_decays_when_error_gone(self):
+        outer = StraightOuterLoop(ea_deadband=0.001, kp_theta=0.0, ki_theta=1.0)
+        outer.step(LaneState(error_y=0.0, error_angle=0.1), 0.02)
+        outer.step(LaneState(error_y=0.0, error_angle=0.1), 0.02)
+        self.assertGreater(outer._ea_integral, 0.0)
+        # 误差归零后积分指数衰减（ea_int_decay=0.5 → τ=2s），每帧单调下降
+        acc = outer._ea_integral
+        for _ in range(50):
+            outer.step(LaneState(error_y=0.0, error_angle=0.0), 0.02)
+            self.assertLess(outer._ea_integral, acc)
+            acc = outer._ea_integral
+
+    def test_sign_theta_flips_rotation_direction(self):
+        outer = StraightOuterLoop(ea_deadband=0.001, kp_theta=2.0, sign_theta=-1.0)
+        composed = outer.step(LaneState(error_y=0.0, error_angle=0.05), 0.02)
+        omega = (composed[0] - outer.vx_cruise) / outer.r_eff
+        self.assertLess(omega, 0.0)
+
+    def test_vy_and_omega_compose_independently(self):
+        outer = StraightOuterLoop(
+            deadband_y=0.01, kp_y=1.0, strafe_v=0.1,
+            ea_deadband=0.001, kp_theta=2.0,
+        )
+        composed = outer.step(LaneState(error_y=0.05, error_angle=0.05), 0.02)
+        # vy=+1*(0.05-0.01)=+0.04; ω≈+0.098 → wheel[0] = 0.25+0.04+0.3*0.098 > 0.25+0.04
+        self.assertGreater(composed[0], 0.25 + 0.04)
+        self.assertEqual(outer.corrections, 1)
 
 
 class TestOdomTurnPID(unittest.TestCase):

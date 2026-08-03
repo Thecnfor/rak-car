@@ -1,33 +1,50 @@
 """main/chassis/controllers/straight.py
-直道控制律：vx 定速巡航 + vy 横移回正正交合成（十字正交分解，odom theta 保持 0）。
-step() 输出 mecanum_inverse(vx_cruise, vy, 0) 4 轮线速度，交给 DoubleLoopRunner
+直道控制律：vx 定速巡航 + vy 横移回正 + ω 视觉航向纠正，三通道十字正交分解。
+step() 输出 mecanum_inverse(vx_cruise, vy, omega) 4 轮线速度，交给 DoubleLoopRunner
 下发（runner 负责 smoother / watchdog / 标定 / 暂停恢复）。
 
-vy = sign_y * (kp_y * (ey - deadband_y) + kd_y * d(ey)/dt)，过死区后按比例，
-再被 kd_y 阻尼压接近速度（防回正过头 → 回正后重新偏移的震荡），|vy| ≤ strafe_v。
-error_y 需经 runner 的 calibrator 标成米（--error-scale-y 等）。
+vy 通道：PD 修 error_y（横向偏差 → 左右纯平移），
+    vy = sign_y * (kp_y * (ey - deadband_y) + kd_y * d(ey)/dt)，过死区后按比例，
+    再被 kd_y 阻尼压接近速度（防回正过头 → 回正后重新偏移的震荡），|vy| ≤ strafe_v。
+ω 通道：PI 修 error_angle（视觉航向 → 原地纯旋转摆正），取自 orthogonal.py 旋转通道：
+    omega = sign_theta * (kp_theta * ea + ki_theta * I(ea))，I 指数衰减 + 硬 cap，
+    |omega| ≤ omega_max。
+    直道右偏的根因就是旧版 ω 恒 0——只横移不转航向，车头一直歪着、横移在硬顶；
+    加了 ω 后车会主动转到与线平行，横移只兜残余偏差。
+error_y / error_angle 需经 runner 的 calibrator 标成物理量（--error-scale-y 等）。
 
 弯道（里程计 theta 闭环 90° 转弯）后续再接回：OdomTurnPID 在 controllers/odom_turn.py 保留。
 """
 from __future__ import annotations
 
+import math
+from dataclasses import asdict
 from typing import List, Optional
 
 from ..state import LaneState
 from .base import OuterLoop, mecanum_inverse
+from .orthogonal import OrthogonalDebug  # 直道 debug 复用 orthogonal 模板（vy 的 I 槽位是 D 项）
 
 
 class StraightOuterLoop(OuterLoop):
-    """直道：vx 巡航 + vy 横移正交回正（θ 保持 0）。
+    """直道：vx 巡航 + vy 横移回正 + ω 视觉航向纠正（三通道十字正交分解）。
 
     参数：
-        vx_cruise  - 直道巡航前向速度 (m/s)。全程 omega=0, 只发前进。
+        vx_cruise  - 直道巡航前向速度 (m/s)。全程 vx 恒定。
         deadband_y - |error_y| 死区 (m, 标定后)。超过才启动 vy 横移回正。
         kp_y       - vy 横移通道比例增益 (m/s 每米误差)。过死区后 vy = sign_y*kp_y*(ey-deadband)。
         kd_y       - vy 横移通道阻尼增益。误差快速归零（要冲过头）时压掉部分 vy，
                      抑制回正过头 → 回正后重新偏移的极限环。0 关闭。
         sign_y     - y 回正方向, +1 = error_y>0(车在线右) 左移回中; 实车反了改 -1。
         strafe_v   - |vy| 横移速度上限 (m/s)。
+        kp_theta   - ω 航向通道比例增益 (rad/s 每弧度航向误差)。
+        ki_theta   - ω 航向通道积分增益。消稳态航向偏差（右偏就是稳态偏差）。
+        omega_max  - |ω| 旋转速度上限 (rad/s)。直道巡航给比 orthogonal 小的值。
+        ea_deadband- ω 通道死区 (rad)。|error_angle| 小于它 → ω 不输出。
+        ea_int_decay - ω 积分指数衰减 (s^-1)，无误差时 I 自己归 0。
+        ea_int_cap - ω 积分硬上限 (rad·s)。
+        sign_theta - ω 方向, +1 = error_angle>0(车头偏右) 逆时针左转回正
+                     （跟 orthogonal 的符号约定一致）。实车反了改 -1。
         r_eff      - mecanum_inverse 半径 (m), 算 4 轮速用。
     """
 
@@ -40,6 +57,13 @@ class StraightOuterLoop(OuterLoop):
         kd_y: float = 0.2,
         sign_y: float = 1.0,
         strafe_v: float = 0.05,
+        kp_theta: float = 1.5,
+        ki_theta: float = 0.15,
+        omega_max: float = 0.25,
+        ea_deadband: float = 0.005,
+        ea_int_decay: float = 0.5,
+        ea_int_cap: float = 0.1,
+        sign_theta: float = 1.0,
         r_eff: float = 0.30,
     ) -> None:
         self.vx_cruise = float(vx_cruise)
@@ -49,9 +73,22 @@ class StraightOuterLoop(OuterLoop):
         self.sign_y = -1.0 if float(sign_y) < 0 else 1.0
         self.strafe_v = float(strafe_v)
         self.r_eff = float(r_eff)
+
+        # ω 视觉航向通道（PI，同 orthogonal.py 旋转通道）
+        self.kp_theta = float(kp_theta)
+        self.ki_theta = float(ki_theta)
+        self.omega_max = float(omega_max)
+        self.ea_deadband = float(ea_deadband)
+        self.ea_int_decay = float(ea_int_decay)
+        self.ea_int_cap = float(ea_int_cap)
+        self.sign_theta = -1.0 if float(sign_theta) < 0 else 1.0
+        self._ea_integral = 0.0  # ω 通道积分
+
         self.corrections = 0  # vy 横移回正生效的帧数
         self._prev_ey: Optional[float] = None  # 上一帧 ey，算 D 阻尼用
+        self._dbg: Optional[OrthogonalDebug] = None
 
+    # ── 内部 ────────────────────────────────────────────────────
     def _vy_from_ey(self, ey: float) -> float:
         """error_y → vy 横移通道 P 项（十字正交分解的 vy 轴）。过死区后按比例推，上限 strafe_v。"""
         if abs(ey) <= self.deadband_y:
@@ -60,28 +97,80 @@ class StraightOuterLoop(OuterLoop):
         vy = self.sign_y * self.kp_y * e
         return max(-self.strafe_v, min(self.strafe_v, vy))
 
-    def step(self, state: LaneState, dt: float) -> List[float]:
-        """直道: vx 定速巡航 + vy 横移回正正交合成（十字正交分解），
-        ω 恒 0 → odom theta 保持 0。error_y 经 runner 标定后是米。
+    def _omega_from_ea(self, ea: float, dt: float):
+        """error_angle → ω 视觉航向通道 PI（取自 orthogonal.py 旋转通道 227-237）。
 
-        vy 通道 PD：P 项过死区按比例推，D 项（-kd_y*d(ey)/dt）在误差快速归零、
+        死区（拉普拉斯风格，过了就按比例）+ 积分指数衰减（无误差时 I 自己归 0，
+        不留"上一段路"的积分）+ 硬 cap，最后整体钳到 ±omega_max。
+        返回 (omega, ea_dz, p, i)，p/i 给 debug 用。
+        """
+        ea_dz = 0.0
+        if abs(ea) > self.ea_deadband:
+            ea_dz = ea - self.ea_deadband if ea > 0 else ea + self.ea_deadband
+        self._ea_integral = (
+            self._ea_integral * math.exp(-self.ea_int_decay * dt) + ea_dz * dt
+        )
+        if self.ea_int_cap > 0:
+            self._ea_integral = max(-self.ea_int_cap, min(self.ea_int_cap, self._ea_integral))
+        p = self.kp_theta * ea_dz
+        i = self.ki_theta * self._ea_integral
+        omega = self.sign_theta * (p + i)
+        if self.omega_max > 0:
+            omega = max(-self.omega_max, min(self.omega_max, omega))
+        return omega, ea_dz, p, i
+
+    # ── 主 step ─────────────────────────────────────────────────
+    def step(self, state: LaneState, dt: float) -> List[float]:
+        """直道: vx 定速巡航 + vy 横移回正 + ω 视觉航向纠正（三通道十字正交分解）。
+        error_y / error_angle 经 runner 标定后是物理量。
+
+        vy 通道 PD：P 项过死区按比例推，D 项（+sign_y*kd_y*d(ey)/dt）在误差快速归零、
         车要冲过头时把 vy 往回拉，抵消惯性。D 只在回正生效区间内叠加，最后整体
         钳到 ±strafe_v。
+        ω 通道 PI：error_angle → 主动转航向（直道右偏的根因是 ω 恒 0）。各通道独立，
+        None（丢线 / feed 未就绪）时该通道输出 0。
         """
-        vy = 0.0
+        vy, vy_p, vy_d, vy_dz = 0.0, 0.0, 0.0, 0.0
         ey = state.error_y
         if ey is not None:
+            vy_p = self._vy_from_ey(ey)
             if abs(ey) > self.deadband_y:
-                vy = self._vy_from_ey(ey)
+                vy = vy_p
+                vy_dz = ey - self.deadband_y if ey > 0 else ey + self.deadband_y
                 if self.kd_y and self._prev_ey is not None and dt > 0.0:
                     # ey 正在归零（prev_ey → ey，符号与 P 相反）→ 往回拉；反向则继续推
                     # sign_y 同时乘 P/D 两项：sign_y 翻号时阻尼语义不跟着翻（+1 下 `-kd*de/dt` 会反向助冲）
-                    vy += self.sign_y * self.kd_y * (ey - self._prev_ey) / dt
+                    vy_d = self.sign_y * self.kd_y * (ey - self._prev_ey) / dt
+                    vy += vy_d
                     vy = max(-self.strafe_v, min(self.strafe_v, vy))
             self._prev_ey = ey
             if vy != 0.0:
                 self.corrections += 1
-        return mecanum_inverse(self.vx_cruise, vy, 0.0, self.r_eff)
+
+        omega, ea_dz, omega_p, omega_i = 0.0, 0.0, 0.0, 0.0
+        ea = state.error_angle
+        if ea is not None:
+            omega, ea_dz, omega_p, omega_i = self._omega_from_ea(ea, dt)
+
+        wheels = mecanum_inverse(self.vx_cruise, vy, omega, self.r_eff)
+        self._dbg = OrthogonalDebug(
+            error_y=ey if ey is not None else 0.0,
+            error_angle=ea if ea is not None else 0.0,
+            dt=dt,
+            vy_p_term=vy_p, vy_i_term=vy_d, vy_raw=vy, vy_dz=vy_dz,
+            omega_p_term=omega_p, omega_i_term=omega_i, omega_raw=omega, omega_dz=ea_dz,
+            vx=self.vx_cruise, vy=vy, omega=omega,
+            wheels=wheels, locked_vx=False,  # 直道永远巡航
+        )
+        return wheels
+
+    def debug_snapshot(self) -> dict:
+        """给 lane_trace 的正交模板打 ω/vy P/I；无 debug 帧返回空 dict。"""
+        if self._dbg is None:
+            return {}
+        d = asdict(self._dbg)
+        d["type"] = "orthogonal"
+        return d
 
 
 __all__ = ["StraightOuterLoop"]

@@ -20,6 +20,7 @@ if TYPE_CHECKING:  # 避免 config 反向依赖控制律实现
 class ControllerType(str, Enum):
     """profile 支持的控制律。``build_outer()`` 按这个字段分发。"""
 
+    STRAIGHT = "straight"  # 直道底层：vx 巡航 + vy 横移 + ω 视觉航向（mission 默认）
     CURVATURE_ADAPTIVE = "curvature_adaptive"
     STANLEY = "stanley"
     P = "p"
@@ -50,7 +51,9 @@ class LaneFollowProfile:
     """巡线外环全部可调量。字段语义见 controllers/curvature_adaptive.py 等。"""
 
     # --- 控制律选择（#6） ---
-    controller_type: ControllerType = ControllerType.CURVATURE_ADAPTIVE
+    # 默认 straight：StraightOuterLoop 是底盘巡线直行的底层（vx 巡航 + vy 横移 + ω 航向）。
+    # 场地有急弯时切回 curvature_adaptive / stanley。
+    controller_type: ControllerType = ControllerType.STRAIGHT
 
     # --- 循环节律 ---
     hz: float = 50.0
@@ -80,6 +83,9 @@ class LaneFollowProfile:
         if self.controller_type == ControllerType.P:
             from ..controllers.p_controller import POuterLoop
             return POuterLoop()
+        if self.controller_type == ControllerType.STRAIGHT:
+            from ..controllers.straight import StraightOuterLoop
+            return StraightOuterLoop()
         if self.controller_type == ControllerType.ORTHOGONAL:
             from ..controllers.orthogonal import OrthogonalOuterLoop
             # 默认 vx=0："原地水平稳定"；

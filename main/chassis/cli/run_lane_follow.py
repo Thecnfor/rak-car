@@ -89,7 +89,7 @@ def main(argv: list[str] | None = None) -> None:
         "--controller",
         choices=[c.value for c in ControllerType],
         default=None,
-        help="覆盖 profile.controller_type（curvature_adaptive / stanley / p）",
+        help="覆盖 profile.controller_type（straight / curvature_adaptive / stanley / p / orthogonal）",
     )
     parser.add_argument("--dry-run", action="store_true", help="只跑控制律不下发轮速")
     parser.add_argument("--no-trace", action="store_true", help="关掉每帧打印")
@@ -172,6 +172,22 @@ def main(argv: list[str] | None = None) -> None:
         "--strafe-v", type=float, default=0.05,
         help="|vy| 横移速度上限 (m/s)，默认 0.05。"
     )
+    parser.add_argument(
+        "--kp-theta", type=float, default=1.5,
+        help="ω 视觉航向通道比例增益 (rad/s 每弧度航向误差)，默认 1.5。"
+    )
+    parser.add_argument(
+        "--ki-theta", type=float, default=0.15,
+        help="ω 航向通道积分增益，消稳态航向偏差（直道右偏就是稳态偏差），默认 0.15。"
+    )
+    parser.add_argument(
+        "--omega-max", type=float, default=0.25,
+        help="|ω| 旋转速度上限 (rad/s)，默认 0.25（直道巡航比 orthogonal 小）。"
+    )
+    parser.add_argument(
+        "--sign-theta", type=float, default=1.0,
+        help="ω 方向，+1 = error_angle>0(车头偏右) 逆时针左转回正；实车反了改 -1。"
+    )
     args = parser.parse_args(argv)
 
     profile = _build_profile(args)
@@ -200,6 +216,10 @@ def main(argv: list[str] | None = None) -> None:
             kd_y=args.kd_y,
             sign_y=args.sign_y,
             strafe_v=args.strafe_v,
+            kp_theta=args.kp_theta,
+            ki_theta=args.ki_theta,
+            omega_max=args.omega_max,
+            sign_theta=args.sign_theta,
         )
     # --vx-target 只作用在有 vx_target 字段的控制器（OrthogonalOuterLoop 等），
     # 用来从"原地水平稳定（vx=0）"切到"正交巡航"。其他 outer 没有这个字段
