@@ -3,7 +3,7 @@
 step() 输出 mecanum_inverse(vx_cruise, vy, 0) 4 轮线速度，交给 DoubleLoopRunner
 下发（runner 负责 smoother / watchdog / 标定 / 暂停恢复）。
 
-vy = sign_y * (kp_y * (ey - deadband_y) - kd_y * d(ey)/dt)，过死区后按比例，
+vy = sign_y * (kp_y * (ey - deadband_y) + kd_y * d(ey)/dt)，过死区后按比例，
 再被 kd_y 阻尼压接近速度（防回正过头 → 回正后重新偏移的震荡），|vy| ≤ strafe_v。
 error_y 需经 runner 的 calibrator 标成米（--error-scale-y 等）。
 
@@ -26,7 +26,7 @@ class StraightOuterLoop(OuterLoop):
         kp_y       - vy 横移通道比例增益 (m/s 每米误差)。过死区后 vy = sign_y*kp_y*(ey-deadband)。
         kd_y       - vy 横移通道阻尼增益。误差快速归零（要冲过头）时压掉部分 vy，
                      抑制回正过头 → 回正后重新偏移的极限环。0 关闭。
-        sign_y     - y 回正方向, -1 = error_y>0(目标在右) 左移回中; 实车反了改 +1。
+        sign_y     - y 回正方向, +1 = error_y>0(车在线右) 左移回中; 实车反了改 -1。
         strafe_v   - |vy| 横移速度上限 (m/s)。
         r_eff      - mecanum_inverse 半径 (m), 算 4 轮速用。
     """
@@ -35,10 +35,10 @@ class StraightOuterLoop(OuterLoop):
         self,
         *,
         vx_cruise: float = 0.25,
-        deadband_y: float = 0.01,
+        deadband_y: float = 0.3,
         kp_y: float = 0.2,
         kd_y: float = 0.2,
-        sign_y: float = -1.0,
+        sign_y: float = 1.0,
         strafe_v: float = 0.05,
         r_eff: float = 0.30,
     ) -> None:
@@ -75,7 +75,8 @@ class StraightOuterLoop(OuterLoop):
                 vy = self._vy_from_ey(ey)
                 if self.kd_y and self._prev_ey is not None and dt > 0.0:
                     # ey 正在归零（prev_ey → ey，符号与 P 相反）→ 往回拉；反向则继续推
-                    vy -= self.kd_y * (ey - self._prev_ey) / dt
+                    # sign_y 同时乘 P/D 两项：sign_y 翻号时阻尼语义不跟着翻（+1 下 `-kd*de/dt` 会反向助冲）
+                    vy += self.sign_y * self.kd_y * (ey - self._prev_ey) / dt
                     vy = max(-self.strafe_v, min(self.strafe_v, vy))
             self._prev_ey = ey
             if vy != 0.0:

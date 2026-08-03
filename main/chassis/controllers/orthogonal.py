@@ -72,7 +72,7 @@ class OrthogonalOuterLoop(OuterLoop):
     - ω 通道：PI 修 d_a（角度偏差 → 原地纯旋转）
     - 每通道独立的死区 / 积分抗饱和（指数 decay + 硬 cap）
     - 符号约定（与 curvature_adaptive 一致，跟车端 lane_pid 相反）：
-        * error_y>0 说明目标在"底盘视角的右边"，
+        * error_y>0 说明车在"底盘视角的右边"（线在车左），
           所以应该 vy<0 横移向左去回中线 → 公式用 -kp*d_e
         * error_angle>0 说明车头偏左、需要顺时针回正（右手坐标系 ω<0），
           所以 ω 通道也用 -kp_θ*d_a

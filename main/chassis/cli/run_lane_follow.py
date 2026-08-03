@@ -152,8 +152,8 @@ def main(argv: list[str] | None = None) -> None:
         help="直道巡航前向速度 (m/s)，默认 0.25。"
     )
     parser.add_argument(
-        "--deadband-y", type=float, default=0.01,
-        help="y 回正死区 (m，标定后)。|error_y| 超过才启动 vy 横移，默认 0.01。"
+        "--deadband-y", type=float, default=0.3,
+        help="y 回正死区 (m，标定后)。|error_y| 超过才启动 vy 横移，默认 0.3。"
     )
     parser.add_argument(
         "--kp-y", type=float, default=0.2,
@@ -165,8 +165,8 @@ def main(argv: list[str] | None = None) -> None:
              "抑制回正过头 → 回正后重新偏移的震荡。0 关闭。默认 0.2。"
     )
     parser.add_argument(
-        "--sign-y", type=float, default=-1.0,
-        help="y 回正方向，-1 = error_y>0(目标在右) 左移回中；实车反了改 +1。"
+        "--sign-y", type=float, default=1.0,
+        help="y 回正方向，+1 = error_y>0(车在线右) 左移回中；实车反了改 -1。"
     )
     parser.add_argument(
         "--strafe-v", type=float, default=0.05,

@@ -77,7 +77,7 @@ class ChassisClient:
 
         dx_m>0 前进 / <0 后退 (车体本地 x 偏移, 单位 m)。
         dy_m 是车体本地 y 偏移 (横移, 单位 m), 符号与 vy 一致:
-            error_y>0 (目标在右) → dy_m<0 左移回中。
+            error_y>0 (车在线右) → dy_m>0 左移回中。
         走 runtime CAR_ACTIONS["move_for"] → 车端 car.move_for, 一次性位置闭环,
         走完自动停。theta_offset 恒 0 —— 直道回正不旋转, 保持 odom theta 为 0。
         返回 /v1/execute 同步 job dict (status/result/error)。
