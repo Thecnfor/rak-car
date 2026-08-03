@@ -28,8 +28,11 @@ module.exports = {
         RAK_CAR_INFER_POLL_INTERVAL: "1.0",
         RAK_CAR_INFER_READY_TIMEOUT: "45",
         RAK_CAR_INFER_HEALTH_TIMEOUT: "2.0",
-        /* 4GB RAM 缓解：先不预热任何模型,首次调用时再加载(~400ms 冷启动 vs ~150MB*2 常驻) */
-        RAK_INFER_EAGER_MODELS: "",
+        /* lane_feed 守护线程在 pm2 启动后会立刻调 lane 推理;
+           lane 必须 eager 预热,否则守护线程第一次调用触发 14s lazy load,
+           lane_state 进入 stale backoff,业务看到 external_feed_stale。
+           ~1.1GB RAM,值得。 */
+        RAK_INFER_EAGER_MODELS: "lane",
         /* 模型 idle 60s 就卸,腾内存给其他进程 (默认 300 太长) */
         RAK_INFER_IDLE_UNLOAD_SECONDS: "60",
         /* 抑制 Paddle C++ 端的 IR pass verbose (0=INFO, 1=WARNING, 2=ERROR, 3=FATAL) */
