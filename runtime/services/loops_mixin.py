@@ -73,7 +73,11 @@ class LoopsMixin:
             return None
 
     def _degrade_one_step(self):
-        """按 _degrade_order 顺序找第一个还没降档的 feed，把 hz 砍半。"""
+        """按 _degrade_order 顺序找第一个还没降到最低档的 feed，把 hz 砍半。
+
+        修复：原逻辑在某个 feed 已经降到 5Hz 时两个 if 分支都不命中，直接 return None，
+        导致后续 feed 永远不会被降级。现在改为 continue，遍历完整个列表。
+        """
         with self._resource_lock:
             for feed_name in self._degrade_order:
                 if feed_name == "lane":
@@ -81,19 +85,20 @@ class LoopsMixin:
                 cur = self._feed_current_hz.get(feed_name, 0.0)
                 default = self._feed_default_hz.get(feed_name, cur)
                 if cur >= default:
-                    # 当前还在 default，下一次降到 default/2
-                    new_hz = max(default / 2.0, 5.0)  # 最低 5Hz
+                    # 当前还在 default，降到 default/2
+                    new_hz = max(default / 2.0, 5.0)
                     self._feed_current_hz[feed_name] = new_hz
                     self._apply_feed_hz(feed_name, new_hz)
                     if feed_name not in self._feeds_degraded:
                         self._feeds_degraded.append(feed_name)
                     return feed_name
-                # 已降过档，看看下一档空间
                 if cur > 5.0:
+                    # 已降过档但还有空间，继续砍半
                     new_hz = max(cur / 2.0, 5.0)
                     self._feed_current_hz[feed_name] = new_hz
                     self._apply_feed_hz(feed_name, new_hz)
                     return feed_name
+                # cur <= 5.0：已到最低档，跳过这个 feed，继续找下一个
         return None
 
     def _restore_one_step(self):

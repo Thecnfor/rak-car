@@ -101,6 +101,37 @@ class LifecycleMixin:
             return self.shared_side_camera
         return None
 
+    def _ensure_feeds_running(self, car):
+        """幂等启动 car 上的 5 路守护线程（lane/arm/task/ir/odom feed）。
+
+        _create_car_locked 和 ensure_initialized 复用路径共用同一份逻辑，
+        两处不再各自写 5 段重复的 try/except。
+        """
+        try:
+            car.start_lane_feed(hz=50.0)
+        except Exception as exc:
+            logger.warning("lane_feed auto-start failed: {}".format(exc))
+        try:
+            car.start_arm_feed(hz=20.0)
+        except Exception as exc:
+            logger.warning("arm_feed auto-start failed: {}".format(exc))
+        try:
+            car.start_task_feed(hz=30.0)
+        except Exception as exc:
+            logger.warning("task_feed auto-start failed: {}".format(exc))
+        try:
+            car.start_ir_feed(
+                hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
+            )
+        except Exception as exc:
+            logger.warning("ir_feed auto-start failed: {}".format(exc))
+        try:
+            car.start_odom_feed(
+                hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
+            )
+        except Exception as exc:
+            logger.warning("odom_feed auto-start failed: {}".format(exc))
+
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
         # 2026-08-03: 构造 MyCar 期间禁 GC。GC finalizer 可能 finalize 泄漏的
@@ -171,41 +202,8 @@ class LifecycleMixin:
         self.last_init_at = time.time()
         self.last_error = None
         self.auto_heal_armed = True
-        # 默认启 lane_feed 守护线程：比赛阶段 lane_state 必须持续更新
-        # 供外环消费。start_lane_feed 幂等，重复调用立即返回。
-        try:
-            car.start_lane_feed(hz=50.0)
-        except Exception as exc:  # pragma: no cover - 不让 init 失败
-            logger.warning("lane_feed auto-start failed: {}".format(exc))
-        # 默认启 arm_feed 守护线程:持续刷新 streamer.arm_state(y/x 位置),
-        # 供 WS subscribe_arm_state 实时推送,调试机械臂必备
-        try:
-            car.start_arm_feed(hz=20.0)
-        except Exception as exc:
-            logger.warning("arm_feed auto-start failed: {}".format(exc))
-        # 默认启 task_feed 守护线程:持续刷新 streamer.task_state(侧摄目标检测),
-        # 供 WS subscribe_task_detection 实时推送,"边走边看"侧摄目标的必需组件
-        try:
-            car.start_task_feed(hz=30.0)
-        except Exception as exc:
-            logger.warning("task_feed auto-start failed: {}".format(exc))
-        # 2026-07-31 默认启 ir_feed 守护线程(50Hz,与 lane_feed 同档):
-        # 供 main/chassis/tasks/read_ir.py 与 orchestrator._wait_until_triggered
-        # 走缓存读,避免每次进 job_queue。hz 由 env RAK_CAR_IR_FEED_HZ 覆盖。
-        try:
-            car.start_ir_feed(
-                hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
-            )
-        except Exception as exc:
-            logger.warning("ir_feed auto-start failed: {}".format(exc))
-        # 2026-07-31 默认启 odom_feed 守护线程(50Hz):同上模式,
-        # 喂底盘里程计缓存,给 main/chassis/api.py.get_odometry 走 fast-path。hz 由 env 覆盖。
-        try:
-            car.start_odom_feed(
-                hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
-            )
-        except Exception as exc:
-            logger.warning("odom_feed auto-start failed: {}".format(exc))
+        # 默认启动 5 路守护线程（lane/arm/task/ir/odom feed）
+        self._ensure_feeds_running(car)
         return car
 
     def _ensure_infer_ready(self):
@@ -260,34 +258,8 @@ class LifecycleMixin:
                     # x 自动复位只保留在 _create_car_locked() 的真正 init 路径；
                     # 手动复位仍然显式调用 arm.reset_x / arm.reset_all。
                     self.controller_generation = session.get("generation")
-                    # 复用现有 car 时也确保 lane_feed 跑着（幂等）
-                    try:
-                        self.car.start_lane_feed(hz=50.0)
-                    except Exception as exc:  # pragma: no cover
-                        logger.warning("lane_feed auto-start (reused) failed: {}".format(exc))
-                    # arm_feed 同理
-                    try:
-                        self.car.start_arm_feed(hz=20.0)
-                    except Exception as exc:
-                        logger.warning("arm_feed auto-start (reused) failed: {}".format(exc))
-                    # task_feed 同理
-                    try:
-                        self.car.start_task_feed(hz=30.0)
-                    except Exception as exc:
-                        logger.warning("task_feed auto-start (reused) failed: {}".format(exc))
-                    # 2026-07-31：ir_feed / odom_feed 同理（复用现有 car 时也确保在跑）
-                    try:
-                        self.car.start_ir_feed(
-                            hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
-                        )
-                    except Exception as exc:
-                        logger.warning("ir_feed auto-start (reused) failed: {}".format(exc))
-                    try:
-                        self.car.start_odom_feed(
-                            hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
-                        )
-                    except Exception as exc:
-                        logger.warning("odom_feed auto-start (reused) failed: {}".format(exc))
+                    # 复用现有 car 时也确保 5 路守护线程在跑（幂等）
+                    self._ensure_feeds_running(self.car)
                     return self.car
             except Exception:
                 self.last_error = traceback.format_exc()

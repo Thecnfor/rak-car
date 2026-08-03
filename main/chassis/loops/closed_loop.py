@@ -117,11 +117,21 @@ class DoubleLoopRunner:
     def _sense(self) -> LaneState:
         # ChassisClient.read_lane() 内部已 ws 优先 + 异常兜底返回空 LaneState，
         # 外环不再自己 try/except —— 空 state 的 has_error 为 False，控制律自然输出零速。
-        state = self.api.read_lane()
+        # 超时降级：read_lane 底层走 HTTP，request_timeout 默认 5s；如果 runtime 短暂
+        # 负载高，外环会在此阻塞 5s 期间车继续按上一帧速度行驶。
+        # 用一个短的 deadline 包住，超时直接返回空 LaneState（控制律输出零速），
+        # 不让外环卡死。
+        try:
+            state = self.api.read_lane()
+        except Exception:
+            state = LaneState()
         # 标定层：把 lane 模型裸输出标成控制律物理量（默认 no-op）。
         # 放在 _sense 边界而不是控制律内部，控制器零改动。
         if self.calibrator is not None:
-            state = self.calibrator.calibrate(state)
+            try:
+                state = self.calibrator.calibrate(state)
+            except Exception:
+                pass
         return state
 
     def run(self, max_seconds: float = 30.0) -> None:

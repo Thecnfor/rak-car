@@ -366,7 +366,6 @@ class ArmController:
             self._y_seeking_bottom = False
             self.y_speed(0)  # 必停
         return False
-        self.y_speed(0)
 
     def move_y_position(self, target):
         """
@@ -442,6 +441,7 @@ class ArmController:
             self.y_pid.setpoint = target
             while True:
                 if self._must_stop():
+                    logger.info(f"move_y_position 丢步兜底 round={round_idx}: 急停/取消，中止")
                     break
                 if self.y_pid_moveto(target):
                     break
