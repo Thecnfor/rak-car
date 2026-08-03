@@ -22,7 +22,9 @@ const taskOverlay = $("taskOverlay") as HTMLInputElement;
 const jogSpeed = $("jogSpeed") as HTMLInputElement;
 const jogSpeedLabel = $("jogSpeedLabel")!;
 const btnGoHome = $("btnGoHome") as HTMLButtonElement;
+const btnGrasp = $("btnGrasp") as HTMLButtonElement;
 const btnZeroAll = $("btnZeroAll") as HTMLButtonElement;
+const coupleArmHand = $("coupleArmHand") as HTMLInputElement;
 const poseName = $("poseName") as HTMLInputElement;
 const btnTeach = $("btnTeach") as HTMLButtonElement;
 const poseTableBody = document.querySelector("#poseTable tbody")!;
@@ -40,6 +42,10 @@ let poses: Pose[] = loadPoses();
 let armCmd = 90;    // 大臂 +90 = 复位位
 let handCmd = -90;  // 手爪 -90 = UP
 let estopped = false;
+let graspOn = false;
+// 臂爪联动：手爪舵机装在大臂连杆上，大臂转 Δ 时手爪补 -Δ 保持末端姿态不变。
+// 比例常量化；真机方向若反，把 COUPLE_RATIO 翻成 +1。
+const COUPLE_RATIO = -1;
 
 function loadPoses(): Pose[] {
   try { return JSON.parse(localStorage.getItem(POSES_KEY) || "[]") as Pose[]; }
@@ -126,8 +132,14 @@ function stopJog(hard = false) {
 function servoStep(axis: "arm" | "hand", delta: number) {
   if (estopped) return;
   if (axis === "arm") {
+    const before = armCmd;
     armCmd = Math.max(-150, Math.min(90, armCmd + delta));
-    api.armVelocity({ arm_angle: armCmd }).catch(() => undefined);
+    const applied = armCmd - before;  // 限位截断后的真实增量
+    // 联动：大臂转 applied 时手爪补 COUPLE_RATIO*applied，保持末端姿态
+    if (coupleArmHand.checked && applied !== 0) {
+      handCmd = Math.max(-90, Math.min(0, handCmd + COUPLE_RATIO * applied));
+    }
+    api.armVelocity({ arm_angle: armCmd, hand_angle: handCmd }).catch(() => undefined);
   } else {
     handCmd = Math.max(-90, Math.min(0, handCmd + delta));
     api.armVelocity({ hand_angle: handCmd }).catch(() => undefined);
@@ -176,15 +188,40 @@ btnZeroAll.addEventListener("click", () => {
   api.armVelocity({ x_vel: 0, y_vel: 0 }).catch(() => undefined);
 });
 
+/** sync execute 返回 {ok, job}；job.status 必须 succeeded，否则抛带 error 的错。 */
+function assertJobOk(d: Record<string, unknown>, label: string) {
+  const job = (d.job ?? {}) as Record<string, unknown>;
+  if (job.status !== "succeeded") {
+    throw new Error(label + " 失败: " + String(job.error ?? job.status ?? "unknown"));
+  }
+}
+
 btnGoHome.addEventListener("click", async () => {
   btnGoHome.disabled = true;
   try {
-    await api.executeArm("composite_go_home", {});
+    assertJobOk(await api.executeArm("composite_go_home"), "go_home");
     armCmd = 90; handCmd = -90;  // go_home 回复位位
   } catch (e) {
-    alert("go_home 失败: " + (e as Error).message);
+    alert((e as Error).message);
   } finally {
     btnGoHome.disabled = false;
+  }
+});
+
+// 吸盘开关：grasp(bool) 走 job_queue，sync 等完成
+btnGrasp.addEventListener("click", async () => {
+  if (estopped) return;
+  btnGrasp.disabled = true;
+  const next = !graspOn;
+  try {
+    assertJobOk(await api.executeArm("grasp", { value: next }), "吸盘");
+    graspOn = next;
+    btnGrasp.textContent = "吸盘: " + (graspOn ? "开" : "关");
+    btnGrasp.classList.toggle("primary", graspOn);
+  } catch (e) {
+    alert((e as Error).message);
+  } finally {
+    btnGrasp.disabled = false;
   }
 });
 
@@ -257,13 +294,13 @@ async function gotoPose(p: Pose, btn: HTMLButtonElement) {
   const old = btn.textContent;
   btn.textContent = "运动中…";
   try {
-    // composite_run: x/y 单位米（SDK 口径），arm/hand 单位度
-    await api.executeArm("composite_run", {
+    // composite_run: x/y 单位米（SDK 口径），arm/hand 单位度；参数走 kwargs
+    assertJobOk(await api.executeArm("composite_run", {
       x: p.x_mm / 1000,
       y: p.y_mm / 1000,
       arm: p.arm,
       hand: p.hand,
-    });
+    }), "前往位姿");
     armCmd = p.arm;
     handCmd = p.hand;
   } catch (e) {

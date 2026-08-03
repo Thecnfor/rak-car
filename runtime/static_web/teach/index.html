@@ -4,10 +4,10 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>示教器 · RAK-CAR</title>
-  <script type="module" crossorigin src="../assets/teach-BexkxzDl.js"></script>
-  <link rel="modulepreload" crossorigin href="../assets/base-CgcSJqTL.js">
+  <script type="module" crossorigin src="../assets/teach-J-ft2WiH.js"></script>
+  <link rel="modulepreload" crossorigin href="../assets/base-sj6cywlp.js">
   <link rel="stylesheet" crossorigin href="../assets/base-DfDI-Lv3.css">
-  <link rel="stylesheet" crossorigin href="../assets/teach-BEVX1L3p.css">
+  <link rel="stylesheet" crossorigin href="../assets/teach-4QPbMr_0.css">
 </head>
 <body>
   <div class="statusbar">
@@ -65,10 +65,14 @@
           <span>点动速度</span>
           <input type="range" id="jogSpeed" min="1" max="8" step="1" value="3">
           <b id="jogSpeedLabel">0.03 m/s</b>
+          <label class="couple-toggle">
+            <input type="checkbox" id="coupleArmHand" checked> 臂爪联动
+          </label>
         </div>
         <div class="warn-line">⚠ x 轴无软限位：点动时盯紧机械臂行程，失焦/松手自动停</div>
         <div class="btn-row">
           <button id="btnGoHome">归位 (composite_go_home)</button>
+          <button id="btnGrasp">吸盘: 关</button>
           <button id="btnZeroAll">全停 (velocity 0)</button>
         </div>
       </div>
