@@ -17,8 +17,8 @@ vx 强制 0 不前进——即"原地水平巡航"。
 为什么叫"十字正交"：
 把底盘三个控制输入 (vx, vy, ω) 看作 3D 向量空间的三个正交基：
 - vx 轴：前进/后退（y 正方向为前）
-- vy 轴：纯横移（x 正方向为右）
-- ω 轴：纯旋转（右手定则，ω>0 为逆时针？现场按约定符号）
+- vy 轴：纯横移（本车实测 +vy=物理左移，见下方符号约定）
+- ω 轴：纯旋转（右手定则，ω>0 为逆时针左转，现场按约定符号）
 三者在麦轮上完全独立（不要求轮胎有 slip，麦轮正/横移/旋转
 都不通过地面摩擦的侧向力耦合，靠辊子自己滚）。
 所以每个通道对应一路 PI 即可——没有前馈 cross-term。
@@ -71,13 +71,15 @@ class OrthogonalOuterLoop(OuterLoop):
     - vy 通道：PI 修 d_e（横向偏差 → 左右纯平移）
     - ω 通道：PI 修 d_a（角度偏差 → 原地纯旋转）
     - 每通道独立的死区 / 积分抗饱和（指数 decay + 硬 cap）
-    - 符号约定（与 curvature_adaptive 一致，跟车端 lane_pid 相反）：
-        * error_y>0 说明车在"底盘视角的右边"（线在车左），
-          所以应该 vy<0 横移向左去回中线 → 公式用 -kp*d_e
-        * error_angle>0 说明车头偏左、需要顺时针回正（右手坐标系 ω<0），
-          所以 ω 通道也用 -kp_θ*d_a
-      如果现场发现"越打越偏"，改 ``flip_error_{y,angle}`` 即可，
-      不用改控制律。
+    - 符号约定（2026-08-04 对齐本车实车，跟 straight 的 sign_y=+1 一致）：
+        * error_y>0 说明车在"底盘视角的右边"（线在车左，实车量过）。
+          本车 +vy=物理左移（跟 straight 实测一致），所以 vy>0 左移回中
+          → 公式用 +kp_y*d_e
+        * error_angle>0 说明车头偏右、需要逆时针/左转回正。
+          本车 ω>0=逆时针左转 → 公式用 +kp_θ*d_a（与 curvature_adaptive
+          主力控制律的 ω=+kp_θ*ea 一致；注意它跟车端 lane_pid 的
+          ω=-kp_angle*ea 相反）
+      如果现场发现方向反了，改 ``flip_error_{y,angle}`` 即可，不用改控制律。
     """
 
     def __init__(
@@ -210,26 +212,26 @@ class OrthogonalOuterLoop(OuterLoop):
         if self.flip_error_angle:
             d_a = -d_a
 
-        # ── 横移通道：-kp*d_e + -ki*I(d_e) ─────────────────────
+        # ── 横移通道：+kp*d_e + +ki*I(d_e) ─────────────────────
         ey_dz = self._apply_deadband(d_e, self.ey_deadband)
         self._ey_integral = self._decay_and_accum(
             self._ey_integral, ey_dz, dt,
             decay=self.ey_int_decay, cap=self.ey_int_cap,
         )
-        p_y = -self.kp_y * ey_dz
-        i_y = -self.ki_y * self._ey_integral
+        p_y = +self.kp_y * ey_dz
+        i_y = +self.ki_y * self._ey_integral
         vy_raw = p_y + i_y
         if self.vy_max > 0:
             vy_raw = max(-self.vy_max, min(self.vy_max, vy_raw))
 
-        # ── 旋转通道：-kp_θ*d_a + -ki_θ*I(d_a) ─────────────────
+        # ── 旋转通道：+kp_θ*d_a + +ki_θ*I(d_a) ─────────────────
         ea_dz = self._apply_deadband(d_a, self.ea_deadband)
         self._ea_integral = self._decay_and_accum(
             self._ea_integral, ea_dz, dt,
             decay=self.ea_int_decay, cap=self.ea_int_cap,
         )
-        p_θ = -self.kp_theta * ea_dz
-        i_θ = -self.ki_theta * self._ea_integral
+        p_θ = +self.kp_theta * ea_dz
+        i_θ = +self.ki_theta * self._ea_integral
         omega_raw = p_θ + i_θ
         if self.omega_max > 0:
             omega_raw = max(-self.omega_max, min(self.omega_max, omega_raw))

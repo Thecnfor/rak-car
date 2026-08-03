@@ -242,9 +242,9 @@ class IrState:
 
 | 控律 | 类 | 公式 | 适用场景 | 调参难度 |
 | --- | --- | --- | --- | --- |
-| **P** | `POuterLoop` | `vy = -kp_y * error_y`<br/>`omega = -kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
-| **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = -delta` | 弯道、转向主导的赛道 | ⭐⭐ |
-| **弧度自适应**（主力） | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_raw = -kp_y*ey - ki_y*Σey*dt*decay`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥 + 横向 I 项（消除稳态偏差）。直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力 | ⭐⭐⭐ |
+| **P** | `POuterLoop` | `vy = +kp_y * error_y`<br/>`omega = +kp_theta * error_angle` | 起步、调试场地、低速直线赛道 | ⭐ 最简单 |
+| **Stanley** | `StanleyOuterLoop` | `delta = error_angle + atan(k * error_y / vx)`<br/>`omega = +delta` | 弯道、转向主导的赛道 | ⭐⭐ |
+| **弧度自适应**（主力） | `CurvatureAdaptiveOuterLoop` | `vx = v_max * exp(-kappa)`<br/>`omega = kp_theta*ea*(1+g*kappa) + k_curv*dkappa`<br/>`axis_mix = sigmoid((kappa - center)/width)`<br/>`vy_keep = vy_floor + (1-vy_floor)*(1-axis_mix)`<br/>`vy_raw = +kp_y*ey + ki_y*Σey*dt*decay`<br/>`vy_decided = vy_keep * vy_raw`<br/>`omega_decided = axis_mix * omega_raw` | 弧度偏差 / 变化率自适应 + 横移/转向互斥 + 横向 I 项（消除稳态偏差）。直线由 `vy` 接管、弯道由 `ω` 接管，`vx` 始终独立，弯道段保留 `vy_floor` 横向修正能力 | ⭐⭐⭐ |
 
 **实测典型取值**（调参从这开始）：
 
@@ -320,7 +320,7 @@ runner = DoubleLoopRunner(api=api, outer=outer, hz=50.0, smoother=smoother)
 
 **问题**：lane 模型（128×128 CNN）输出 `result[0]/result[1]` 被原样当
 `error_y / error_angle` 喂给控制律，但控制律假设 `error_y` 单位是**米**。若模型
-训练时的输出尺度不是米（归一化 / 像素 / 量级 1e-3），`vy = -kp_y * error_y`
+训练时的输出尺度不是米（归一化 / 像素 / 量级 1e-3），`vy = +kp_y * error_y`
 ≈ 0，横移通道失效 → 车只剩 ω 在修 → **出弯后修正慢、只能靠长直线修回来**。
 
 **工具**：`ErrorCalibrator`（`controllers/calibration.py`）在 `_sense()` 边界把

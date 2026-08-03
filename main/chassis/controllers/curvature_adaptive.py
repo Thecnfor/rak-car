@@ -224,7 +224,8 @@ class CurvatureAdaptiveOuterLoop(OuterLoop):
         eff_ki_boost = self.sharp_ki_curve_boost if is_sharp else self.ki_curve_boost
         i_boost = 1.0 + eff_ki_boost * kappa
 
-        vy_raw = -self.kp_y * ey_used - self.ki_y * self._ey_integral * i_boost
+        # 2026-08-04 对齐本车实车（error_y>0=车在线右, +vy=物理左移, 跟 straight sign_y=+1 一致）
+        vy_raw = +self.kp_y * ey_used + self.ki_y * self._ey_integral * i_boost
 
         eff_omega_gain = self.sharp_omega_gain if is_sharp else self.omega_gain
         boost = 1.0 + eff_omega_gain * min(kappa, KAPPA_HARD_CAP)

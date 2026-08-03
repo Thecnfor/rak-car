@@ -19,7 +19,7 @@ class TestLookahead(unittest.TestCase):
         self.assertAlmostEqual(c.debug_snapshot()["ey_used"], 0.04, places=9)
 
     def test_positive_ea_adds_forward_drift(self):
-        # ea>0（车头朝左偏）→ 侧向漂移为正，ey_used 应比原始 ey 大
+        # ea>0（车头朝右偏，本车约定）→ 侧向漂移为正，ey_used 应比原始 ey 大
         c = CurvatureAdaptiveOuterLoop(lookahead_s=0.2)
         c.step(LaneState(error_y=0.0, error_angle=0.3), 0.02)
         self.assertGreater(c.debug_snapshot()["ey_used"], 0.0)

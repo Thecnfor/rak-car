@@ -1,6 +1,6 @@
 """main/chassis/controllers/p_controller.py
-最简化版外环：对 error_y 做 P 控制。适合 demo / 起步。
-不做横向 v_y，只做前向 vx + 转向 omega。
+最简化版外环：error_y 做 P 给 vy 横移，error_angle 做 P 给 omega 转向。
+适合 demo / 起步。
 """
 from typing import List
 
@@ -20,6 +20,7 @@ class POuterLoop(OuterLoop):
     def step(self, state: LaneState, dt: float) -> List[float]:
         if not state.has_error:
             return self._safe_zero()
-        vy = -self.kp_y * float(state.error_y)
-        omega = -self.kp_theta * float(state.error_angle)
+        # 2026-08-04 对齐本车实车（error_y>0=车在线右, +vy=物理左移; error_angle>0=车头偏右, ω>0=左转）
+        vy = +self.kp_y * float(state.error_y)
+        omega = +self.kp_theta * float(state.error_angle)
         return mecanum_inverse(self.vx, vy, omega, self.r_eff)
