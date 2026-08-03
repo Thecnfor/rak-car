@@ -419,27 +419,28 @@ def _pick_and_store(
     runner.grasp(True, timeout=5.0)
     time.sleep(0.3)  # 让真空建立
 
-    # 0.6 抬 y=-30 出保护区 (球出吸嘴正下方, 防横移拖飞)
-    #    2026-08-04 (用户): 不是 x=-30 是 y=-30, 让球出保护区 + 后面复合动作不卡
-    print(f"  [{LOG_PREFIX}] 中间姿态 y=-30")
-    arm_client.composite_run(y_mm=-30.0, speed=80, timeout=10.0)
+    # 0.6 抬 y=-40 (出保护区 + 抬一点缓冲, 球出吸嘴正下方, 防横移拖飞)
+    #    2026-08-04 (用户): grasp 后 y=-40, 然后同步到 bin 位置 (y=-60 ∥ x=bin),
+    #    再 y=-30 + grasp(False) 放下, 最后回 P + creep。
+    print(f"  [{LOG_PREFIX}] 中间姿态 y=-40")
+    arm_client.composite_run(y_mm=-40.0, speed=80, timeout=10.0)
 
     # 1+2+3+4 全部后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
-    #    - bin 放仓位 (y=-20 ∥ x=bin_x, 4 轴并发)
-    #    - grasp(False)
-    #    - y=-30 出保护区
+    #    - bin 上方 (y=-60 ∥ x=bin, 4 轴并发, y=-60 在 bin 开门 y gate [-205,-145] 上方)
+    #    - 落下放球 (y=-30, grasp(False))
     #    - 回 P 姿态 (y=-120 ∥ x=return, 4 轴并发)
-    # 下一轮 step_target4 主循环开头 goto_pose_p 会阻塞等 arm 到位,
-    #    此时底盘 creep (realtime 通道) 可以并行跑, 不冲突。
-    # 2026-08-04 (用户): 不能堵塞底盘 creep → 全部 _call_arm(sync=False) 异步发
     import threading
     def _bg_release():
         try:
+            # bin 上方
             arm_client.composite_run(
-                y_mm=-20.0, x_mm=bin_x, speed=80, timeout=30.0,
+                y_mm=-60.0, x_mm=bin_x, speed=80, timeout=30.0,
             )
-            runner.grasp(False, timeout=5.0)
+            # 落到 bin 放仓位 + grasp(False)
             arm_client.composite_run(y_mm=-30.0, speed=80, timeout=10.0)
+            runner.grasp(False, timeout=5.0)
+            time.sleep(0.2)
+            # 回 P 姿态
             if return_x_mm is not None:
                 arm_client.composite_run(
                     y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
