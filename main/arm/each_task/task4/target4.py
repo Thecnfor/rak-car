@@ -75,7 +75,9 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
 from main.arm import (  # noqa: E402
     ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
 )
-from main.arm.each_task.common import goto_pose_p, POSE_P_X_MM, POSE_P_GRAB_Y_MM  # noqa: E402
+from main.arm.each_task.common import (  # noqa: E402
+    goto_pose_p, POSE_P_X_MM, POSE_P_GRAB_Y_MM, POSE_P_ARM_DEG, POSE_P_HAND_DEG,
+)
 from main.chassis import track_chassis  # noqa: E402
 
 
@@ -371,12 +373,18 @@ def _pick_and_store(
     bin_x = BIN_X_MM[color]
 
     # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
+    #    ⚠️ 2026-08-03 现场 (用户): track_velocity_pick 默认 arm_start=-90 / hand_start=0
+    #    是 task1 init 姿态 (吸嘴朝前), task4 抓球姿态是 arm=+90° (大臂抓球位)
+    #    + hand=0° (朝下) —— 必须显式传 arm_start=90 / hand_start=0, 否则
+    #    默认值会把吸嘴反向朝天挡住 vision。
     print(f"  [{LOG_PREFIX}] [0/3] track_velocity_pick(label={label!r}, "
-          f"skip_pose_align=True, grasp_y={POSE_P_GRAB_Y_MM})")
+          f"arm_start=90, hand_start=0, grasp_y={POSE_P_GRAB_Y_MM})")
     try:
         pick_res = runner.track_velocity_pick(
             label,
             skip_pose_align=True,
+            arm_start=POSE_P_ARM_DEG,  # 90° 抓球大臂位
+            hand_start=POSE_P_HAND_DEG,  # 0° 朝下
             grasp_y_mm=POSE_P_GRAB_Y_MM,
             timeout=pick_timeout_s,
         )
