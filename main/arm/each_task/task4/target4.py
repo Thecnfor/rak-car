@@ -101,8 +101,9 @@ DEFAULT_MAX_CREEP_M: float = 0.8
 DEFAULT_MAX_SECONDS: float = 180.0
 """任务总时长预算 (s)。"""
 
-DEFAULT_TRACK_MAX_SECONDS: float = 12.0
-"""单球底盘视觉伺服收敛预算 (s)。超时但目标仍在画面 → 照样试抓 (臂伺服补残差)。"""
+DEFAULT_TRACK_MAX_SECONDS: float = 8.0
+"""单球底盘视觉伺服收敛预算 (s)。超时但目标仍在画面 → 照样试抓 (臂伺服补残差)。
+2026-08-04: 12→8, 配合下面 kp/v_max 提速, 正常 3-5s 收敛。"""
 
 DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
 """连续 pick 失败超过此数 → 退出 (单个球抓不起不应拖垮全场)。
@@ -319,10 +320,18 @@ def _track_leftmost_ball(*, max_seconds: float, dry_run: bool):
     内部 finally 自动零速。返回 TrackChassisResult
     (arrived / reason / final_frame.label=cx 最小的球 label)。
     """
+    # 2026-08-04 (用户: 压缩延迟快速收敛): task4 专属提速档。
+    #   共享默认 kp=0.20/v_max=0.12/hold=5 是 2026-08-02 防振荡的保守档,
+    #   task4 球距近 + 只采一次, 提 kp/v_max + 降 hold_frames 更快收敛。
+    #   ⚠️ 若真机出现左右振荡不收敛 → 把 kp/v_max 往回调。
     return track_chassis(
         target=BALL_LABELS,
         select_mode="leftmost",
         setpoint_cxcy=(0.0, 0.0),
+        kp=0.30,            # 0.20 → 0.30 (更快拉回中心)
+        v_max=0.18,         # 0.12 → 0.18 (更快的底盘速度)
+        hold_frames=3,      # 5 → 3 (带内 3 帧即判到, 省 0.1s)
+        v_slew=0.03,        # 0.02 → 0.03 (加速度略提, 仍限幅防爆冲)
         max_seconds=max_seconds,
         dry_run=dry_run,
     )
