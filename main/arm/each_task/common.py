@@ -49,6 +49,74 @@ DEFAULT_WALL_MM: float = -300.0
 DEFAULT_WALL_TOL_MM: float = 30.0
 """距墙 < 此值视为 wall_hit, 立即 break (不等 stall 计数器)。"""
 
+
+# ============================================================================
+# P 姿态 (Pose-P) —— task4 标准采收/检测姿态
+# ============================================================================
+# 2026-08-03 现场标定 (下位机 reset 后): 球在画面中心 + 侧摄能稳定看到球
+# 区间内的统一姿态。所有 task4 寻路 / 检测 / 抓取之间都恢复到这里。
+
+POSE_P_Y_MM: float = -100.0
+"""P 姿态 y (mm)。"""
+
+POSE_P_X_MM: float = -270.0
+"""P 姿态 x (mm)。"""
+
+POSE_P_ARM_DEG: float = 90.0
+"""P 姿态大臂角度 (°, MID / 复位位, 业务硬限上界)。"""
+
+POSE_P_HAND_DEG: float = 0.0
+"""P 姿态手爪角度 (°, DOWN, 需先 arm >= +30° 出联动保护区)。"""
+
+POSE_P_GRAB_Y_MM: float = -160.0
+"""P 姿态下抓球 y (mm, 4cm 球球心高度)。"""
+
+# ponytail: POSE_P 是 task4 单一真相源, 不要在 target4/target1 等其他文件里硬编
+# 同一组数字, 一律 from main.arm.each_task.common import POSE_P_*
+
+
+def goto_pose_p(client, runner, *, log_prefix: str = "[goto_pose_p]") -> dict:
+    """恢复臂到 P 姿态 (Pose-P): y=POSE_P_Y → composite_run(arm/hand) → x=POSE_P_X。
+
+    复用 move_x_hard_reach 的 split + reset_x 撞墙兜底 (belt-slip 修复后稳)。
+    composite_run 走 4 电机 ThreadPoolExecutor 并行, arm/hand/y 同步摆位。
+
+    Args:
+        client: ArmClient
+        runner: ArmRunner (保留参数兼容性, 当前未直接用)
+        log_prefix: 打印前缀
+
+    Returns:
+        dict 含 ``actual_y_mm``, ``actual_x_mm`` (从 realtime 读真值)。
+        任何内部异常向上抛 (业务层决定是否退化)。
+    """
+    print(f"\n========== {log_prefix} 恢复 P 姿态 "
+          f"(y={POSE_P_Y_MM} → arm={POSE_P_ARM_DEG}°/hand={POSE_P_HAND_DEG}° "
+          f"→ x={POSE_P_X_MM}) ==========")
+    # 1. y/arm/hand 并行摆位 (y 提前出保护区 [0,-30])
+    client.composite_run(
+        arm=POSE_P_ARM_DEG,
+        y_mm=POSE_P_Y_MM,
+        hand=POSE_P_HAND_DEG,
+        speed=80,
+        timeout=30.0,
+    )
+    # 2. x 到 P 姿态位 (split + reset_x 撞墙兜底)
+    x_info = move_x_hard_reach(
+        client, runner,
+        target_x_mm=POSE_P_X_MM,
+        log_prefix=log_prefix,
+    )
+    actual_y = client._read_y_mm_realtime()
+    actual_x = client._read_x_mm_realtime()
+    print(f"========== {log_prefix} 完成 "
+          f"(realtime y={actual_y}mm x={actual_x}mm) ==========\n")
+    return {
+        "x_info": x_info,
+        "actual_y_mm": actual_y,
+        "actual_x_mm": actual_x,
+    }
+
 DEFAULT_OVERSHOOT_RATIO: float = 1.5
 """overshoot 判定: 单轮 step > |初始 delta| × 此值 → 标记 overshoot。"""
 

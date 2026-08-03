@@ -73,6 +73,7 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
 from main.arm import (  # noqa: E402
     ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
 )
+from main.arm.each_task.common import goto_pose_p, POSE_P_X_MM  # noqa: E402
 from main.chassis import track_chassis  # noqa: E402
 
 
@@ -100,8 +101,9 @@ DEFAULT_TRACK_MAX_SECONDS: float = 12.0
 DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 3
 """连续 pick 失败超过此数 → 退出 (单个球抓不起不应拖垮全场)。"""
 
-DEFAULT_RETURN_X_MM: Optional[float] = -260.0
-"""放 bin 后 x 回的目标位置 (mm)。默认 -260 = target1 抓取位。None = 不回。"""
+DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM
+"""放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。
+回 P 姿态便于下一球直接走视觉伺服;若只跑单球可传 None。"""
 
 DEFAULT_PICK_TIMEOUT_S: float = 60.0
 """pick_by_vision 总超时 (s)。"""
@@ -402,6 +404,16 @@ def step_target4(
             print(f"\n========== [{LOG_PREFIX}] 第 {ball_idx} 球 "
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
+
+            # 2.0 恢复 P 姿态 (每轮开头兜底, 不依赖上一次循环的成功)
+            #    2026-08-03 现场决定: P 姿态是 task4 单一参考姿态,
+            #    寻路 / 检测 / 抓取之间都先回这里再继续。
+            if not dry_run:
+                try:
+                    goto_pose_p(arm_client, runner, log_prefix=f"{LOG_PREFIX}/球{ball_idx}")
+                except Exception as e:
+                    print(f"  [{LOG_PREFIX}] ⚠️ 恢复 P 姿态失败: "
+                          f"{type(e).__name__}: {str(e)[:120]}, 继续")
 
             # 2.1 creep 搜索 (慢速前移直到见球)
             print(f"  [{LOG_PREFIX}] 🔍 creep 搜索 ({creep_speed_mps:.2f} m/s, "
