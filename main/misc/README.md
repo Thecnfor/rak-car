@@ -22,10 +22,27 @@
 
 | 文件 | 类型 | 备注 |
 | --- | --- | --- |
-| [shooting_logic.md](./shooting_logic.md) | 笔记 | 枪射击逻辑调研结论（硬件层 + MyCar API + 任务层用法） |
 | [single_shot.py](./single_shot.py) | mini 任务 | 单发点射，连响 3 次确认触发 |
 | [burst_shot.py](./burst_shot.py) | mini 任务 | 连发，间隔可调 |
 | [drive_and_shoot.py](./drive_and_shoot.py) | mini 任务 | 边走边打：边巡线边周期性射击 |
+| [test_order_read.py](./test_order_read.py) | 冒烟 | OCR 读订单（task6 在调它的 `run()`） |
+| [test_veggie_detect.py](./test_veggie_detect.py) | 冒烟 | 蔬菜检测（task6 在调它的 `run()`） |
+| [llm_config.yml](./llm_config.yml) | 配置 | ERNIE token / 端点（task3 LLM 判别与 test_pest_llm_shoot 用） |
+
+## 射击硬件时序（红线，勿改）
+
+枪走 **`PoutD(4)`** 数字口（MC602 第 4 路继电器）。runtime 暴露两个 car action（见 [API_INDEX.md §6](../API_INDEX.md)）：
+
+| action | 行为 |
+| --- | --- |
+| `shooting` | 单发脉冲：拉低 50ms → 拉高 250ms → `finally` 拉低 → 200ms，总 ~500ms。`try/finally` 保证异常也拉低，防继电器常吸烧枪。250ms 高电平是经验值：长了过烧、短了不触发 |
+| `set_shoot_state` | 直接写电平，**无收尾逻辑**，只适合调试时常开/常闭，不要拿来连发 |
+
+三条红线：
+
+1. **不要 `set_shoot_state(True)` 持续触发**——没有收尾，硬件常吸。
+2. **`shooting` 调用间隔 ≥500ms**——内部 sleep 被打断会乱序；连发每发之间还要留装填时间（task 层实测 sleep 5s）。
+3. **端口占用**：当前只有 `PoutD(4)` 接枪；以后加继电器别撞端口号。
 
 ## 加新 mini 任务的姿势
 

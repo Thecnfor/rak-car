@@ -44,7 +44,7 @@ python3 /home/jetson/workspace/rak-car/main/quick_start.py
 
 ```text
 health: {'state': {'initialized': True, ...}, 'inference': {...}}
-actions: count=76
+actions: count=60+   # CAR_ACTIONS + ARM_ACTIONS + SYSTEM_ACTIONS，见 API_INDEX.md §6
 client ready
 ```
 
@@ -56,17 +56,16 @@ from main.arm import ArmClient, ArmRunner
 client = ArmClient.connect()
 runner = ArmRunner(client)
 
-runner.move_xy(100.0, 80.0)
-runner.set_side("LEFT")
-runner.move_xy(120.0, 40.0)
-runner.grasp(True)
-runner.set_hand("DOWN")
-runner.move_xy(0.0, 30.0)
-runner.grasp(False)
+runner.move_xy(100.0, -80.0)            # y 负 = 向上
+runner.set_arm_angle(-90.0)             # 大臂角度
+runner.move_xy(120.0, -40.0)
+runner.grasp(True)                      # 吸
+runner.move_xy(0.0, -30.0)
+runner.grasp(False)                     # 放
 runner.go_home()
 ```
 
-完整模板：[`main/arm/examples/04_grasp_template.py`](./arm/examples/04_grasp_template.py)。
+真机模板：[`main/arm/examples/11_grasp.py`](./arm/examples/11_grasp.py) / [`12_vision_pick_water.py`](./arm/examples/12_vision_pick_water.py)。
 
 机械臂首次上电：
 
@@ -128,7 +127,8 @@ for det in task_state["detections"]:
 
 ## 8. 下一步
 
-- 机械臂：[`main/arm/README.md`](./arm/README.md) + [`main/arm/QUICKSTART.md`](./arm/QUICKSTART.md)
+- 机械臂：[`main/arm/README.md`](./arm/README.md)（10 行起步 + examples 05–12 都在里面）
+- 写 task 先查：[`main/README.md` 现成方法速查](./README.md#写-task-先查这张表现成方法速查)
 - 底盘外环：[`main/chassis/README.md`](./chassis/README.md)
 - 完整 API：[`main/API_INDEX.md`](./API_INDEX.md)
 - mini 任务模板：[`main/misc/`](./misc/)
