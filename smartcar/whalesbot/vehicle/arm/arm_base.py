@@ -708,7 +708,8 @@ class ArmController:
                   x_direction: str = "right",
                   reset_x_velocity: float = 0.05,
                   timeout: float = 60.0,
-                  reset_x: bool = True):
+                  reset_x: bool = True,
+                  do_reset_y: bool = True):
         """
         复合复位:x 撞墙 + 大臂 + 手爪 三路并行,完成后 reset_y 触底串行。
 
@@ -717,6 +718,13 @@ class ArmController:
           - reset_x=False: 跳过 reset_x 撞墙,只并行 arm + hand,最后 reset_y 串行收尾。
             给 ensure_initialized 复用路径 (auto-init 自愈循环) 用,避免反复撞墙触发
             commit fb24b1a 描述的 PM2 死循环。
+
+        2026-08-03 改造: 加 do_reset_y=True 开关,允许 caller 自己消化 reset_y 后让
+          reset_all 只跑并行段。典型用法:init 想把"存储仓归位"提到第一步,
+          那 storage 步骤里就要先 reset_y 建零,再 move_y + set_storage_angle,
+          此时 reset_all 只需撞墙 + 大臂 + 手爪,并行段后不再 reset_y (do_reset_y=False)。
+          - do_reset_y=True  (默认): 与原来完全一致,并行段 + reset_y 串行收尾
+          - do_reset_y=False: 只跑并行段,跳过 reset_y。返回里 "y": None 表示跳过。
 
         为什么不能无条件接入 _create_car_locked / ensure_initialized:
           commit fb24b1a 已根治"reset_x 撞墙 + auto-init 反复调用"的 PM2 死循环。
@@ -733,16 +741,18 @@ class ArmController:
         进入 _should_probe_controller recover 路径。
 
         Args:
-            arm_angle: 大臂目标角度 (°),默认 0=MID
+            arm_angle: 大臂目标角度 (°),默认 90=UP
             hand_angle: 手爪目标角度 (°),默认 -90=UP
             x_direction: x 撞墙方向,默认 "right"
-            reset_x_velocity: x 撞墙速度 (m/s),默认 0.03
+            reset_x_velocity: x 撞墙速度 (m/s),默认 0.05
             timeout: 并行阶段总超时 (s)
             reset_x: 是否包含 x 撞墙 (默认 True)
+            do_reset_y: 是否在并行阶段之后串行跑 reset_y 触底 (默认 True)
 
         Returns:
-            dict: {"x": bool|None, "arm": bool, "hand": bool, "y": bool}
+            dict: {"x": bool|None, "arm": bool, "hand": bool, "y": bool|None}
                   reset_x=False 时 "x": None (表示跳过)
+                  do_reset_y=False 时 "y": None (表示跳过)
         """
         from concurrent.futures import ThreadPoolExecutor, as_completed
         results = {}
@@ -782,13 +792,18 @@ class ArmController:
         except Exception as exc:
             logger.warning("reset_all: 并行阶段异常: %s" % exc)
 
-        # reset_y 串行,最后（不放在线程池里 — 触底磁感应是绝对零点）
-        try:
-            y_ok = bool(self.reset_y())
-        except Exception as exc:
-            logger.warning("reset_all: reset_y 异常: %s" % exc)
-            y_ok = False
-        results["y"] = y_ok
+        # reset_y 串行,最后（不放在线程池里 — 触底磁感应是绝对零点）。
+        # do_reset_y=False:跳过 y 收尾,典型用法是 caller 在 reset_all 之前已自行调用
+        # reset_y (例如 init 把存储仓归位提前,内部已做 reset_y 建零)。
+        if do_reset_y:
+            try:
+                y_ok = bool(self.reset_y())
+            except Exception as exc:
+                logger.warning("reset_all: reset_y 异常: %s" % exc)
+                y_ok = False
+            results["y"] = y_ok
+        else:
+            results["y"] = None  # 表示跳过, caller 已自行处理 y
 
         logger.info("reset_all 完成: %s" % results)
         return results
