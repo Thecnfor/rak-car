@@ -486,6 +486,8 @@ class ArmRunner:
                             gain_arm: float = 0.4, gain_x: float = 0.08,
                             deadzone: float = 0.02, max_vel: float = 0.15,
                             sign_arm: float = 1.0, sign_x: float = -1.0,
+                            arm_min: Optional[float] = None,
+                            arm_max: Optional[float] = None,
                             lock_first: bool = True,
                             settle_hits: int = 3,
                             hold_s: float = 0.5,
@@ -507,6 +509,11 @@ class ArmRunner:
 
         方向符号 (实机标定 2026-08-02):
           sign_arm=+1 (dx>0 → arm 更负), sign_x=-1 (dy>0 → x 往左).
+
+        arm_min/arm_max (可选, 2026-08-03):
+          覆盖 find_target_arm_cross 默认 [-150, 90] 的大臂 clamp 范围.
+          任务二在 +95° 抓取 (超过默认 90), 必须传 arm_min/arm_max 让大臂
+          能绕着抓取角增量微调; 不传保持旧行为 (默认 [-150, 90]).
 
         为什么用 velocity 模式:
           走 POST /v1/realtime/arm-velocity (免 arm_queue, 高频平滑).
@@ -547,6 +554,13 @@ class ArmRunner:
                     self.client.http.wait_job(job_id, timeout=5.0)
             except Exception:
                 pass  # 退化到下面 servo, 失败也不致命
+        # arm_min/arm_max 可选: 覆盖 find_target_arm_cross 默认 [-150, 90].
+        # 任务二大臂在 +95° 抓取 (超过默认 arm_max=90), 不覆盖会把大臂钉死在 90.
+        cross_kw = {}
+        if arm_min is not None:
+            cross_kw["arm_min"] = arm_min
+        if arm_max is not None:
+            cross_kw["arm_max"] = arm_max
         try:
             self._set_arm_feed(stop=True)
             result = self.client._make_vision_with_move().find_target_arm_cross(
@@ -556,7 +570,7 @@ class ArmRunner:
                 arm_start=arm_start,
                 sign_arm=sign_arm, sign_x=sign_x,
                 setpoint_x_norm=sx, setpoint_y_norm=sy,
-                selector=selector)
+                selector=selector, **cross_kw)
         finally:
             self._set_arm_feed(stop=False)
 

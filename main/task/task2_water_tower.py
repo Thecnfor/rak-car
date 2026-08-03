@@ -27,8 +27,10 @@
   1. composite_run: X 收回 + Y 抬升到 -120 (并发)
   2. composite_run: 大臂转 +95° + X 伸出到方块抓取坐标 (并发)
   3. 手爪转 0° (Rule C: set_arm_angle 已内置 get_state 物理到位确认)
-  4. move_y 到吸取高度 -75
-  5. grasp + move_y 到运输高度 -105
+  4. cam2 视觉伺服 (pick_vision.enabled): track_velocity_pick 识别水立方 →
+     定位到吸嘴正下方 → move_y 到吸附高度 -75 → 吸附 → 抬回
+     (盲抓回退: move_y 到 -75 + grasp + move_y 到运输高度)
+  5. move_y 到运输高度 -150
   6. composite_run: X 收回 + 大臂转 -95° + 手爪 -90° (并发)
   7. Y 梯度下降 (第 1/2/3 块深度不同) + composite_release + grasp off
 
@@ -210,20 +212,25 @@ def _pick_cube(
 ) -> None:
     """抓取单个水方块 (不含投放).
 
-    执行顺序 (composite_run 内置并发 + SafetyMixin 自动 y 保护区校验):
-      1. composite_run: 大臂 → +95° + X → cube_x_mm + Y → -120 (并发)
-      2. 手爪 → 0°
+    手爪转 0° 后走 cam2 视觉伺服 (2026-08-03, pick_vision.enabled=true):
+      1. composite_run: 大臂 → +95° + X → cube_x_mm + Y → servo_y_mm (并发)
+      2. 手爪 → 0° (末端朝下, cam2 能看到吸嘴正下方的水立方)
       3. 轮询 get_state 确认大臂物理到位 (Rule C 业务层校验)
-      4. move_y 到吸取高度
-      5. grasp + 等待真空稳定 + move_y 抬升到运输高度
+      4. runner.track_velocity_pick: cam2 识别水立方 → 视觉定位到吸嘴正下方
+         (velocity 模式, 免 arm_queue) → move_y 到吸附高度 → 吸附 → 抬回
+      5. 补 move_y 到运输高度 (与盲抓路径一致的结束位, 供后续 _deliver_cube)
+
+    盲抓回退 (pick_vision.enabled=false):
+      4'. move_y 到吸取高度 + grasp + 等待真空稳定 + move_y 抬升到运输高度
     """
     pick = cfg["pick_pose"]
+    vision = cfg.get("pick_vision") or {}
 
     # 1) 复合动作: arm 转 + X 伸出 + Y 抬升并发
     runner.client.composite_run(
         arm=float(pick["arm_angle_deg"]),
         x_mm=float(cube_x_mm),
-        y_mm=float(pick["y_descend_mm"]),
+        y_mm=float(vision.get("servo_y_mm", pick["y_transition_mm"])),
     )
 
     # 2) 手爪转 0°
@@ -232,13 +239,48 @@ def _pick_cube(
     # 3) 业务层校验大臂物理到位
     _wait_arm_angle_reached(arm_client, pick["arm_angle_deg"])
 
-    # 4) 下降到吸取高度
-    runner.move_y(float(pick["y_descend_mm"]))
+    if not vision.get("enabled"):
+        # ---- 盲抓回退: 固定姿态下降 + 吸附 + 抬升 ----
+        runner.move_y(float(pick["y_descend_mm"]))
+        runner.grasp(on=True)
+        time.sleep(cfg["vacuum_settle_s"])
+        runner.move_y(float(pick["y_lift_mm"]))
+        return
 
-    # 5) 开真空 + 等待稳定 + 抬升
-    runner.grasp(on=True)
-    time.sleep(cfg["vacuum_settle_s"])
-    runner.move_y(float(pick["y_lift_mm"]))
+    # ---- cam2 视觉伺服抓水立方 ----
+    result = runner.track_velocity_pick(
+        vision.get("label", "water"),
+        x_start=cube_x_mm,
+        y_start=float(vision.get("servo_y_mm", pick["y_transition_mm"])),
+        arm_start=float(pick["arm_angle_deg"]),
+        hand_start=float(pick["hand_angle_deg"]),
+        grasp_y_mm=float(vision.get("grasp_y_mm", pick["y_descend_mm"])),
+        timeout=float(vision.get("timeout", 15.0)),
+        hz=float(vision.get("hz", 20.0)),
+        gain_arm=float(vision.get("gain_arm", 0.4)),
+        gain_x=float(vision.get("gain_x", 0.08)),
+        deadzone=float(vision.get("deadzone", 0.03)),
+        max_vel=float(vision.get("max_vel", 0.20)),
+        sign_arm=float(vision.get("sign_arm", 1.0)),
+        sign_x=float(vision.get("sign_x", -1.0)),
+        arm_min=vision.get("arm_min"),
+        arm_max=vision.get("arm_max"),
+        settle_hits=int(vision.get("settle_hits", 3)),
+        hold_s=float(vision.get("hold_s", 0.3)),
+        lift_back=True,
+        # (1)(2) 已摆好 S 姿态 (手爪 0°), 跳过 runner 内部重复 composite_run
+        skip_pose_align=True,
+    )
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"cam2 视觉抓水立方失败 (reason={result.get('reason')}, "
+            f"trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
+        )
+    # track_velocity_pick 已抬回 servo_y_mm; 补一次 move_y 到运输高度 (与盲抓路径一致)
+    lift_y = float(pick.get("y_lift_mm", -150.0))
+    servo_y = float(vision.get("servo_y_mm", pick["y_transition_mm"]))
+    if abs(lift_y - servo_y) > 1.0:
+        runner.move_y(lift_y)
 
 
 def _deliver_cube(
