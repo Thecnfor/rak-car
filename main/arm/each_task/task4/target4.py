@@ -406,38 +406,29 @@ def _pick_and_store(
         return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
     print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
 
-    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球, 然后抬回 P 姿态)
+    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球)
     print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
     arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
     runner.grasp(True, timeout=5.0)
-    time.sleep(1.0)  # 让真空建立
-    print(f"  [{LOG_PREFIX}] 抬回 P 姿态 y={POSE_P_Y_MM}")
-    arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=10.0)
+    time.sleep(0.5)  # 让真空建立
 
-    try:
-        # 1. 升 y (出保护区 + 离地) ∥ 横移到 bin 上方
-        print(f"  [{LOG_PREFIX}] [1/3] composite_run(y={Y_TRANSIT_MM} ∥ x={bin_x}) "
-              f"→ bin 高位")
+    # 1. 一步到 bin 放仓位 (4 轴并发, 没有中间过渡姿态)
+    print(f"  [{LOG_PREFIX}] composite_run(y={Y_PUT_MM} ∥ x={bin_x}) → bin 放仓位")
+    arm_client.composite_run(
+        y_mm=Y_PUT_MM, x_mm=bin_x, speed=80, timeout=30.0,
+    )
+    # 2. 放气
+    print(f"  [{LOG_PREFIX}] grasp(False) 放球")
+    runner.grasp(False, timeout=5.0)
+    time.sleep(0.3)
+
+    # 3. 一步回 P 姿态 (4 轴并发)
+    if return_x_mm is not None:
         arm_client.composite_run(
-            y_mm=Y_TRANSIT_MM, x_mm=bin_x, speed=80, timeout=30.0,
+            y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
         )
-        # 2. y 降到 Y_PUT_MM → grasp(False) 放球
-        print(f"  [{LOG_PREFIX}] [2/3] composite_run(y={Y_PUT_MM}) → grasp(False)")
-        arm_client.composite_run(
-            y_mm=Y_PUT_MM, speed=80, timeout=30.0,
-        )
-        runner.grasp(False, timeout=10.0)
-        time.sleep(0.3)  # 让球稳定掉进 bin
-        # 3. 恢复到 P 姿态 (识别位姿: y=POSE_P_Y, x=return_x_mm)
-        if return_x_mm is not None:
-            arm_client.composite_run(
-                y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
-            )
-        else:
-            arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
-    except Exception as e:
-        return {"ok": False,
-                "error": f"pick_and_store: {type(e).__name__}: {str(e)[:120]}"}
+    else:
+        arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
     return {"ok": True, "error": None}
 
 
