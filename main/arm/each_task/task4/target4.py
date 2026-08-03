@@ -387,12 +387,17 @@ def _pick_and_store(
             arm_start=POSE_P_ARM_DEG,  # 90° 抓球大臂位
             hand_start=POSE_P_HAND_DEG,  # 0° 朝下
             grasp_y_mm=-20.0,  # 球高度 (4cm 球, 抓球位 ≈ -20mm)
-            timeout=pick_timeout_s,
-            deadzone=0.05,
-            settle_hits=2,
-            max_vel=0.20,
-            gain_arm=0.5,
-            gain_x=0.10,
+            # 2026-08-03 现场: 用 task1_seeding.py 实测的同款 PID 参数
+            # (gain_arm=2.5/gain_x=0.55/max_vel=0.70/timeout=2/settle_hits=1),
+            # 我之前用 gain_arm=0.6/gain_x=0.15 太保守 → ball 在 8s 内离
+            # setpoint 0.26 没收敛。
+            timeout=4.0,
+            hz=20.0,
+            settle_hits=1,
+            deadzone=0.06,
+            max_vel=0.70,
+            gain_arm=2.5,
+            gain_x=0.55,
             lift_back=False,  # 不让 track_velocity_pick 抬回, 业务层管
         )
         if not pick_res.get("ok"):
