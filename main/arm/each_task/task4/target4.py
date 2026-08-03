@@ -61,6 +61,7 @@ try:  # noqa: E402
     from .constants import (  # noqa: E402
         LOG_PREFIX_TASK4,
         COLOR_BLUE, COLOR_YELLOW,
+        GRASP_HOLD_S,
     )
 except ImportError:  # pragma: no cover —— 直接 python target4.py 时无包上下文
     from main.arm.each_task.task4 import (  # type: ignore # noqa: E402
@@ -68,6 +69,7 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
     )
     from main.arm.each_task.task4.constants import (  # type: ignore # noqa: E402
         LOG_PREFIX_TASK4, COLOR_BLUE, COLOR_YELLOW,
+        GRASP_HOLD_S,
     )
 
 from main.arm import (  # noqa: E402
