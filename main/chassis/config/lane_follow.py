@@ -62,6 +62,11 @@ class LaneFollowProfile:
     # 控制器参数全部走 curvature_adaptive.py 默认值，这里不再持有一份。
     # CLI --tune 仍可覆盖 profile 字段，但 build_outer() 不再透传这些字段。
 
+    # --- 误差标定（视觉零漂）---
+    # 实车放车道正中读 trace ey，把这个读数（带符号）填到这里 → 正中即标成 0。
+    # 0 = 不标定。CLI 未显式传 --error-offset-y 时用它。
+    error_offset_y: float = 0.0
+
     # --- 下发软化（饱和 + slew rate）---
     wheel_max_abs: float = 0.70
     wheel_max_accel: float = 0.4

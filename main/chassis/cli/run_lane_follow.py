@@ -133,7 +133,8 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--error-offset-y", type=float, default=0.0,
-        help="error_y 零点偏移（视觉零漂，米/模型尺度）。默认 0。"
+        help="error_y 零点偏移（视觉零漂，米/模型尺度）。默认 0；\n"
+             "若 profile.error_offset_y 已标好，这里留 0 即用 profile 值。"
     )
     parser.add_argument(
         "--error-ema-alpha", type=float, default=None,
@@ -157,6 +158,11 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument(
         "--kp-y", type=float, default=0.2,
         help="vy 横移通道比例增益 (m/s 每米误差)。横移回正与 vx 巡航正交合成。"
+    )
+    parser.add_argument(
+        "--kd-y", type=float, default=0.2,
+        help="vy 横移通道阻尼增益。误差快速归零（要冲过头）时压掉部分 vy，\n"
+             "抑制回正过头 → 回正后重新偏移的震荡。0 关闭。默认 0.2。"
     )
     parser.add_argument(
         "--sign-y", type=float, default=-1.0,
@@ -191,6 +197,7 @@ def main(argv: list[str] | None = None) -> None:
             vx_cruise=args.vx_cruise,
             deadband_y=args.deadband_y,
             kp_y=args.kp_y,
+            kd_y=args.kd_y,
             sign_y=args.sign_y,
             strafe_v=args.strafe_v,
         )
@@ -209,8 +216,9 @@ def main(argv: list[str] | None = None) -> None:
         cal_kwargs["scale_y"] = args.error_scale_y
     if args.error_scale_angle is not None:
         cal_kwargs["scale_angle"] = args.error_scale_angle
-    if args.error_offset_y != 0.0:
-        cal_kwargs["offset_y"] = args.error_offset_y
+    if args.error_offset_y != 0.0 or profile.error_offset_y != 0.0:
+        # 优先 CLI 显式传的 offset；没传（==0 哨兵）且 profile 标过 → 用 profile 值
+        cal_kwargs["offset_y"] = args.error_offset_y if args.error_offset_y != 0.0 else profile.error_offset_y
     if args.error_ema_alpha is not None:
         cal_kwargs["ema_alpha"] = args.error_ema_alpha
     calibrator = ErrorCalibrator(**cal_kwargs) if cal_kwargs else None
