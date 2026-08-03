@@ -13,7 +13,7 @@ BOOT_PING_ACK = bytes.fromhex("66 BB 01 01 0A 00 5A 02 00 76")
 RUN_CODE = bytes.fromhex("55 AA 00 40 0B 00 00 D0 00 08 DD")
 RUN_CODE_ACK = bytes.fromhex("66 BB 01 41 0B 00 00 D0 00 08 B9")
 
-MC601_PING = bytes.fromhex("77 68 04 00 01 CA 01 0A")
+# 2026-08-03：MC601 路径整体删除（全进程只支持 MC602 USB 有线）
 MC602_PING = bytes.fromhex("77 68 07 02 01 10 0A")
 
 PORT_STABLE_FOR_S = 0.8
@@ -88,26 +88,7 @@ def _open_serial(port_name, baudrate=115200, timeout=0.03):
     )
 
 
-def ping_mc601(serial_obj, timeout_s=0.05):
-    serial_obj.baudrate = 380400
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        serial_obj.reset_input_buffer()
-        serial_obj.reset_output_buffer()
-        serial_obj.write(MC601_PING)
-        head = _read_exact(serial_obj, 3, 0.03)
-        if len(head) != 3:
-            continue
-        frame_len = head[2] + 7
-        body = _read_exact(serial_obj, frame_len - 3, 0.03)
-        response = head + body
-        if (
-            len(response) == frame_len
-            and response[:2] == bytes.fromhex("77 68")
-            and response[-1:] == bytes.fromhex("0A")
-        ):
-            return True
-    return False
+
 
 
 def ping_mc602(serial_obj, timeout_s=0.05):
@@ -297,8 +278,6 @@ def recover_controller_with_probe(
             try:
                 with _open_serial(port_name) as serial_obj:
                     if ping_mc602(serial_obj, timeout_s=0.3):
-                        return True, "控制器 program 模式在线"
-                    if ping_mc601(serial_obj, timeout_s=0.3):
                         return True, "控制器 program 模式在线"
                     ok, ret = boot_ping(serial_obj, timeout_s=0.12)
                     if debug_hook is not None:

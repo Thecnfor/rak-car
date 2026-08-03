@@ -543,7 +543,7 @@ class ServoBus_2(DevCmdInterface):
         """读取总线舵机当前角度（mc602, dev_id=0x06, GET sub_mode=1）。
 
         协议格式 <bbbbbbh，回包最后一个字段即为有符号 short 角度。
-        mc602 仅实现该路径；mc601 走 ServoBus_1，本轮未补。
+        MC602 USB 有线是唯一通信路径（2026-08-03 起 MC601/无线已删除）。
         """
         result = self.act_mode(1, 0, 0, 0, mode=1, port_id=port_id)
         if isinstance(result, (list, tuple)):

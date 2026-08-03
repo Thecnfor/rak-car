@@ -91,7 +91,7 @@ class HardwareIOMixin:
         return {"port": int(port), "angle": float(angle), "speed": int(speed)}
 
     def read_bus_servo(self, port):
-        """读取总线舵机当前角度（mc602 实现；mc601 暂不支持）。"""
+        """读取总线舵机当前角度（mc602 ServoBus_2 协议）。"""
         servo = self._get_realtime_instance("bus_servo", port)
         return int(servo.read_angle())
 

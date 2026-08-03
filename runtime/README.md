@@ -183,7 +183,7 @@ runtime 把「动作执行」与「init / 引用替换」分到两把锁，让�
 - **读共享**：`share_key` 相同的读请求（`encoder_N` / `analog2_N` / `encoder4_batch`）并发时只打一个物理读帧，结果广播——odom_feed、realtime 端点、odometry 线程读同一编码器不再各付一个 RTT
 - **优先级**：URGENT > NORMAL > READ；零速/急停帧插队
 - **心跳让路**：controller_session 心跳在 2s 内有业务 IO 时不发 ping 帧（有流量即存活证据）
-- **降级**：引擎未 attach / `RAK_CAR_SERIAL_ENGINE=0` / mc601 → 自动退回旧 lock 同步路径，异常语义不变
+- **降级**：引擎未 attach / `RAK_CAR_SERIAL_ENGINE=0` → 自动退回旧 lock 同步路径，异常语义不变。**MC602 USB 有线是唯一通信路径**（2026-08-03 起 MC601/无线协议类已整体删除）
 - 离线单测：`smartcar/test/test_serial_engine.py`（16 项，无硬件，`/usr/bin/python3 smartcar/test/test_serial_engine.py`）
 
 ### 双 worker 队列
