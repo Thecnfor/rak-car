@@ -349,59 +349,59 @@ def _pick_and_store(
     return_x_mm: Optional[float],
     pick_timeout_s: float,
 ) -> dict:
-    """直接抓手姿态: creep 见球后, 假设吸嘴已在球正上方 (track_chassis 拉到中心
-    或 P 姿态 + 移到位 = 视觉对齐即吸嘴对齐), 直接进入抓取姿态。
+    """底盘对齐后 + 臂精准定位抓取 + composite_run 并行放 bin。
 
-    2026-08-03 现场 (用户): '对齐之后进入抓取姿态直接就是对齐的,
-    直接 y 下来 + grasp 就能抓住'。
-    跳过 find_target / move_to_vision_target 的视觉-PID 伺服, 避免 task 模型
-    label 与 ball_* 不匹配的卡死。
+    2026-08-03 现场 (用户): '现在是两个定位 — 底盘对齐然后精准追踪'。
+      step 2.2 底盘对齐 (track_chassis) 已做了;
+      本函数加回 step 2.5: track_velocity_pick 精准追踪 (P 姿态吸嘴 setpoint),
+      之后才进入放仓固定两位置。
 
     流程:
+      0. track_velocity_pick(label, skip_pose_align=True) — 已在 P 姿态, 跳过入口
+         composite_run, 直接走 arm 控 cx + x 十字控 cy + 吸嘴 setpoint
+         → y 降到 grasp_y → grasp(True) → 自动回抬
       1. composite_run 升 y (出保护区) ∥ x 横移到 bin 上方 (固定两位置)
-      2. composite_run y 降到 Y_PICK_MM (球心高度) → 吸嘴已压在球上
-      3. grasp(True) + sleep(hold)
-      4. composite_run y 升到 Y_TRANSIT_MM
-      5. composite_run y 降到 Y_PUT_MM (放仓位) → grasp(False)
-      6. 恢复到 return_x_mm (默认 POSE_P_X = -300)
+      2. composite_run y 降到 Y_PUT_MM (放仓位) → grasp(False)
+      3. 恢复到 return_x_mm (默认 POSE_P_X = -300)
 
     Returns:
         {"ok": bool, "error": str|None}
     """
+    label = f"ball_{color}"
     bin_x = BIN_X_MM[color]
-    print(f"  [{LOG_PREFIX}] 🎯 直接抓手姿态 color={color} bin_x={bin_x} "
-          f"(跳过 track/find_target, 假设吸嘴已在球上方)")
+
+    # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
+    print(f"  [{LOG_PREFIX}] [0/3] track_velocity_pick(label={label!r}, "
+          f"skip_pose_align=True, grasp_y={POSE_P_GRAB_Y_MM})")
+    try:
+        pick_res = runner.track_velocity_pick(
+            label,
+            skip_pose_align=True,
+            grasp_y_mm=POSE_P_GRAB_Y_MM,
+            timeout=pick_timeout_s,
+        )
+        if not pick_res.get("ok"):
+            return {"ok": False,
+                    "error": f"track_velocity_pick: {pick_res.get('reason')}"}
+    except Exception as e:
+        return {"ok": False,
+                "error": f"track_velocity_pick: {type(e).__name__}: {str(e)[:120]}"}
 
     try:
         # 1. 升 y (出保护区) ∥ 横移到 bin 上方
-        print(f"  [{LOG_PREFIX}] [1/5] composite_run(y={Y_TRANSIT_MM} ∥ x={bin_x}) "
+        print(f"  [{LOG_PREFIX}] [1/3] composite_run(y={Y_TRANSIT_MM} ∥ x={bin_x}) "
               f"→ bin 高位")
         arm_client.composite_run(
             y_mm=Y_TRANSIT_MM, x_mm=bin_x, speed=80, timeout=30.0,
         )
-        # 2. y 降到 Y_PICK_MM (球心), x 不动
-        print(f"  [{LOG_PREFIX}] [2/5] composite_run(y={Y_PICK_MM}) "
-              f"→ 吸嘴压在球上")
-        arm_client.composite_run(
-            y_mm=Y_PICK_MM, speed=80, timeout=30.0,
-        )
-        # 3. grasp + hold
-        print(f"  [{LOG_PREFIX}] [3/5] grasp(True) + sleep")
-        runner.grasp(True, timeout=10.0)
-        time.sleep(GRASP_HOLD_S)  # 沿用 constants.GRASP_HOLD_S
-        # 4. 升 y (持球抬升, 出 gate)
-        print(f"  [{LOG_PREFIX}] [4/5] composite_run(y={Y_TRANSIT_MM}) 持球抬升")
-        arm_client.composite_run(
-            y_mm=Y_TRANSIT_MM, speed=80, timeout=30.0,
-        )
-        # 5. y 降到 Y_PUT_MM → grasp(False)
-        print(f"  [{LOG_PREFIX}] [5/5] composite_run(y={Y_PUT_MM}) → grasp(False)")
+        # 2. y 降到 Y_PUT_MM → grasp(False)
+        print(f"  [{LOG_PREFIX}] [2/3] composite_run(y={Y_PUT_MM}) → grasp(False)")
         arm_client.composite_run(
             y_mm=Y_PUT_MM, speed=80, timeout=30.0,
         )
         runner.grasp(False, timeout=10.0)
         time.sleep(0.2)
-        # 6. 恢复到识别位姿 (return_x_mm = POSE_P_X = -300)
+        # 3. 恢复到识别位姿 (return_x_mm = POSE_P_X = -300)
         if return_x_mm is not None:
             arm_client.composite_run(
                 y_mm=Y_FINAL_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
