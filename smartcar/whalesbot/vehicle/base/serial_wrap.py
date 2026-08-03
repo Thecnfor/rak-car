@@ -397,263 +397,6 @@ def set_urgent_prefixes(prefixes):
     _URGENT_CMD_PREFIXES = frozenset(prefixes)
 
 
-class SerialEngineJob:
-    """一次串口 round-trip 的提交凭证。
-
-    调用方 `submit()` 后 `event.wait(timeout)`，成功后从 `result` 取应答 payload。
-    失败语义与旧同步路径一一对应（见 SerialWrap.get_anwser）：
-      - result=None + error=None       → 控制器无响应（旧 ControllerNoResponseError）
-      - result=None + error="transport" → 串口通信异常（旧 ControllerTransportError）
-      - result=None + error="not_ready" → 控制器未连接（旧 ControllerNotReadyError）
-    """
-    __slots__ = (
-        "kind", "payload", "time_out", "priority",
-        "coalesce_key", "share_key",
-        "event", "result", "error", "submitted_at",
-    )
-
-    def __init__(self, kind, payload, time_out, priority=PRIORITY_NORMAL,
-                 coalesce_key=None, share_key=None):
-        self.kind = kind            # "mc602"
-        self.payload = payload      # bytes（帧载荷）
-        self.time_out = float(time_out)
-        self.priority = priority
-        self.coalesce_key = coalesce_key  # 同 key 写帧队列内只留最新
-        self.share_key = share_key        # 同 key 读请求合并为一次物理读
-        self.event = _threading.Event()
-        self.result = None
-        self.error = None
-        self.submitted_at = time.time()
-
-    def done(self, result=None, error=None):
-        self.result = result
-        self.error = error
-        self.event.set()
-
-
-class SerialEngine:
-    """单 io 线程串口调度器。线程安全，供 SerialWrap 挂载/卸载。"""
-
-    def __init__(self):
-        self._wakeup_r, self._wakeup_w = os.pipe()
-        try:
-            os.set_blocking(self._wakeup_r, False)
-            os.set_blocking(self._wakeup_w, False)
-        except Exception:
-            pass
-        self._seq = _itertools.count()
-        self._pending = []          # heapq: (priority, seq, job)
-        self._coalesce_groups = {}  # coalesce_key -> [job, ...]
-        self._inflight = {}         # share_key -> [job, ...]
-        self._pending_lock = _threading.Lock()
-        self._attached = False
-        self._dev_kind = None
-        self._serial = None
-        self._dev = None
-        self._thread = None
-        self._stop_event = _threading.Event()
-        self._idle = _threading.Event()
-        self._idle.set()
-        self.stats = {
-            "frames": 0, "coalesced": 0, "shared": 0,
-            "timeouts": 0, "errors": 0,
-        }
-
-    # ---------- 生命周期 ----------
-
-    def start(self):
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop_event.clear()
-        self._thread = _threading.Thread(
-            target=self._io_loop, name="serial-engine", daemon=True
-        )
-        self._thread.start()
-
-    def shutdown(self):
-        self._stop_event.set()
-        self._wake()
-
-    def attach(self, serial_obj, dev):
-        """连接建立后由 SerialWrap 在 self.lock 内调用。"""
-        kind = None
-        if dev is not None:
-            name = str(getattr(dev, "name", "")).lower()
-            if "mc602" in name and "wireness" not in name:
-                kind = "mc602"
-        with self._pending_lock:
-            self._attached = kind is not None
-            self._dev_kind = kind
-            self._serial = serial_obj
-            self._dev = dev
-        self._wake()
-
-    def detach(self):
-        """recovery/close 前调用。等 io 线程跑完当前帧再清空队列。"""
-        with self._pending_lock:
-            self._attached = False
-        self.quiesce(timeout=1.5)
-        with self._pending_lock:
-            self._dev_kind = None
-            self._serial = None
-            self._dev = None
-            pending = [job for _, _, job in self._pending]
-            self._pending = []
-            self._coalesce_groups.clear()
-            inflight = []
-            for jobs in self._inflight.values():
-                inflight.extend(jobs)
-            self._inflight.clear()
-        for job in pending + inflight:
-            job.done(error="transport")
-
-    def quiesce(self, timeout=1.5):
-        """等 io 线程把手头帧跑完（空闲）。"""
-        return self._idle.wait(timeout)
-
-    def is_attached(self, kind=None):
-        if kind is None:
-            return self._attached
-        return self._attached and self._dev_kind == kind
-
-    # ---------- 提交 ----------
-
-    def submit(self, job):
-        if self._stop_event.is_set() or self._thread is None or not self._thread.is_alive():
-            return False
-        with self._pending_lock:
-            if not self._attached:
-                return False
-            sk = job.share_key
-            if sk is not None:
-                group = self._inflight.get(sk)
-                if group is not None:
-                    # 已有同 key 读帧在飞：并组共享应答
-                    group.append(job)
-                    self.stats["shared"] += 1
-                    return True
-            ck = job.coalesce_key
-            if ck is not None:
-                self._coalesce_groups.setdefault(ck, []).append(job)
-            _heapq.heappush(self._pending, (job.priority, next(self._seq), job))
-        self._wake()
-        return True
-
-    def _wake(self):
-        try:
-            os.write(self._wakeup_w, b"x")
-        except Exception:
-            pass
-
-    # ---------- io 线程主循环 ----------
-
-    def _io_loop(self):
-        wake_r = self._wakeup_r
-        while not self._stop_event.is_set():
-            job, members = self._pop_next()
-            if job is None:
-                self._idle.set()
-                try:
-                    os.read(wake_r, 64)
-                except Exception:
-                    pass
-                # select 等唤醒
-                try:
-                    _select.select([wake_r], [], [], _ENGINE_IDLE_SLEEP)
-                except Exception:
-                    time.sleep(_ENGINE_IDLE_SLEEP)
-                continue
-            self._idle.clear()
-            self._execute(job, members)
-
-    def _pop_next(self):
-        with self._pending_lock:
-            while self._pending:
-                priority, seq, job = _heapq.heappop(self._pending)
-                ck = job.coalesce_key
-                if ck is not None:
-                    group = self._coalesce_groups.get(ck, [])
-                    # 写合并：只认组内最新一条，旧条目丢弃
-                    if group and group[-1] is not job:
-                        # 这不是最新的，把旧 job 们复制到最新 job 的 members 里
-                        latest = group[-1]
-                        # 把所有 group 成员（除最新）做 coalesce 等待者
-                        old_members = [j for j in group if j is not latest]
-                        # 最新帧出队时 members = old_members + [latest]
-                        # 这里只是跳过旧帧，不单独 done()：等最新帧出队时统一广播
-                        continue
-                    # 最新帧：members = 整组（除自身外的旧帧）
-                    members = [j for j in group if j is not job]
-                    self._coalesce_groups.pop(ck, None)
-                else:
-                    members = []
-                # 处理 share_key：出队时把自己注册到 inflight
-                sk = job.share_key
-                if sk is not None:
-                    self._inflight.setdefault(sk, []).append(job)
-                return job, members
-        return None, []
-
-    def _execute(self, job, coalesced_members):
-        """在 io 线程里执行一次物理 round-trip，结果广播给 job + coalesced_members。"""
-        with self._pending_lock:
-            serial_obj = self._serial
-            dev = self._dev
-            attached = self._attached
-        if not attached or serial_obj is None or dev is None:
-            job.done(error="not_ready")
-            for m in coalesced_members:
-                m.done(error="not_ready")
-            return
-        # 超时检查：在队列里等太久的帧直接丢弃
-        age = time.time() - job.submitted_at
-        if age > job.time_out:
-            self.stats["timeouts"] += 1
-            job.done(error=None)  # 无响应语义
-            for m in coalesced_members:
-                m.done(error=None)
-            self._finish_share(job)
-            return
-        result = None
-        error = None
-        try:
-            serial_obj.reset_input_buffer()
-            serial_obj.reset_output_buffer()
-            dev.send_cmd(serial_obj, job.payload)
-            res = dev.get_anwser(serial_obj, job.time_out)
-            if res is None:
-                error = None  # ControllerNoResponseError 语义
-            else:
-                result = res
-            self.stats["frames"] += 1
-        except serial.SerialException:
-            error = "transport"
-            self.stats["errors"] += 1
-        except Exception:
-            error = "transport"
-            self.stats["errors"] += 1
-        # 广播结果
-        job.done(result=result, error=error)
-        self.stats["coalesced"] += len(coalesced_members)
-        for m in coalesced_members:
-            m.done(result=result, error=error)
-        self._finish_share(job)
-
-    def _finish_share(self, job):
-        """share_key 帧完成后，广播给已并组等待的其他 job。"""
-        sk = job.share_key
-        if sk is None:
-            return
-        with self._pending_lock:
-            waiters = self._inflight.pop(sk, [])
-        for w in waiters:
-            if w is job:
-                continue
-            if not w.event.is_set():
-                w.done(result=job.result, error=job.error)
-                self.stats["shared"] += 1
-
-
 # 模块级单例引擎（SerialWrap.__init__ 时 attach，recovery 时 detach+attach）
 _serial_engine: SerialEngine = SerialEngine()
 _serial_engine.start()
@@ -833,7 +576,7 @@ class SerialWrap(serial.Serial):
     def connect_until_ready(self, timeout=None):
         return self.reconnect(timeout=timeout, probe_result=None)
 
-(self, dev):
+    def _engine_kind_for(self, dev):
         name = str(getattr(dev, "name", "")).lower()
         if "wireness" in name:
             return "mc602_wireness"
@@ -905,33 +648,32 @@ class SerialWrap(serial.Serial):
                 _notify_runtime_session("note_io_failure", self.last_error)
                 raise ControllerNoResponseError(self.last_error)
         # ---- 同步降级路径（旧语义,逐字节保留） ----
-||||||| 55fd140
-    def get_anwser(self, cmd:bytes, time_out=0.1)->bytes:
-        with self.lock:
-            if self.dev is None or not self.connect_flag or not self.is_open:
-                self.last_error = "控制器未连接"
-                _notify_runtime_session("mark_offline", self.last_error)
-                raise ControllerNotReadyError(self.last_error)
-            try:
-                self.reset_buffer()
-                self.dev.send_cmd(self, cmd)
-                res = self.dev.get_anwser(self)
-            except serial.SerialException as exc:
-                self.last_error = "串口通信异常: {}".format(exc)
-                _notify_runtime_session("note_io_failure", self.last_error)
-                raise ControllerTransportError(self.last_error)
-            except Exception as exc:
-                self.last_error = "控制器通信异常: {}".format(exc)
-                _notify_runtime_session("note_io_failure", self.last_error)
-                raise ControllerTransportError(self.last_error)
-            if res is None:
-                self.last_error = "控制器无响应，可能已脱离 program 模式"
-                _notify_runtime_session("note_io_failure", self.last_error)
-                raise ControllerNoResponseError(self.last_error)
-            self.last_ok_at = time.time()
-            self.last_error = None
-            _notify_runtime_session("note_io_success")
-            return res
+        else:
+            with self.lock:
+                if self.dev is None or not self.connect_flag or not self.is_open:
+                    self.last_error = "控制器未连接"
+                    _notify_runtime_session("mark_offline", self.last_error)
+                    raise ControllerNotReadyError(self.last_error)
+                try:
+                    self.reset_buffer()
+                    self.dev.send_cmd(self, cmd)
+                    res = self.dev.get_anwser(self)
+                except serial.SerialException as exc:
+                    self.last_error = "串口通信异常: {}".format(exc)
+                    _notify_runtime_session("note_io_failure", self.last_error)
+                    raise ControllerTransportError(self.last_error)
+                except Exception as exc:
+                    self.last_error = "控制器通信异常: {}".format(exc)
+                    _notify_runtime_session("note_io_failure", self.last_error)
+                    raise ControllerTransportError(self.last_error)
+                if res is None:
+                    self.last_error = "控制器无响应，可能已脱离 program 模式"
+                    _notify_runtime_session("note_io_failure", self.last_error)
+                    raise ControllerNoResponseError(self.last_error)
+                self.last_ok_at = time.time()
+                self.last_error = None
+                _notify_runtime_session("note_io_success")
+                return res
 
     def ping_current(self, timeout=0.05):
         with self.lock:

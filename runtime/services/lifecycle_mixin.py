@@ -134,6 +134,14 @@ class LifecycleMixin:
 
     def _create_car_locked(self, reset_arm=False, reset_position=True):
         session = self._ensure_controller_ready()
+        # 2026-08-03: 必须先保证模块级 singleton serial_wrap 已经稳定连接,
+        # 否则 MyCar.__init__ 走到 ArmController.y_params_init → motor_y.get_dis()
+        # → serial.get_anwser 会立刻 raise ControllerNotReadyError("控制器未连接"),
+        # mark_offline 回调把 controller_session 设回 DISCONNECTED, 进死循环。
+        # controller_session.ensure_ready 内的 sync_with_probe 一进来就 _close_locked
+        # 重置 connect_flag, singleton 自己又有 auto_connect 异步重连,两条路径相互踩;
+        # 这里 poll 等待 singleton 在调用方抢到 _ref_lock 之前稳定到 connect_flag=True。
+        self._wait_serial_wrap_ready(timeout=5.0)
         # 2026-08-03: 构造 MyCar 期间禁 GC。GC finalizer 可能 finalize 泄漏的
         # zmq.Context, __del__ → destroy() → term() 永等未关 socket —— 若卡在构造
         # 线程里, initializing 永真, 自愈循环整体瘫痪 (证据:
@@ -155,24 +163,20 @@ class LifecycleMixin:
         car.beep()
         time.sleep(1)
         # 2026-08-03 init 新顺序（用户要求）：
-        #   ① 存储仓归位 (内部先 reset_y 建零 → move_y(-0.150) → set_storage_angle(98))
-        #   ② reset_all (do_reset_y=False) 只跑并行段: x 撞墙 ‖ 大臂 +90° ‖ 手爪 UP
+        #   ① 存储仓归位 (舵机 close 到 98°)
+        #   ② reset-all (含 y 校准 + x 撞墙 ‖ 大臂 +90° ‖ 手爪 UP)
         #   ③ 里程计清零 (init_car_position)
         # 关键设计:move_y_position 必须 in reset_y 之后,
-        # 但用户要求"存储仓归位"看上去要第一步 ——
-        # 把 reset_y 内嵌到"存储仓归位"内部,从外部看就是"存储仓先"。
+        # 因此 reset_y 放在 ② (reset_all, do_reset_y=True) 里, 后续 move_y
+        # 才能拿到正确的 y_pose_start; ① 不动 y 轴。
         init_x_v = float(os.getenv("RAK_CAR_RESET_X_VELOCITY", "0.05"))
-        # ① 存储仓归位 (自包含:校准 y + 抬升到 -150mm + 舵机 close)
+        # ① 存储仓归位 (仅舵机 close 到 98°, 不动 y 轴)
         try:
-            cal_res = car.arm.reset_y()
-            if not cal_res:
-                logger.warning("init storage 准备: reset_y 未成功, 仍尝试 move_y (可能撞)")
-            car.arm.move_y_position(-0.150)
             car.set_storage_angle(98, speed=5)
-            logger.info("init storage close (98°) 完成 (reset_y=%s)", cal_res)
+            logger.info("init storage close (98°) 完成")
         except Exception as exc:  # pragma: no cover - 不让 init 失败
             logger.warning("init storage close 失败: %s" % exc)
-        # ② 并行段: x 撞墙 + 大臂 + 手爪 (do_reset_y=False,不再重复 reset_y)
+        # ② reset-all: y 校准 + x 撞墙 + 大臂 + 手爪 (并行段)
         try:
             reset_res = car.arm.reset_all(
                 arm_angle=90,        # 复位位 +90°
@@ -180,9 +184,9 @@ class LifecycleMixin:
                 x_direction="right", # 默认撞右墙
                 reset_x_velocity=init_x_v,
                 timeout=60.0,
-                do_reset_y=False,    # y 已在 ① 内建零, 这里不再做
+                do_reset_y=True,     # y 校准在 ②, 后续 move_y 才有正确基准
             )
-            logger.info("init reset_all (parallel only) 完成: %s", reset_res)
+            logger.info("init reset_all (含 y 校准) 完成: %s", reset_res)
         except Exception as exc:
             self.last_error = "arm reset_all 失败: {}".format(exc)
             logger.warning("init 时 reset_all 失败: %s" % exc)
@@ -238,20 +242,12 @@ class LifecycleMixin:
                     self.car.STOP_PARAM = self.stop_after_action
                     if reset_arm:
                         # 2026-08-03：复用现有 car 的"完整复位"路径与 _create_car_locked 对齐
-                        # "三步顺序：存储仓 (含 reset_y) → reset_all (并行 + do_reset_y=False) → odom"。
+                        # "三步顺序：存储仓 (舵机 close) → reset_all (含 y 校准) → odom"。
                         # 复用路径仍然 reset_x=False 跳过撞墙,防 auto-init 自愈循环反复撞墙触发
                         # commit fb24b1a 描述的 PM2 死循环。
                         try:
-                            cal_res = self.car.arm.reset_y()
-                            if not cal_res:
-                                logger.warning(
-                                    "ensure_initialized storage 准备: reset_y 未成功,"
-                                    "仍尝试 move_y (可能撞)")
-                            self.car.arm.move_y_position(-0.150)
                             self.car.set_storage_angle(98, speed=5)
-                            logger.info(
-                                "ensure_initialized storage close (98°) 完成 (reset_y=%s)",
-                                cal_res)
+                            logger.info("ensure_initialized storage close (98°) 完成")
                         except Exception as exc:  # pragma: no cover
                             logger.warning("ensure_initialized storage close 失败: %s" % exc)
                         try:
@@ -263,9 +259,9 @@ class LifecycleMixin:
                                 reset_x_velocity=init_x_v,
                                 timeout=60.0,
                                 reset_x=False,    # 复用路径:跳过撞墙
-                                do_reset_y=False, # y 已在 storage 步骤建零
+                                do_reset_y=True,  # y 校准在 reset_all 内完成
                             )
-                            logger.info("ensure_initialized reset_all 完成: %s", reset_res)
+                            logger.info("ensure_initialized reset_all (含 y) 完成: %s", reset_res)
                         except Exception as exc:
                             logger.warning("ensure_initialized reset_all 失败: %s" % exc)
                     if reset_position:
@@ -351,6 +347,37 @@ class LifecycleMixin:
     def shutdown(self):
         self.close()
         self.infer_service.stop()
+
+    def _wait_serial_wrap_ready(self, timeout=5.0):
+        """poll 等模块级 singleton serial_wrap 稳定到 connect_flag=True, 必要时主动 sync_with_probe。
+
+        controller_session 的 probe 每次都 _close_locked 重置 connect_flag,
+        singleton 自己又有 auto_connect_until_ready 异步重连;两条路径在 race。
+        MyCar.__init__ 走到 ArmController 一步就直接读 serial, 必须先等稳定。
+        poll 超时再没连上,就主动 sync_with_probe() 拉一次, 拿不到就让上层报错。
+        """
+        try:
+            from smartcar.whalesbot.vehicle.base.serial_wrap import serial_wrap
+        except Exception:
+            return
+        deadline = time.time() + float(timeout)
+        while time.time() < deadline:
+            if (
+                getattr(serial_wrap, "connect_flag", False)
+                and getattr(serial_wrap, "dev", None) is not None
+                and getattr(serial_wrap, "is_open", False)
+            ):
+                return
+            time.sleep(0.05)
+        # 超时仍未稳定 — 主动拉一次 probe, 让 singleton 重新进入 program 模式
+        try:
+            logger.warning(
+                "serial_wrap singleton 未在 %.1fs 内稳定, 主动 sync_with_probe()",
+                timeout,
+            )
+            serial_wrap.sync_with_probe(probe_result=None)
+        except Exception as exc:
+            logger.warning("serial_wrap.sync_with_probe 失败: %s", exc)
 
     def _wait_until_ready(self, reset_position=False, timeout=None):
         timeout = self.action_ready_timeout if timeout is None else float(timeout)
