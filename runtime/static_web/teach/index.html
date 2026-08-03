@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>示教器 · RAK-CAR</title>
-  <script type="module" crossorigin src="../assets/teach-J-ft2WiH.js"></script>
-  <link rel="modulepreload" crossorigin href="../assets/base-sj6cywlp.js">
+  <script type="module" crossorigin src="../assets/teach-nXm5A_U5.js"></script>
+  <link rel="modulepreload" crossorigin href="../assets/base-DPRbPaTn.js">
   <link rel="stylesheet" crossorigin href="../assets/base-DfDI-Lv3.css">
   <link rel="stylesheet" crossorigin href="../assets/teach-4QPbMr_0.css">
 </head>
@@ -55,19 +55,16 @@
             <span class="keycap">D</span> x→ (右)
           </div>
           <div class="krow">
-            <span class="keycap">Q</span> 大臂 −5°
-            <span class="keycap">E</span> 大臂 +5°
-            <span class="keycap">R</span> 手爪 −5°
-            <span class="keycap">F</span> 手爪 +5°
+            <span class="keycap">Q</span> 大臂 −（长按）
+            <span class="keycap">E</span> 大臂 +（长按）
+            <span class="keycap">R</span> 手爪 −（长按）
+            <span class="keycap">F</span> 手爪 +（长按）
           </div>
         </div>
         <div class="slider-row">
           <span>点动速度</span>
           <input type="range" id="jogSpeed" min="1" max="8" step="1" value="3">
           <b id="jogSpeedLabel">0.03 m/s</b>
-          <label class="couple-toggle">
-            <input type="checkbox" id="coupleArmHand" checked> 臂爪联动
-          </label>
         </div>
         <div class="warn-line">⚠ x 轴无软限位：点动时盯紧机械臂行程，失焦/松手自动停</div>
         <div class="btn-row">
@@ -75,6 +72,16 @@
           <button id="btnGrasp">吸盘: 关</button>
           <button id="btnZeroAll">全停 (velocity 0)</button>
         </div>
+      </div>
+
+      <div class="panel">
+        <h3>task 检测目标（实时坐标）</h3>
+        <table id="detTable">
+          <thead>
+            <tr><th>label</th><th>score</th><th>cx</th><th>cy</th><th>w</th><th>h</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
       </div>
 
       <div class="panel">

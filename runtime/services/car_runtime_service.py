@@ -71,6 +71,12 @@ class CarRuntimeService(
         # 两条队列物理隔离，互不阻塞；底层硬件字节流仍由 SDK 的 serial_mc602.lock 串行。
         self.job_lock = threading.Lock()
         self.jobs = {}
+        # 2026-08-04：底盘三速"最后指令"缓存。lane_feed 的 forward/lateral/
+        # angular_speed 字段从未被填（外环在客户端跑，车端只收轮速），调试页
+        # 要显示底盘速度只能记最后一次 /v1/realtime/chassis-velocity 指令
+        # （run.py 外环与 web 示教点动都走这个端点）。
+        self._chassis_cmd_lock = threading.Lock()
+        self._chassis_cmd = {"vx": None, "vy": None, "wz": None, "updated_at": None}
         # D.6 协作退出事件：与 jobs 字典分开存放，避免 JSON 序列化时碰到
         # `threading.Event`（不可序列化）抛错。key 与 jobs[job_id]["id"] 对齐。
         self.job_stop_events: dict = {}
@@ -204,6 +210,10 @@ class CarRuntimeService(
         )
         # 直发轮速，绕开 set_velocity（set_velocity 会反复 lock + set）
         car.wheels_chassis.set_linear([float(s) for s in wheel_speeds])
+        with self._chassis_cmd_lock:
+            self._chassis_cmd = {
+                "vx": vx, "vy": vy, "wz": wz, "updated_at": time.time(),
+            }
         return {
             "vx": vx,
             "vy": vy,
@@ -284,6 +294,11 @@ class CarRuntimeService(
             self._realtime_check_locked()
             car = self.car
         return car.get_wheel_encoders()
+
+    def get_chassis_command(self):
+        """最后一次 /v1/realtime/chassis-velocity 指令缓存（调试页显示用）。"""
+        with self._chassis_cmd_lock:
+            return dict(self._chassis_cmd)
 
     def get_lane_state(self):
         """外环专用：读 streamer 缓存的 lane_state。

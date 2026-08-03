@@ -75,12 +75,6 @@
           <input type="range" id="jogLin" min="5" max="50" step="5" value="15">
           <b id="jogLinLabel">0.15 m/s</b>
         </div>
-        <div class="slider-row">
-          <span>旋转速度</span>
-          <input type="range" id="jogAng" min="2" max="15" step="1" value="5">
-          <b id="jogAngLabel">0.5 rad/s</b>
-        </div>
-        <div class="warn-line">⚠ 点动直发轮速，不走里程计闭环；松手/失焦自动停</div>
         <div class="btn-row">
           <button id="btnStop">全停 (0,0,0)</button>
         </div>
@@ -92,8 +86,8 @@
           <tbody>
             <tr><td>mode</td><td class="num" id="laneMode">--</td><td>active</td><td class="num" id="laneActive">--</td></tr>
             <tr><td>error_y</td><td class="num" id="laneEy">--</td><td>error_angle</td><td class="num" id="laneEa">--</td></tr>
-            <tr><td>forward</td><td class="num" id="laneVf">--</td><td>lateral</td><td class="num" id="laneVl">--</td></tr>
-            <tr><td>angular</td><td class="num" id="laneVa">--</td><td>distance</td><td class="num" id="laneDist">--</td></tr>
+            <tr><td>vx 指令</td><td class="num" id="cmdVx">--</td><td>vy 指令</td><td class="num" id="cmdVy">--</td></tr>
+            <tr><td>wz 指令</td><td class="num" id="cmdWz">--</td><td>distance</td><td class="num" id="laneDist">--</td></tr>
           </tbody>
         </table>
       </div>

@@ -24,7 +24,7 @@ const jogSpeedLabel = $("jogSpeedLabel")!;
 const btnGoHome = $("btnGoHome") as HTMLButtonElement;
 const btnGrasp = $("btnGrasp") as HTMLButtonElement;
 const btnZeroAll = $("btnZeroAll") as HTMLButtonElement;
-const coupleArmHand = $("coupleArmHand") as HTMLInputElement;
+const detTableBody = document.querySelector("#detTable tbody")!;
 const poseName = $("poseName") as HTMLInputElement;
 const btnTeach = $("btnTeach") as HTMLButtonElement;
 const poseTableBody = document.querySelector("#poseTable tbody")!;
@@ -43,9 +43,9 @@ let armCmd = 90;    // 大臂 +90 = 复位位
 let handCmd = -90;  // 手爪 -90 = UP
 let estopped = false;
 let graspOn = false;
-// 臂爪联动：手爪舵机装在大臂连杆上，大臂转 Δ 时手爪补 -Δ 保持末端姿态不变。
-// 比例常量化；真机方向若反，把 COUPLE_RATIO 翻成 +1。
-const COUPLE_RATIO = -1;
+// 舵机长按点动角速度 (°/s)，100ms tick 积分成目标角连续下发（舵机是位置控制，
+// 目标角连续追 = 平滑转动）。Q/E 大臂、R/F 手爪，松手即停。
+const SERVO_JOG_DEG_PER_S = 20;
 
 function loadPoses(): Pose[] {
   try { return JSON.parse(localStorage.getItem(POSES_KEY) || "[]") as Pose[]; }
@@ -104,23 +104,36 @@ jogSpeed.addEventListener("input", () => {
 });
 jogSpeedLabel.textContent = jogVelocity().toFixed(2) + " m/s";
 
-async function sendJog() {
+async function jogTick() {
   if (estopped) return;  // 急停后不发速度（runtime 也会 409 拒）
+  // x/y 速度模式
   const v = jogVelocity();
   let xVel = 0, yVel = 0;
   if (axes.has("a")) xVel -= v;
   if (axes.has("d")) xVel += v;
   if (axes.has("w")) yVel -= v;  // y 负 = 向上
   if (axes.has("s")) yVel += v;
+  // 舵机长按：目标角连续积分（位置控制舵机追目标角 = 平滑转动）
+  const step = SERVO_JOG_DEG_PER_S * 0.1;
+  let armDelta = 0, handDelta = 0;
+  if (axes.has("q")) armDelta -= step;
+  if (axes.has("e")) armDelta += step;
+  if (axes.has("r")) handDelta -= step;
+  if (axes.has("f")) handDelta += step;
+  if (armDelta !== 0) armCmd = Math.max(-150, Math.min(90, armCmd + armDelta));
+  if (handDelta !== 0) handCmd = Math.max(-90, Math.min(0, handCmd + handDelta));
+  const payload: Record<string, number> = { x_vel: xVel, y_vel: yVel };
+  if (armDelta !== 0) payload.arm_angle = Math.round(armCmd * 10) / 10;
+  if (handDelta !== 0) payload.hand_angle = Math.round(handCmd * 10) / 10;
   try {
-    await api.armVelocity({ x_vel: xVel, y_vel: yVel });
+    await api.armVelocity(payload);
   } catch { /* 连接抖动：下个 tick 重试；急停后 409 属预期 */ }
 }
 
 function startJog() {
   if (jogTimer) return;
-  jogTimer = window.setInterval(sendJog, 100);
-  sendJog();
+  jogTimer = window.setInterval(jogTick, 100);
+  jogTick();
 }
 function stopJog(hard = false) {
   axes.clear();
@@ -129,23 +142,7 @@ function stopJog(hard = false) {
   api.armVelocity({ x_vel: 0, y_vel: 0 }).catch(() => undefined);
 }
 
-function servoStep(axis: "arm" | "hand", delta: number) {
-  if (estopped) return;
-  if (axis === "arm") {
-    const before = armCmd;
-    armCmd = Math.max(-150, Math.min(90, armCmd + delta));
-    const applied = armCmd - before;  // 限位截断后的真实增量
-    // 联动：大臂转 applied 时手爪补 COUPLE_RATIO*applied，保持末端姿态
-    if (coupleArmHand.checked && applied !== 0) {
-      handCmd = Math.max(-90, Math.min(0, handCmd + COUPLE_RATIO * applied));
-    }
-    api.armVelocity({ arm_angle: armCmd, hand_angle: handCmd }).catch(() => undefined);
-  } else {
-    handCmd = Math.max(-90, Math.min(0, handCmd + delta));
-    api.armVelocity({ hand_angle: handCmd }).catch(() => undefined);
-  }
-}
-const KEY_AXIS: Record<string, string> = { w: "w", s: "s", a: "a", d: "d" };
+const KEY_AXIS: Record<string, true> = { w: true, s: true, a: true, d: true, q: true, e: true, r: true, f: true };
 const keycaps = new Map<string, HTMLElement>();
 document.querySelectorAll<HTMLElement>(".keycap").forEach((el) => {
   keycaps.set(el.textContent!.trim().toLowerCase(), el);
@@ -160,10 +157,7 @@ document.addEventListener("keydown", (ev) => {
     keycaps.get(k)?.classList.add("pressed");
     startJog();
     ev.preventDefault();
-  } else if (k === "q") { servoStep("arm", -5); keyPress(k); ev.preventDefault(); }
-  else if (k === "e") { servoStep("arm", +5); keyPress(k); ev.preventDefault(); }
-  else if (k === "r") { servoStep("hand", -5); keyPress(k); ev.preventDefault(); }
-  else if (k === "f") { servoStep("hand", +5); keyPress(k); ev.preventDefault(); }
+  }
 });
 document.addEventListener("keyup", (ev) => {
   const k = ev.key.toLowerCase();
@@ -173,15 +167,50 @@ document.addEventListener("keyup", (ev) => {
     if (axes.size === 0) stopJog();
   }
 });
-function keyPress(k: string) {
-  const el = keycaps.get(k);
-  if (!el) return;
-  el.classList.add("pressed");
-  window.setTimeout(() => el.classList.remove("pressed"), 180);
-}
 // 失焦/切页 = 安全第一，立即全停
 window.addEventListener("blur", () => stopJog());
 document.addEventListener("visibilitychange", () => { if (document.hidden) stopJog(); });
+
+// ---------- task 检测目标实时坐标（task_feed 缓存，10Hz） ----------
+async function pollDets() {
+  try {
+    const d = (await api.taskState()) as Record<string, any>;
+    const st = d.task_state || {};
+    const dets = (st.detections || []) as Array<Record<string, any>>;
+    detTableBody.innerHTML = "";
+    const top = dets.slice().sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 8);
+    for (const det of top) {
+      const bn = det.bbox_norm || {};
+      const tr = document.createElement("tr");
+      const cells = [
+        String(det.label ?? det.cls_id ?? "?"),
+        typeof det.score === "number" ? det.score.toFixed(2) : "--",
+        fmt(bn.x_center, 3),
+        fmt(bn.y_center, 3),
+        fmt(bn.width, 3),
+        fmt(bn.height, 3),
+      ];
+      for (const t of cells) {
+        const td = document.createElement("td");
+        td.textContent = t;
+        td.className = "num";
+        tr.appendChild(td);
+      }
+      detTableBody.appendChild(tr);
+    }
+    if (!top.length) {
+      const tr = document.createElement("tr");
+      const td = document.createElement("td");
+      td.colSpan = 6;
+      td.className = "dim";
+      td.textContent = "无检测（task_feed 空）";
+      tr.appendChild(td);
+      detTableBody.appendChild(tr);
+    }
+  } catch { /* 静默 */ }
+}
+window.setInterval(pollDets, 100);
+pollDets();
 
 btnZeroAll.addEventListener("click", () => {
   stopJog();

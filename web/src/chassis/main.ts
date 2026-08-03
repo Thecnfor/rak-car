@@ -21,12 +21,12 @@ const btnZeroOdom = $("btnZeroOdom") as HTMLButtonElement;
 const trajInfo = $("trajInfo")!;
 const laneMode = $("laneMode"), laneActive = $("laneActive");
 const laneEy = $("laneEy"), laneEa = $("laneEa");
-const laneVf = $("laneVf"), laneVl = $("laneVl"), laneVa = $("laneVa"), laneDist = $("laneDist");
+const laneDist = $("laneDist");
+const cmdVx = $("cmdVx"), cmdVy = $("cmdVy"), cmdWz = $("cmdWz");
 const encEls = [$("enc0"), $("enc1"), $("enc2"), $("enc3")];
 
 let estopped = false;
 
-// ---------- 轨迹 ----------
 const canvas = $("trajCanvas") as HTMLCanvasElement;
 const ctx = canvas.getContext("2d")!;
 interface Pt { x: number; y: number; t: number }
@@ -150,10 +150,17 @@ async function pollLane() {
     laneActive.textContent = String(d.active ?? "--");
     laneEy.textContent = fmt(d.error_y, 4);
     laneEa.textContent = fmt(d.error_angle, 4);
-    laneVf.textContent = fmt(d.forward_speed, 3);
-    laneVl.textContent = fmt(d.lateral_speed, 3);
-    laneVa.textContent = fmt(d.angular_speed, 3);
     laneDist.textContent = fmt(d.distance, 2);
+  } catch { /* 静默 */ }
+  // 三速显示走"最后底盘指令"缓存（lane_feed 的 forward/lateral/angular
+  // 字段从未被填 —— 外环在客户端跑，车端只收轮速）
+  try {
+    const c = (await api.chassisCommand()) as Record<string, any>;
+    const cmd = c.chassis_command || {};
+    const fresh = cmd.updated_at && Date.now() / 1000 - cmd.updated_at < 2;
+    cmdVx.textContent = fresh ? fmt(cmd.vx, 3) : "--";
+    cmdVy.textContent = fresh ? fmt(cmd.vy, 3) : "--";
+    cmdWz.textContent = fresh ? fmt(cmd.wz, 3) : "--";
   } catch { /* 静默 */ }
 }
 window.setInterval(pollLane, 200);
@@ -172,16 +179,15 @@ laneOverlay.addEventListener("change", () => {
   }
 });
 
+jogLinLabel.textContent = linV().toFixed(2) + " m/s";
+jogAngLabel.textContent = angV().toFixed(1) + " rad/s";
+
 // ---------- 底盘点动 ----------
 const axes = new Set<string>();
 let jogTimer: number | null = null;
 
 function linV(): number { return Number(jogLin.value) / 100; }   // 0.05..0.50
 function angV(): number { return Number(jogAng.value) / 10; }     // 0.2..1.5
-jogLin.addEventListener("input", () => { jogLinLabel.textContent = linV().toFixed(2) + " m/s"; });
-jogAng.addEventListener("input", () => { jogAngLabel.textContent = angV().toFixed(1) + " rad/s"; });
-jogLinLabel.textContent = linV().toFixed(2) + " m/s";
-jogAngLabel.textContent = angV().toFixed(1) + " rad/s";
 
 async function sendJog() {
   if (estopped) return;
