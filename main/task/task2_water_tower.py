@@ -50,9 +50,6 @@ from main.task._config import load_task_config
 
 logger = logging.getLogger("task.task2_water_tower")
 
-# 梯度放置: 同一水塔内第 1/2/3 块的投放 Y 深度依次加深 (避免堆叠碰撞)
-DELIVER_Y_BY_INDEX = [-60.0, -75.0, -95.0]
-
 # 水塔等级标签 → 所需方块数
 WATER_TOWER_LABELS = {"water_l1", "water_l2", "water_l3"}
 
@@ -114,11 +111,11 @@ def _wait_arm_angle_reached(
     raise RuntimeError("大臂角度在 {:.0f}s 内未到达 {:.0f}°".format(timeout, target_deg))
 
 
-def _detect_tower_count(client: RuntimeApiClient) -> int:
+def _detect_tower_count(client: RuntimeApiClient) -> Optional[int]:
     """cam2 识别水塔等级标签, 返回需要的方块数.
 
-    仅轮询 1 秒, 超时/失败 → 默认返回 1 块, 不崩溃.
-    返回值映射: water_l1 → 1 块, water_l2 → 2 块, water_l3 → 3 块.
+    仅轮询 1 秒. 识别到等级标 → 返回块数 (water_l1→1, water_l2→2, water_l3→3);
+    没识别到 → 返回 None (调用方决定底盘前移重试或兜底取 1 块, 不崩溃).
     """
     count_map = {"water_l1": 1, "water_l2": 2, "water_l3": 3}
     deadline = time.time() + 1.0
@@ -142,8 +139,65 @@ def _detect_tower_count(client: RuntimeApiClient) -> int:
                 logger.info("水塔识别 %s → 需要 %d 块", label, n)
                 return n
         time.sleep(0.2)
-    logger.warning("cam2 识别超时, 默认取 1 块")
-    return 1
+    logger.warning("cam2 未识别到水塔等级标")
+    return None
+
+
+def _align_to_tower(
+    arm_client: ArmClient,
+    track_cfg: Dict[str, Any],
+) -> Any:
+    """cam2 视觉闭环: 把底盘纵向对齐到水塔等级标前后到位 (track_chassis).
+
+    track_chassis 阻塞式跑闭环, 把 water 等级标 bbox 中心拉到 setpoint_cxcy.
+    vx_only=True (规定, 2026-08-03) → 只控 vx(前后), vy 恒 0, 横向不做闭环.
+    退出时零速命令是异步的 → 显式停稳 (task1_seeding.py:337-344 的范式).
+    """
+    from main.chassis import track_chassis  # 懒加载, 与 task1 一致
+
+    result = track_chassis(
+        track_cfg.get("target", "water"),
+        setpoint_cxcy=tuple(track_cfg.get("setpoint_cxcy", (0.0, 0.0))),
+        # 只控前后 (任务二规定), vy 恒 0, 到达只看 cx
+        vx_only=bool(track_cfg.get("vx_only", False)),
+        # 轴符号从配置来 (水塔场景方向实测与 cylinder 默认相反, 2026-08-03)
+        sign_vx=int(track_cfg.get("sign_vx", -1)),
+        sign_vy=int(track_cfg.get("sign_vy", 1)),
+        kp=track_cfg.get("kp", 0.50),
+        v_max=track_cfg.get("v_max", 0.25),
+        v_slew=track_cfg.get("v_slew", 0.02),  # 每帧速度变化限幅 (2026-08-03 实测太急 → 调缓)
+        deadband=track_cfg.get("deadband", 0.08),
+        hold_frames=track_cfg.get("hold_frames", 3),
+        max_lost_frames=track_cfg.get("max_lost_frames", 30),
+        max_seconds=track_cfg.get("max_seconds", 6.0),
+    )
+    logger.info("track_chassis result: arrived=%s reason=%s frames=%d",
+                result.arrived, result.reason, result.frames)
+    _stop_chassis(arm_client)
+    return result
+
+
+def _stop_chassis(arm_client: ArmClient) -> None:
+    """对齐结束后显式把底盘停稳 (track_chassis 零速异步, 防止漂移)."""
+    try:
+        arm_client.http.post(
+            "/v1/realtime/chassis-velocity",
+            {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+            timeout=2.0,
+        )
+    except Exception:
+        pass
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        try:
+            resp = arm_client.http.get("/v1/realtime/wheels/speeds", timeout=1)
+            speeds = (resp or {}).get("speeds") or []
+            if all(abs(float(s)) < 0.01 for s in speeds):
+                break
+        except Exception:
+            break
+        time.sleep(0.1)
+    time.sleep(0.2)
 
 
 # ── 核心动作子流程 ────────────────────────────────────────────────
@@ -201,7 +255,8 @@ def _deliver_cube(
       3. grasp off 释放方块
     """
     carry = cfg["carry_pose"]
-    deliver_y = DELIVER_Y_BY_INDEX[min(cube_index, len(DELIVER_Y_BY_INDEX) - 1)]
+    deliver_ys = cfg.get("deliver_y_by_index", [-60.0, -75.0, -95.0])
+    deliver_y = deliver_ys[min(cube_index, len(deliver_ys) - 1)]
 
     # 1) 复合动作: 大臂转 + 手爪转 + X 伸出并发 (SafetyMixin 自动校验 y 保护区)
     runner.client.composite_run(
@@ -221,11 +276,12 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     """任务二主入口: 水塔取水 (2 座水塔 × N 块水方块投放).
 
     主流程:
-      初始化: X 收至 -220 → 大臂转 -95° + 手爪 -45° (检测姿态)
+      初始化: X 收至 detection_pose.x_mm → 大臂转检测角 + 手爪检测角 (检测姿态)
       对每座水塔循环:
-        1) Y 下降到 -30 → cam2 识别水塔等级 (需几块)
-        2) 按块循环: 底盘到方块组 → 抓块 → 底盘回水塔 → 梯度投放
-        3) 结束后底盘前进 60cm 到下一座水塔
+        1) Y 下降到 detection_pose.y_mm → cam2 识别水塔等级 (需几块)
+        2) track_chassis 视觉闭环把底盘横向对齐到水塔等级标居中
+        3) 按块循环: 底盘到方块组 → 抓块 → 底盘回水塔 → 梯度投放
+        4) 结束后底盘前进 tower_spacing_m 到下一座水塔
 
     Args:
         client: 可选 RuntimeApiClient, None 时内部新建
@@ -249,50 +305,75 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
     completed: List[str] = []
     detection = cfg["detection_pose"]
+    track_cfg = cfg.get("track_align", {})
     timeout = cfg["chassis_move_timeout_s"]
     group_forward_m = cfg["group_forward_m"]
-    x_target_mm = -220.0
+    tower_spacing_m = cfg.get("tower_spacing_m", 0.65)
+    detect_retry_step_m = cfg.get("detect_retry_step_m", 0.10)
+    detect_retry_max = cfg.get("detect_retry_max", 1)
+    x_target_mm = float(detection["x_mm"])
 
     try:
-        # ===== 初始化步骤 1: X 收至 -220mm =====
+        # ===== 初始化: 摆好检测姿态 =====
         logger.info("初始化: X 收至 %.0f mm", x_target_mm)
         runner.move_x(x_target_mm)
 
-        # ===== 初始化步骤 2: 大臂 + 手爪到检测姿态 =====
-        logger.info("初始化: 大臂=%s°, 手爪=-45°", detection["arm_angle_deg"])
+        logger.info("初始化: 大臂=%s°, 手爪=%s°",
+                    detection["arm_angle_deg"], detection["hand_angle_deg"])
         runner.set_arm_angle(float(detection["arm_angle_deg"]), speed=80)
         time.sleep(2.0)
-        arm_client.set_hand_angle(-45.0, speed=80, timeout=10.0)
+        arm_client.set_hand_angle(float(detection["hand_angle_deg"]), speed=80, timeout=10.0)
         time.sleep(1.0)
 
         for tower_idx, tower_label in enumerate(cfg["source_position_order"]):
             logger.info("=== 处理水塔 %s (第 %d 座) ===", tower_label, tower_idx + 1)
 
-            # 非第一座水塔: 底盘前进到下一座 (间距 60cm)
+            # 第 2 座塔: 底盘前进 tower_spacing_m → 重新摆检测姿态
             if tower_idx > 0:
-                tower_spacing_m = cfg.get("tower_spacing_m", 0.60)
                 logger.info("底盘: 从第 %d 座到水塔 %s (前进 %.2f m)",
                             tower_idx, tower_label, tower_spacing_m)
                 runner.move_x(x_target_mm)
                 _chassis_move_for(arm_client, tower_spacing_m, timeout=timeout)
                 runner.move_x(x_target_mm)
-                logger.info("恢复手爪 -45° 检测姿态 (水塔 %s)", tower_label)
-                arm_client.set_hand_angle(-45.0, speed=80, timeout=10.0)
+                logger.info("恢复手爪 %s° 检测姿态 (水塔 %s)",
+                            detection["hand_angle_deg"], tower_label)
+                arm_client.set_hand_angle(float(detection["hand_angle_deg"]), speed=80, timeout=10.0)
                 time.sleep(0.5)
 
             # 下降 Y 到检测高度
-            logger.info("Y 下降到 -30mm 执行检测")
+            logger.info("Y 下降到 %.0fmm 执行检测", detection["y_mm"])
             try:
-                runner.move_y(-30)
+                runner.move_y(float(detection["y_mm"]))
                 time.sleep(0.3)
             except Exception:
                 logger.warning("Y 下降失败, 跳过水塔 %s", tower_label)
                 continue
 
-            # 识别需几块
+            # 识别需几块; 未识别到等级标 → 底盘前移 detect_retry_step_m 再检测
+            # (2026-08-03 用户规定: cam2 没看到第一个水塔等级标 → 前进 0.1m 再 cam2)
             needed = _detect_tower_count(client)
+            retry = 0
+            while needed is None and retry < detect_retry_max:
+                retry += 1
+                logger.info("cam2 未识别到水塔 %s 等级标, 底盘前移 %.2f m 再检测 (第 %d/%d 次)",
+                            tower_label, detect_retry_step_m, retry, detect_retry_max)
+                # 前移用 main.chassis.ChassisClient.move_for (2026-08-03 用户规定)
+                from main.chassis import ChassisClient
+                chassis = ChassisClient.connect()
+                try:
+                    chassis.move_for(detect_retry_step_m, timeout=timeout)
+                finally:
+                    chassis.close()
+                needed = _detect_tower_count(client)
+            if needed is None:
+                logger.warning("水塔 %s 重试后仍未识别到等级标, 兜底取 1 块", tower_label)
+                needed = 1
             logger.info("水塔 %s 需投放 %d 块水方块", tower_label, needed)
 
+            # cam2 视觉闭环: 把底盘横向对齐到水塔等级标居中
+            _align_to_tower(arm_client, track_cfg)
+
+            # 对齐后的底盘位置视为水塔原点
             chassis_at_tower_m = 0.0  # 底盘相对水塔原点的偏移 (m): >0 前进, <0 后退
             picked = 0
             first_x = cfg["first_cube_x_mm"]

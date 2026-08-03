@@ -243,6 +243,8 @@ def track_chassis(
     # 如果换车/换摄像头，只要改这两个 sign 不需要动控制律
     sign_vx: int = -1,
     sign_vy: int = +1,
+    # 只控前后: True → vy 恒 0, 到达判定只看 cx(前后). task2 水塔对齐用 (2026-08-03 规定)
+    vx_only: bool = False,
     # 控制律（2026-08-02 真机 cylinder_2/h_tu_dou 稳档：纯 P 振荡，所以 kp 保守 + slew 限幅）
     kp: float = 0.20,          # 比例增益（降 55% 防振荡）
     v_max: float = 0.12,        # 单向速度上限（绝对值，比前次 0.20 降 40%）
@@ -275,6 +277,7 @@ def track_chassis(
       - 公式: ``vx = sign_vx * kp * cx_err``, ``vy = sign_vy * kp * cy_err``
       - 如果发现反了，改 ``sign_vx=+/-1`` / ``sign_vy=+/-1`` 即可，不动控制律
       - wz = 0 全程,**不旋转**
+      - ``vx_only=True`` → 只控 vx(前后), vy 恒 0, 到达判定只看 cx（task2 水塔对齐, 横向不做闭环）
 
     返回 ``TrackChassisResult``: arrived=True / 到达帧信息 / 跑了多少帧。
     """
@@ -363,7 +366,10 @@ def track_chassis(
             cy_err = frm.cy_err if frm.cy_err is not None else 0.0
             # 控制律（含 sign_vx / sign_vy，2026-08-02 现场调好）
             vx = float(sign_vx) * float(kp) * float(cx_err)
-            vy = float(sign_vy) * float(kp) * float(cy_err)
+            if vx_only:
+                vy = 0.0                                    # 只控前后, 横向冻结 (task2 水塔)
+            else:
+                vy = float(sign_vy) * float(kp) * float(cy_err)
             if vx > v_max:
                 vx = v_max
             elif vx < -v_max:
@@ -380,7 +386,10 @@ def track_chassis(
                 if abs(dvy) > v_slew:
                     vy = last_vy + v_slew if dvy > 0 else last_vy - v_slew
 
-            in_deadband = abs(cx_err) < deadband and abs(cy_err) < deadband
+            if vx_only:
+                in_deadband = abs(cx_err) < deadband        # vx_only: 到达只看前后
+            else:
+                in_deadband = abs(cx_err) < deadband and abs(cy_err) < deadband
             if in_deadband:
                 vx = 0.0
                 vy = 0.0

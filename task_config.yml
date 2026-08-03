@@ -92,6 +92,10 @@ task_cfg:
     tower_spacing_m: 0.65
     group_forward_m: 0.32
 
+    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前移 0.1m 再 cam2 检测)
+    detect_retry_step_m: 0.10
+    detect_retry_max: 1
+
     init_pose:
       y_mm: -150
       x_mm: 0
@@ -106,6 +110,30 @@ task_cfg:
 
     first_cube_x_mm: -155
     second_cube_x_mm: -265
+
+    # cam2 视觉闭环: 底盘对齐到水塔等级标 (track_chassis 参数)
+    track_align:
+      target: "water"            # 等级标 group (water_l1/l2/l3 全家)
+      setpoint_cxcy: [0.0, 0.0]  # 等级标居中
+      # 2026-08-03 规定: task2 的 track_chassis 只控 vx(前后), vy 恒 0 (横向不做闭环)
+      vx_only: true
+      # 轴符号: -1/+1 是 2026-08-02 cylinder 标定值。水塔实测方向反了 →
+      #   前后反 (该进反退) 改 sign_vx=+1; 左右反 (该左反右) 改 sign_vy=-1
+      # 2026-08-03 实测: 前后反 → sign_vx=+1; 横向未观测 (vx_only 后不控 vy, sign_vy 不生效)
+      sign_vx: +1
+      sign_vy: +1
+      # 2026-08-03 实测 "移动太急" → 全面调缓: kp 0.50→0.30, v_max 0.25→0.15,
+      # 新增 v_slew 每帧速度变化限幅 0.015 (~0.3 m/s², 比默认 0.02 更缓防急冲/急停)
+      kp: 0.22
+      v_max: 0.11
+      v_slew: 0.011
+      deadband: 0.08
+      hold_frames: 3
+      max_lost_frames: 30
+      max_seconds: 6.0
+
+    # 同一水塔内第 1/2/3 块的投放 Y 深度梯度 (避免堆叠碰撞)
+    deliver_y_by_index: [-60, -75, -95]
 
     pick_pose:
       y_transition_mm: -120

@@ -66,6 +66,36 @@ class ChassisClient:
     def emergency_stop(self):
         return self.http.emergency_stop()
 
+    def move_for(
+        self,
+        dx_m: float,
+        timeout: float = 30.0,
+        max_velocity_ms: float = 0.20,
+    ) -> dict:
+        """底盘相对位移 move_for (sync 阻塞到位后返回)。
+
+        dx_m>0 前进 / <0 后退 (车体本地 x 偏移, 单位 m)。
+        走 runtime CAR_ACTIONS["move_for"] → 车端 car.move_for, 一次性位置闭环,
+        走完自动停。返回 /v1/execute 同步 job dict (status/result/error)。
+
+        Raises:
+            RuntimeError: move_for job 失败 (status != succeeded)。
+        """
+        offset = [float(dx_m), 0.0, 0.0]  # [x_offset, y_offset, theta_offset] 单位 m
+        job = self.http.execute_car_action(
+            "move_for",
+            offset,
+            timeout=timeout,
+            sync=True,
+            max_velocities=[max_velocity_ms, max_velocity_ms, 3.14159 / 3],
+        )
+        ok = isinstance(job, dict) and job.get("status") == "succeeded"
+        if not ok:
+            status = job.get("status") if isinstance(job, dict) else type(job).__name__
+            err = job.get("error") if isinstance(job, dict) else None
+            raise RuntimeError("move_for failed: status=%r error=%r" % (status, err))
+        return job
+
     # ---- 状态读取 ----
 
     def get_lane_state(self) -> dict:
