@@ -107,7 +107,13 @@ def goto_pose_p(client, runner, *, log_prefix: str = "[goto_pose_p]") -> dict:
         target_x_mm=POSE_P_X_MM,
         log_prefix=log_prefix,
     )
-    actual_y = client._read_y_mm_realtime()
+    actual_y = client._read_x_mm_realtime()  # placeholder; reuse safe-read below
+    try:
+        st = client.http.get_arm_state()
+        y_st = st.get("arm_state", {}) if isinstance(st, dict) else {}
+        actual_y = y_st.get("y_mm")
+    except Exception:
+        actual_y = None
     actual_x = client._read_x_mm_realtime()
     print(f"========== {log_prefix} 完成 "
           f"(realtime y={actual_y}mm x={actual_x}mm) ==========\n")

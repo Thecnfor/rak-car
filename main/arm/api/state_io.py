@@ -94,10 +94,12 @@ class StateIOMixin:
             self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
             return None
 
-        # RuntimeApiClient.get_arm_state() 返回 {"ok": bool, "result": dict, ...}
-        result = st.get("result") if isinstance(st, dict) else None
+        # RuntimeApiClient.get_arm_state() 返回 {"ok": bool, "arm_state": dict, ...}
+        # 2026-08-03 现场 bug: 之前注释说 "result" 但 RuntimeApiClient 实际是 "arm_state"
+        # 字段, 拿 result 永远 None, _read_x_mm_realtime 永远读不到 → move_x 抛 RuntimeError
+        result = st.get("arm_state") if isinstance(st, dict) else None
         if not isinstance(result, dict):
-            self._last_rt_err = "get_arm_state 返回无 result"
+            self._last_rt_err = "get_arm_state 返回无 arm_state"
             return None
 
         x_mm = result.get("x_mm")
