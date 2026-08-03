@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-r"""main/tasks/task333/shoot_4_targets.py — 直走 + 瞄准 + 射击 + 归位
+r"""main/task/task3/shoot_4_targets.py — 直走 + 瞄准 + 射击 + 归位
 
 完整流程(2026-08-02 用户硬约束:完全禁用 yaw/lateral,只允许前后移动):
 1. 检测视野内 4 个目标,按 xc 左→右排好,冻结顺序
@@ -23,8 +23,8 @@ r"""main/tasks/task333/shoot_4_targets.py — 直走 + 瞄准 + 射击 + 归位
 
 用法:
     cd "C:\Users\花花世界\Desktop\天道酬勤\rak-car"
-    python -m main.tasks.task333.shoot_4_targets
-    python -m main.tasks.task333.shoot_4_targets --shoot-distance 0.5 --target-distance 1.05
+    python -m main.task.task3.shoot_4_targets
+    python -m main.task.task3.shoot_4_targets --shoot-distance 0.5 --target-distance 1.05
 """
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ import sys
 import time
 
 from main.api_client import RuntimeApiClient
-from main.tasks.task333.go_straight_2m import (
+from main.task.task3.go_straight_2m import (
     car_call,
     read_odom,
 )

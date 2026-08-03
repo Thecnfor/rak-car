@@ -1,14 +1,14 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-r"""main/tasks/task333/go_straight_2m.py - 走 2 米直线
+r"""main/task/task3/go_straight_2m.py - 走 2 米直线
 
 极简实现:沿用户指定的轴走 2m,每步前进 15cm 后做横向纠偏(yaw 反向)。
 
 用法:
     cd "C:\Users\花花世界\Desktop\天道酬勤\rak-car"
-    python -m main.tasks.task333.go_straight_2m
-    python -m main.tasks.task333.go_straight_2m --axis -x   # 默认
-    python -m main.tasks.task333.go_straight_2m --axis -y   # 走 odom -y 方向
+    python -m main.task.task3.go_straight_2m
+    python -m main.task.task3.go_straight_2m --axis -x   # 默认
+    python -m main.task.task3.go_straight_2m --axis -y   # 走 odom -y 方向
 
 约束:
     - 总前进距离 = 2m(--total-distance 可调)

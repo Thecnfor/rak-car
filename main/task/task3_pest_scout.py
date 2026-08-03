@@ -1,33 +1,53 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-"""任务三: 害虫侦察 + 害虫射击 (暂未实现).
+"""任务三: 害虫侦察 + 害虫射击 (thin wrapper over task3_pipeline).
 
-期望功能:
-  1. 巡路过程中识别场地里的害虫位置 (YOLO 推理 / PaddleOCR 标牌识别)
-  2. 使用 PoutD (气枪/发射器) 对识别到的害虫进行射击
+业务方案:在 main/task/task3/task3_pipeline.py 实现的 drive + LLM 判别 +
+shoot_target 三段式流水线。本文件只是 orchestrator registry 期望的薄封装
+(run(client=None) -> Dict),实际跑 subprocess 调 task3_pipeline.main()。
 
-当前状态: TODO 占位. 等 task3 业务方案确认后, 把具体流程写到
-        main.arm.each_task.task3/, 然后本文件改为薄封装调用.
+容错语义: 与占位期一致, 但不再抛 NotImplementedError —— 任何子进程失败
+仍以 subprocess 非零退出码冒泡, orchestrator 看到的 status 决定后续动作。
 
-容错语义: orchestrator 捕获 NotImplementedError 后仅 warning + 跳过, 不中断主任务流.
+注意: task3_pipeline 自身会 await 用户按 Enter 切射击姿态, 第一次跑会
+停在 "[pause] 请将车辆移动到射击区..."。用 --no-pause 可以跳过人工确认
+(实机 8 球压测时再开)。
 """
 from __future__ import annotations
 
+import subprocess
+import sys
 from typing import Any, Dict, Optional
 
 from main.api_client import RuntimeApiClient
 
 
-def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
-    """任务三主入口 (当前占位, raise NotImplementedError).
+def run(
+    client: Optional[RuntimeApiClient] = None,  # noqa: ARG001
+    *,
+    extra_args: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    """薄封装: subprocess 跑 `python -m main.task.task3.task3_pipeline`。
 
     Args:
-        client: 可选 RuntimeApiClient (当前未使用, 仅保持接口一致)
+        client: 兼容 orchestrator 签名,本任务不直接用(任务内自带 RuntimeApiClient)
+        extra_args: 透传给 task3_pipeline 的额外 CLI 参数,例如 ["--no-pause"]
 
     Returns:
-        永远不会正常返回, 直接抛出 NotImplementedError.
+        {"status": "ok"|"failed", "exit_code": int, "args": [...]}
     """
-    raise NotImplementedError(
-        "task3_pest_scout (害虫侦察 + 射击) 业务暂未实现, "
-        "等业务方案确认后, 将流程写到 main.arm.each_task.task3/ 再改为此文件的薄封装."
-    )
+    cmd = [sys.executable, "-m", "main.task.task3.task3_pipeline"]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    print(f"[task3] launching: {' '.join(cmd)}", flush=True)
+    proc = subprocess.run(cmd, check=False)
+    return {
+        "status": "ok" if proc.returncode == 0 else "failed",
+        "exit_code": proc.returncode,
+        "args": cmd,
+    }
+
+
+if __name__ == "__main__":
+    raise SystemExit(run().get("exit_code", 1))

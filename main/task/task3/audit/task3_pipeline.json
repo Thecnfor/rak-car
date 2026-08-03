@@ -1,0 +1,78 @@
+{
+  "config": {
+    "token": "49af7cbdb60770ef24d713a4d551a0f096bd75b8",
+    "target_count": 4,
+    "creep_speed": 0.18,
+    "max_travel": 4.0,
+    "min_score": 0.5,
+    "center_tol": 0.1,
+    "unlock_tol": 0.45,
+    "crop_padding": 0.1,
+    "llm_timeout": 15.0,
+    "job_timeout": 20.0,
+    "poll_interval": 0.15,
+    "save": "audit/task3_pipeline.json",
+    "dry_run": false,
+    "dry_run_steps": 10,
+    "no_pause": false
+  },
+  "targets": [
+    {
+      "number": 1,
+      "image_path": "/home/xrak/Desktop/rak-car/main/task/task3/audit/task3_pipeline/targets/target_01.jpg",
+      "xc": 0.084375,
+      "score": 0.9392940402030945,
+      "traveled_m": 0.216,
+      "timestamp": 1785795328.3865073,
+      "species": "unknown",
+      "classification": "pest",
+      "result": 0,
+      "analysis": "The image is too blurry to identify any animal. Since no specific animal can be recognized, it is classified as unknown. However, as the question requires a result, based on the context of agriculture and common scenarios, if it were a pest it would be more likely to be a concern. But without clear identification, this is a default assumption."
+    },
+    {
+      "number": 2,
+      "image_path": "/home/xrak/Desktop/rak-car/main/task/task3/audit/task3_pipeline/targets/target_02.jpg",
+      "xc": -0.1,
+      "score": 0.9510197043418884,
+      "traveled_m": 0.324,
+      "timestamp": 1785795329.0915723,
+      "species": "bee",
+      "classification": "beneficial",
+      "result": 1,
+      "analysis": "The image shows a bee, which is a beneficial animal in agriculture. Bees are crucial pollinators for many crops, enhancing fruit and seed production."
+    },
+    {
+      "number": 3,
+      "image_path": "/home/xrak/Desktop/rak-car/main/task/task3/audit/task3_pipeline/targets/target_03.jpg",
+      "xc": 0.021875,
+      "score": 0.9721188545227051,
+      "traveled_m": 0.459,
+      "timestamp": 1785795329.9548614,
+      "species": "ladybug",
+      "classification": "beneficial",
+      "result": 1,
+      "analysis": "The ladybug in the image is a beneficial insect commonly found in agricultural environments. Ladybugs are natural predators of aphids and other soft-bodied insects that harm crops. They help control pest populations, reducing the need for chemical pesticides."
+    },
+    {
+      "number": 4,
+      "image_path": "/home/xrak/Desktop/rak-car/main/task/task3/audit/task3_pipeline/targets/target_04.jpg",
+      "xc": -0.0046875,
+      "score": 0.9353747367858887,
+      "traveled_m": 0.594,
+      "timestamp": 1785795330.82794,
+      "species": "locust",
+      "classification": "pest",
+      "result": 0,
+      "analysis": "The animal in the image is a locust, which is a notorious agricultural pest known for forming swarms that can devastate crops over large areas, consuming vegetables, fruits, and grains, leading to significant agricultural losses."
+    }
+  ],
+  "pest_numbers": [
+    1,
+    4
+  ],
+  "beneficial_numbers": [
+    2,
+    3
+  ],
+  "traveled_m": 0.594
+}
