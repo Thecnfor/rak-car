@@ -375,14 +375,13 @@ def _pick_and_store(
     bin_x = BIN_X_MM[color]
 
     # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
-    #    2026-08-03 现场:
-    #      - track_velocity_pick 默认 arm_start=-90 是 task1 init, 任务4 要传 arm=+90
-    #      - grasp_y=-20 才抓到 (球心高度)
-    #      - lift_back=True 会把球带着跑, 业务层管抬回
-    #      - sign_y 默认 +1 在 task1 (y=-180 视野) 正确, task4 (y=-120 视野) 方向反了
-    #        → 直接调底层 find_target_arm_cross (暴露 sign_y 形参), 不用 track_velocity_pick
+    #    2026-08-03 现场 (用户): track_velocity_pick 默认 arm_start=-90 是 task1 init,
+    #    任务4 要传 arm=+90; grasp_y=-20 才抓到 (球心高度); lift_back=True 会把球带着跑,
+    #    业务层管抬回。
+    #    find_target_arm_cross 不接受 sign_y (sign_y 只在 find_target_4dof),
+    #    用 task1 同款参数 + sign_x=-1 + sign_arm=+1 默认就行。
     print(f"  [{LOG_PREFIX}] [0/3] find_target_arm_cross(label={label!r}, "
-          f"arm_start=90, hand_start=0, sign_y=-1)")
+          f"arm_start=90, hand_start=0)")
     sx, sy = runner._resolve_nozzle_setpoint(None, None, label=label) or (0.0, 0.0)
     selector = TargetSelector.for_label(
         label, strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
@@ -393,8 +392,10 @@ def _pick_and_store(
             gain_arm=2.5, gain_x=0.55,
             deadzone=0.06, max_vel=0.70,
             arm_start=POSE_P_ARM_DEG,  # +90
-            sign_arm=1.0, sign_x=-1.0,
-            sign_y=-1.0,  # task4 视野 (y=-120) 下方向反了
+            # 2026-08-03 (用户): task4 arm=+90 与 task1 arm=-90 差 180° 旋转,
+            # 视野坐标反向 → x 物理方向也要反过来。task1 默认 sign_x=-1,
+            # task4 用 sign_x=+1。
+            sign_arm=1.0, sign_x=+1.0,
             setpoint_x_norm=sx, setpoint_y_norm=sy,
             selector=selector,
         )
