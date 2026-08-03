@@ -413,37 +413,43 @@ def _pick_and_store(
         return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
     print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
 
-    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球)
+    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球) - 必须同步, 等真空建立
     print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
     arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
     runner.grasp(True, timeout=5.0)
-    time.sleep(0.5)  # 让真空建立
+    time.sleep(0.3)  # 让真空建立
 
-    # 0.6 先 x 上升到 -30 (出 bin 区 + 球出吸嘴下方), 再开始同步 bin 动作
-    #    2026-08-04 (用户): 抓球后直接 composite_run(y=bin,x=bin_x) 可能球卡在吸嘴
-    #    下方被横移拖飞, 先抬升 x 到中间 (-30) 球出吸嘴正下方再放仓。
-    print(f"  [{LOG_PREFIX}] 中间姿态 x=-30 + 抬升 y={Y_TRANSIT_MM}")
-    arm_client.composite_run(
-        y_mm=Y_TRANSIT_MM, x_mm=-30.0, speed=80, timeout=30.0,
-    )
+    # 0.6 抬 y=-30 出保护区 (球出吸嘴正下方, 防横移拖飞)
+    #    2026-08-04 (用户): 不是 x=-30 是 y=-30, 让球出保护区 + 后面复合动作不卡
+    print(f"  [{LOG_PREFIX}] 中间姿态 y=-30")
+    arm_client.composite_run(y_mm=-30.0, speed=80, timeout=10.0)
 
-    # 1. 一步到 bin 放仓位 (4 轴并发, 没有中间过渡姿态)
-    print(f"  [{LOG_PREFIX}] composite_run(y={Y_PUT_MM} ∥ x={bin_x}) → bin 放仓位")
-    arm_client.composite_run(
-        y_mm=Y_PUT_MM, x_mm=bin_x, speed=80, timeout=30.0,
-    )
-    # 2. 放气
-    print(f"  [{LOG_PREFIX}] grasp(False) 放球")
-    runner.grasp(False, timeout=5.0)
-    time.sleep(0.3)
+    # 1+2+3+4 全部后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
+    #    - bin 放仓位 (y=-20 ∥ x=bin_x, 4 轴并发)
+    #    - grasp(False)
+    #    - y=-30 出保护区
+    #    - 回 P 姿态 (y=-120 ∥ x=return, 4 轴并发)
+    # 下一轮 step_target4 主循环开头 goto_pose_p 会阻塞等 arm 到位,
+    #    此时底盘 creep (realtime 通道) 可以并行跑, 不冲突。
+    # 2026-08-04 (用户): 不能堵塞底盘 creep → 全部 _call_arm(sync=False) 异步发
+    import threading
+    def _bg_release():
+        try:
+            arm_client.composite_run(
+                y_mm=-20.0, x_mm=bin_x, speed=80, timeout=30.0,
+            )
+            runner.grasp(False, timeout=5.0)
+            arm_client.composite_run(y_mm=-30.0, speed=80, timeout=10.0)
+            if return_x_mm is not None:
+                arm_client.composite_run(
+                    y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
+                )
+            else:
+                arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
+        except Exception as e:
+            print(f"  [{LOG_PREFIX}] [bg_release] FAIL: {type(e).__name__}: {e}")
 
-    # 3. 一步回 P 姿态 (4 轴并发)
-    if return_x_mm is not None:
-        arm_client.composite_run(
-            y_mm=POSE_P_Y_MM, x_mm=return_x_mm, speed=80, timeout=30.0,
-        )
-    else:
-        arm_client.composite_run(y_mm=POSE_P_Y_MM, speed=80, timeout=30.0)
+    threading.Thread(target=_bg_release, daemon=True, name="task4-release").start()
     return {"ok": True, "error": None}
 
 
