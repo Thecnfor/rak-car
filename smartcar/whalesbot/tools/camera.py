@@ -211,11 +211,36 @@ class Camera:
         if self.cap is not None and self.cap.isOpened():
             self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
-            # 2026-08-03：协商 30Hz。MJPEG @ 640x480 UVC 标准支持 30fps；
-            # SP2812 在 Jetson xHCI USB2.0 480M hub 下两路均能拉到 30Hz
-            # （按 50KB/帧 MJPEG 估算每路 ~94Mbps，远低于 480Mbps 总带宽）。
-            # CAP_PROP_FPS 在某些驱动上写不进去（仍返回旧值），因此只设不读。
+            # 2026-08-03：真协商 30Hz。SP2812 在 Jetson xHCI USB2.0 480M hub 下
+            # 理论上两路均能拉 30Hz (按 50KB/帧 MJPEG 估算每路 ~94Mbps,远低于
+            # 480Mbps 总带宽)。但 UVC 默认协商常常落到 10Hz,必须显式设 FOURCC
+            # MJPG + BUFFERSIZE=1 + fps 三件套,再**读回**验证。
+            try:
+                self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+            except Exception:
+                pass
+            try:
+                # BUFFERSIZE=1 减少队列堆积（更接近实时）
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
             self.cap.set(cv2.CAP_PROP_FPS, 30)
+            # 读回看协商成功没;失败也不致命,后续 update() 仍按 read 节奏跑
+            negotiated_fps = self.cap.get(cv2.CAP_PROP_FPS)
+            negotiated_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            negotiated_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self._negotiated_fps = float(negotiated_fps) if negotiated_fps else 0.0
+            if abs(self._negotiated_fps - 30.0) > 1.0:
+                logger.warning(
+                    "camera %s negotiated fps=%.1f (want 30, got %.1f); "
+                    "stream will run at %.1f Hz",
+                    self.src, self._negotiated_fps, self._negotiated_fps, self._negotiated_fps,
+                )
+            else:
+                logger.info(
+                    "camera %s negotiated 640x480@%.1f fps (MJPG)",
+                    self.src, self._negotiated_fps,
+                )
             # 兜底：启动时主动关 autosuspend（udev 不生效时的兜底）
             disable_usb_autosuspend_for(self.src)
 

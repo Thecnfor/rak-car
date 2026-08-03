@@ -1,1 +1,1 @@
-from .base.infer_wrap import  YoloeInfer, OCRReco, LaneInfer
+from .base.infer_wrap import YoloeInfer, OCRReco, LaneInfer, LaneBlendInfer

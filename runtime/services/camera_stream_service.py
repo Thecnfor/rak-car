@@ -101,6 +101,13 @@ class CameraStreamService:
         self.key_lock = threading.Lock()
         self.frames = {}
         self.frame_meta = {}
+        # 2026-08-03: 真实 fps 测量。
+        # Camera.update() 后台 read 出来的节奏由 UVC 驱动 + 摄像头协商决定,
+        # CAP_PROP_FPS=30 set 不一定生效 (Jetson 默认落 10Hz)。
+        # 记每帧 source_update_at 时间戳,get_status() 用最近 2s 窗口算实测 fps。
+        self._frame_ts = {"cam1": [], "cam2": []}
+        self._frame_ts_lock = threading.Lock()
+        self._measured_window_s = 2.0
         # JPEG 编码缓存：{cam_id: (source_updated_at: float, jpeg_bytes: bytes)}
         # 一次编码喂所有 MJPEG 连接 + 所有 HTTP /stream/frame/*.jpg 客户端，
         # 避免每个连接独立 cv2.imencode 抢占 CPU。
@@ -196,6 +203,28 @@ class CameraStreamService:
                     "usb_autosuspend": usb_power["autosuspend"],
                     "usb_power_warn": usb_power["warn"],
                 }
+        # 2026-08-03: 实测 fps(基于最近 2s source_update_at 时间戳间隔)
+        measured_fps = {}
+        try:
+            with self._frame_ts_lock:
+                now = time.time()
+                for cam_id in ("cam1", "cam2"):
+                    ts_list = self._frame_ts.get(cam_id, [])
+                    # 只看窗口内
+                    cutoff = now - self._measured_window_s
+                    recent = [t for t in ts_list if t >= cutoff]
+                    if len(recent) >= 2:
+                        span = recent[-1] - recent[0]
+                        if span > 0:
+                            measured_fps[cam_id] = round(
+                                (len(recent) - 1) / span, 2,
+                            )
+                        else:
+                            measured_fps[cam_id] = None
+                    else:
+                        measured_fps[cam_id] = None
+        except Exception:
+            pass
         return {
             "status": "running" if self.running else "stopped",
             "active_cams": active_cams,
@@ -203,6 +232,7 @@ class CameraStreamService:
             "quality": self.quality,
             "stale_timeout": self.stale_timeout,
             "cameras": cameras,
+            "measured_fps": measured_fps,
         }
 
     @staticmethod
@@ -357,6 +387,17 @@ class CameraStreamService:
                 }
             )
             self.frame_meta[normalized] = meta
+        # 2026-08-03: 记录源时间戳到环形缓冲,get_status() 算实测 fps
+        try:
+            with self._frame_ts_lock:
+                ts_list = self._frame_ts.setdefault(normalized, [])
+                ts_list.append(float(source_updated_at))
+                # 修剪窗口外
+                cutoff = time.time() - self._measured_window_s
+                while ts_list and ts_list[0] < cutoff:
+                    ts_list.pop(0)
+        except Exception:
+            pass
 
     @staticmethod
     def _is_valid_image(image):
