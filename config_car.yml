@@ -125,8 +125,9 @@ location_pid:
 
 infer_cfg:
   - name: lane
-    infer_type: LaneInfer
-    model_dir: lane_model
+    infer_type: LaneBlendInfer
+    model_dir: lane_model           # d_a 源（live 版本,d_a 完美）
+    model_dir_d_e: lane_model_d_e   # d_e 源（incoming 备份,d_e 完美）
     port: 5001
     img_size: [128, 128]
     run_mode: paddle
