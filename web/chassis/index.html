@@ -81,6 +81,16 @@
           <input type="range" id="jogAng" min="2" max="15" step="1" value="5">
           <b id="jogAngLabel">0.5 rad/s</b>
         </div>
+        <div class="slider-row">
+          <span>平移→前后补偿</span>
+          <input type="range" id="compKxy" min="-30" max="30" step="1" value="9">
+          <b id="compKxyLabel">0.09</b>
+        </div>
+        <div class="slider-row">
+          <span>前后→平移补偿</span>
+          <input type="range" id="compKyx" min="-30" max="30" step="1" value="-10">
+          <b id="compKyxLabel">-0.10</b>
+        </div>
         <div class="btn-row">
           <button id="btnStop">全停 (0,0,0)</button>
         </div>

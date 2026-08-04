@@ -209,6 +209,35 @@ let jogTimer: number | null = null;
 
 function linV(): number { return Number(jogLin.value) / 100; }   // 0.05..0.50
 function angV(): number { return Number(jogAng.value) / 10; }     // 0.2..1.5
+// 麦轮打滑前馈补偿（2026-08-04 实测）：纯 vy 指令产生 dx≈−0.09·dy 的前后漂移，
+// 纯 vx 产生 dy≈+0.10·dx 的左右漂移。发指令时交叉补偿抵消。系数面板可调。
+const COMP_KEY = "rakcar.chassis.comp";
+const DEFAULT_COMP = { kxy: 0.09, kyx: -0.10 };
+let comp = loadComp();
+function loadComp() {
+  try {
+    const c = JSON.parse(localStorage.getItem(COMP_KEY) || "null");
+    if (c && typeof c.kxy === "number" && typeof c.kyx === "number") return c;
+  } catch { /* ignore */ }
+  return { ...DEFAULT_COMP };
+}
+
+// 补偿滑档 ↔ comp（localStorage 持久化；现场看轨迹画布调到走直）
+const compKxy = $("compKxy") as HTMLInputElement;
+const compKyx = $("compKyx") as HTMLInputElement;
+const compKxyLabel = $("compKxyLabel")!;
+const compKyxLabel = $("compKyxLabel")!;
+function applyComp() {
+  comp = { kxy: Number(compKxy.value) / 100, kyx: Number(compKyx.value) / 100 };
+  compKxyLabel.textContent = comp.kxy.toFixed(2);
+  compKyxLabel.textContent = comp.kyx.toFixed(2);
+  localStorage.setItem(COMP_KEY, JSON.stringify(comp));
+}
+compKxy.value = String(Math.round(comp.kxy * 100));
+compKyx.value = String(Math.round(comp.kyx * 100));
+applyComp();
+compKxy.addEventListener("input", applyComp);
+compKyx.addEventListener("input", applyComp);
 // 轴向映射（直觉 = 物理，2026-08-04 多源确认：odom 干净矩阵 / IK / 轮编码器
 // 签名 / 赛场外环能跑通）。不再做符号翻转 —— 方向异常先强刷页面排除旧 bundle。
 async function sendJog() {
@@ -220,6 +249,9 @@ async function sendJog() {
   if (axes.has("d")) vy -= linV();   // D = 右移
   if (axes.has("q")) wz += angV();   // Q = 逆时针
   if (axes.has("e")) wz -= angV();   // E = 顺时针
+  // 打滑前馈补偿：交叉项抵消滚子滑动漂移
+  vx += comp.kxy * vy;
+  vy += comp.kyx * vx;
   lastCmd = { vx, vy, wz };
   drawTrace();
   try {
