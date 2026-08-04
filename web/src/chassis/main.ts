@@ -189,17 +189,57 @@ const axes = new Set<string>();
 let jogTimer: number | null = null;
 
 function linV(): number { return Number(jogLin.value) / 100; }   // 0.05..0.50
-function angV(): number { return Number(jogAng.value) / 10; }     // 0.2..1.5
+// 轴向符号标定（2026-08-04 里程计实测）：本车 +vx 物理=后退、+vy 物理=右移、
+// +wz=逆时针。前端按"W=前进/A=左移/Q=逆时针"的直觉映射，用符号常量翻转。
+// 现场若换车/换接线方向反了，用面板上的翻转勾选修正（localStorage 持久化）。
+const SIGNS_KEY = "rakcar.chassis.signs";
+const DEFAULT_SIGNS = { vx: -1, vy: -1, wz: +1 };
+let signs: { vx: number; vy: number; wz: number } = loadSigns();
+function loadSigns() {
+  try {
+    const s = JSON.parse(localStorage.getItem(SIGNS_KEY) || "null");
+    if (s && typeof s.vx === "number" && typeof s.vy === "number" && typeof s.wz === "number") return s;
+  } catch { /* ignore */ }
+  return { ...DEFAULT_SIGNS };
+}
+function saveSigns() {
+  localStorage.setItem(SIGNS_KEY, JSON.stringify(signs));
+}
+
+// 翻转勾选 ↔ signs（默认值已含实测标定；勾选 = 在默认基础上再翻一次）
+const flipVx = $("flipVx") as HTMLInputElement;
+const flipVy = $("flipVy") as HTMLInputElement;
+const flipWz = $("flipWz") as HTMLInputElement;
+function applySigns() {
+  signs = {
+    vx: DEFAULT_SIGNS.vx * (flipVx.checked ? -1 : 1),
+    vy: DEFAULT_SIGNS.vy * (flipVy.checked ? -1 : 1),
+    wz: DEFAULT_SIGNS.wz * (flipWz.checked ? -1 : 1),
+  };
+  saveSigns();
+}
+try {
+  const saved = JSON.parse(localStorage.getItem(SIGNS_KEY) || "null");
+  if (saved) {
+    flipVx.checked = saved.vx !== DEFAULT_SIGNS.vx;
+    flipVy.checked = saved.vy !== DEFAULT_SIGNS.vy;
+    flipWz.checked = saved.wz !== DEFAULT_SIGNS.wz;
+  }
+} catch { /* ignore */ }
+applySigns();
+flipVx.addEventListener("change", applySigns);
+flipVy.addEventListener("change", applySigns);
+flipWz.addEventListener("change", applySigns);
 
 async function sendJog() {
   if (estopped) return;
   let vx = 0, vy = 0, wz = 0;
-  if (axes.has("w")) vx += linV();
-  if (axes.has("s")) vx -= linV();
-  if (axes.has("a")) vy += linV();
-  if (axes.has("d")) vy -= linV();
-  if (axes.has("q")) wz += angV();
-  if (axes.has("e")) wz -= angV();
+  if (axes.has("w")) vx += signs.vx * linV();   // W = 前进
+  if (axes.has("s")) vx -= signs.vx * linV();   // S = 后退
+  if (axes.has("a")) vy += signs.vy * linV();   // A = 左移
+  if (axes.has("d")) vy -= signs.vy * linV();   // D = 右移
+  if (axes.has("q")) wz += signs.wz * angV();   // Q = 逆时针
+  if (axes.has("e")) wz -= signs.wz * angV();   // E = 顺时针
   try {
     await api.chassisVelocity({ vx, vy, wz });
   } catch { /* 抖动重试；急停 409 预期 */ }
