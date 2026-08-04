@@ -75,9 +75,12 @@ class CarRuntimeService(
         # 2026-08-04：底盘三速"最后指令"缓存。lane_feed 的 forward/lateral/
         # angular_speed 字段从未被填（外环在客户端跑，车端只收轮速），调试页
         # 要显示底盘速度只能记最后一次 /v1/realtime/chassis-velocity 指令
-        # （run.py 外环与 web 示教点动都走这个端点）。
         self._chassis_cmd_lock = threading.Lock()
         self._chassis_cmd = {"vx": None, "vy": None, "wz": None, "updated_at": None}
+        # 2026-08-04：命令历史环（方向诊断用）：记录最近 60 条三速指令，
+        # 用户复现"按键方向不对"时读 /v1/realtime/chassis/command 的 history
+        # 对照物理行为，区分"页面发错"还是"车动错"。
+        self._chassis_cmd_history = []
         # D.6 协作退出事件：与 jobs 字典分开存放，避免 JSON 序列化时碰到
         # `threading.Event`（不可序列化）抛错。key 与 jobs[job_id]["id"] 对齐。
         self.job_stop_events: dict = {}
@@ -215,6 +218,11 @@ class CarRuntimeService(
             self._chassis_cmd = {
                 "vx": vx, "vy": vy, "wz": wz, "updated_at": time.time(),
             }
+            self._chassis_cmd_history.append(
+                {"vx": vx, "vy": vy, "wz": wz, "t": time.time()}
+            )
+            if len(self._chassis_cmd_history) > 60:
+                del self._chassis_cmd_history[: len(self._chassis_cmd_history) - 60]
         return {
             "vx": vx,
             "vy": vy,
@@ -297,9 +305,11 @@ class CarRuntimeService(
         return car.get_wheel_encoders()
 
     def get_chassis_command(self):
-        """最后一次 /v1/realtime/chassis-velocity 指令缓存（调试页显示用）。"""
+        """最后一次 /v1/realtime/chassis-velocity 指令缓存 + 最近历史（诊断用）。"""
         with self._chassis_cmd_lock:
-            return dict(self._chassis_cmd)
+            out = dict(self._chassis_cmd)
+            out["history"] = list(self._chassis_cmd_history)
+            return out
 
     def get_lane_state(self):
         """外环专用：读 streamer 缓存的 lane_state。
