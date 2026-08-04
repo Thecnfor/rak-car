@@ -12,6 +12,10 @@
 
 弯角未知（地图只有 45/90/120）→ StaircaseTurn：目标 45→90→120 连续抬升，
 配合 lane 回正校验；识别用 CurveDetector（|error_angle| 阈值 + 持续帧）。
+
+出口判定只信贴近里程碑的停顿窗（|θ_target-θ|≤exit_window）+ 连续 exit_sustain 帧
+—— 盲转扫场中 lane 单帧不可信，转弯出口紧接着的十字路口假 lane 不能提前结束转弯。
+CurveDetector 触发后有 rearm_clean 冷却，防止十字路口垃圾读数立即重触发。
 """
 from __future__ import annotations
 
@@ -54,6 +58,7 @@ class OdomTurnPID:
         kp: float = 2.2,
         ki: float = 0.35,
         kd: float = 0.06,
+        kd_alpha: float = 0.0,
         omega_max: float = 1.4,
         int_decay: float = 0.4,
         int_cap: float = 0.35,
@@ -64,6 +69,7 @@ class OdomTurnPID:
         self.kp = float(kp)
         self.ki = float(ki)
         self.kd = float(kd)
+        self.kd_alpha = float(kd_alpha)  # D 项一阶低通系数（<=0=裸 D 原版；>0 才滤波）
         self.omega_max = float(omega_max)
         self.int_decay = float(int_decay)
         self.int_cap = float(int_cap)
@@ -72,6 +78,7 @@ class OdomTurnPID:
         self._target: Optional[float] = None
         self._integral: float = 0.0
         self._prev_err: Optional[float] = None
+        self._d_filt: float = 0.0
 
     @property
     def active(self) -> bool:
@@ -89,6 +96,7 @@ class OdomTurnPID:
         self._target = self._start + delta
         self._integral = 0.0
         self._prev_err = None
+        self._d_filt = 0.0
 
     def extend(self, increment_deg: float) -> None:
         """连续抬升目标：θ_target += increment（StaircaseTurn 阶梯续转用，中间不停）。
@@ -100,6 +108,7 @@ class OdomTurnPID:
         self._target += math.radians(float(increment_deg))
         self._integral = 0.0
         self._prev_err = None
+        self._d_filt = 0.0
 
     def error(self, theta_now: float) -> float:
         if self._target is None:
@@ -117,11 +126,17 @@ class OdomTurnPID:
         self._integral = self._integral * math.exp(-self.int_decay * dt) + err * dt
         if self.int_cap > 0:
             self._integral = max(-self.int_cap, min(self.int_cap, self._integral))
-        d = 0.0
-        if self._prev_err is not None:
+        # D 项：kd_alpha>0 时一阶低通（odom 20Hz 积分/50Hz 读，θ 台阶波裸 D 有 20Hz 尖刺）；
+        # kd_alpha<=0 走原版裸 D（普通弯道行为不变）。
+        if self._prev_err is None:
+            self._d_filt = 0.0
+        elif self.kd_alpha > 0.0:
             d = (err - self._prev_err) / dt
+            self._d_filt = self.kd_alpha * d + (1.0 - self.kd_alpha) * self._d_filt
+        else:
+            self._d_filt = (err - self._prev_err) / dt
         self._prev_err = err
-        omega = self.kp * err + self.ki * self._integral + self.kd * d
+        omega = self.kp * err + self.ki * self._integral + self.kd * self._d_filt
         return max(-self.omega_max, min(self.omega_max, omega)), False
 
     def wheels(self, omega: float) -> List[float]:
@@ -158,6 +173,11 @@ class StaircaseTurn:
         straight_tol_deg: float = 6.0,
         straight_tol_y_m: float = 0.05,
         min_align_rot_deg: float = 5.0,
+        # 十字路口弯专用加固（默认关，普通弯道行为不变）：
+        exit_window_deg: Optional[float] = None,   # None=原版单帧出口；设值=贴近里程碑才判
+        exit_sustain: int = 1,
+        escalate_sustain: int = 1,
+        kd_alpha: float = 0.0,                     # 内部 OdomTurnPID 的 D 低通，>0 才生效
     ) -> None:
         self._targets = [float(t) for t in targets_deg]
         self._increments = [self._targets[0]] + [
@@ -167,13 +187,19 @@ class StaircaseTurn:
         self.tol_a = math.radians(float(straight_tol_deg))
         self.tol_y = float(straight_tol_y_m)
         self._min_align_rot = math.radians(float(min_align_rot_deg))
+        self._exit_window = None if exit_window_deg is None else math.radians(float(exit_window_deg))
+        self._exit_sustain = max(1, int(exit_sustain))
+        self._escalate_sustain = max(1, int(escalate_sustain))
+        self._kd_alpha = float(kd_alpha)
         self.phase: str = "idle"  # idle / turning / done / fail
         self.reason: str = ""     # done/fail 的原因，便于日志
         self._idx = 0
         self._direction = 1
         self._ea_ref = 1          # 弯道识别时刻 error_angle 的符号
         self._theta_start = 0.0
-        self._turn = OdomTurnPID()
+        self._exit_count = 0      # 出口判定连续帧计数（加固模式）
+        self._escalate_count = 0  # 升档判定连续帧计数（加固模式）
+        self._turn = OdomTurnPID(kd_alpha=self._kd_alpha)
 
     @property
     def active(self) -> bool:
@@ -185,10 +211,13 @@ class StaircaseTurn:
         self._ea_ref = 1 if float(ea_ref) >= 0 else -1
         self._idx = 0
         self._theta_start = float(theta_start)
-        self._turn = OdomTurnPID(turn_deg=self._direction * self._increments[0])
+        self._turn = OdomTurnPID(turn_deg=self._direction * self._increments[0],
+                                 kd_alpha=self._kd_alpha)
         self._turn.start(self._theta_start)
         self.phase = "turning"
         self.reason = ""
+        self._exit_count = 0
+        self._escalate_count = 0
 
     def _rotated_enough(self, theta_now: float) -> bool:
         return abs(theta_now - self._theta_start) >= self._min_align_rot
@@ -205,11 +234,23 @@ class StaircaseTurn:
         return self._turn.wheels(omega)
 
     def step(self, theta_now: float, dt: float, lane: Optional[LaneState]) -> Tuple[float, str]:
-        """返回 (ω, phase)；phase ∈ turning/done/fail。done/fail 后 ω 恒 0。"""
+        """返回 (ω, phase)；phase ∈ turning/done/fail。done/fail 后 ω 恒 0。
+
+        默认（exit_window_deg=None）= 原版行为：转过 min_align_rot 后单帧 lane 判定。
+        十字路口弯（exit_window_deg 设值）走加固路径：出口只信贴近里程碑的停顿窗
+        （|θ_target-θ|≤exit_window，车已 ω→0 停稳）+ 连续 exit_sustain 帧 —— 盲转
+        扫场中 lane 单帧不可信，弯道出口紧接着的十字路口假 lane 不能提前结束转弯；
+        升档同样要连续 escalate_sustain 帧。加固只作用在指定弯，普通弯道行为不变。
+        """
         if self.phase in ("done", "fail"):
             return 0.0, self.phase
         theta_now = float(theta_now)
-        # 1) 连续回正检测：转过一点后，lane 一露头说平行就停（不用凑里程碑）
+        if self._exit_window is None:
+            return self._step_original(theta_now, dt, lane)
+        return self._step_hardened(theta_now, dt, lane)
+
+    def _step_original(self, theta_now: float, dt: float, lane: Optional[LaneState]) -> Tuple[float, str]:
+        """原版判定：转过 min_align_rot 后，lane 任一帧说平行/过转就 done（单帧）。"""
         if (self._rotated_enough(theta_now)
                 and lane is not None and lane.is_fresh and lane.error_angle is not None):
             ea = float(lane.error_angle)
@@ -222,7 +263,7 @@ class StaircaseTurn:
                 # 过转：反向残余大误差 → 交给直道 vy 回正
                 self.phase, self.reason = "done", "overshoot"
                 return 0.0, self.phase
-        # 2) 里程碑：当前 θ_target 已到仍未回正 → 升档 / fail
+        # 里程碑：当前 θ_target 已到仍未回正 → 升档 / fail
         if abs(self._turn.error(theta_now)) < self.tol:
             lane_ok = lane is not None and lane.is_fresh and lane.error_angle is not None
             if lane_ok:
@@ -236,6 +277,52 @@ class StaircaseTurn:
         omega, _ = self._turn.step(theta_now, dt)
         return omega, self.phase
 
+    def _step_hardened(self, theta_now: float, dt: float, lane: Optional[LaneState]) -> Tuple[float, str]:
+        """加固判定（十字路口弯）：出口只信里程碑停顿窗 + 连续帧；升档也要连续帧。"""
+        near = abs(self._turn.error(theta_now)) <= self._exit_window
+        lane_ok = lane is not None and lane.is_fresh and lane.error_angle is not None
+        # 1) 出口判定：贴近里程碑且 lane 新鲜 → 连续 exit_sustain 帧同结论才 done
+        if near and lane_ok:
+            ea = float(lane.error_angle)
+            if abs(ea) <= self.tol_a:
+                self._exit_count += 1
+                if self._exit_count >= self._exit_sustain:
+                    centered = lane.error_y is not None and abs(float(lane.error_y)) <= self.tol_y
+                    self.phase = "done"
+                    self.reason = "straight" if centered else "parallel_y_off"
+                    return 0.0, self.phase
+                return 0.0, self.phase      # 窗内停车攒帧，等结论
+            if math.copysign(1.0, ea) != self._ea_ref:
+                # 过转：反向残余大误差 → 交给直道 vy 回正
+                self._exit_count += 1
+                if self._exit_count >= self._exit_sustain:
+                    self.phase, self.reason = "done", "overshoot"
+                    return 0.0, self.phase
+                return 0.0, self.phase      # 窗内停车攒帧，等结论
+            self._exit_count = 0
+        else:
+            self._exit_count = 0
+        # 2) 里程碑已到仍未回正 → 同向残余需连续 escalate_sustain 帧才升档；
+        #    lane 丢则盲升档（真实 90°/120° 弯里同向 lane 可能暂时看不见，仍应续转）
+        at_milestone = abs(self._turn.error(theta_now)) < self.tol
+        if at_milestone:
+            if lane_ok:
+                ea = float(lane.error_angle)
+                same = abs(ea) > self.tol_a and math.copysign(1.0, ea) == self._ea_ref
+            else:
+                same = True
+            if same:
+                self._escalate_count += 1
+                if self._escalate_count >= self._escalate_sustain:
+                    self._escalate_count = 0
+                    self._escalate()
+                return 0.0, self.phase      # 里程碑停车攒帧
+            self._escalate_count = 0
+        else:
+            self._escalate_count = 0
+        omega, _ = self._turn.step(theta_now, dt)
+        return omega, self.phase
+
 
 class CurveDetector:
     """纯视觉弯道识别：|error_angle| 持续 sustain 帧超 detect_tol → 触发。
@@ -246,31 +333,45 @@ class CurveDetector:
 
     阈值（默认）：直道 error_angle 正常噪声 <10°，detect_tol=20° 留裕量；
     sustain=5 帧（50Hz 下 0.1s）去抖。按场地再调。
+
+    rearm_clean：触发后必须连续 rearm_clean 帧干净直道（|ea|≤tol）才允许再触发。
+    弯道出口紧接着的十字路口 lane 是垃圾读数，没有冷却会在 0.1s 内重触发，把车转进
+    十字路口反复过不去（2026-08-05 实车：45° 弯出口即十字路口）。
     """
 
-    def __init__(self, tol_deg: float = 20.0, sustain: int = 5, sign_cal: int = 1) -> None:
+    def __init__(self, tol_deg: float = 20.0, sustain: int = 5, sign_cal: int = 1,
+                 rearm_clean: int = 0) -> None:
         self.tol = math.radians(float(tol_deg))
         self.sustain = max(1, int(sustain))
         self.sign_cal = 1 if float(sign_cal) >= 0 else -1
+        self.rearm_clean = max(0, int(rearm_clean))
         self._count = 0
+        self._rearm = 0          # 剩余待清帧：>0 时禁止再触发，只被干净直道递减
         self.entry_sign: int = 1
 
     def reset(self) -> None:
         self._count = 0
+        self._rearm = 0
 
     def update(self, lane: Optional[LaneState]) -> Optional[int]:
         """每帧调一次：返回 None 或 direction(±1)；entry_sign 同步更新。"""
         if lane is None or not lane.is_fresh or lane.error_angle is None:
             self._count = 0
-            return None
+            return None          # lane 丢不算干净直道，rearm 保持阻塞
         ea = float(lane.error_angle)
         if abs(ea) <= self.tol:
             self._count = 0
+            if self._rearm > 0:
+                self._rearm -= 1
             return None
         self._count += 1
         if self._count < self.sustain:
             return None
+        if self._rearm > 0:
+            self._count = 0      # 冷却中：垃圾读数不触发，也不递减 rearm
+            return None
         self._count = 0
+        self._rearm = self.rearm_clean
         self.entry_sign = 1 if ea > 0 else -1
         return self.sign_cal * self.entry_sign
 
@@ -312,7 +413,55 @@ def demo():
     # 超限（真 180，ea 恒 +30 同向）：三档用尽 → fail
     phase, reason, deg = run(180, lambda d: (30.0, True))
     assert phase == "fail" and reason == "max_angle_still_not_straight", (phase, reason, deg)
-    print("StaircaseTurn demo OK")
+    # 十字路口弯回归（加固模式，普通弯道不受影响）：
+    # 旋转中途 lane 误报已回正（假反向 overshoot）→ 不得早停，得转到 45° 里程碑才收尾
+    # （原版逻辑 ~11° 就 done overshoot → 回正后立即重触发 → 十字路口反复转不过去）。
+    # 加固路径 exit_sustain=1 时：里程碑窗内单帧 ea=0 即 done（等 3 帧只是更稳，不影响判定性质）。
+    hardened_turn = StaircaseTurn(exit_window_deg=3.0, exit_sustain=3,
+                                  escalate_sustain=3, kd_alpha=0.4)
+    def run_turn(turn, real_deg, lane_at):
+        turn.start(0.0, direction=1, ea_ref=1)
+        theta = 0.0
+        for _ in range(5000):
+            deg = math.degrees(theta)
+            ea, fresh = lane_at(deg)
+            state = LaneState(error_angle=math.radians(ea), error_y=0.0,
+                              age_ms=0 if fresh else 2000)
+            omega, phase = turn.step(theta, 0.02, state)
+            if phase != "turning":
+                return phase, turn.reason, deg
+            theta += omega * 0.02
+        return "timeout", turn.reason, deg
+
+    mid_garbage = lambda d: (0.0, False) if d < 10.0 else (-30.0, True) if d < 41.0 else (0.0, True)
+    phase, reason, deg = run_turn(StaircaseTurn(), 45, mid_garbage)      # 原版：~11° 就 done overshoot
+    assert phase == "done" and reason == "overshoot" and deg < 30, (phase, reason, deg)
+    phase, reason, deg = run_turn(hardened_turn, 45, mid_garbage)        # 加固：转到 42° 才收尾
+    assert phase == "done" and reason == "straight", (phase, reason, deg)
+    assert deg >= 40, f"加固路径旋转中假 lane 不得早停: {deg}"
+    # CurveDetector rearm（加固才开）：触发后十字路口垃圾 |ea| 持续大 → 冷却期内不得重触发；
+    # 干净直道跑完冷却 → 应能再触发
+    det = CurveDetector(rearm_clean=20)
+    fresh = lambda ea: LaneState(error_angle=math.radians(ea), error_y=0.0, age_ms=0)
+    for _ in range(5):
+        d = det.update(fresh(30.0))
+    assert d is not None, "弯道应触发"
+    # 加固 detector：tol=12 + sustain=3 必须抓住 sub-20° 的 3 帧短信号 —— 45° 弯
+    # 出口接十字路口, 弯道那 3 帧 error_angle 只有 ~0.3rad(≈17°), 默认 20° 判不进
+    # (2026-08-05 实车 trace), 降到 12° 才在信号内触发.
+    det3 = CurveDetector(tol_deg=12, sustain=3, rearm_clean=20)
+    for _ in range(2):
+        assert det3.update(fresh(18.0)) is None, "sustain=3 前 2 帧不应触发"
+    assert det3.update(fresh(18.0)) is not None, "第 3 帧 18°(sub-20°) 应触发"
+    for _ in range(60):
+        assert det.update(fresh(-28.0)) is None, "rearm 冷却内十字路口不得重触发"
+    for _ in range(20):
+        det.update(fresh(2.0))
+    fired = None
+    for _ in range(5):
+        fired = det.update(fresh(30.0))
+    assert fired is not None, "rearm 冷却结束后应能再触发"
+    print("StaircaseTurn + CurveDetector demo OK")
 
 
 if __name__ == "__main__":
