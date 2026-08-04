@@ -62,6 +62,8 @@ class OrthogonalDebug:
 
     # 模式：vx=0 就是"原地水平稳定"
     locked_vx: bool
+    # 2026-08-05：straight 的 ω cross-track 项（error_y → ω）。orthogonal 不用，默认 0。
+    omega_ey_term: float = 0.0
 
 
 class OrthogonalOuterLoop(OuterLoop):

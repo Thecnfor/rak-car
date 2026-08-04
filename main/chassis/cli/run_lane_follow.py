@@ -189,6 +189,19 @@ def main(argv: list[str] | None = None) -> None:
         help="ω 方向，+1 = error_angle>0(车头偏右) 逆时针左转回正；实车反了改 -1。"
     )
     parser.add_argument(
+        "--ea-target", type=float, default=None,
+        help="可选额外 ω 收敛偏置 (rad)。默认 None=用控制器默认 0.0——配合\n"
+             "--k-ey-omega cross-track 让车头收敛到与实际车道中心线平行（真平行由\n"
+             "横向漂移反推，不靠这个固定偏置）。仅当你仍想要固定右偏时才设正偏置。"
+    )
+    parser.add_argument(
+        "--k-ey-omega", type=float, default=None,
+        help="error_y → ω 的 cross-track 增益 (rad/s 每单位 error_y)。\n"
+             "error_angle 读 0 的零区内角度通道是瞎的，靠横向偏移反推真实平行方向：\n"
+             "车头不平行 → 横向漂移 → error_y 变化 → 纠正到漂移归零 = 真平行。\n"
+             "默认 None=用 StraightOuterLoop 的默认 0.5。需按 error_y 标定尺度调。"
+    )
+    parser.add_argument(
         "--turn", action="store_true",
         help="接弯道阶梯转弯：CurveDetector(|error_angle|>20° 持续 5 帧)识别弯道 →\n"
              "StaircaseTurn θ 闭环 45→90→120° 连续转，lane 回正后交还直道巡航。\n"
@@ -227,6 +240,12 @@ def main(argv: list[str] | None = None) -> None:
             omega_max=args.omega_max,
             sign_theta=args.sign_theta,
         )
+    # --ea-target / --k-ey-omega：覆盖 ω 通道收敛目标 / cross-track 增益。
+    # 两个路径（--controller straight 走 build_outer / --straight-follow 手写）统一在这里覆盖。
+    if args.ea_target is not None and hasattr(outer, "ea_target"):
+        outer.ea_target = float(args.ea_target)
+    if args.k_ey_omega is not None and hasattr(outer, "k_ey_omega"):
+        outer.k_ey_omega = float(args.k_ey_omega)
     # --vx-target 只作用在有 vx_target 字段的控制器（OrthogonalOuterLoop 等），
     # 用来从"原地水平稳定（vx=0）"切到"正交巡航"。其他 outer 没有这个字段
     # 也没关系，跳过即可。
