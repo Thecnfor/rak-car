@@ -190,11 +190,12 @@ let jogTimer: number | null = null;
 
 function linV(): number { return Number(jogLin.value) / 100; }   // 0.05..0.50
 function angV(): number { return Number(jogAng.value) / 10; }     // 0.2..1.5
-// 轴向符号标定（2026-08-04 里程计实测）：本车 +vx 物理=后退、+vy 物理=右移、
-// +wz=逆时针。前端按"W=前进/A=左移/Q=逆时针"的直觉映射，用符号常量翻转。
-// 现场若换车/换接线方向反了，用面板上的翻转勾选修正（localStorage 持久化）。
-const SIGNS_KEY = "rakcar.chassis.signs";
-const DEFAULT_SIGNS = { vx: -1, vy: -1, wz: +1 };
+// 轴向符号标定：2026-08-04 静止检查+四组合自洽的里程计实测确认直觉映射
+// (+vx=前进 / +vy=左移 / +wz=逆时针) 正确。早前一轮"反号"结论是重启后
+// odom theta 未稳定的污染数据，已撤销。注意 mecanum odom theta 会漂，
+// 现场若感觉方向反了用勾选翻转（localStorage 持久化），或先点"里程计清零"。
+const SIGNS_KEY = "rakcar.chassis.signs.v2";  // v2: 作废错误反号期间的旧存储
+const DEFAULT_SIGNS = { vx: +1, vy: +1, wz: +1 };
 let signs: { vx: number; vy: number; wz: number } = loadSigns();
 function loadSigns() {
   try {
