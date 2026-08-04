@@ -99,8 +99,19 @@ def _chassis_move_for(
     dx_m: float,
     timeout: float,
 ) -> dict:
-    """底盘纵向 move_for 阻塞调用 (sync=True 等结果)."""
-    return arm_client._call_car("move_for", dx_m, timeout=timeout, sync=True)
+    """底盘纵向 move_for 阻塞调用 (sync=True 等结果).
+
+    走 ChassisClient.move_for —— move_for 是底盘动作, 不应走
+    ArmClient._call_car. 后者签名是 (name, timeout=20.0, *args, sync=False, **kwargs),
+    第二个位置参数是 timeout, 写成 _call_car("move_for", dx_m, timeout=...)
+    会把 dx_m 误绑给 timeout, 报 "multiple values for argument 'timeout'".
+    """
+    from main.chassis import ChassisClient
+    chassis = ChassisClient.connect()
+    try:
+        return chassis.move_for(dx_m=dx_m, timeout=timeout)
+    finally:
+        chassis.close()
 
 
 # ── 单棵蔬菜抓取+投放 (走 ArmRunner + composite_*) ──────────────────

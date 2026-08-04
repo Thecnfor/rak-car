@@ -63,8 +63,19 @@ def _chassis_move_for(
     dx_m: float,
     timeout: float,
 ) -> dict:
-    """底盘纵向 move_for 阻塞调用 (sync=True 等结果)."""
-    return arm_client._call_car("move_for", dx_m, timeout=timeout, sync=True)
+    """底盘纵向 move_for 阻塞调用 (sync=True 等结果).
+
+    走 ChassisClient.move_for —— move_for 是底盘动作, 不应走
+    ArmClient._call_car. 后者签名是 (name, timeout=20.0, *args, sync=False, **kwargs),
+    第二个位置参数是 timeout, 写成 _call_car("move_for", dx_m, timeout=...)
+    会把 dx_m 误绑给 timeout, 报 "multiple values for argument 'timeout'".
+    """
+    from main.chassis import ChassisClient
+    chassis = ChassisClient.connect()
+    try:
+        return chassis.move_for(dx_m=dx_m, timeout=timeout)
+    finally:
+        chassis.close()
 
 
 def _read_arm_state(arm_client: ArmClient) -> Dict[str, Any]:
@@ -226,10 +237,15 @@ def _pick_cube(
     pick = cfg["pick_pose"]
     vision = cfg.get("pick_vision") or {}
 
-    # 1) 复合动作: arm 转 + X 伸出 + Y 抬升并发
+    # 2026-08-04: 抓取 init 姿态 X 由 cube_x_mm 决定 (per-cube, 用 first/second_cube_x_mm).
+    # pick_pose 不再单独定义 x_mm. 视觉伺服从方块物理 X 起步 (cam2 装在 X 滑台上,
+    # 臂在水方块正上方时 bbox 中心始终 = setpoint_cxcy, 与 X 起点无关).
+    init_x_mm = float(cube_x_mm)
+
+    # 1) 复合动作: arm 转 + X 伸出 + Y 抬升并发 (走 init 姿态)
     runner.client.composite_run(
         arm=float(pick["arm_angle_deg"]),
-        x_mm=float(cube_x_mm),
+        x_mm=init_x_mm,
         y_mm=float(vision.get("servo_y_mm", pick["y_transition_mm"])),
     )
 
@@ -248,9 +264,15 @@ def _pick_cube(
         return
 
     # ---- cam2 视觉伺服抓水立方 ----
+    # 2026-08-04: setpoint_cxcy 从 pick_vision 透传, 覆盖 arm_origin.yaml 的默认标定.
+    # 标定方法: 手动把臂摆到 pick_pose init 姿态 (x=-150, y=-150, arm=90, hand=-10),
+    # 把水方块放在吸嘴正下方, curl 5 帧取 bbox_norm 平均.
+    sp = vision.get("setpoint_cxcy")
+    sp_x = float(sp[0]) if (sp and len(sp) >= 1) else None
+    sp_y = float(sp[1]) if (sp and len(sp) >= 2) else None
     result = runner.track_velocity_pick(
         vision.get("label", "water"),
-        x_start=cube_x_mm,
+        x_start=init_x_mm,
         y_start=float(vision.get("servo_y_mm", pick["y_transition_mm"])),
         arm_start=float(pick["arm_angle_deg"]),
         hand_start=float(pick["hand_angle_deg"]),
@@ -265,10 +287,13 @@ def _pick_cube(
         sign_x=float(vision.get("sign_x", -1.0)),
         arm_min=vision.get("arm_min"),
         arm_max=vision.get("arm_max"),
+        setpoint_x_norm=sp_x,
+        setpoint_y_norm=sp_y,
+        descend_hand_deg=vision.get("descend_hand_deg"),  # 2026-08-04: 下降到位后手爪转 0°
         settle_hits=int(vision.get("settle_hits", 3)),
         hold_s=float(vision.get("hold_s", 0.3)),
         lift_back=True,
-        # (1)(2) 已摆好 S 姿态 (手爪 0°), 跳过 runner 内部重复 composite_run
+        # (1)(2) 已摆好 S 姿态 (手爪 -10°), 跳过 runner 内部重复 composite_run
         skip_pose_align=True,
     )
     if not result.get("ok"):
@@ -291,24 +316,33 @@ def _deliver_cube(
 ) -> None:
     """将吸住的水方块投放到水塔内.
 
-    执行顺序 (梯度投放避免堆叠):
-      1. composite_run: 大臂 → -95° + 手爪 → -90° + X → -120 + Y → carry (并发)
-      2. move_y 梯度下降到该方块对应深度
+    执行顺序 (2026-08-04 改, 防撞塔):
+      0. (前置: run() 在 chassis 回塔前已 runner.move_x(detection_pose.x_mm)=-200)
+      1. 阶段1: composite_run 转大臂到 -95° + 手爪 -90° + 降 Y (X 留在 -200 不动)
+                → 此时水方块在车体 back-left, 远离 +X 侧水塔, 旋转零碰撞
+      2. 阶段2: move_x 到投递位 -105 (大臂已锁 -95°, 水方块沿车体左侧平移, 不甩)
       3. grasp off 释放方块
     """
     carry = cfg["carry_pose"]
-    deliver_ys = cfg.get("deliver_y_by_index", [-60.0, -75.0, -95.0])
+    deliver_ys = cfg.get("deliver_y_by_index", [-50.0, -65.0, -80.0])
     deliver_y = deliver_ys[min(cube_index, len(deliver_ys) - 1)]
 
-    # 1) 复合动作: 大臂转 + 手爪转 + X 伸出并发 (SafetyMixin 自动校验 y 保护区)
+    safe_x_mm = float(cfg["detection_pose"]["x_mm"])   # -200 (init/检测位, 远离水塔)
+    deliver_x_mm = float(carry["x_mm"])                 # -105 (投递位)
+
+    # 阶段 1: 大臂转 + 手爪转 + Y 降并发, X 留在 safe 位置 (-200)
     runner.client.composite_run(
         arm=float(carry["arm_angle_deg"]),
         hand=float(carry["hand_angle_deg"]),
-        x_mm=float(carry["x_mm"]),
+        x_mm=safe_x_mm,
         y_mm=float(deliver_y),
     )
 
-    # 2) 关真空释放方块
+    # 阶段 2: 大臂已 -95° (水方块在 back-left), 平移 X 到投递位
+    if abs(deliver_x_mm - safe_x_mm) > 1.0:
+        runner.move_x(deliver_x_mm)
+
+    # 关真空释放方块
     runner.grasp(on=False)
 
 
@@ -357,15 +391,19 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
     try:
         # ===== 初始化: 摆好检测姿态 =====
-        logger.info("初始化: X 收至 %.0f mm", x_target_mm)
-        runner.move_x(x_target_mm)
+        logger.info("初始化: X 收至 %.0f mm (100mm/s)", x_target_mm)
+        # 2026-08-04: 初始化 X 速度 100mm/s (其他 move_x 走默认 40)
+        runner.move_x(x_target_mm, v_max_mms=100)
 
         logger.info("初始化: 大臂=%s°, 手爪=%s°",
                     detection["arm_angle_deg"], detection["hand_angle_deg"])
         runner.set_arm_angle(float(detection["arm_angle_deg"]), speed=80)
-        time.sleep(2.0)
+        # 2026-08-04: 用 _wait_arm_angle_reached 等物理到位, 替代 time.sleep(2.0);
+        # task1 结束后大臂在 +90°, 要转到 -95° 是 185° / 80°/s = 2.3s, sleep 2s 不到位.
+        _wait_arm_angle_reached(arm_client, float(detection["arm_angle_deg"]),
+                                tolerance=5.0, timeout=10.0)
         arm_client.set_hand_angle(float(detection["hand_angle_deg"]), speed=80, timeout=10.0)
-        time.sleep(1.0)
+        time.sleep(0.5)
 
         for tower_idx, tower_label in enumerate(cfg["source_position_order"]):
             logger.info("=== 处理水塔 %s (第 %d 座) ===", tower_label, tower_idx + 1)
@@ -377,6 +415,14 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 runner.move_x(x_target_mm)
                 _chassis_move_for(arm_client, tower_spacing_m, timeout=timeout)
                 runner.move_x(x_target_mm)
+                # 2026-08-04: 跨塔前必须把大臂拉回 detection.arm_angle_deg.
+                # 上一塔最后一块抓失败时大臂会留在 +95° (pick_pose), 不拉回去
+                # cam2 朝前方看 → 看不到水塔等级标 → 识别失败.
+                logger.info("恢复大臂=%s° 检测姿态 (水塔 %s)",
+                            detection["arm_angle_deg"], tower_label)
+                runner.set_arm_angle(float(detection["arm_angle_deg"]), speed=80)
+                _wait_arm_angle_reached(arm_client, float(detection["arm_angle_deg"]),
+                                        tolerance=5.0, timeout=10.0)
                 logger.info("恢复手爪 %s° 检测姿态 (水塔 %s)",
                             detection["hand_angle_deg"], tower_label)
                 arm_client.set_hand_angle(float(detection["hand_angle_deg"]), speed=80, timeout=10.0)
