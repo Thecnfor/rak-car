@@ -87,8 +87,23 @@ function drawTrace() {
   ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(ax, ay); ctx.stroke();
   ctx.fillStyle = "#00e676";
   ctx.beginPath(); ctx.arc(hx, hy, 4, 0, Math.PI * 2); ctx.fill();
+  // 指令向量箭头（青色，画布中心）：页面认为车往哪走
+  const mag = Math.hypot(lastCmd.vx, lastCmd.vy);
+  if (mag > 0.01) {
+    const L = 40;
+    ctx.strokeStyle = "#00d4ff";
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(cx - lastCmd.vy / mag * L * (mag > 0 ? 1 : 0), cy - lastCmd.vx / mag * L);
+    ctx.stroke();
+  }
   trajInfo.textContent = trace.length + " pts";
 }
+
+// 当前三速指令向量（页面认为车往哪走）：青色箭头，top-down 前=上 左=左。
+// 方向自检：按 A 时箭头应指左，且真车应向左 —— 两者不一致才是 bug。
+let lastCmd = { vx: 0, vy: 0, wz: 0 };
 
 btnClearTrace.addEventListener("click", () => { trace = []; drawTrace(); });
 btnZeroOdom.addEventListener("click", async () => {
@@ -205,6 +220,8 @@ async function sendJog() {
   if (axes.has("d")) vy -= linV();   // D = 右移
   if (axes.has("q")) wz += angV();   // Q = 逆时针
   if (axes.has("e")) wz -= angV();   // E = 顺时针
+  lastCmd = { vx, vy, wz };
+  drawTrace();
   try {
     await api.chassisVelocity({ vx, vy, wz });
   } catch { /* 抖动重试；急停 409 预期 */ }
