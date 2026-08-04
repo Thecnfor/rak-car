@@ -189,6 +189,7 @@ const axes = new Set<string>();
 let jogTimer: number | null = null;
 
 function linV(): number { return Number(jogLin.value) / 100; }   // 0.05..0.50
+function angV(): number { return Number(jogAng.value) / 10; }     // 0.2..1.5
 // 轴向符号标定（2026-08-04 里程计实测）：本车 +vx 物理=后退、+vy 物理=右移、
 // +wz=逆时针。前端按"W=前进/A=左移/Q=逆时针"的直觉映射，用符号常量翻转。
 // 现场若换车/换接线方向反了，用面板上的翻转勾选修正（localStorage 持久化）。
