@@ -36,22 +36,6 @@
   cursor: pointer;
   user-select: none;
 }
-.sign-row {
-  display: flex;
-  align-items: center;
-  gap: 12px;
-  font-size: 12px;
-  margin-bottom: 10px;
-}
-.sign-row label {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  color: var(--text-dim);
-  cursor: pointer;
-  user-select: none;
-}
-.sign-row input { accent-color: var(--warn); }
 
 .jog-keys { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; font-size: 13px; }
 .krow { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

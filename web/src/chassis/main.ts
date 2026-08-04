@@ -25,6 +25,10 @@ const laneDist = $("laneDist");
 const cmdVx = $("cmdVx"), cmdVy = $("cmdVy"), cmdWz = $("cmdWz");
 const encEls = [$("enc0"), $("enc1"), $("enc2"), $("enc3")];
 
+// 构建时间戳：方向异常时先核对这个，排除旧 bundle / 缓存页面
+const BUILD_STAMP = "2026-08-04T16:00";
+const buildStamp = $("buildStamp");
+buildStamp.textContent = "build " + BUILD_STAMP;
 let estopped = false;
 
 const canvas = $("trajCanvas") as HTMLCanvasElement;
@@ -190,58 +194,17 @@ let jogTimer: number | null = null;
 
 function linV(): number { return Number(jogLin.value) / 100; }   // 0.05..0.50
 function angV(): number { return Number(jogAng.value) / 10; }     // 0.2..1.5
-// 轴向符号标定：2026-08-04 静止检查+四组合自洽的里程计实测确认直觉映射
-// (+vx=前进 / +vy=左移 / +wz=逆时针) 正确。早前一轮"反号"结论是重启后
-// odom theta 未稳定的污染数据，已撤销。注意 mecanum odom theta 会漂，
-// 现场若感觉方向反了用勾选翻转（localStorage 持久化），或先点"里程计清零"。
-const SIGNS_KEY = "rakcar.chassis.signs.v2";  // v2: 作废错误反号期间的旧存储
-const DEFAULT_SIGNS = { vx: +1, vy: +1, wz: +1 };
-let signs: { vx: number; vy: number; wz: number } = loadSigns();
-function loadSigns() {
-  try {
-    const s = JSON.parse(localStorage.getItem(SIGNS_KEY) || "null");
-    if (s && typeof s.vx === "number" && typeof s.vy === "number" && typeof s.wz === "number") return s;
-  } catch { /* ignore */ }
-  return { ...DEFAULT_SIGNS };
-}
-function saveSigns() {
-  localStorage.setItem(SIGNS_KEY, JSON.stringify(signs));
-}
-
-// 翻转勾选 ↔ signs（默认值已含实测标定；勾选 = 在默认基础上再翻一次）
-const flipVx = $("flipVx") as HTMLInputElement;
-const flipVy = $("flipVy") as HTMLInputElement;
-const flipWz = $("flipWz") as HTMLInputElement;
-function applySigns() {
-  signs = {
-    vx: DEFAULT_SIGNS.vx * (flipVx.checked ? -1 : 1),
-    vy: DEFAULT_SIGNS.vy * (flipVy.checked ? -1 : 1),
-    wz: DEFAULT_SIGNS.wz * (flipWz.checked ? -1 : 1),
-  };
-  saveSigns();
-}
-try {
-  const saved = JSON.parse(localStorage.getItem(SIGNS_KEY) || "null");
-  if (saved) {
-    flipVx.checked = saved.vx !== DEFAULT_SIGNS.vx;
-    flipVy.checked = saved.vy !== DEFAULT_SIGNS.vy;
-    flipWz.checked = saved.wz !== DEFAULT_SIGNS.wz;
-  }
-} catch { /* ignore */ }
-applySigns();
-flipVx.addEventListener("change", applySigns);
-flipVy.addEventListener("change", applySigns);
-flipWz.addEventListener("change", applySigns);
-
+// 轴向映射（直觉 = 物理，2026-08-04 多源确认：odom 干净矩阵 / IK / 轮编码器
+// 签名 / 赛场外环能跑通）。不再做符号翻转 —— 方向异常先强刷页面排除旧 bundle。
 async function sendJog() {
   if (estopped) return;
   let vx = 0, vy = 0, wz = 0;
-  if (axes.has("w")) vx += signs.vx * linV();   // W = 前进
-  if (axes.has("s")) vx -= signs.vx * linV();   // S = 后退
-  if (axes.has("a")) vy += signs.vy * linV();   // A = 左移
-  if (axes.has("d")) vy -= signs.vy * linV();   // D = 右移
-  if (axes.has("q")) wz += signs.wz * angV();   // Q = 逆时针
-  if (axes.has("e")) wz -= signs.wz * angV();   // E = 顺时针
+  if (axes.has("w")) vx += linV();   // W = 前进
+  if (axes.has("s")) vx -= linV();   // S = 后退
+  if (axes.has("a")) vy += linV();   // A = 左移
+  if (axes.has("d")) vy -= linV();   // D = 右移
+  if (axes.has("q")) wz += angV();   // Q = 逆时针
+  if (axes.has("e")) wz -= angV();   // E = 顺时针
   try {
     await api.chassisVelocity({ vx, vy, wz });
   } catch { /* 抖动重试；急停 409 预期 */ }

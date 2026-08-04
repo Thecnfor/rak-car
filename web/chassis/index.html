@@ -16,6 +16,7 @@
       <span class="dot" id="connDot"></span>
       <span id="connText">连接: --</span>
     </span>
+    <span class="dim" id="buildStamp"></span>
     <span class="dim">
       x=<b id="odomX">--</b>m
       y=<b id="odomY">--</b>m
@@ -79,12 +80,6 @@
           <span>旋转速度</span>
           <input type="range" id="jogAng" min="2" max="15" step="1" value="5">
           <b id="jogAngLabel">0.5 rad/s</b>
-        </div>
-        <div class="sign-row">
-          <span class="dim">轴向翻转:</span>
-          <label><input type="checkbox" id="flipVx"> 前后</label>
-          <label><input type="checkbox" id="flipVy"> 左右</label>
-          <label><input type="checkbox" id="flipWz"> 旋转</label>
         </div>
         <div class="btn-row">
           <button id="btnStop">全停 (0,0,0)</button>
