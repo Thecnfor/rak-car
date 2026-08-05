@@ -198,7 +198,10 @@ class Orchestrator:
         profile = LANE_FOLLOW
         # 弯道阶梯转弯常开（巡线段随时可能遇弯）：CurveDetector 识别 →
         # StaircaseTurn θ 闭环 45→90→120°，lane 回正后交还 outer。
+        # crossroad_turn（task_config.yml 顶层声明）：第几个弯出口紧接着十字路口，
+        # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
         from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
+        from main.task._config import load_crossroad_turn
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -208,6 +211,7 @@ class Orchestrator:
             smoother=profile.build_smoother(),
             turn=StaircaseTurn(),
             detector=CurveDetector(),
+            crossroad_turn=load_crossroad_turn(),
         )
 
         # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）

@@ -52,6 +52,9 @@ class DoubleLoopRunner:
         calibrator: Optional["ErrorCalibrator"] = None,
         turn: Optional["StaircaseTurn"] = None,
         detector: Optional["CurveDetector"] = None,
+        crossroad_turn: Optional[int] = None,
+        crossroad_tol_deg: float = 10.5,
+        crossroad_sustain: int = 3,
     ) -> None:
         self.api = api
         self.outer = outer
@@ -62,6 +65,17 @@ class DoubleLoopRunner:
         # 行为与旧版完全一致。
         self.turn = turn
         self.detector = detector
+        # 十字路口弯（赛道特例）：第 crossroad_turn 个转弯的出口紧接着十字路口，lane
+        # 是垃圾读数，需要加固（里程碑窗口出口 + 触发后冷却）。只作用在该弯，换完即
+        # 换回普通对 —— 其他弯道行为与不加固完全一致。None = 不启用。
+        self._normal_turn = turn
+        self._normal_detector = detector
+        self._crossroad_turn = int(crossroad_turn) if crossroad_turn else None
+        self._crossroad_tol_deg = float(crossroad_tol_deg)
+        self._crossroad_sustain = max(1, int(crossroad_sustain))
+        self._turn_seq = 0          # 已完成的转弯数（第 N 个弯 = 计数器 N+1）
+        self._cross_turn: Optional["StaircaseTurn"] = None
+        self._cross_detector: Optional["CurveDetector"] = None
         # 两个兜底各自可关：传 None 就不挂
         # - watchdog_ms=None：不因 lane_state 过期急停
         # - lost_line_ms=None：不因误差齐 0 急停（笔直居中的路段本来就会齐 0）
@@ -149,6 +163,32 @@ class DoubleLoopRunner:
         except Exception:
             return None
 
+    def _maybe_arm_crossroad(self) -> None:
+        """下一弯（第 _turn_seq+1 个）是配置的十字路口弯 → 换加固的 detector/turn。"""
+        if (self._crossroad_turn is None or self._cross_turn is not None
+                or self._turn_seq + 1 != self._crossroad_turn):
+            return
+        from ..controllers.odom_turn import CurveDetector, StaircaseTurn
+        # 十字路口弯专用识别（实测 2026-08-05）：
+        #   * tol_deg=12：弯道那 3 帧 error_angle 只有 ~0.3rad（≈17°，在默认 20° 阈值
+        #     之下）→ 默认 tol=20 全按"干净直道"清零、永不触发；降到 12°（仍高于直道
+        #     噪声 <10°）才能把这 ~3 帧判成弯道。
+        #   * sustain=3：信号只有 ~3 帧，5 帧攒不满。
+        # 触发后 rearm_clean=20 冷却挡十字路口垃圾读数重触发。
+        self._cross_detector = CurveDetector(tol_deg=self._crossroad_tol_deg,
+                                             sustain=self._crossroad_sustain,
+                                             rearm_clean=20)
+        self._cross_turn = StaircaseTurn(exit_window_deg=3.0, exit_sustain=3,
+                                         escalate_sustain=3, kd_alpha=0.4)
+        self.turn, self.detector = self._cross_turn, self._cross_detector
+
+    def _on_turn_end(self) -> None:
+        """转弯结束（done/fail）：计数；十字路口弯结束 → 换回普通对。"""
+        self._turn_seq += 1
+        if self._cross_turn is not None:
+            self.turn, self.detector = self._normal_turn, self._normal_detector
+            self._cross_turn = self._cross_detector = None
+
     def _compute_raw(self, state: LaneState) -> List[float]:
         """算控制律原始 4 轮速：转弯中走 StaircaseTurn，否则走 outer。
 
@@ -160,9 +200,12 @@ class DoubleLoopRunner:
             if theta is None:
                 return [0.0, 0.0, 0.0, 0.0]  # odom 缺失：零速等下一帧
             omega, phase = self.turn.step(theta, self.dt, state)
+            if phase in ("done", "fail"):
+                self._on_turn_end()
             return self.turn.wheels(omega)
         # 巡线：识别到弯道 → 启动阶梯转弯
         if self.detector is not None:
+            self._maybe_arm_crossroad()  # 下一弯是十字路口弯 → 先换加固对
             d = self.detector.update(state)
             if d is not None and self.turn is not None:
                 odom = self._sense_odom()
