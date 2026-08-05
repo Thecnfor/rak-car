@@ -1,40 +1,66 @@
-"""task7 / the_final —— **任务七完整编排** (liaobiao1+liaobiao2 对应匹配循环 → 投递)。
+"""task7 / the_final —— **任务七完整编排** (liaobiao1+liaobiao2 对应匹配循环 → 双位置投递)。
 
-按用户 2026-08-05 现场修正后的循环逻辑 (v2):
+按用户 2026-08-05 现场修正后的循环逻辑 (v3):
 
   ┌─── 循环 (max N 次, 默认 10) ───┐
   │  Step 1: duiying.run()         target OCR + liebiao 比对, 拿到 matches
   │    ↓                           (matches: [{source, list_no, name, goods, target_id, target_label}])
-  │  Step 2: 检查 matches            找到第一个 source=='liaobiao1' OR source=='liaobiao2'
-  │    ↓ 是                         ↓ 否 (matches 空)
-  │    ├ source=='liaobiao1':       ↓
-  │    │  Step 3: runner.suck()     底盘前进 60cm (move_for +600mm)
-  │    │  Step 4: get_position1()        ↓
-  │    │  Step 5: position1()       再次 duiying → 回到 Step 1
-  │    ├ source=='liaobiao2':       (下一轮继续走对应循环)
-  │    │  Step 3: runner.suck()
-  │    │  Step 4: get_position2()
-  │    │  Step 5: position2()
-  │    └ 命中后 break (任务完成)
+  │  Step 2: 检查 matches            matches 数: 0 / 1 / 2
+  │    ↓ 0 个                       ↓ 1+ 个
+  │    底盘前进 60cm                遍历每个 match, 每个独立执行:
+  │    再次 duiying (回 Step 1)      ├ match.source=='liaobiao1' → runner.suck() + get_position1()
+  │                                   └ match.source=='liaobiao2' → runner.suck() + get_position2()
+  │                                   然后按 match.target_id (1-6) 调 position1/2/3/4/5/6.py
+  │                                全部执行完 → break (任务完成)
   └─────────────────────────────────┘
 
-  ⚠️ **v2 修正 (2026-08-05)**:
-    - v1 只看 source=='liaobiao1', 用户现场修正: **liaobiao1 和 liaobiao2 都要对应**
-    - match.source == 'liaobiao1' → runner.suck() + get_position1 + position1 → break
-    - match.source == 'liaobiao2' → runner.suck() + get_position2 + position2 → break
-    - **未命中分支也回到 Step 1** (重新调 duiying), 跟 v1 一致 (v1 已实现, 仅描述不准确)
-    - v1 的 target_id==1 限制**取消**: 任何 source 匹配都触发对应 position (用户 2026-08-05 简化)
+  ⚠️ **v4 修正 (2026-08-05)**:
+    - v3 命中后 break (跑一次就结束), 用户现场确认:
+      **命中后也不 break, 跟无匹配一样都前进 60cm, 然后下一轮重新走对应循环**。
+    - 两路 (有/无 match) 统一底盘前进 + continue, 跑到 max_iterations 才停。
+    - 修了 v3 的 dead code bug: 之前 `return {...ok: True...}` 让底盘前进 (line 365-384) 永远跑不到。
+    - v3 的 matches 遍历 + dispatch (source→get_position, target_id→position) 完整保留。
+
+  ⚠️ **v3 修正 (2026-08-05)**:
+    - v2 只处理"第一个匹配"且只 dispatch liaobiao1→position1, liaobiao2→position2
+    - v3 修正:
+      1. **遍历所有 matches** (可能有 2 个: 一个 liaobiao1 + 一个 liaobiao2)
+      2. 每个 match 独立走: ``runner.suck() → get_position<source> → position<target_id>``
+      3. ``source`` (liaobiao1/2) 决定 get_position (1 或 2)
+      4. ``target_id`` (1-6) 决定 position (1-6), 不是只 1/2
+      5. 0 个 match → 底盘前进 60cm → 回到 Step 1 (跟 v2 一致)
+      6. v2 的 "只第一个匹配 + target_id==1 限制" 全部取消
+
+  ⚠️ **dispatch 表** (target_id 1-6 → position 模块):
+    | target_id | module         |
+    |-----------|----------------|
+    | 1         | position1_mod  |  (底盘后退 + 7 步臂含 Step 2.5 放气 + 底盘前进, v4)
+    | 2         | position2_mod  |  (底盘前进 + 7 步臂含 Step 6 放气 + 底盘后退, v4)
+    | 3         | position3_mod  |  (底盘前进 + 7 步臂含 Step 2.5 放气 + 底盘后退, v4)
+    | 4         | position4_mod  |  (底盘后退 + 10 步臂含 Step 2.06 放气 + 底盘前进, v3)
+    | 5         | position5_mod  |  (无底盘, 10 步臂含 Step 7 放气, v3)
+    | 6         | position6_mod  |  (底盘前进 + 10 步臂含 Step 2.06 放气 + 底盘后退, v3)
 
   ⚠️ 终止条件 (任一触发即停):
-    1. 找到匹配 (source=='liaobiao1' OR source=='liaobiao2') → 执行完对应 get_position+position → break
-    2. 达到 max_iterations 次 (默认 10) → 仍未匹配 → abort (防硬件无限循环)
-    3. 任一步骤抛异常 → 立即 abort (跟 task6/the_final.py 同款硬件安全策略)
+    1. 达到 max_iterations 次 (默认 10) → 正常收尾 (v4: 不是 abort, 是 ok=True 退出)
+    2. 任一步骤抛异常 → 立即 abort (跟 task6/the_final.py 同款硬件安全策略)
+    ⚠️ v4: 命中不再 break (用户 2026-08-05 现场要求: 命中后前进 60cm 继续下一轮)
+    ⚠️ 跑到 max_iterations 仍可 ctrl-C 中途打断; 想提前停就 --max-iterations=N
 
-  ⚠️ matches 解析逻辑 (来自 duiying.run() 返回):
-    - match.source == "liaobiao1": ✅ 触发 position1 分支
-    - match.source == "liaobiao2": ✅ 触发 position2 分支
-    - matches 中可能有多个匹配, 取第一个 (按 duiying 输出顺序, liaobiao1 优先)
-    - matches == []: 未命中 → 底盘前进 + 重试
+  ⚠️ **每个 match 执行三步** (顺序固定):
+    1. ``runner.suck()`` — 启动吸气 (建立真空)
+    2. ``get_position<source>.run()`` — 5 步纯臂摆位:
+       - source=='liaobiao1' → ``get_position1_mod.run()``
+       - source=='liaobiao2' → ``get_position2_mod.run()``
+    3. ``position<target_id>.run()`` — 投递 (含 Step 放气):
+       - target_id 1-6 → ``position{1,2,3,4,5,6}_mod.run()``
+
+  ⚠️ matches 解析 (来自 duiying.run() 返回):
+    - 0 个 match → 未命中 → 底盘前进 + 重试
+    - 1 个 match (任一 source) → 执行 1 次
+    - 2 个 match (source=liaobiao1 + source=liaobiao2 各 1) → 执行 2 次 (按 matches 列表顺序)
+    - match.source ∈ {'liaobiao1', 'liaobiao2'}, match.target_id ∈ {1, 2, 3, 4, 5, 6}
+    - 其它 source/target_id 视为异常 (防御性 raise)
 
   ⚠️ **错误处理策略 (硬件安全优先)**:
     - duiying.run() 抛异常 → abort (返回 failed_step="iter{N}-duiying")
@@ -48,7 +74,7 @@
 
   ⚠️ **不动手的事**:
     - 不修改 duiying / get_position* / position* / dipan 等已有文件
-    - 不调用 suck 之外的真空管理 (不放气, 因为 position1/2 内部 Step 2.5/Step 6 已放气)
+    - 不调用 suck 之外的真空管理 (不放气, 因为 position<N> 内部 Step 放气)
     - 不引入 pytest 单测 (跟 task7 其他脚本同款)
 
 跑法:
@@ -77,6 +103,10 @@ from main.arm.each_task.task7 import (  # noqa: E402
     get_position2 as get_position2_mod,
     position1 as position1_mod,
     position2 as position2_mod,
+    position3 as position3_mod,
+    position4 as position4_mod,
+    position5 as position5_mod,
+    position6 as position6_mod,
 )
 
 
@@ -100,6 +130,21 @@ DEFAULT_CHASSIS_TIMEOUT_S: float = 10.0
 
 DEFAULT_CHASSIS_VELOCITY_MS: float = 0.10
 """底盘最大线速度 (m/s), 与 task7/position1.py / dipan.py 默认一致。"""
+
+# Dispatch 表: match.target_id (1-6) → 对应 position 模块
+# v3 加: 不再只 dispatch 到 position1/2, 而是根据 target_id 调 position1-6。
+_POSITION_MODULES: dict[int, object] = {
+    1: position1_mod,
+    2: position2_mod,
+    3: position3_mod,
+    4: position4_mod,
+    5: position5_mod,
+    6: position6_mod,
+}
+"""match.target_id (1-6) → position{N}.run() 模块引用。
+
+⚠️ 每个 position 模块内含底盘 + 7-10 步臂 + Step 放气 (v3/v4 状态)。
+⚠️ key 必须是 1-6 范围; 其它值在 valid_matches 过滤时被丢弃, run() 不会再到这里。"""
 
 
 # ---------- 底盘 move_for 内联 (跟 task6/the_final.py / task7/position1.py 同款) ----------
@@ -225,70 +270,75 @@ def run(client: ArmClient, runner: ArmRunner,
         matches: list[dict] = duiying_result.get("matches") or []
         print(f"  duiying.matches = {matches}")
 
-        # ===== 检查匹配 (source=='liaobiao1' OR source=='liaobiao2', 任意 target_id) =====
-        # v2 修正: 不只看 liaobiao1, 也要对照 liaobiao2。
-        # target_id 不再限制 (v1 限制 target_id==1, v2 取消)。
-        # 取第一个匹配 (duiying 输出顺序, liaobiao1 优先 if 都有)。
-        target_match: dict | None = None
-        for m in matches:
-            if m.get("source") in ("liaobiao1", "liaobiao2"):
-                target_match = m
-                break
+        # ===== 过滤合法 matches (source ∈ liaobiao1/2 AND target_id ∈ 1-6) =====
+        valid_matches = [
+            m for m in matches
+            if m.get("source") in ("liaobiao1", "liaobiao2")
+            and m.get("target_id") in (1, 2, 3, 4, 5, 6)
+        ]
 
-        if target_match is not None:
-            # ===== 命中: 根据 source 分支执行 =====
-            source = target_match.get("source")
-            print(f"\n  ✅ 命中: source={source}")
-            print(f"     人名={target_match['name']!r}, 蔬菜={target_match['goods']!r}")
-            print(f"     target 位置 {target_match['target_id']} ({target_match['target_label']})")
-
-            # Step 3: suck (无论 source 是哪个, 都先启动吸气)
-            print(f"\n  ── Step 3: runner.suck() (启动吸气) ──")
-            runner.suck()
-
-            # Step 4 + 5: 按 source 分支
-            if source == "liaobiao1":
-                print(f"\n  ── Step 4: get_position1.run() (5 步纯臂: y up → x → arm → hand → y down) ──")
-                get_position1_mod.run(client, runner)
-                print(f"\n  ── Step 5: position1.run() (底盘后退 13cm + 7 步臂含 Step 2.5 放气 + 底盘前进 13cm) ──")
-                position1_mod.run(client, runner)
-            elif source == "liaobiao2":
-                print(f"\n  ── Step 4: get_position2.run() (5 步纯臂, 跟 position1 同款但 x 略不同) ──")
-                get_position2_mod.run(client, runner)
-                print(f"\n  ── Step 5: position2.run() (底盘前进 + 7 步臂含 Step 6 放气 + 底盘后退) ──")
-                position2_mod.run(client, runner)
-            else:
-                # 理论上不会到这里 (上面 for 循环只 accept liaobiao1/2), 但防御性 raise
-                raise RuntimeError(f"未知的 match.source: {source!r}")
-
-            matched_match = target_match
+        if not valid_matches:
+            # ===== 0 个 match: 标记 + 准备前进 =====
+            print(f"\n  ⚠️ 0 个有效 match → 本轮执行跳过, 前进 {forward_mm:.0f}mm 后下一轮重新 duiying")
             iteration_results.append({
                 "iter": i,
-                "matched": True,
-                "match": target_match,
+                "matched": False,
+                "matches": matches,
+                "valid_count": 0,
             })
-            dt = time.time() - t0
-            print(f"\n========== {LOG_PREFIX} 任务完成 ({dt:.2f}s, 迭代 {i} 命中, source={source}) ==========")
-            print(f"  ✅ 投递成功: 货物落到 {source} 位置, 真空已断 "
-                  f"(position{'1' if source == 'liaobiao1' else '2'} Step 放气)")
-            print(f"  ⚠️ 不放气 (下次编排需自己负责 suck/drop_object 周期)")
-            return {
-                "ok": True,
-                "matched_match": matched_match,
-                "iterations": i,
-                "results": iteration_results,
-                "duration_s": dt,
-            }
+        else:
+            # ===== 1+ 个 valid match: 遍历执行每个 =====
+            print(f"\n  ✅ 命中: {len(valid_matches)} 个有效 match, 依次执行")
+            executed_matches: list[dict] = []
+            for match_idx, match in enumerate(valid_matches, 1):
+                source = match.get("source")
+                target_id = match.get("target_id")
+                print(f"\n  ── Match {match_idx}/{len(valid_matches)}: source={source}, target_id={target_id} ───")
+                print(f"     人名={match['name']!r}, 蔬菜={match['goods']!r}, "
+                      f"target 标签={match.get('target_label')!r}")
 
-        # ===== 未命中: 底盘前进 + 重试 (回到 Step 1 下一轮继续走对应循环) =====
-        print(f"\n  ⚠️ 未命中 (matches 不含 liaobiao1/2) → 底盘前进 {forward_mm:.0f}mm, 下一轮重新 duiying")
-        iteration_results.append({
-            "iter": i,
-            "matched": False,
-            "matches": matches,
-        })
+                # Step 3a: suck (启动吸气, 每个 match 前都需要)
+                print(f"  [Step 3a] runner.suck() (启动吸气)")
+                runner.suck()
 
-        # 底盘前进 (强制转正, 即便用户传 --forward -50 也变成 +600 前进)
+                # Step 3b: get_position based on source
+                if source == "liaobiao1":
+                    print(f"  [Step 3b] get_position1.run() (5 步纯臂摆位, liaobiao1 入口)")
+                    get_position1_mod.run(client, runner)
+                elif source == "liaobiao2":
+                    print(f"  [Step 3b] get_position2.run() (5 步纯臂摆位, liaobiao2 入口)")
+                    get_position2_mod.run(client, runner)
+                else:
+                    raise RuntimeError(
+                        f"match.source={source!r} 不是 'liaobiao1'/'liaobiao2' (已被过滤掉, "
+                        f"理论上到这里不可能)"
+                    )
+
+                # Step 3c: position based on target_id (1-6)
+                pos_mod = _POSITION_MODULES.get(target_id)
+                if pos_mod is None:
+                    raise RuntimeError(
+                        f"match.target_id={target_id!r} 不在 1-6 范围 (已被过滤掉, 理论上到这里不可能)"
+                    )
+                print(f"  [Step 3c] position{target_id}_mod.run() "
+                      f"(投递到位置 {target_id}, position 内部 Step 放气)")
+                pos_mod.run(client, runner)
+
+                executed_matches.append(match)
+                iteration_results.append({
+                    "iter": i,
+                    "matched": True,
+                    "match": match,
+                })
+                print(f"  ✅ Match {match_idx}/{len(valid_matches)} 完成 (source={source}, "
+                      f"target_id={target_id})")
+
+            # v4 改动: 命中后**不 break**, 跟"无匹配"一样都前进 60cm 然后继续下一轮
+            print(f"\n  ➡️ 本轮 {len(executed_matches)} 个 match 全部执行完, "
+                  f"准备前进 {forward_mm:.0f}mm 进入下一轮 duiying")
+
+        # ===== 统一前进 (无论有/无 match, 都前进 60cm + 下一轮继续) =====
+        # v4 改动: 之前命中分支提前 return 导致这段 dead code, 现在合并到统一处理
         forward_signed_mm = abs(forward_mm)
         forward_timeout = max(timeout, 5.0, abs(forward_signed_mm) / 1000.0 / max(max_velocity_ms, 0.01) + 2.0)
         try:
@@ -308,21 +358,30 @@ def run(client: ArmClient, runner: ArmRunner,
                 "results": iteration_results,
                 "duration_s": time.time() - t0,
             }
+        # 底盘前进成功 → 继续下一轮 duiying (回到 for 开头)
 
-    # ===== 达 max_iterations 仍未命中 =====
+    # ===== 达 max_iterations 收尾 =====
+    # v4 改动: 之前是 "max_iterations 仍未命中 → abort", 现在是 "max_iterations 收尾 (不论命中与否)"
     dt = time.time() - t0
-    print(f"\n========== {LOG_PREFIX} 中止 ({dt:.2f}s, 达 max_iterations={max_iterations} 仍未命中) ==========")
+    total_matches = sum(1 for r in iteration_results if r.get("matched"))
+    total_empty = sum(1 for r in iteration_results if not r.get("matched"))
+    print(f"\n========== {LOG_PREFIX} 收尾 ({dt:.2f}s, "
+          f"跑完 {max_iterations} 轮, 命中 {total_matches} 轮 / 空 {total_empty} 轮) ==========")
     print(f"  ⚠️ 硬件累计前进 {max_iterations} × {forward_signed_mm:.0f}mm = "
-          f"{max_iterations * forward_signed_mm / 1000:.1f}m 仍未找到匹配项")
+          f"{max_iterations * forward_signed_mm / 1000:.1f}m")
+    print(f"  ⚠️ 本脚本无 break-on-match, 跑到 max_iterations 才停。如想提前停, "
+          f"用 max-iterations=N 减小上限。")
     print(f"  请人工检查:")
     print(f"    1. .liebiao.json 是否正确 (跑过 task6/target1.py?)")
     print(f"    2. duiying.target OCR 是否识别到 6 个名字")
     print(f"    3. 底盘当前物理位置是否在赛道内")
     return {
-        "ok": False,
-        "failed_step": "max_iterations_reached",
+        "ok": True,                          # v4: 跑完 max_iterations 是正常退出, 不是 abort
+        "failed_step": None,
         "error": None,
         "iterations": max_iterations,
+        "total_matches": total_matches,
+        "total_empty": total_empty,
         "results": iteration_results,
         "duration_s": dt,
     }
@@ -334,8 +393,8 @@ def build_parser() -> argparse.ArgumentParser:
     """CLI 参数: 4 个 (max-iterations / forward / vel / timeout), 其它常量都顶在文件里。"""
     p = argparse.ArgumentParser(
         description=(
-            "task7 the_final: 对应匹配循环 (duiying → 匹配 [liaobiao1+target=1] → "
-            "suck+get_position1+position1 break, 否则前进 60cm 重试, max 10 次)"
+            "task7 the_final v4: 对应匹配循环 (duiying → 匹配 [liaobiao1/2+target=1-6] → "
+            "suck+get_position+position → 底盘前进 60cm → 下一轮继续, max 10 次, 无 break-on-match)"
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
