@@ -14,13 +14,27 @@ class ResetOpsMixin:
 
     def reset_x(self, direction: str = "right",
                 reset_velocity_mms: float = 30.0,
+                probe_time: float = 0.3,
                 timeout: float = 30.0) -> dict:
+        """撞墙定 x 原点 (ARM_API §9.1).
+
+        Args:
+            direction: "right" (target 增大方向) 或 "left"。
+            reset_velocity_mms: 撞墙速度 (mm/s),业务层限速。
+            probe_time: 反向探针时间 (秒),默认 0.3 跟 arm_base.py 默认对齐;
+                设为 0 在"车刚好在 selected 方向的墙上"场景下会立即误判 stall
+                → calibrate 失败,留 0.3 让反向探针先验证 motor 工作更稳。
+                (2026-08-01 之前 wrapper 不透传 probe_time,业务层必须绕过
+                wrapper 直调 _call_arm;现在 wrapper 支持,escape hatch 可删。)
+            timeout: HTTP 同步超时 (秒)。
+        """
         if direction not in ("right", "left"):
             raise ValueError("direction 必须是 'right' 或 'left'")
         return self._call_arm(
             "reset_x", timeout=timeout,
             direction=direction,
             reset_velocity=reset_velocity_mms / 1000.0,
+            probe_time=probe_time,
         )
 
     def reset_all(self, arm_angle: float = 90, hand_angle: float = -90,

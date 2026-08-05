@@ -60,22 +60,33 @@ def step_open_storage(
     open_storage 只管"舵机怎么转"。
 
     Args:
-        client: ArmClient 实例 (保留传参以兼容旧调用方; 本函数未直接使用)
-        runner: ArmRunner 实例 (用于 set_storage_angle)
+        client: ArmClient 实例 (用于 set_storage_angle, ArmRunner 不暴露此接口)。
+                runner 参数保留只为兼容旧调用方签名, 本函数未使用。
+        runner: ArmRunner 实例 (保留兼容旧调用方签名, 本函数未使用)。
         angle_deg: 开仓角度 (默认 75°, 与 STORAGE_OPEN_ANGLE_DEG 一致)
         speed: 舵机速度 (默认 5, ARM_API §6.1)
         timeout: HTTP 同步超时
 
     Returns:
-        dict: {"ok": True, "storage": "OPEN", "angle_deg": 75}
+        dict: {"ok": bool, "storage": "OPEN", "angle_deg": 75, "raw_job": dict}
 
     Raises:
         RuntimeError: set_storage_angle job failed 时抛出 (带车端 error)
     """
     print(f"{LOG_PREFIX_TASK4} [open_storage] 开始开仓 (angle={angle_deg}°)")
 
-    # ---- 直传舵机: set_storage_angle 走 runner, 触发 ARMClient 自身 gate ----
-    runner.set_storage_angle(angle_deg, speed=speed, timeout=timeout)
+    # ---- 直传舵机: set_storage_angle 是 ArmClient StorageMixin 的接口,
+    #    ArmRunner 不暴露此方法 (只有 set_storage 两档 + grasp), 必须走 client.
+    #    详见 ARM_API.md §6.2 + main/arm/api/storage.py:68.
+    result = client.set_storage_angle(
+        angle=float(angle_deg), speed=speed, timeout=timeout,
+    )
+    if not result.get("ok"):
+        err = result.get("raw_job") or {}
+        raise RuntimeError(
+            f"set_storage_angle({angle_deg}°) failed: "
+            f"{err.get('error', err.get('status', 'unknown'))}"
+        )
 
     print(
         f"{LOG_PREFIX_TASK4} [open_storage] ✅ 开仓完成 "
@@ -85,6 +96,7 @@ def step_open_storage(
         "ok": True,
         "storage": "OPEN",
         "angle_deg": angle_deg,
+        "raw_job": result.get("raw_job"),
     }
 
 

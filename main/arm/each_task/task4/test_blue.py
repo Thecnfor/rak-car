@@ -69,16 +69,14 @@ def test_blue(client: ArmClient, runner: ArmRunner) -> dict:
     runner.set_arm_angle(90.0, speed=80, timeout=10.0)
 
     # 5. reset_x 撞墙定 x=0 原点 (代替 move_x(0))
-    #    ⚠️ ARM_API §9 escape hatch: 绕过 ArmClient.reset_x wrapper (不透传 probe_time),
-    #       直调底层 action + probe_time=0.3 + reset_velocity=50mm/s
-    #       (跟 main/arm/each_task/task4/x_to_zero.py:reset_x_to_zero() 同款)
+    #    2026-08-01 切到 wrapper: reset_x 已支持 probe_time 透传, escape hatch 可去。
     #    ⚠️ calibrate 框架有 bug, x_get_position 不可信; 位置验证走 realtime
     print("  [arm]  reset_x(direction='right', v=50mm/s, probe_time=0.3)  撞墙定 x=0")
-    client._call_arm(
-        "reset_x", timeout=30.0, sync=True,
+    client.reset_x(
         direction="right",
-        reset_velocity=0.05,   # 50 mm/s, §9.2 建议比 wrapper 默认 20 稳
-        probe_time=0.3,        # ⚠️ 不设 0: 0 在 "车刚好在 selected 方向墙上" 场景会误判 stall
+        reset_velocity_mms=50.0,   # §9.2 建议比 wrapper 默认 20 稳
+        probe_time=0.3,            # ⚠️ 不设 0: 0 在 "车刚好在 selected 方向墙上" 场景会误判 stall
+        timeout=30.0,
     )
     x_after_reset = client._read_x_mm_realtime()
     print(f"  [arm]  reset_x 完成, realtime x = {x_after_reset} (撞墙点 = x=0 原点)")

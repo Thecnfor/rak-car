@@ -34,8 +34,50 @@ from main.arm.each_task.task5.pick_and_place import (  # noqa: E402
 
 LOG_PREFIX: str = "[task5/test4_from_blue_to_low]"
 
+<<<<<<< Updated upstream
 VISION_LABEL: str = "ball_blue"
 """--vision 模式的视觉伺服 label (labels.py 20 项之一)。"""
+=======
+GRASP_HOLD_S_DEFAULT: float = 5.0
+"""吸气独立保持秒数 (用户 2026-07-23 要求 5s)。在 grasp(True) 之后, low_tower 之前执行。
+设 0 可跳过保持 (退化为 v3 逻辑)。"""
+
+# reset_x 撞墙定原点参数 (内联, 跟 get_blue.py 的 _reset_x_wall 同款, ARM_API §9.2)
+RESET_X_DIRECTION: str = "right"
+"""终点 reset_x 方向: low_tower 在 x=-169mm, 取蓝墙在 x 增大方向 (get_blue.py
+测试结论 2026-07-22), 故走 right (正速度) 撞取蓝墙 → 撞到点定义为 x=0。"""
+
+RESET_X_VELOCITY_MMS: float = 50.0
+"""撞墙速度 (mm/s)。§9.2 建议 50mm/s 比 wrapper 默认 20 稳。"""
+
+RESET_X_PROBE_TIME: float = 0.3
+"""arm_base.py 默认值: probe_time=0 在 '车刚好在 selected 方向的墙上' 场景下
+会立即误判 stall → calibrate 失败/撞错位置。留 0.3 让反向探针先验证 motor 工作。"""
+
+RESET_X_TIMEOUT: float = 30.0
+
+
+# ---------- reset_x 撞墙 (内联, 跟 get_blue.py 的 _reset_x_wall 同款) ----------
+
+def _reset_x_wall(client: ArmClient) -> dict:
+    """撞墙定 x 原点, 一步到位。走 ArmClient.reset_x wrapper (2026-08-01 wrapper 已透传
+    probe_time, 不再需要 escape hatch)。
+
+    Returns:
+        {"reset": job dict, "x_mm_after": float | None}
+    """
+    print(f"  {LOG_PREFIX} reset_x(direction={RESET_X_DIRECTION}, v={RESET_X_VELOCITY_MMS}mm/s, "
+          f"probe_time={RESET_X_PROBE_TIME})  撞墙一步到位")
+    job = client.reset_x(
+        direction=RESET_X_DIRECTION,
+        reset_velocity_mms=RESET_X_VELOCITY_MMS,   # mm/s, wrapper 内部转 m/s
+        probe_time=RESET_X_PROBE_TIME,
+        timeout=RESET_X_TIMEOUT,
+    )
+    x_after = client._read_x_mm_realtime()
+    print(f"  {LOG_PREFIX} reset_x 完成, realtime x={x_after}")
+    return {"reset": job, "x_mm_after": x_after}
+>>>>>>> Stashed changes
 
 
 def run(client: ArmClient, runner: ArmRunner,

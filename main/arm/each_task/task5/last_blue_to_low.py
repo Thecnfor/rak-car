@@ -15,7 +15,8 @@
   - target_blue 的 prep 姿态 (y=-200 / x=-40 / arm=90°) 是"专门为球在画面里好认"
     设计的, 臂更展开 (90°) 把吸盘抬离画面, 球在 cx_norm/cy_norm 表现更稳。
   - get_blue 的 prep 姿态 (y=-130 / x=0 / arm=85°) 是"实际抓取位姿", 臂没完全
-    展开, 球检测时的 cx/cy 数值会跟 target_blue 位姿下的 BALL_VERIFIED_* 不同。
+    展开, 球检测时的 cx/cy 数值会跟 target_blue 位姿下不同 (但 2026-08-02 已
+    取消 BALL_VERIFIED_* 位置验证, 不再因此过滤球)。
   - 当前选择 get_blue 的 prep: **prep+grab 一次到位, 进 test4_run 时已就位**, 省
     掉 prep→grab 的过渡动作 (~0.5s 舵机臂 5° 调整)。如果发现球检测不准, 退回
     target_blue prep 仅需去掉下面对 get_blue.* 的 import 即可 (回退到默认行为)。

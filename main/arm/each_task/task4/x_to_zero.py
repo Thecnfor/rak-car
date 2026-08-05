@@ -53,8 +53,8 @@ def reset_x_to_zero(client: ArmClient,
                      velocity_mms: float = RESET_X_VELOCITY_MMS,
                      probe_time: float = RESET_X_PROBE_TIME,
                      timeout: float = RESET_X_TIMEOUT) -> dict:
-    """撞墙定 x=0 原点。绕过 ArmClient.reset_x wrapper (不透传 probe_time),
-    直调底层 action + probe_time=0.3 (避免 stall 误判)。
+    """撞墙定 x=0 原点。走 ArmClient.reset_x wrapper (2026-08-01 wrapper 已透传 probe_time,
+    不再需要 escape hatch)。
 
     Returns:
         {"reset": job dict, "x_mm_after": float | None}
@@ -63,11 +63,11 @@ def reset_x_to_zero(client: ArmClient,
         raise ValueError("direction 必须是 'left' 或 'right'")
     print(f"  {LOG_PREFIX} reset_x(direction={direction}, v={velocity_mms}mm/s, "
           f"probe_time={probe_time})  撞墙定 x=0")
-    job = client._call_arm(
-        "reset_x", timeout=timeout, sync=True,
+    job = client.reset_x(
         direction=direction,
-        reset_velocity=velocity_mms / 1000.0,  # m/s
+        reset_velocity_mms=velocity_mms,   # mm/s, wrapper 内部转 m/s
         probe_time=probe_time,
+        timeout=timeout,
     )
     # reset_x 后位置读数不可信 (calibrate 框架坏), 只信 realtime (§11)
     x_after = client._read_x_mm_realtime()

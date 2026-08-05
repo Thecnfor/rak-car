@@ -159,16 +159,17 @@ def move_x_trust(
     v_max_mms: float = DEFAULT_V_MAX_MMS,
     timeout: float = 30.0,
 ) -> dict:
-    """trust 模式 move_x: 单次 move_x() 调用, 不做 belt-slip/wall/overshoot 检测。
+    """trust 模式 move_x: 单次 composite_run() 调用, 不做 belt-slip/wall/overshoot 检测。
 
-    适用 realtime 读数不可靠的场景 (move_x 内部 PID 用控制器内部位置, 准)。
+    适用 realtime 读数不可靠的场景 (composite_run 内部 PID 用控制器内部位置, 准)。
 
     Args:
-        client: ArmClient 实例 (调 .move_x + ._read_x_mm_realtime)。
+        client: ArmClient 实例 (调 .composite_run + ._read_x_mm_realtime)。
         runner: ArmRunner 实例 (保留参数兼容性, 函数内未使用)。
         target_x_mm: 目标 x 位置 (mm)。
         log_prefix: 日志前缀, 例如 "[task5/high_tower]" / "[task5/low_tower]" / "[task5/target]"。
-        v_max_mms: 业务限速 (mm/s)。
+        v_max_mms: 业务限速 (mm/s)。**保留签名兼容性,内部不传给 composite_run**
+            (composite_run SDK 端无 v_max_mms;原 move_x wrapper 也没透传过)。
         timeout: 单次超时 (秒)。
 
     Returns:
@@ -183,12 +184,30 @@ def move_x_trust(
         }
     """
     print(f"  {log_prefix} move_x({target_x_mm:+.0f}mm)  TRUST 模式 "
-          f"(不 stall/wall/overshoot 检测, 信任 move_x 内部 PID)")
+          f"(不 stall/wall/overshoot 检测, 信任 composite_run 内部 PID)")
+
+    # y_protected 检查 (原 move_x wrapper 第一行做,composite_run 纯 x 不会替我们做)
+    try:
+        client._check_y_protected("move_x_trust")
+    except ValueError as e:
+        print(f"  {log_prefix} [FAIL] y_protected: {e}")
+        return {
+            "target_x": target_x_mm,
+            "actual_x": None,
+            "segments": 0,
+            "reached": True,   # trust 模式不抛
+            "result": "trust_failed",
+            "wall_hit": False,
+            "overshoot_mm": 0.0,
+            "error": str(e),
+        }
 
     try:
-        client.move_x(x_mm=target_x_mm, v_max_mms=v_max_mms, timeout=timeout)
+        # 2026-08-01 切到 composite_run (业务层首选, ARM_API §9.6.1);
+        # y_mm=None 跳过 composite_run 内部 _check_safe, 由上面手动检查。
+        client.composite_run(x_mm=target_x_mm, timeout=timeout)
     except Exception as e:
-        print(f"  {log_prefix} [FAIL] move_x 异常: "
+        print(f"  {log_prefix} [FAIL] composite_run 异常: "
               f"{type(e).__name__}: {str(e)[:80]}")
         return {
             "target_x": target_x_mm,
@@ -200,6 +219,17 @@ def move_x_trust(
             "overshoot_mm": 0.0,
             "error": str(e),
         }
+
+    # 丢步核对 (原 move_x wrapper 末尾 _check_step_loss,composite_run 不会做)
+    try:
+        from ..state import ArmOrigin
+        origin = client.origin or ArmOrigin()
+        state = client.get_state()
+        client._check_step_loss("x", target_mm=target_x_mm,
+                                actual_mm=state.x_mm,
+                                threshold_mm=origin.step_loss_x_mm)
+    except Exception as e:
+        print(f"  {log_prefix} [WARN] step_loss 核对读取失败: {e}", flush=True)
 
     # 读一次参考值, 不阻塞
     x_after = client._read_x_mm_realtime()
@@ -283,10 +313,24 @@ def move_x_with_split(
             "overshoot_mm": float,   # 单轮最大超调 (0 = 没超)
         }
     """
+    # 等 arm_feed 就绪 (2026-08-01 暴露 startup race: runtime rebuild 后 arm_feed
+    # 要几百 ms 才上报第一帧; 业务脚本 connect() 后立即 split 必撞这窗口)。
+    # 默认 10s 等不到再 raise,业务层看见 last_realtime_error() 可定位。
+    if not client.wait_for_arm_state_active(timeout_s=10.0, poll_interval_s=0.2):
+        err = client.last_realtime_error() or "未知"
+        raise RuntimeError(
+            f"realtime x_mm 10s 内仍读不到 — {err}\n"
+            f"    排查: (1) runtime 健康: curl http://<jetson>:5050/v1/health | grep initialized\n"
+            f"           (2) arm_feed 状态: curl http://<jetson>:5050/v1/realtime/arm/state\n"
+            f"           (3) 若 initializing=True → 等 MC602 init 完 (auto_init 后台跑)"
+        )
+
     # 读基准
     x0 = client._read_x_mm_realtime()
     if x0 is None:
-        raise RuntimeError("realtime x_mm 读不到 (arm_feed 未启 / realtime 不可用)")
+        # wait_for_arm_state_active 已成功过一次,这里不应该 None。保险起见仍 raise。
+        err = client.last_realtime_error() or "未知"
+        raise RuntimeError(f"realtime x_mm 二次读失败 — {err}")
     delta = target_x_mm - x0
     initial_delta_abs = abs(delta)
 
@@ -313,7 +357,10 @@ def move_x_with_split(
 
     for rnd in range(1, max_rounds + 1):
         try:
-            client.move_x(x_mm=target_x_mm, v_max_mms=v_max_mms)
+            # 2026-08-01 切到 composite_run (业务层首选, ARM_API §9.6.1)。
+            # y_mm=None 跳过 composite_run 内部 _check_safe,
+            # y_protected 已在函数开头检查 (上面对 wait_for_arm_state_active 之后调用)。
+            client.composite_run(x_mm=target_x_mm, timeout=30.0)
             x_now = client._read_x_mm_realtime()
             if x_now is None:
                 raise RuntimeError("realtime x_mm 读不到")
@@ -484,11 +531,12 @@ def move_x_hard_reach(
               f"; **先试 reset_x 一次** (last-ditch 救 motor)")
         try:
             print(f"  {log_prefix} [FUSE-rescue] reset_x 撞墙重置编码器...")
-            reset_job = client._call_arm(
-                "reset_x", timeout=reset_timeout, sync=True,
+            # 2026-08-01 切到 wrapper (reset_ops.py 已支持 probe_time 透传)
+            reset_job = client.reset_x(
                 direction=reset_direction,
-                reset_velocity=reset_velocity_mms / 1000.0,
+                reset_velocity_mms=reset_velocity_mms,   # mm/s, wrapper 内部转 m/s
                 probe_time=reset_probe_time,
+                timeout=reset_timeout,
             )
             print(f"  {log_prefix} [FUSE-rescue] reset_x 完成, 再走一次 split...")
             res_rescue = move_x_with_split(
@@ -535,14 +583,30 @@ def move_x_hard_reach(
         res1["reset_count"] = 0
         return res1
 
+    # ⚠️ 2026-08-01: split#1 撞物理墙 → 直接接受,不再 reset_x (物理墙挡住,reset_x
+    #   calibrate 也救不了,且 reset_x 在撞墙点会推不动失败)。target 超过物理墙时
+    #   这是正常行为,业务层看 result='wall_hit' + actual_x 知道实际位置。
+    if res1.get("wall_hit"):
+        print(f"  {log_prefix} 第一次 split 撞物理墙 (actual_x={res1['actual_x']:+.1f}mm,"
+              f" target={target_x_mm:+.0f}mm), 接受 wall_hit, 不 reset_x")
+        res1["reset_count"] = 0
+        res1["degraded"] = True
+        res1["error"] = (
+            f"split#1 撞物理墙 (actual_x={res1['actual_x']:+.1f}mm, "
+            f"target={target_x_mm:+.0f}mm)。target 超过物理极限, "
+            f"target1.py 应把 TARGET1_X_MM 改到 ≤ 物理墙 - 缓冲。"
+        )
+        return res1
+
     # 没到位, reset_x 撞墙重置
     print(f"  {log_prefix} 第一次 split 没到位 (result={res1['result']!r}, "
           f"residual={res1['residual_mm']:+.1f}mm), reset_x 撞墙重置...")
-    reset_job = client._call_arm(
-        "reset_x", timeout=reset_timeout, sync=True,
+    # 2026-08-01 切到 wrapper (reset_ops.py 已支持 probe_time 透传)
+    reset_job = client.reset_x(
         direction=reset_direction,
-        reset_velocity=reset_velocity_mms / 1000.0,  # m/s
+        reset_velocity_mms=reset_velocity_mms,   # mm/s, wrapper 内部转 m/s
         probe_time=reset_probe_time,
+        timeout=reset_timeout,
     )
     print(f"  {log_prefix} reset_x 完成, 重新走 split...")
 

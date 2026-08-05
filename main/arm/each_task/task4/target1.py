@@ -57,15 +57,15 @@ LOG_PREFIX: str = "[task4/target1]"
 TARGET1_Y_MM: float = -133
 """target1 y。出 y 保护区 [0,-30]。y 软上限 = -soft_y_max_mm=-200, target1 留 67mm
 余量到 -133, 不贴软限位边界; arm_base y 阈值 [-0.20, 0.0] 不变。
-2026-07-28: y 校准到 -133 (用户实测球检测落点最稳, 对应 BALL_VERIFIED_*
-第 7 次现场实测; 之前 -150 / -125 / -100 都已弃用)。"""
+2026-07-28: y 校准到 -133 (用户实测球检测落点最稳; 之前 -150 / -125 / -100
+都已弃用)。**2026-08-02 取消 BALL_VERIFIED_* 位置验证** 后, y 不再需要严格居中。"""
 
-TARGET1_X_MM: float = -260.0
-"""target1 x。距 init=0 远 260mm, split 模式分段。
+TARGET1_X_MM: float = -210.0
+"""target1 x。
 
-⚠️ **超物理墙**: 实测 x 物理墙 ≈ -119.5mm (ARM_API §7.2, test_x_to_150.py docstring),
-目标 -260mm 会撞墙 → wall_hit 检测 → 最终位置 ≈ -119.5mm, 不到 -260mm。
-如要真到位需现场确认 rail 长度或校准原点。
+⚠️ **2026-08-01 现场实测**: motor 物理墙 ≈ -221.5mm (不是旧的 -119.5mm 注释,
+那是 belt-slip 修前的猜测值)。target=-260 永远到不了 (撞物理墙),改为 -210 留
+11.5mm 缓冲 + 让 split 撞墙就 break (wall_hit = 物理极限, 接受现状)。
 
 ⚠️ **2026-07-31 v6++ 用户反馈**: belt-slip 已修复, 速度 30→40→80 mm/s
 (SDK 无硬限, arm_base.py:482-487 临时收紧 x_velocity_limit)。
@@ -92,8 +92,8 @@ MOVE_X_STALL_MM: float = 10.0         # stall 判定放宽 (10mm, belt-slip 残�
 MOVE_X_MAX_STALL_ROUNDS: int = 5      # 容忍 5 轮 stall (旧 3, belt-slip 修复初期)
 MOVE_X_KICK_SLEEP_S: float = 0.3      # 多给 0.1s 让带重咬合
 MOVE_X_MAX_ROUNDS: int = 15           # 多给 3 轮机会
-MOVE_X_WALL_MM: float = -300.0        # x 物理墙 (belt-slip 修好后撞墙检测生效)
-MOVE_X_WALL_TOL_MM: float = 30.0      # 距墙 30mm 视为撞墙
+MOVE_X_WALL_MM: float = -220.0        # x 物理墙 (2026-08-01 现场实测 -221.5mm)
+MOVE_X_WALL_TOL_MM: float = 10.0      # 距墙 10mm 视为撞墙 (立即 break)
 
 
 # ---------- 主入口 ----------

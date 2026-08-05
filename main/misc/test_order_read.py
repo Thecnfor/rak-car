@@ -133,15 +133,15 @@ def run():
         dt = time.time() - t0
         if "error" in d:
             print(f"  ❌ ({dt:.1f}s): {d['error']}"); time.sleep(poll); continue
-        name, goods, addr = d.get("name", ""), d.get("goods", ""), d.get("address")
-        if not name or goods not in valid_goods or addr not in (1, 2):
-            print(f"  ❌ 校验失败: name={name} goods={goods} addr={addr}"); continue
-        print(f"  ✅ ({dt:.1f}s): {name} ← {goods} → {addr}号楼")
-        orders.append({"name": name, "goods": goods, "address": addr})
+        name, goods = d.get("name", ""), d.get("goods", "")
+        if not name or goods not in valid_goods:
+            print(f"  ❌ 校验失败: name={name} goods={goods}"); continue
+        print(f"  ✅ ({dt:.1f}s): {name} ← {goods}")
+        orders.append({"name": name, "goods": goods})
         break
 
     print(f"\n共 {len(orders)} 个订单")
-    for o in orders: print(f"  {o['name']} ← {o['goods']} → {o['address']}号楼")
+    for o in orders: print(f"  {o['name']} ← {o['goods']}")
     return {"ok": len(orders) > 0, "orders": orders}
 
 

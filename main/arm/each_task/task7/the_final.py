@@ -2,7 +2,7 @@
 
 按用户 2026-08-05 现场修正后的循环逻辑 (v3):
 
-  ┌─── 循环 (max N 次, 默认 10) ───┐
+  ┌─── 循环 (max N 次, 默认 2) ───┐
   │  Step 1: duiying.run()         target OCR + liebiao 比对, 拿到 matches
   │    ↓                           (matches: [{source, list_no, name, goods, target_id, target_label}])
   │  Step 2: 检查 matches            matches 数: 0 / 1 / 2
@@ -42,10 +42,10 @@
     | 6         | position6_mod  |  (底盘前进 + 10 步臂含 Step 2.06 放气 + 底盘后退, v3)
 
   ⚠️ 终止条件 (任一触发即停):
-    1. 达到 max_iterations 次 (默认 10) → 正常收尾 (v4: 不是 abort, 是 ok=True 退出)
+    1. 达到 max_iterations 次 (默认 2) → 正常收尾 (v4: 不是 abort, 是 ok=True 退出)
     2. 任一步骤抛异常 → 立即 abort (跟 task6/the_final.py 同款硬件安全策略)
     ⚠️ v4: 命中不再 break (用户 2026-08-05 现场要求: 命中后前进 60cm 继续下一轮)
-    ⚠️ 跑到 max_iterations 仍可 ctrl-C 中途打断; 想提前停就 --max-iterations=N
+    ⚠️ 默认 2 轮足够 (找 1 个目标 + 60cm 后再看 1 次); 跑 N 轮 --max-iterations=N
 
   ⚠️ **每个 match 执行三步** (顺序固定):
     1. ``runner.suck()`` — 启动吸气 (建立真空)
@@ -114,9 +114,10 @@ from main.arm.each_task.task7 import (  # noqa: E402
 
 LOG_PREFIX: str = "[task7/the_final]"
 
-DEFAULT_MAX_ITERATIONS: int = 10
-"""最大迭代次数 (防硬件无限循环)。用户 2026-08-04 未指定, 默认 10 次足够覆盖
-30cm × 10 = 6m 范围。"""
+DEFAULT_MAX_ITERATIONS: int = 2
+"""最大迭代次数 (防硬件无限循环)。用户 2026-08-05 现场改为 2 次:
+典型场景: 路上 1-2 个目标, duiying #1 找第一个 + duiying #2 看 60cm 后还有没有。
+若还有, 下一轮跑 (但默认只跑 2 轮, 想多跑 --max-iterations=N)。"""
 
 DEFAULT_FORWARD_MM: float = 600.0
 """未匹配时底盘前进距离 (mm)。用户 2026-08-04 指定 60cm = 600mm。
@@ -339,26 +340,32 @@ def run(client: ArmClient, runner: ArmRunner,
 
         # ===== 统一前进 (无论有/无 match, 都前进 60cm + 下一轮继续) =====
         # v4 改动: 之前命中分支提前 return 导致这段 dead code, 现在合并到统一处理
-        forward_signed_mm = abs(forward_mm)
-        forward_timeout = max(timeout, 5.0, abs(forward_signed_mm) / 1000.0 / max(max_velocity_ms, 0.01) + 2.0)
-        try:
-            _chassis_move_for(
-                client, forward_signed_mm,
-                max_velocity_ms, forward_timeout,
-                log_prefix=f"  {LOG_PREFIX} iter{i}-forward",
-            )
-        except Exception as exc:                                # noqa: BLE001
-            print(f"\n  ❌ 底盘前进异常: {exc!r}")
-            print(f"\n========== {LOG_PREFIX} 中止 (迭代 {i} 底盘前进失败) ==========")
-            return {
-                "ok": False,
-                "failed_step": f"iter{i}-forward",
-                "error": repr(exc),
-                "iterations": len(iteration_results),
-                "results": iteration_results,
-                "duration_s": time.time() - t0,
-            }
-        # 底盘前进成功 → 继续下一轮 duiying (回到 for 开头)
+        # v5 改动 (2026-08-06): **最后一轮不前进** (i == max_iterations 时跳过)
+        # 原因: 最后一轮跑完 duiying 后没有"下一轮"需要进入, 前进 60cm 是白白浪费,
+        # 且会让车停在 60cm 偏移的位置 (后续编排不知道这是 the_final 末尾)。
+        if i < max_iterations:
+            forward_signed_mm = abs(forward_mm)
+            forward_timeout = max(timeout, 5.0, abs(forward_signed_mm) / 1000.0 / max(max_velocity_ms, 0.01) + 2.0)
+            try:
+                _chassis_move_for(
+                    client, forward_signed_mm,
+                    max_velocity_ms, forward_timeout,
+                    log_prefix=f"  {LOG_PREFIX} iter{i}-forward",
+                )
+            except Exception as exc:                                # noqa: BLE001
+                print(f"\n  ❌ 底盘前进异常: {exc!r}")
+                print(f"\n========== {LOG_PREFIX} 中止 (迭代 {i} 底盘前进失败) ==========")
+                return {
+                    "ok": False,
+                    "failed_step": f"iter{i}-forward",
+                    "error": repr(exc),
+                    "iterations": len(iteration_results),
+                    "results": iteration_results,
+                    "duration_s": time.time() - t0,
+                }
+            # 底盘前进成功 → 继续下一轮 duiying (回到 for 开头)
+        else:
+            print(f"\n  ⏹️ 最后一轮 (iter {i}/{max_iterations}), 跳过前进 60cm 直接收尾")
 
     # ===== 达 max_iterations 收尾 =====
     # v4 改动: 之前是 "max_iterations 仍未命中 → abort", 现在是 "max_iterations 收尾 (不论命中与否)"
@@ -367,8 +374,11 @@ def run(client: ArmClient, runner: ArmRunner,
     total_empty = sum(1 for r in iteration_results if not r.get("matched"))
     print(f"\n========== {LOG_PREFIX} 收尾 ({dt:.2f}s, "
           f"跑完 {max_iterations} 轮, 命中 {total_matches} 轮 / 空 {total_empty} 轮) ==========")
-    print(f"  ⚠️ 硬件累计前进 {max_iterations} × {forward_signed_mm:.0f}mm = "
-          f"{max_iterations * forward_signed_mm / 1000:.1f}m")
+    # v5 改动: 最后一轮 (iter max_iterations) 不前进, 累计 = (max-1) × forward
+    actual_forwards = max(0, max_iterations - 1)
+    print(f"  ⚠️ 硬件累计前进 {actual_forwards} × {forward_signed_mm:.0f}mm = "
+          f"{actual_forwards * forward_signed_mm / 1000:.1f}m "
+          f"(最后一轮 iter {max_iterations} 不前进, 避免白白走 60cm)")
     print(f"  ⚠️ 本脚本无 break-on-match, 跑到 max_iterations 才停。如想提前停, "
           f"用 max-iterations=N 减小上限。")
     print(f"  请人工检查:")
@@ -399,7 +409,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--max-iterations", type=int, default=DEFAULT_MAX_ITERATIONS,
-                   help="最大迭代次数 (防硬件无限循环, 默认 10)")
+                   help="最大迭代次数 (防硬件无限循环, 默认 2)")
     p.add_argument("--forward", type=float, default=DEFAULT_FORWARD_MM,
                    help="未匹配时底盘前进距离 (mm, 默认 600 = 60cm, 强制正值)")
     p.add_argument("--vel", type=float, default=DEFAULT_CHASSIS_VELOCITY_MS,

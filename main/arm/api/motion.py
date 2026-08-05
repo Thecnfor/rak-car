@@ -5,11 +5,17 @@
 """
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from typing import Optional
 
 
 def _mm_to_m(v_mm: float) -> float:
     return float(v_mm) / 1000.0
+
+
+logger = logging.getLogger(__name__)
 
 
 class MotionMixin:
@@ -82,3 +88,153 @@ class MotionMixin:
         except Exception as e:
             print(f"[move_x] 状态校验读取失败: {e}", flush=True)
         return job
+
+    # ---- x_speed safety watchdog（belt-slip 兜底）----
+    #
+    # 背景：x 轴是 motor_280 + 编码器 + 同步带，belt-slip 下电机在转但车不动。
+    # 纯开环 x_speed 不知道车动没动，堵转时空转烧带子/电机。
+    #
+    # 兜底策略：每次开环 x_speed 时起一个 daemon 线程，周期（默认 100ms）读
+    # realtime x_mm，若 max_stale_s 秒内 x 变化 < 0.5mm，自动调 x_speed(0) 停机。
+    # 见 ARM_API.md §10 + memory [[x-speed-safety-watchdog]]。
+    #
+    # latest-wins：再次调用 x_speed_with_safety 会取消前一个 watchdog + 设新速度；
+    # 显式 stop_x_speed_safety() 立即停。watchdog 不依赖 _call_arm 同步返回，
+    # 完全可以跟其他动作并发。
+    #
+    # 2026-08-01: 从 b1806da WIP commit 的 monolith api.py 迁回 (mixin 拆分 c9fbc99
+    # 时漏掉了,导致 common.move_x_with_split kick 路径 AttributeError)。
+
+    def x_speed_with_safety(
+        self,
+        velocity: float,
+        max_stale_s: float = 2.0,
+        poll_interval_s: float = 0.1,
+        move_threshold_mm: float = 0.5,
+        timeout: float = 10.0,
+    ) -> dict:
+        """开环 x_speed + 后台 watchdog 兜底 belt-slip 堵转。
+
+        Args:
+            velocity: 目标速度（m/s，正值向 x 增大方向，负值反向）。
+                     与车端 arm.x_speed(velocity) 同单位（m/s）。
+            max_stale_s: watchdog 容忍"无位移"最长时间（秒）。超此值自动 x_speed(0)。
+            poll_interval_s: watchdog 轮询间隔（秒）。
+            move_threshold_mm: 判定"x 有动"的最小位移（mm），避免编码器噪声误判。
+            timeout: car action HTTP 超时（秒）。
+
+        Returns:
+            ``/v1/execute`` 异步返回的 job dict（sync=False 不等完成）。
+
+        注意：
+          - 调用后 motor 立即按 velocity 转；调用方负责在合适时机调
+            ``stop_x_speed_safety()`` 或再调一次 ``x_speed_with_safety(0)``。
+          - latest-wins：再调一次会自动取消前一个 watchdog + 设新速度。
+        """
+        v_ms = float(velocity)
+        # 确保 _x_safety_lock 已初始化 (聚合类 __init__ 里初始化,但 mixin 内兜底)
+        if not hasattr(self, "_x_safety_lock"):
+            self._init_x_safety_state()
+        with self._x_safety_lock:
+            # 1) 取消前一个 watchdog（保留取消设置，但下面要立刻建新的）
+            self._cancel_x_safety_locked()
+
+            # 2) 起新 watchdog
+            start_x = self._read_x_mm_realtime()  # 起点（realtime 真值）
+            stop_event = threading.Event()
+            self._x_safety_stop_event = stop_event
+            self._x_safety_start_x_mm = start_x
+            self._x_safety_velocity_ms = v_ms
+
+            def _watchdog() -> None:
+                last_x = start_x
+                last_change_t = time.time()
+                # 在内部循环里访问 self，daemon 线程随 client 生命周期共存
+                while not stop_event.wait(poll_interval_s):
+                    cur = self._read_x_mm_realtime()
+                    if cur is None:
+                        # 读不到就继续等下一轮（realtime 偶发不可用）
+                        continue
+                    if abs(cur - last_x) > move_threshold_mm:
+                        last_x = cur
+                        last_change_t = time.time()
+                    elif (time.time() - last_change_t) > max_stale_s:
+                        # 卡住超时 → 强停 + 退出
+                        try:
+                            self._call_arm(
+                                "x_speed", timeout=5.0, sync=False, velocity=0.0
+                            )
+                            logger.warning(
+                                "x_speed_with_safety: x_mm %.1fmm 超 %ss 未变，"
+                                "已自动 x_speed(0)（belt-slip 兜底）",
+                                last_x, max_stale_s,
+                            )
+                        except Exception as exc:  # pragma: no cover
+                            logger.warning(
+                                "x_speed_with_safety: 自动停机失败: %s", exc
+                            )
+                        return
+
+            t = threading.Thread(
+                target=_watchdog, daemon=True, name="x-safety-watchdog"
+            )
+            self._x_safety_thread = t
+            t.start()
+
+        # 3) 下发开环速度（异步，不等完成）
+        return self._call_arm(
+            "x_speed", timeout=timeout, sync=False, velocity=v_ms
+        )
+
+    def stop_x_speed_safety(self) -> dict:
+        """停 watchdog + 立即 x_speed(0)。
+
+        行为：
+          - 取消在跑的 watchdog 线程（latest-wins 的"前一个"被取消语义）。
+          - 下发一次 x_speed(0) 异步停止电机。
+
+        Returns:
+            ``/v1/execute`` 异步返回的 x_speed(0) job dict。
+
+        注意：即使当前没有 safety session（is_x_safety_active()=False），
+        调本方法也安全 —— watchdog 取消 no-op + x_speed(0) 必下。
+        """
+        if not hasattr(self, "_x_safety_lock"):
+            self._init_x_safety_state()
+        with self._x_safety_lock:
+            self._cancel_x_safety_locked()
+        # 立即下发停车（async，不等完成）
+        return self._call_arm(
+            "x_speed", timeout=5.0, sync=False, velocity=0.0
+        )
+
+    def is_x_safety_active(self) -> bool:
+        """watchdog 线程是否在跑。
+
+        Returns:
+            True = 上一次 ``x_speed_with_safety()`` 起的 watchdog 还在监控中；
+            False = 没在跑（或已被 ``stop_x_speed_safety()`` / 新的
+            ``x_speed_with_safety()`` 取消）。
+        """
+        if not hasattr(self, "_x_safety_lock"):
+            return False
+        with self._x_safety_lock:
+            t = self._x_safety_thread
+            return t is not None and t.is_alive()
+
+    def _cancel_x_safety_locked(self) -> None:
+        """取消 watchdog（调用方必须持 ``_x_safety_lock``）。"""
+        if self._x_safety_stop_event is not None:
+            self._x_safety_stop_event.set()
+        self._x_safety_thread = None
+        self._x_safety_stop_event = None
+        self._x_safety_start_x_mm = None
+        self._x_safety_velocity_ms = 0.0
+
+    def _init_x_safety_state(self) -> None:
+        """初始化 x_speed safety watchdog 状态 (聚合类 __init__ 已调, 这里兜底)。"""
+        self._x_safety_lock = threading.Lock()
+        self._x_safety_stop_event: Optional[threading.Event] = None
+        self._x_safety_thread: Optional[threading.Thread] = None
+        self._x_safety_start_x_mm: Optional[float] = None
+        self._x_safety_velocity_ms: float = 0.0

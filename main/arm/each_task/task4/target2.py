@@ -166,6 +166,22 @@ def _is_ball_like(
     return True
 
 
+<<<<<<< Updated upstream
+=======
+def _verify_ball_in_target1_pose(ball: dict) -> bool:
+    """**已弃用 2026-08-02** —— 用户要求 "识别到球就抓, 不用在最佳抓取位置"。
+
+    原 BALL_VERIFIED_* 7 项位置验证已删除 (constants.py 删 BALL_VERIFIED_*
+    13 常量 + 本函数也删除); 现 fetch_balls 只要球过 TARGET_* 4 项基础过滤
+    (score / aspect / area) 且 color 是蓝/黄, 即视为有效候选。
+
+    保留此 stub 是为兼容历史 import (target_blue.py / target_yellow.py 等
+    旧版本可能仍引用); 直接返回 True (永远通过)。
+    """
+    return True
+
+
+>>>>>>> Stashed changes
 # ---------- 核心 API ----------
 
 def fetch_balls(
@@ -176,7 +192,10 @@ def fetch_balls(
     aspect_tol: Optional[float] = None,
     area_min: Optional[float] = None,
     area_max: Optional[float] = None,
+<<<<<<< Updated upstream
     debug: bool = False,
+=======
+>>>>>>> Stashed changes
 ) -> list[dict]:
     """调 task_feed 拿当前帧的球类识别结果 + 按阈值过滤 + 颜色映射。
 
@@ -185,8 +204,11 @@ def fetch_balls(
         score_min: score 阈值 (None → 用 constants.TARGET_SCORE_MIN)
         color_filter: "blue" / "yellow" / None (None=不按颜色过滤)
         aspect_tol / area_min / area_max: 几何阈值 (None → 用 constants)
+<<<<<<< Updated upstream
         debug: True 时打印每条 detection 的过滤原因 (score/aspect/area/bbox 字段缺失
                / color unknown); 默认 False 静默 (与旧行为一致)。
+=======
+>>>>>>> Stashed changes
 
     Returns:
         list[dict]: 每球一个 dict, 字段见模块 docstring。
@@ -220,7 +242,11 @@ def fetch_balls(
               f"{area_min}<=area<={area_max}")
 
     out: list[dict] = []
+<<<<<<< Updated upstream
     for i, det in enumerate(detections):
+=======
+    for det in detections:
+>>>>>>> Stashed changes
         if not isinstance(det, dict):
             if debug:
                 print(f"  [{LOG_PREFIX}] [DEBUG] det[{i}] 跳过 (不是 dict)")
@@ -290,9 +316,12 @@ def fetch_balls(
         }
         out.append(ball)
 
+<<<<<<< Updated upstream
     if debug:
         print(f"  [{LOG_PREFIX}] [DEBUG] 通过过滤: {len(out)}/{len(detections)} "
               f"(raw={len(detections)})")
+=======
+>>>>>>> Stashed changes
     return out
 
 
@@ -352,11 +381,16 @@ def step_target2_once(
     """单次识别 + (可选) 写盘。
 
     Args:
+<<<<<<< Updated upstream
         debug: True 时打印:
                - raw task_state 全部 keys + active + count + updated_at
                - raw detections 前 3 条完整字段
                - **fetch_balls 内部每条 detection 的过滤原因** (score/aspect/area/bbox/
                  color unknown/active=False), 立刻定位为什么返回 0 球。
+=======
+        debug: True 时打印 raw detections 全部字段 (前 3 条) + active/count/updated_at;
+               用于现场诊断 task_feed 输出结构跟 fetch_balls 假设不一致的问题。
+>>>>>>> Stashed changes
 
     Returns:
         {"ok": bool, "balls": list[dict], "raw_task_state": dict|None, "saved_path": str|None}
@@ -384,7 +418,10 @@ def step_target2_once(
         http_client,
         score_min=score_min,
         color_filter=color_filter,
+<<<<<<< Updated upstream
         debug=debug,
+=======
+>>>>>>> Stashed changes
     )
     saved_path = save_latest(balls) if save else None
     _print_balls(balls, raw=raw_task_state if show_raw else None)

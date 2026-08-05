@@ -84,6 +84,13 @@ def _move_x_with_split(client: ArmClient, runner: ArmRunner,
     """薄 wrapper: 透传 common.move_x_with_split, 注入 LOG_PREFIX。
 
     见 main/arm/each_task/common.py:move_x_with_split 完整 docstring。
+<<<<<<< Updated upstream
+=======
+
+    2026-08-01 切到 common 版 (替换原内联 reach+stall 模式): 自动获得
+    wall_hit / overshoot / FUSE-rescue 增强 (来自 low_tower 2026-07-30 现场 case
+    的加强)。行为对短距场景兼容,跟 high_tower.py / low_tower.py / target.py 对齐。
+>>>>>>> Stashed changes
     """
     return move_x_with_split(
         client, runner, target_x_mm,

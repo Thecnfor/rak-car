@@ -33,6 +33,7 @@
   - 单帧可能空 (球没进画面 / task_feed 刚起), 故按 `DETECT_HZ` 轮询到
     `DETECT_TIMEOUT_S` 为止, 拿到球就立刻返回。
 
+<<<<<<< Updated upstream
 ⚠️⚠️ **BALL_VERIFIED_* 验证层已删除 (2026-08-01)**:
   - `task4/target2.py` 的 `fetch_balls()` 曾有 `verify_target1_pose` 参数: task4
     target1.py 位姿 (y=-150 / x=-260 / arm=+90 / hand=0) 标定的 7 项范围验证
@@ -43,6 +44,8 @@
     阈值传自己的 DETECT_*。
   - 将来若要给本位姿加位姿专属几何基线, 请新标一套专属常量, 不要复用 task4 旧值。
 
+=======
+>>>>>>> Stashed changes
 ⚠️ **顺序沿用 get_blue / get_yellow 的既定套路** (y → x → 大臂 → 手爪):
   - 第 1 步 move_y 走步进电机, **不过 y 保护区** (api.py:372-373 注释:
     '即使在保护区 [0, -30] 也可以调, 用于出保护区') → 从 init (y=0) 直接跑也行。
@@ -90,6 +93,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
+from main.arm.each_task.common import move_x_with_split  # noqa: E402
 
 
 # ---------- 目标位姿常量 (内联, 不依赖 constants.py) ----------
@@ -199,10 +203,13 @@ def detect_balls(client: ArmClient,
     TARGET_* 默认值 —— 那套是近景标定的, 会把本位姿的球全筛光 (2026-07-29
     实测: area 0.148~0.168 vs task4 下限 0.20, 三球全丢)。详见常量区注释。
 
+<<<<<<< Updated upstream
     ⚠️ 2026-08-01: task4 已删 BALL_VERIFIED_* 验证层 (verify_target1_pose 参数
     不存在了), fetch_balls 只剩 score/aspect/area 三层基线过滤。位姿差异问题
     由本文件传自己的 DETECT_* 阈值解决 (近景标定值不可复用)。
 
+=======
+>>>>>>> Stashed changes
     纯只读: 不动机械臂。任何异常都只 warn + 返回 [], 不抛 (摆位已成功,
     不该因为看不到球把整个脚本判失败)。
 
@@ -268,71 +275,22 @@ def detect_balls(client: ArmClient,
 
 
 
-# ---------- belt-slip 安全 move_x (内联, 走 test_x_to_150.py 模式) ----------
+# ---------- belt-slip 安全 move_x (薄 wrapper, 透传 common 版) ----------
 
-def _move_x_with_split(client: ArmClient, target_x_mm: float) -> dict:
-    """belt-slip 安全 move_x —— 走 test_x_to_150.py 模式:
-    每轮 client.move_x(target, v_max_mms) (透传限速), 然后 realtime 读真值;
-    卡住 → kick 停一下让带重咬合; 连续 N 轮无进展 → 放弃。
+def _move_x_with_split(client: ArmClient, runner: ArmRunner,
+                       target_x_mm: float) -> dict:
+    """薄 wrapper: 透传 common.move_x_with_split, 注入 LOG_PREFIX。
 
-    Returns:
-        {"target_x": float, "actual_x": float, "segments": int, "reached": bool}
+    见 main/arm/each_task/common.py:move_x_with_split 完整 docstring。
+
+    2026-08-01 切到 common 版 (替换原内联 reach+stall 模式): 自动获得
+    wall_hit / overshoot / FUSE-rescue 增强 (来自 low_tower 2026-07-30 现场 case
+    的加强)。行为对短距场景兼容,跟 high_tower.py / low_tower.py / target.py 对齐。
     """
-    x0 = client._read_x_mm_realtime()
-    if x0 is None:
-        raise RuntimeError("realtime x_mm 读不到 (arm_feed 未启 / realtime 不可用)")
-    delta = target_x_mm - x0
-
-    if abs(delta) <= MOVE_X_TOL_MM:
-        print(f"  {LOG_PREFIX} move_x({target_x_mm}mm)  已在容差内 (x0={x0:+.1f}mm), 跳过")
-        return {"target_x": target_x_mm, "actual_x": x0, "segments": 0, "reached": True}
-
-    print(f"  {LOG_PREFIX} move_x({target_x_mm}mm)  距 {delta:+.1f}mm  "
-          f"v_max={MOVE_X_V_MAX_MMS:.0f}mm/s  TOL=±{MOVE_X_TOL_MM:.0f}mm  "
-          f"reach+stall 模式 (test_x_to_150.py 同款)")
-
-    x_prev = x0
-    stall_rounds = 0
-    steps = 0
-    reached = False
-    x_final = x0
-
-    for rnd in range(1, MOVE_X_MAX_ROUNDS + 1):
-        try:
-            client.move_x(x_mm=target_x_mm, v_max_mms=MOVE_X_V_MAX_MMS)
-            x_now = client._read_x_mm_realtime()
-            if x_now is None:
-                raise RuntimeError("realtime x_mm 读不到")
-        except Exception as e:
-            print(f"  {LOG_PREFIX} [FAIL] 轮{rnd:2d}  {type(e).__name__}: {str(e)[:80]}")
-            break
-
-        step = x_now - x_prev
-        err = x_now - target_x_mm
-        steps += 1
-        x_prev = x_now
-        x_final = x_now
-        print(f"  {LOG_PREFIX} 轮{rnd:2d}  x={x_now:+7.1f}mm  本轮走={step:+6.1f}mm  "
-              f"距目标={err:+6.1f}mm")
-
-        if abs(err) < MOVE_X_TOL_MM:
-            reached = True
-            break
-
-        if abs(step) < MOVE_X_STALL_MM:
-            stall_rounds += 1
-            print(f"         [SLIP] 本轮几乎没动, kick 停 {MOVE_X_KICK_SLEEP_S}s 让同步带重咬合 "
-                  f"(连续卡住 {stall_rounds}/{MOVE_X_MAX_STALL_ROUNDS})")
-            if stall_rounds >= MOVE_X_MAX_STALL_ROUNDS:
-                print(f"         [ABORT] 连续 {MOVE_X_MAX_STALL_ROUNDS} 轮无进展, "
-                      f"撞墙/带打滑治不动, 放弃")
-                break
-            client.stop_x_speed_safety()
-            time.sleep(MOVE_X_KICK_SLEEP_S)
-        else:
-            stall_rounds = 0
-
-    return {"target_x": target_x_mm, "actual_x": x_final, "segments": steps, "reached": reached}
+    return move_x_with_split(
+        client, runner, target_x_mm,
+        log_prefix=LOG_PREFIX,
+    )
 
 
 # ---------- 主入口 ----------
@@ -364,8 +322,8 @@ def run(client: ArmClient, runner: ArmRunner,
     runner.move_y(y_mm, timeout=30.0)
 
     # 2. x → -40 (belt-slip 安全 move_x, 透传 v_max_mms=30; 卡住 kick + stall 放弃)
-    print(f"  [2/5] move_x({x_mm}mm)  belt-slip 安全 (test_x_to_150.py 模式)")
-    x_info = _move_x_with_split(client, x_mm)
+    print(f"  [2/5] move_x({x_mm}mm)  belt-slip 安全 (common 版, 含 wall_hit/overshoot/FUSE)")
+    x_info = _move_x_with_split(client, runner, x_mm)
     print(f"        x_info={x_info}")
 
     # 3. 大臂 → 90° (业务硬限上界 / 复位位 / init 例外位; y=-200 远出保护区)

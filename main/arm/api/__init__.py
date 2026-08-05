@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from typing import Optional
 
 from main.api_client import RuntimeApiClient
@@ -41,6 +42,13 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
         self.traj = traj or TrajectoryGenerator()
         self._vision: Optional[object] = None
         self._storage_side_cache = "UNKNOWN"
+        # x_speed safety watchdog 状态 (2026-08-01 补: mixin 拆分 c9fbc99 时漏掉,
+        # MotionMixin 内的 x_speed_with_safety / stop_x_speed_safety 需要这些状态)
+        self._x_safety_lock = threading.Lock()
+        self._x_safety_stop_event: Optional[threading.Event] = None
+        self._x_safety_thread: Optional[threading.Thread] = None
+        self._x_safety_start_x_mm: Optional[float] = None
+        self._x_safety_velocity_ms: float = 0.0
 
     @classmethod
     def connect(cls, load_origin: bool = True) -> "ArmClient":

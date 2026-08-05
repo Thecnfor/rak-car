@@ -94,22 +94,78 @@ class StateIOMixin:
             self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
             return None
 
-        # RuntimeApiClient.get_arm_state() 返回 {"ok": bool, "arm_state": dict, ...}
-        # 2026-08-03 现场 bug: 之前注释说 "result" 但 RuntimeApiClient 实际是 "arm_state"
-        # 字段, 拿 result 永远 None, _read_x_mm_realtime 永远读不到 → move_x 抛 RuntimeError
+# runtime `/v1/realtime/arm/state` 返回 {"ok": bool, "arm_state": dict, ...}
+        # (见 runtime/api/routers/realtime.py:62 — 注意不是 "result",这是 2026-08-01
+        # 发现的 latent bug: 旧版按 "result" 取永远 None,导致 split 模式总报
+        # "realtime x_mm 读不到"。)
         result = st.get("arm_state") if isinstance(st, dict) else None
         if not isinstance(result, dict):
-            self._last_rt_err = "get_arm_state 返回无 arm_state"
+            self._last_rt_err = (
+                f"get_arm_state 返回无 arm_state (top-level keys="
+                f"{list(st.keys()) if isinstance(st, dict) else 'N/A'})"
+            )
+            return None
+
+        # runtime 正在 init (controller reboot 后) → arm_state 全 None / active=False
+        if not result.get("active"):
+            self._last_rt_err = (
+                f"arm_feed 未启 (active=False, mode={result.get('mode')!r}) — "
+                f"runtime 可能在 reinit,或 MyCar() 未构造完成"
+            )
             return None
 
         x_mm = result.get("x_mm")
         if x_mm is None:
-            # arm_feed 可能只填了 y_m (init 期常见), x_mm 还未上报
-            self._last_rt_err = "arm_feed result 缺 x_mm (feed 刚启动?)"
+            # arm_feed 可能刚启动,x_mm 还未上报
+            self._last_rt_err = "arm_feed active 但 x_mm 仍 None (feed 刚启动?)"
             return None
 
         self._last_rt_err = None
         return float(x_mm)
+
+    def wait_for_arm_state_active(
+        self,
+        timeout_s: float = 10.0,
+        poll_interval_s: float = 0.2,
+    ) -> bool:
+        """等 runtime `arm_feed` 守护线程 active=True **且** x_mm 有真值。
+
+        适用 startup race (2026-08-01 暴露):
+          - runtime `_create_car_locked` 触发 arm_feed 起线程要几百 ms
+          - 业务脚本 `ArmClient.connect()` 后立即 `move_x_with_split`
+            会撞上 arm_feed 还没上报第一帧,旧版直接 raise
+          - 现在业务层在第一轮读 x 前调一下本函数,容忍 startup 抖动
+
+        Args:
+            timeout_s: 总超时 (秒)。arm_feed 真的死了 / 控制器没接上,
+                超时返回 False,业务层自己 raise。
+            poll_interval_s: 轮询间隔 (秒)。
+
+        Returns:
+            bool: True = 等到 active + x_mm; False = 超时仍未就绪。
+                超时时 ``self._last_rt_err`` 保留最后一次失败原因,
+                业务层可 ``last_realtime_error()`` 取出来。
+
+        Side effects:
+            覆盖 ``self._last_rt_err`` (最后一次调用的状态)。
+        """
+        import time as _time
+
+        deadline = _time.monotonic() + float(timeout_s)
+        last_log_ts = 0.0
+        while True:
+            x = self._read_x_mm_realtime()
+            if x is not None:
+                return True
+            now = _time.monotonic()
+            if now >= deadline:
+                return False
+            # 每 1s 打一次日志,避免刷屏 (e.g. 5s 等 25 次只打 5 行)
+            if now - last_log_ts >= 1.0:
+                err = self._last_rt_err or "未知"
+                print(f"  [wait_arm_feed] {timeout_s - (deadline - now):.1f}s 内仍不可用: {err}")
+                last_log_ts = now
+            _time.sleep(poll_interval_s)
 
     def last_realtime_error(self) -> Optional[str]:
         """读上次 ``_read_x_mm_realtime`` 失败的错误上下文。
