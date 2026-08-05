@@ -23,76 +23,65 @@ from typing import Any, Dict, Optional
 from main.api_client import RuntimeApiClient
 from main.arm import ArmClient, ArmRunner
 
-
-# ---- 默认值 (跟 target4.py 保持一致, 改这里等于改业务默认) ----
-
-# ---- 姿态参数 (集中管理, 现场快速调整) ----
-
-# P 姿态 (准备/搜索位姿)
-POSE_P_Y_MM: float = -130.0
-POSE_P_X_MM: float = -300.0
-POSE_P_ARM_DEG: float = 90.0
-POSE_P_HAND_DEG: float = 10.0
-
-# 中转姿态 (放 bin 过程中的过渡位姿)
-TRANSIT_Y_MM: float = -130.0
-TRANSIT_X_MM: float = -150.0
-
-# 抓取姿态 (盲降抓球位姿)
-PICK_Y_MM: float = -58.0
-PICK_X_MM: float = -240.0
-
-# 放 bin 姿态
-PUT_Y_MM: float = -110.0
-BIN_X_BLUE_MM: float = 0.0
-BIN_X_YELLOW_MM: float = -65.0
-
-# ---- 业务参数 ----
-
-_DEFAULT_MAX_PICKS: int = 8
-_DEFAULT_MAX_SECONDS: float = 180.0
-_DEFAULT_MAX_CREEP_M: float = 0.8
-_DEFAULT_CREEP_SPEED_MPS: float = 0.0225
-_DEFAULT_TRACK_MAX_SECONDS: float = 6.0
-_DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
-_DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM   # 放 bin 后回 P 姿态 x
-_DEFAULT_PICK_TIMEOUT_S: float = 60.0
+# 所有参数默认值统一从 target4.py 读取，单一配置入口
+from main.arm.each_task.task4.target4 import (
+    DEFAULT_MAX_PICKS,
+    DEFAULT_MAX_CREEP_M,
+    DEFAULT_MAX_SECONDS,
+    DEFAULT_TRACK_MAX_SECONDS,
+    DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
+    DEFAULT_RETURN_X_MM,
+    DEFAULT_PICK_TIMEOUT_S,
+    DEFAULT_CREEP_SPEED_MPS,
+    TASK4_POSE_P_Y_MM,
+    TASK4_POSE_P_X_MM,
+    TASK4_POSE_P_ARM_DEG,
+    TASK4_POSE_P_HAND_DEG,
+    X_PICK_MM,
+    Y_PICK_MM,
+    Y_TRANSIT_MM,
+    X_TRANSIT_MM,
+    Y_PUT_MM,
+    BIN_X_MM,
+    COLOR_BLUE,
+    COLOR_YELLOW,
+)
 
 
 def run(
     client: Optional[RuntimeApiClient] = None,
     *,
     # 抓取预算
-    max_picks: int = _DEFAULT_MAX_PICKS,
-    max_seconds: float = _DEFAULT_MAX_SECONDS,
-    max_creep_m: float = _DEFAULT_MAX_CREEP_M,
+    max_picks: int = DEFAULT_MAX_PICKS,
+    max_seconds: float = DEFAULT_MAX_SECONDS,
+    max_creep_m: float = DEFAULT_MAX_CREEP_M,
     # 搜索速度 (m/s)
-    creep_speed_mps: float = _DEFAULT_CREEP_SPEED_MPS,
+    creep_speed_mps: float = DEFAULT_CREEP_SPEED_MPS,
     # 底盘视觉伺服收敛预算 (s)
-    track_max_seconds: float = _DEFAULT_TRACK_MAX_SECONDS,
+    track_max_seconds: float = DEFAULT_TRACK_MAX_SECONDS,
     # 连续 pick 失败容忍 (命中即退出, 防死循环)
-    max_consecutive_pick_failures: int = _DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
-    # 放 bin 后 x 回位 (mm); None = 不回; 默认 -300 = P 姿态 x
-    return_x_mm: Optional[float] = _DEFAULT_RETURN_X_MM,
+    max_consecutive_pick_failures: int = DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
+    # 放 bin 后 x 回位 (mm); None = 不回; 默认 = P 姿态 x
+    return_x_mm: Optional[float] = DEFAULT_RETURN_X_MM,
     # pick_by_vision 总超时 (s)
-    pick_timeout_s: float = _DEFAULT_PICK_TIMEOUT_S,
+    pick_timeout_s: float = DEFAULT_PICK_TIMEOUT_S,
     # 准备位姿 (当前 target4 已内嵌 P 姿态恢复, 此参数保留兼容)
     do_prep: bool = False,
     # 调试
     dry_run: bool = False,
     debug_recognition: bool = False,
-    # ---- 姿态参数 (默认值在顶部常量, 现场可快速改) ----
-    pose_p_y_mm: float = POSE_P_Y_MM,
-    pose_p_x_mm: float = POSE_P_X_MM,
-    pose_p_arm_deg: float = POSE_P_ARM_DEG,
-    pose_p_hand_deg: float = POSE_P_HAND_DEG,
-    pick_y_mm: float = PICK_Y_MM,
-    pick_x_mm: float = PICK_X_MM,
-    transit_y_mm: float = TRANSIT_Y_MM,
-    transit_x_mm: float = TRANSIT_X_MM,
-    put_y_mm: float = PUT_Y_MM,
-    bin_x_blue_mm: float = BIN_X_BLUE_MM,
-    bin_x_yellow_mm: float = BIN_X_YELLOW_MM,
+    # ---- 姿态参数 (默认值来自 target4.py, 单一配置入口) ----
+    pose_p_y_mm: float = TASK4_POSE_P_Y_MM,
+    pose_p_x_mm: float = TASK4_POSE_P_X_MM,
+    pose_p_arm_deg: float = TASK4_POSE_P_ARM_DEG,
+    pose_p_hand_deg: float = TASK4_POSE_P_HAND_DEG,
+    pick_y_mm: float = Y_PICK_MM,
+    pick_x_mm: float = X_PICK_MM,
+    transit_y_mm: float = Y_TRANSIT_MM,
+    transit_x_mm: float = X_TRANSIT_MM,
+    put_y_mm: float = Y_PUT_MM,
+    bin_x_blue_mm: float = BIN_X_MM[COLOR_BLUE],
+    bin_x_yellow_mm: float = BIN_X_MM[COLOR_YELLOW],
 ) -> Dict[str, Any]:
     """任务四主入口: 薄封装 step_target4, 参数全透传.
 
@@ -164,24 +153,24 @@ def _build_parser() -> argparse.ArgumentParser:
         description="task4_harvest: 作物抓取 (薄封装, 参数全透传)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--max-picks", type=int, default=_DEFAULT_MAX_PICKS,
+    p.add_argument("--max-picks", type=int, default=DEFAULT_MAX_PICKS,
                    help="最多抓取数")
-    p.add_argument("--max-seconds", type=float, default=_DEFAULT_MAX_SECONDS,
+    p.add_argument("--max-seconds", type=float, default=DEFAULT_MAX_SECONDS,
                    help="任务总时长预算 (s)")
-    p.add_argument("--max-creep-m", type=float, default=_DEFAULT_MAX_CREEP_M,
+    p.add_argument("--max-creep-m", type=float, default=DEFAULT_MAX_CREEP_M,
                    help="累计前移距离预算 (m)")
-    p.add_argument("--creep-speed", type=float, default=_DEFAULT_CREEP_SPEED_MPS,
+    p.add_argument("--creep-speed", type=float, default=DEFAULT_CREEP_SPEED_MPS,
                    help="creep 前移速度 (m/s), 第一球用此值, 后续减半")
-    p.add_argument("--track-max-seconds", type=float, default=_DEFAULT_TRACK_MAX_SECONDS,
+    p.add_argument("--track-max-seconds", type=float, default=DEFAULT_TRACK_MAX_SECONDS,
                    help="单球底盘视觉伺服收敛预算 (s)")
     p.add_argument("--max-consecutive-pick-failures", type=int,
-                   default=_DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
+                   default=DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
                    help="连续 pick 失败容忍 (命中即退出)")
-    p.add_argument("--return-x", type=float, default=_DEFAULT_RETURN_X_MM,
-                   help="放 bin 后 x 回位 (mm); -300 = P 姿态 x; None = 不回 (传 --no-return)")
+    p.add_argument("--return-x", type=float, default=DEFAULT_RETURN_X_MM,
+                   help=f"放 bin 后 x 回位 (mm); {DEFAULT_RETURN_X_MM} = P 姿态 x; None = 不回 (传 --no-return)")
     p.add_argument("--no-return", action="store_true",
                    help="放 bin 后 x 不回位")
-    p.add_argument("--pick-timeout", type=float, default=_DEFAULT_PICK_TIMEOUT_S,
+    p.add_argument("--pick-timeout", type=float, default=DEFAULT_PICK_TIMEOUT_S,
                    help="pick_by_vision 总超时 (s)")
     p.add_argument("--do-prep", action="store_true",
                    help="开头跑 target1 准备位姿 (当前 target4 已删, 保留兼容)")
