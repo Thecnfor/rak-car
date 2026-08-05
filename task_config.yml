@@ -221,7 +221,7 @@ waypoints:
   - name: task1_seeding
     task_id: 1
     task_module: main.task.task1_seeding
-    ir_threshold_m: 0.6
+    ir_threshold_m: 0.7
     ir_side: right
     dis_at_least_m: 0.90
     trigger_op: AND

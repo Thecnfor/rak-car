@@ -78,7 +78,7 @@ class Waypoint:
 # 保留 DEFAULT_WAYPOINTS 作为 fallback —— 启动时优先从 yaml 加载.
 DEFAULT_WAYPOINTS: List[Waypoint] = [
     Waypoint("task1_seeding",     task_id=1,
-             ir_threshold_m=0.60, ir_side="right",
+             ir_threshold_m=0.70, ir_side="right",
              dis_at_least_m=0.90, trigger_op="AND"),
     Waypoint("task3_pest_scout", task_id=3,
              ir_threshold_m=2.00, ir_side="left",
