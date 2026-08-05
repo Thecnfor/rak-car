@@ -86,7 +86,7 @@ class SafetyMixin:
     # ---- 大臂 / 手爪硬限(业务层 2026-07-27 v3) ----
 
     _ARM_ANGLE_MIN = -150.0
-    _ARM_ANGLE_MAX = 90.0
+    _ARM_ANGLE_MAX = 150.0
     _HAND_ANGLE_MIN = -90.0
     _HAND_ANGLE_MAX = 10.0
     _ARM_SAFE_BAND_MIN = -30.0
@@ -101,7 +101,7 @@ class SafetyMixin:
             raise ValueError(
                 f"{action} arm_angle({a}) 超出业务硬限 [{self._ARM_ANGLE_MIN}, "
                 f"{self._ARM_ANGLE_MAX}]°。\n"
-                f"  规则: 大臂角度 ∈ [+90, -150]° (+90 是复位位, -150 是结构极限)"
+                f"  规则: 大臂角度 ∈ [+150, -150]° (对称硬限, 2026-08-05 用户放宽 +90→+150)"
             )
 
     def _validate_hand_angle_client(self, angle, action):

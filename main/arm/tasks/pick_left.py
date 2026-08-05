@@ -16,7 +16,7 @@ from ..api import ArmClient
 from ..loops.runner import ArmRunner
 
 
-# 业务硬限 [+90, -150]°：+90 是复位位，-150 是结构极限（2026-07-27 重定义）
+# 业务硬限 [+150, -150]°（2026-08-05 放宽）：+90 是复位位，-150 是结构极限
 _ARM_ANGLE_FOR_LEFT_PICK = -90.0   # ≈ 旧 LEFT=+93° 的反向
 
 

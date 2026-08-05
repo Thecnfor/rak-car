@@ -10,7 +10,7 @@ from __future__ import annotations
 
 # ---------- Bin 坐标 ----------
 BLUE_BIN_X_MM: float = 0.0
-YELLOW_BIN_X_MM: float = -65.0
+YELLOW_BIN_X_MM: float = -45.0
 
 # ---------- Y 位置 ----------
 SAFE_Y_TRANSIT_MM: float = -190.0
