@@ -6,12 +6,12 @@ task4 P 姿态下的吸嘴-相机偏移标定。
 
 背景:
   10_nozzle_align.py 在基准位 arm=-90°, x=0, y=-100 标定 nozzle_offset,
-  但 task4 在 P 姿态 arm=+90°, x=-300, y=-140 抓球 — 大臂转了 180°,
+  但 task4 在 P 姿态 arm=+90°, x=-300, y=-120 抓球 — 大臂转了 180°,
   相机视角镜像, 吸嘴在画面里的位置也翻了。沿用 10 的标定 → task4
   find_target_arm_cross 把球拉到"画面中心"而不是"吸嘴正下方", 抓球偏。
 
-基准位 (用户约定 2026-08-04):
-  x=-300, y=-140, 大臂=+90°, 手抓=0°  ← P 姿态 (Pose-P)
+基准位 (用户约定 2026-08-05):
+  x=-300, y=-120, 大臂=+90°, 手抓=+10°  ← P 姿态 (Pose-P)
 
 用法:
   export RAK_CAR_API_BASE=http://192.168.5.230:5050
@@ -36,7 +36,7 @@ from main.arm.vision import ArmVisionClient, TargetSelector
 
 # P 姿态 (Pose-P, task4 单一真相源, 与 main/arm/each_task/common.py 同步)
 REF_X_MM = -300.0
-REF_Y_MM = -140.0
+REF_Y_MM = -120.0
 REF_ARM = 90.0
 REF_HAND = 10.0
 
