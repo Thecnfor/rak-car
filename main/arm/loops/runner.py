@@ -104,15 +104,19 @@ class ArmRunner:
         )
         return job
 
-    def move_x(self, x_mm: float, timeout: Optional[float] = None,
-               verify: bool = True) -> dict:
+    def move_x(self, x_mm: float, v_max_mms: Optional[float] = None,
+               timeout: Optional[float] = None, verify: bool = True) -> dict:
         """移动 x 轴（撞墙=0，远离为正）。
 
+        v_max_mms (2026-08-04): 可选速度上限 mm/s, None 时走 client.move_x 默认 40.
         verify=True 时：move 后对比 actual vs target，
         偏差 > origin.step_loss_x_mm 时 warn（不重发，因为 x 是 motor_280 闭环，
         跑偏通常是机械卡阻，重发没意义）。
         """
-        job = self.client.move_x(x_mm=x_mm, timeout=timeout or self.default_timeout_s)
+        move_kw = dict(x_mm=x_mm, timeout=timeout or self.default_timeout_s)
+        if v_max_mms is not None:
+            move_kw["v_max_mms"] = float(v_max_mms)
+        job = self.client.move_x(**move_kw)
         if verify:
             self._verify_x(x_mm=x_mm)
         return job
@@ -481,6 +485,7 @@ class ArmRunner:
                             x_start: float = 0.0, y_start: float = -180.0,
                             arm_start: float = -90.0, hand_start: float = 0.0,
                             grasp_y_mm: float = 0.0,
+                            descend_hand_deg: Optional[float] = None,
                             mode: str = "pick",
                             timeout: float = 30.0, hz: float = 20.0,
                             gain_arm: float = 0.4, gain_x: float = 0.08,
@@ -488,6 +493,8 @@ class ArmRunner:
                             sign_arm: float = 1.0, sign_x: float = -1.0,
                             arm_min: Optional[float] = None,
                             arm_max: Optional[float] = None,
+                            setpoint_x_norm: Optional[float] = None,
+                            setpoint_y_norm: Optional[float] = None,
                             lock_first: bool = True,
                             settle_hits: int = 3,
                             hold_s: float = 0.5,
@@ -523,7 +530,7 @@ class ArmRunner:
              "settled": bool, "lower": bool, "suck": bool, "lift": bool|None,
              "end_arm": float|None, "end_hand": float|None}
         """
-        sp = self._resolve_nozzle_setpoint(None, None, label=label)
+        sp = self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm, label=label)
         sx, sy = (sp if sp else (0.0, 0.0))
         # 多目标场景: lock_first 默认选离画面中心 (吸嘴) 最近的目标并锁定 track_id,
         # 避免选到远处 marker (2026-08-02 实机多 marker 验证)
@@ -621,6 +628,16 @@ class ArmRunner:
         # 然后 wait_job 各自等。三次串行 sync HTTP (>=0.5s×3 = 1.5s) -> 并发只需等
         # 最长的那一个 (~max(move_y 物理 ~0.3s, grasp <0.1s) + poll ~0.1s)。
         try:
+            # 2026-08-04: 视觉对齐后, 先转手爪到 descend_hand_deg, 再下降 y.
+            # 顺序原因: 下降时吸嘴必须已经朝下 (0°), 否则 -10° 的倾斜吸嘴触到
+            # 方块顶面会推开它 (侧向力). 转手爪是同步等物理到位 (~0.3-0.5s).
+            # 设为 None 时跳过, 维持 hand_start (旧行为).
+            if descend_hand_deg is not None:
+                logger.info("track_velocity_pick: 手爪转 %.0f° (descend_hand, 在 move_y 之前)",
+                            descend_hand_deg)
+                self.client.set_hand_angle(
+                    float(descend_hand_deg), speed=80, timeout=5.0)
+
             # 1) 提交 move_y(0) (同步落地)
             target_m = float(grasp_y_mm) / 1000.0
             logger.info("track_velocity_pick: 开始 grasp 段, mode=%s move_y(%.0fmm=%.4fm)",

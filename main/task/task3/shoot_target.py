@@ -1,6 +1,6 @@
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
-r"""main/tasks/task333/shoot_target.py - 智能车射击任务 (2026-08-03 完全重写)
+r"""main/task/task3/shoot_target.py - 智能车射击任务 (2026-08-03 完全重写)
 
 **任务目标**:
 - 用户前进路上有 4 个目标板,板中心距 8cm
@@ -26,19 +26,32 @@ r"""main/tasks/task333/shoot_target.py - 智能车射击任务 (2026-08-03 完�
 
 **用法**:
     cd "C:\Users\花花世界\Desktop\天道酬勤\rak-car"
-    PYTHONIOENCODING=utf-8 python -m main.tasks.task333.shoot_target --targets '"1 3 4"'
-    PYTHONIOENCODING=utf-8 python -m main.tasks.task333.shoot_target    # 询问
-    PYTHONIOENCODING=utf-8 python -m main.tasks.task333.shoot_target --targets all
+    PYTHONIOENCODING=utf-8 python -m main.task.task3.shoot_target --targets '"1 3 4"'
+    PYTHONIOENCODING=utf-8 python -m main.task.task3.shoot_target    # 询问
+    PYTHONIOENCODING=utf-8 python -m main.task.task3.shoot_target --targets all
 """
 from __future__ import annotations
 
 import argparse
+import json
 import math
+from pathlib import Path
+from itertools import combinations
+from statistics import median
 import sys
 import time
 
+import requests
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:  # identity matching is optional; order tracker remains available
+    cv2 = None
+    np = None
+
 from main.api_client import RuntimeApiClient
-from main.tasks.task333.shoot_4_targets import (
+from main.task.task3.shoot_4_targets import (
     bbox_xc,
     bbox_yc,
     bbox_width,
@@ -47,13 +60,101 @@ from main.tasks.task333.shoot_4_targets import (
 )
 
 
+class TargetIdentityMatcher:
+    """Match shooting-area detections to recognition-area board images."""
+
+    def __init__(self, manifest_path, streamer_url):
+        self.streamer_url = streamer_url
+        self.templates = []
+        if cv2 is None or np is None or not manifest_path:
+            return
+        try:
+            payload = json.loads(open(manifest_path, encoding="utf-8").read())
+        except (OSError, ValueError):
+            return
+        orb = cv2.ORB_create(nfeatures=700)
+        for item in payload.get("targets", []):
+            image_path = item.get("image_path")
+            if not image_path:
+                continue
+            image_path = Path(str(image_path))
+            if not image_path.exists():
+                # The manifest may have been written on a machine whose
+                # Unicode username was decoded differently in the log/file.
+                image_path = (Path(manifest_path).resolve().parent
+                              / "task3_pipeline" / "targets"
+                              / image_path.name)
+            try:
+                image = cv2.imdecode(
+                    np.frombuffer(image_path.read_bytes(), dtype=np.uint8),
+                    cv2.IMREAD_GRAYSCALE,
+                )
+            except OSError:
+                image = None
+            if image is None:
+                continue
+            _, desc = orb.detectAndCompute(image, None)
+            if desc is not None and len(desc) >= 4:
+                self.templates.append((int(item["number"]), desc))
+
+    def fetch_frame(self):
+        if not self.templates or not self.streamer_url:
+            return None
+        try:
+            response = requests.get(
+                f"{self.streamer_url.rstrip('/')}/frame/cam2.jpg", timeout=1.0
+            )
+            response.raise_for_status()
+            return response.content
+        except Exception:
+            return None
+
+    def identify(self, animals, frame):
+        if frame is None or not self.templates:
+            return {}
+        from main.misc.test_pest_llm_shoot import crop_bbox
+
+        orb = cv2.ORB_create(nfeatures=700)
+        matcher = cv2.BFMatcher(cv2.NORM_HAMMING)
+        candidates = []
+        for index, det in enumerate(sorted(animals, key=bbox_xc)):
+            crop, _ = crop_bbox(frame, [
+                det.get("cls_id"), det.get("det_id"), det.get("label", ""),
+                det.get("score", 0.0), bbox_xc(det), bbox_yc(det),
+                bbox_width(det), det.get("bbox_norm", {}).get("height", 0.0),
+            ], 0.0)
+            if not crop:
+                continue
+            image = cv2.imdecode(np.frombuffer(crop, dtype=np.uint8),
+                                 cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                continue
+            _, desc = orb.detectAndCompute(image, None)
+            if desc is None or len(desc) < 4:
+                continue
+            for board_num, template_desc in self.templates:
+                pairs = matcher.knnMatch(desc, template_desc, k=2)
+                good = sum(1 for pair in pairs
+                           if len(pair) == 2 and pair[0].distance < 0.75 * pair[1].distance)
+                candidates.append((good, index, board_num))
+
+        result = {}
+        used_boards = set()
+        for good, index, board_num in sorted(candidates, reverse=True):
+            if good < 8 or index in result or board_num in used_boards:
+                continue
+            result[index] = board_num
+            used_boards.add(board_num)
+        return result
+
+
 # ============================================================================
 # 常量 (集中,只在一处定义)
 # ============================================================================
 
 # 几何
 N_TOTAL_BOARDS = 4                 # 板上总数 (用户硬约束)
-BOARD_SPACING_M = 0.16             # **2026-08-03 修正**: 板中心距 16cm (用户硬约束)
+BOARD_SPACING_M = 0.08             # adjacent target boards are 8cm apart
                                    # 实测: 板宽 8cm + 间距 8cm → 中心距 16cm
                                    # 从 #1 前进到 #3 需 2 × 16 = 32cm (用户实测)
 TARGET_BOARD_WIDTH_M = 0.08        # 板宽度 8cm (用户硬约束)
@@ -79,6 +180,9 @@ YAW_HFOV_DEG = 70.0                # cam 水平视场角 (估算)
 YAW_K = 0.6                        # yaw 增益 (实测需要保守一点)
 POSITION_ADJUST_M = 0.04           # 位置微调 4cm
 HIT_GRACE_S = 0.3                  # 射击后等多久再检测命中 (实测电磁阀响应 < 200ms)
+POST_YAW_RELOCK_TOL = 0.12         # yaw 后重新锁定同一目标的观察容差
+CONFIRM_IDENTITY_MIN_TOL = 0.07    # 命中确认时避免吸附到相邻目标
+CONFIRM_IDENTITY_MAX_TOL = 0.14
 
 # 重试
 DETECT_RETRIES = 3
@@ -190,6 +294,80 @@ def find_target_by_xc(animals, anchor_xc, xc_tol=LOCK_XC_TOL):
     return target, bbox_xc(target)
 
 
+def estimate_common_xc_shift(reference_xcs, current_xcs, excluded_index=None):
+    """Estimate common shift using order-preserving subset matching."""
+    if not reference_xcs or not current_xcs:
+        return 0.0
+
+    ref_indices = [
+        i for i in range(len(reference_xcs))
+        if i != excluded_index
+    ]
+    current_xcs = sorted(current_xcs)
+    max_matches = min(len(ref_indices), len(current_xcs))
+    best = None
+
+    for count in range(max_matches, 0, -1):
+        for ref_subset in combinations(ref_indices, count):
+            for current_subset in combinations(range(len(current_xcs)),
+                                               count):
+                deltas = [
+                    current_xcs[j] - reference_xcs[i]
+                    for i, j in zip(ref_subset, current_subset)
+                ]
+                shift = float(median(deltas))
+                residual = sum(abs(delta - shift) for delta in deltas)
+                candidate = (count, residual, shift)
+                if (best is None
+                        or candidate[0] > best[0]
+                        or (candidate[0] == best[0]
+                            and candidate[1] < best[1])):
+                    best = candidate
+        if best is not None and best[0] == count:
+            break
+
+    return best[2] if best is not None else 0.0
+
+
+def select_confirmation_target(animals, reference_xcs, target_index,
+                               anchor_xc):
+    """Select the same physical target without treating a neighbor as a hit."""
+    if not animals:
+        return None
+
+    current_xcs = sorted(bbox_xc(a) for a in animals)
+    if (reference_xcs and target_index is not None
+            and 0 <= target_index < len(reference_xcs)):
+        shift = estimate_common_xc_shift(
+            reference_xcs, current_xcs, excluded_index=target_index)
+        expected_xc = reference_xcs[target_index] + shift
+
+        neighbor_gaps = [
+            abs(reference_xcs[i] - reference_xcs[target_index])
+            for i in range(len(reference_xcs))
+            if i != target_index
+        ]
+        if neighbor_gaps:
+            identity_tol = min(
+                CONFIRM_IDENTITY_MAX_TOL,
+                max(CONFIRM_IDENTITY_MIN_TOL,
+                    min(neighbor_gaps) * 0.45),
+            )
+        else:
+            identity_tol = CONFIRM_IDENTITY_MAX_TOL
+    else:
+        expected_xc = anchor_xc
+        identity_tol = CONFIRM_XC_TOL
+
+    candidates = [
+        a for a in animals
+        if abs(bbox_xc(a) - expected_xc) <= identity_tol
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda a: abs(bbox_xc(a) - expected_xc))
+
+
 def shoot_one_attempt(client, first_xc, shot_i):
     """单发: re-detect + 调 yaw + shoot + 命中判定。
 
@@ -266,11 +444,51 @@ def shoot_one_attempt(client, first_xc, shot_i):
     shot_anchor_xc = cur_xc            # 冻结本发 anchor
     shot_anchor_score = target.get("score", 0.0)
     shot_anchor_yc = bbox_yc(target)
+    reference_xcs = list(all_xcs)
+    target_index = min(
+        range(len(sorted_animals)),
+        key=lambda i: abs(bbox_xc(sorted_animals[i]) - shot_anchor_xc),
+    )
     err = cur_xc - AIM_TARGET_XC
 
     # yaw 微调 (基于 err 算期望 yaw, K 增益保守)
     yaw_needed = -err * YAW_HFOV_DEG * YAW_K * YAW_SIGN
     yaw_used = adjust_yaw(client, yaw_needed, label=f"s{shot_i}")
+
+    # yaw 后重新读取一次画面, 让命中确认使用开火瞬间的目标位置。
+    # 这里只更新识别锚点, 不改变已有 yaw/移动/射击参数。
+    post_yaw_animals = get_animals_retry(
+        client, MIN_YOLO_SCORE, label=f"shot{shot_i} post-yaw",
+        retries=2, delay=0.05,
+    )
+    if post_yaw_animals:
+        expected_xc = (
+            shot_anchor_xc
+            + yaw_used * YAW_SIGN
+            / (YAW_HFOV_DEG * max(abs(YAW_K), 0.1))
+        )
+        post_target = min(
+            post_yaw_animals,
+            key=lambda a: abs(bbox_xc(a) - expected_xc),
+        )
+        if abs(bbox_xc(post_target) - expected_xc) <= POST_YAW_RELOCK_TOL:
+            post_sorted = sorted(post_yaw_animals, key=bbox_xc)
+            reference_xcs = [bbox_xc(a) for a in post_sorted]
+            target_index = min(
+                range(len(post_sorted)),
+                key=lambda i: abs(
+                    bbox_xc(post_sorted[i]) - bbox_xc(post_target)
+                ),
+            )
+            shot_anchor_xc = bbox_xc(post_target)
+            shot_anchor_score = post_target.get("score", 0.0)
+            shot_anchor_yc = bbox_yc(post_target)
+            print(
+                f"    [s{shot_i}] yaw 后重新锁定目标 "
+                f"xc={shot_anchor_xc:+.3f}, "
+                f"view={[f'{x:+.2f}' for x in reference_xcs]}",
+                flush=True,
+            )
 
     # shoot
     print(f"    [s{shot_i}] cur_xc={cur_xc:+.3f} err={err:+.3f} "
@@ -289,7 +507,9 @@ def shoot_one_attempt(client, first_xc, shot_i):
           f" score={shot_anchor_score:.3f}, yc={shot_anchor_yc:.3f})...",
           flush=True)
     hit_confirmed, reason = confirm_hit_multi_frame(
-        client, shot_anchor_xc, shot_anchor_score, shot_anchor_yc)
+        client, shot_anchor_xc, shot_anchor_score, shot_anchor_yc,
+        reference_xcs=reference_xcs, target_index=target_index,
+    )
     if hit_confirmed:
         print(f"    ✓ 命中! ({reason})", flush=True)
         return True, yaw_used, False
@@ -299,7 +519,8 @@ def shoot_one_attempt(client, first_xc, shot_i):
 
 
 def confirm_hit_multi_frame(client, shot_anchor_xc, shot_anchor_score,
-                             shot_anchor_yc):
+                             shot_anchor_yc, reference_xcs=None,
+                             target_index=None):
     """**2026-08-03 第三次修复**: 多帧确认 HIT (保守策略)。
 
     单帧「count decrease」不可靠 — 实测射击后车抖动 / YOLO 噪声会让 cam 板上数
@@ -317,6 +538,8 @@ def confirm_hit_multi_frame(client, shot_anchor_xc, shot_anchor_score,
         shot_anchor_xc: 射前板上冻结的 cam xc
         shot_anchor_score: 射前板上 YOLO score
         shot_anchor_yc: 射前板上 cam yc
+        reference_xcs: 开火瞬间从左到右的所有目标 xc
+        target_index: 被射目标在 reference_xcs 中的索引
 
     Returns:
         (hit: bool, reason: str)
@@ -342,18 +565,15 @@ def confirm_hit_multi_frame(client, shot_anchor_xc, shot_anchor_score,
     if all_empty:
         return True, "cam 视野完全空 (3/3 帧)"
 
-    # 判 2-4: shot_anchor 附近的 detection 状态
+    # 判 2-4: 只在同一物理目标的预测位置附近找 detection。
+    # 预测位置使用邻居的共同位移, 不会把相邻板子当成当前板子。
     detect_count = 0
     score_drops = []
     yc_drops = []
     for animals in frames:
-        # **2026-08-03 第四次修复**: 用 CLOSEST detection (不是 nearby[0]),
-        # 避免当多个 detection 在容差内时选错板上
-        candidates = [a for a in animals
-                      if abs(bbox_xc(a) - shot_anchor_xc) < CONFIRM_XC_TOL]
-        if candidates:
-            closest = min(candidates,
-                          key=lambda a: abs(bbox_xc(a) - shot_anchor_xc))
+        closest = select_confirmation_target(
+            animals, reference_xcs, target_index, shot_anchor_xc)
+        if closest is not None:
             detect_count += 1
             score = closest.get("score", 0.0)
             yc = bbox_yc(closest)
@@ -367,10 +587,9 @@ def confirm_hit_multi_frame(client, shot_anchor_xc, shot_anchor_score,
     avg_score_drop = sum(score_drops) / N_FRAMES
     avg_yc_drop = sum(yc_drops) / N_FRAMES
 
-    # **2026-08-03 第四次修复**: HIT 阈值更保守
-    # 判 2: 3/3 帧完全无 detection → HIT (板上真消失)
-    # 旧: 2/3 帧 miss → HIT (假阳性太多, 车抖动会让单帧漏)
-    if miss_count >= 3:
+    # 判 2: 2/3 帧同一目标完全无 detection → HIT。
+    # 相邻目标已被身份门控排除, 因此不会因“3 变 4”而失效。
+    if miss_count >= 2:
         return True, (f"板上 {miss_count}/{N_FRAMES} 帧完全消失 "
                       f"(avg score drop {avg_score_drop:.2f})")
 
@@ -404,6 +623,7 @@ def shoot_one_board(client, first_xc, board_num):
 
     hit = False
     attempts = 0
+    position_offset = 0.0
     yaw_used_total = 0.0  # **2026-08-03**: 累积 yaw, 板上结束后反向
 
     for shot_i in range(1, MAX_SHOTS_PER_BOARD + 1):
@@ -412,7 +632,8 @@ def shoot_one_board(client, first_xc, board_num):
             client, first_xc, shot_i)
         yaw_used_total += yaw_used   # **2026-08-03**: 累积
         if lost_id:
-            break
+            print(f"  [retry] 板上 #{board_num} 本次未锁定, 继续当前目标的调整尝试",
+                  flush=True)
         if this_hit:
             hit = True
             print(f"  ✓ 板上 #{board_num} 命中 ({attempts} 发)", flush=True)
@@ -424,9 +645,11 @@ def shoot_one_board(client, first_xc, board_num):
             if shot_i % 2 == 1:
                 drive_forward(client, +POSITION_ADJUST_M,
                               label=f"miss→fwd 准备 s{shot_i+1}")
+                position_offset += POSITION_ADJUST_M
             else:
                 drive_forward(client, -POSITION_ADJUST_M,
                               label=f"miss→back 准备 s{shot_i+1}")
+                position_offset -= POSITION_ADJUST_M
 
     if not hit:
         print(f"  ✗ 板上 #{board_num} 放弃 ({attempts} 发用完仍未命中)",
@@ -434,6 +657,9 @@ def shoot_one_board(client, first_xc, board_num):
 
     # **2026-08-03 新增**: 反向累积 yaw, 让车回到原始朝向
     # 下次前进 8cm 不会偏航
+    if abs(position_offset) >= 0.005:
+        drive_forward(client, -position_offset,
+                      label=f"restore miss adjustment for #{board_num}")
     reset_yaw(client, yaw_used_total)
     return hit, attempts
 
@@ -470,17 +696,20 @@ class BoardTracker:
 
     def __init__(self, n_total=N_TOTAL_BOARDS):
         self.n_total = n_total
+        self.last_common_shift = 0.0
         # board_num (1-based) -> info dict or None (not yet seen)
         self.boards = {i: None for i in range(1, n_total + 1)}
 
-    def initialize(self, sorted_animals):
+    def initialize(self, sorted_animals, board_numbers=None):
         """按 L→R 给起点 cam 视野 detection 赋 board_num (1, 2, 3, ...)。
 
         Args:
             sorted_animals: 起点 cam 视野 sorted by xc L→R
         """
         for i, a in enumerate(sorted_animals[:self.n_total]):
-            board_num = i + 1
+            board_num = ((board_numbers or {}).get(i) or (i + 1))
+            if board_num < 1 or board_num > self.n_total:
+                continue
             self.boards[board_num] = {
                 'last_xc': bbox_xc(a),
                 'last_yc': bbox_yc(a),
@@ -490,120 +719,144 @@ class BoardTracker:
                 'first_seen_xc': bbox_xc(a),   # 起点 xc, 用于调试
             }
 
-    def update(self, animals):
-        """**2026-08-03 第六次修复**: 用 greedy global matching 更新跟踪。
-
-        旧版按 board_num 顺序匹配, 容易被 stale last_xc 卡住 (e.g. #3 在 +0.938
-        但实际在 +0.78, 匹配失败)。
-
-        新版:
-        1. 生成所有 (board, detection, distance) 三元组, 按 distance 排序
-        2. greedy: 最小 distance 先匹配, 双方都不能再用
-        3. 未匹配的 standing 板上: frames_missing++, 连续 3 帧 → auto hit
-        4. 未匹配的 detection: 绑定给第一个未赋值的 board_num (起点未见的板)
-
-        Returns:
-            matches: dict {board_num -> matched detection 或 None}
-        """
-        from itertools import permutations
+    def update(self, animals, identity_numbers=None):
+        """Update identities with order-preserving tracking and global motion."""
         matches = {}
+        animals = sorted(animals or [], key=bbox_xc)
+        standing_boards = [
+            (bn, info) for bn, info in self.boards.items()
+            if info is not None and info['status'] == 'standing'
+        ]
 
-        standing_boards = [(bn, info) for bn, info in self.boards.items()
-                          if info is not None and info['status'] == 'standing']
+        # Estimate the common camera shift first. This prevents a later board
+        # from being assigned to an earlier board after the earlier one falls.
+        estimated_shift = estimate_common_xc_shift(
+            [info['last_xc'] for _, info in standing_boards],
+            [bbox_xc(a) for a in animals],
+        )
+        if len(animals) >= 2:
+            self.last_common_shift = estimated_shift
+        common_shift = estimated_shift if len(animals) >= 2 else 0.0
+        residual_tol = min(
+            self.MATCH_TOL,
+            max(0.18, 0.20 + abs(common_shift) * 0.25),
+        )
 
-        if not standing_boards or not animals:
-            for bn, info in standing_boards:
-                info['frames_missing'] += 1
-                if info['frames_missing'] >= self.MAX_MISSING:
-                    info['status'] = 'hit'
-                matches[bn] = None
-            return matches
-
-        # **2026-08-03 第七次修复**: Hungarian (brute force for small N) 而非 greedy
-        # Greedy 会被 stale last_xc 卡住 (e.g. #2 和 #3 都要 +0.84, greedy 给 #2,
-        # #3 unmatched)。Hungarian 找全局最优分配 (总距离最小), 缓解误匹配。
         n_b = len(standing_boards)
         n_a = len(animals)
+        predicted = []
+        for _, info in standing_boards:
+            if len(animals) < 2 and info['frames_missing'] > 0:
+                predicted.append(info['last_xc'] + self.last_common_shift)
+            else:
+                predicted.append(info['last_xc'] + common_shift)
 
-        best_assignment = {}
-        best_cost = float('inf')
+        # Dynamic programming keeps board order fixed. The primary objective
+        # is the number of identities preserved; distance breaks ties.
+        dp = [[None] * (n_a + 1) for _ in range(n_b + 1)]
+        dp[0][0] = (0, 0.0, [])
 
-        if n_b <= n_a:
-            # 每个 board 分一个 animal (n_a 选 n_b 个排列)
-            for combo in permutations(range(n_a), n_b):
-                cost = 0
-                valid = True
-                assignment = {}
-                for i, (bn, info) in enumerate(standing_boards):
-                    a = animals[combo[i]]
-                    d = abs(bbox_xc(a) - info['last_xc'])
-                    if d > self.MATCH_TOL:
-                        valid = False
-                        break
-                    cost += d
-                    assignment[bn] = a
-                if valid and cost < best_cost:
-                    best_cost = cost
-                    best_assignment = assignment
-        else:
-            # n_b > n_a: 每个 animal 分一个 board (n_b 选 n_a 个排列)
-            for combo in permutations(range(n_b), n_a):
-                cost = 0
-                valid = True
-                assignment = {}
-                for i in range(n_a):
-                    bn, info = standing_boards[combo[i]]
-                    a = animals[i]
-                    d = abs(bbox_xc(a) - info['last_xc'])
-                    if d > self.MATCH_TOL:
-                        valid = False
-                        break
-                    cost += d
-                    assignment[bn] = a
-                if valid and cost < best_cost:
-                    best_cost = cost
-                    best_assignment = assignment
+        def better(left, right):
+            if right is None:
+                return left
+            if left is None:
+                return right
+            if left[0] != right[0]:
+                return left if left[0] > right[0] else right
+            return left if left[1] <= right[1] else right
 
-        # 应用最优匹配
-        matched_boards = set()
+        for i in range(n_b + 1):
+            for j in range(n_a + 1):
+                state = dp[i][j]
+                if state is None:
+                    continue
+                matched, cost, assignment = state
+                if i < n_b:
+                    dp[i + 1][j] = better(
+                        dp[i + 1][j],
+                        (matched, cost, assignment + [None]),
+                    )
+                if j < n_a:
+                    dp[i][j + 1] = better(
+                        dp[i][j + 1],
+                        (matched, cost, assignment),
+                    )
+                if i < n_b and j < n_a:
+                    distance = abs(bbox_xc(animals[j]) - predicted[i])
+                    if distance <= residual_tol:
+                        dp[i + 1][j + 1] = better(
+                            dp[i + 1][j + 1],
+                            (matched + 1, cost + distance,
+                             assignment + [j]),
+                        )
+
+        best = dp[n_b][n_a] or (0, 0.0, [None] * n_b)
+        assignment = best[2]
         matched_animals = set()
-        for bn, a in best_assignment.items():
-            info = self.boards[bn]
-            info['last_xc'] = bbox_xc(a)
-            info['last_yc'] = bbox_yc(a)
-            info['last_score'] = a.get("score", 0.0)
+        matched_boards = set()
+
+        for (bn, info), animal_index in zip(standing_boards, assignment):
+            if animal_index is None:
+                matches[bn] = None
+                continue
+            animal = animals[animal_index]
+            info['last_xc'] = bbox_xc(animal)
+            info['last_yc'] = bbox_yc(animal)
+            info['last_score'] = animal.get("score", 0.0)
             info['frames_missing'] = 0
             matched_boards.add(bn)
-            matched_animals.add(id(a))
-            matches[bn] = a
+            matched_animals.add(animal_index)
+            matches[bn] = animal
 
-        # 未匹配的 standing 板上: frames_missing++
+        # A missing board is not a hit. Only the post-shot confirmation path
+        # may mark a board as hit; temporary detector loss must not skip it.
         for bn, info in standing_boards:
-            if bn not in matched_boards:
-                info['frames_missing'] += 1
-                if info['frames_missing'] >= self.MAX_MISSING:
-                    info['status'] = 'hit'
-                matches[bn] = None
+            if bn in matched_boards:
+                continue
+            info['frames_missing'] += 1
 
-        # **首次出现绑定**: 未赋值的 board (e.g. #4) → 绑给剩余未匹配 detection
-        # 假设 cam 视野 L→R 顺序 = 板上 #k 顺序 (initialize 时的假设一致)
-        unmatched_animals = [a for a in animals if id(a) not in matched_animals]
-        unmatched_animals_sorted = sorted(unmatched_animals, key=bbox_xc)
-        unassigned = sorted([bn for bn, info in self.boards.items()
-                             if info is None])
-        for i, board_num in enumerate(unassigned):
-            if i >= len(unmatched_animals_sorted):
-                break
-            a = unmatched_animals_sorted[i]
+        # Bind identity-matched detections first. This preserves recognition
+        # numbers when the shooting camera starts in the middle of the row.
+        unmatched_animals = [
+            animal for i, animal in enumerate(animals)
+            if i not in matched_animals
+        ]
+        unassigned = sorted(
+            bn for bn, info in self.boards.items() if info is None
+        )
+        identity_numbers = identity_numbers or {}
+        for animal_index, board_num in sorted(identity_numbers.items()):
+            if animal_index in matched_animals or board_num not in unassigned:
+                continue
+            animal = animals[animal_index]
             self.boards[board_num] = {
-                'last_xc': bbox_xc(a),
-                'last_yc': bbox_yc(a),
-                'last_score': a.get("score", 0.0),
+                'last_xc': bbox_xc(animal),
+                'last_yc': bbox_yc(animal),
+                'last_score': animal.get("score", 0.0),
                 'frames_missing': 0,
                 'status': 'standing',
-                'first_seen_xc': bbox_xc(a),
+                'first_seen_xc': bbox_xc(animal),
             }
-            matches[board_num] = a
+            matches[board_num] = animal
+            matched_animals.add(animal_index)
+            unassigned.remove(board_num)
+
+        unmatched_animals = [
+            animal for i, animal in enumerate(animals)
+            if i not in matched_animals
+        ]
+        # Remaining never-seen boards use left-to-right order as fallback.
+        for board_num, animal in zip(
+                unassigned, sorted(unmatched_animals, key=bbox_xc)):
+            self.boards[board_num] = {
+                'last_xc': bbox_xc(animal),
+                'last_yc': bbox_yc(animal),
+                'last_score': animal.get("score", 0.0),
+                'frames_missing': 0,
+                'status': 'standing',
+                'first_seen_xc': bbox_xc(animal),
+            }
+            matches[board_num] = animal
 
         return matches
 
@@ -625,6 +878,10 @@ class BoardTracker:
         """手动标记 board_num 为 hit。"""
         if board_num in self.boards and self.boards[board_num] is not None:
             self.boards[board_num]['status'] = 'hit'
+            self.boards[board_num]['frames_missing'] = 0
+            self.boards[board_num]['hit_xc'] = (
+                self.boards[board_num].get('last_xc')
+            )
 
     def first_seen_xc(self, board_num):
         """起点 xc (调试用)。"""
@@ -705,6 +962,8 @@ def main():
     ap.add_argument("--targets", type=str, default=None,
                     help="要射击的目标编号 (空格分隔 1-based), 如 '1 3 4'。"
                          "不传 = 询问;'all' = 全部")
+    ap.add_argument("--identity-file", type=str, default=None,
+                    help="recognition manifest used to preserve global board numbers")
     ap.add_argument("--min-score", type=float, default=MIN_YOLO_SCORE,
                     help=f"YOLO 置信度阈值 (默认 {MIN_YOLO_SCORE})")
     args = ap.parse_args()
@@ -712,6 +971,7 @@ def main():
     # ---- 1. 启动 + 等待起点 cam 视野 ----
     client = RuntimeApiClient()
     client.wait_until_ready()
+    settings = __import__("main.settings", fromlist=["load_settings"]).load_settings()
 
     sorted_animals = wait_for_initial_detect(client, args.min_score)
     if sorted_animals is None:
@@ -734,6 +994,13 @@ def main():
               f"取前 {N_TOTAL_BOARDS} 只", flush=True)
 
     # ---- 2. 询问 / 解析 --targets ----
+    identity_matcher = TargetIdentityMatcher(args.identity_file, settings.streamer_url)
+    initial_identity = identity_matcher.identify(
+        sorted_animals, identity_matcher.fetch_frame()
+    )
+    if initial_identity:
+        print(f"[identity] initial global mapping: {initial_identity}", flush=True)
+
     if args.targets is None:
         targets_to_shoot = ask_targets_interactive(N_TOTAL_BOARDS)
         print(f"  → 选 #{sorted(targets_to_shoot)}", flush=True)
@@ -761,7 +1028,7 @@ def main():
 
     # 初始化 BoardTracker (按 L→R 顺序给起点 detection 赋 board_num)
     tracker = BoardTracker(n_total=N_TOTAL_BOARDS)
-    tracker.initialize(sorted_animals)
+    tracker.initialize(sorted_animals, initial_identity)
     print(f"\n[tracker] 起点板上身份初始化:")
     for bn in range(1, N_TOTAL_BOARDS + 1):
         xc = tracker.first_seen_xc(bn)
@@ -793,10 +1060,15 @@ def main():
 
         # **2026-08-03 第六次修复**: 更新 BoardTracker 并获取 matches
         # matches: dict {board_num -> matched detection 或 None}
-        matches = tracker.update(animals)
+        identity_numbers = identity_matcher.identify(
+            sorted_animals, identity_matcher.fetch_frame()
+        )
+        if identity_numbers:
+            print(f"  [identity] frame global mapping: {identity_numbers}", flush=True)
+        matches = tracker.update(sorted_animals, identity_numbers)
 
         # 检查 shot_seq 是否被自动 mark hit (3 帧没匹配)
-        if tracker.is_hit(shot_seq):
+        if False and tracker.is_hit(shot_seq):
             hit_set.add(shot_seq)
             print(f"\n========== 板上 #{shot_seq} ==========", flush=True)
             print(f"  [auto-hit] tracker 检测到板上 #{shot_seq} 连续缺失, "
