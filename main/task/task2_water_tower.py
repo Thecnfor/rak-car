@@ -102,22 +102,179 @@ def _parallel_chassis_arm(
     task1_seeding.py:619-631 是同样的模式; SDK 串口 SerialEngine 单 io 线程
     调度 (CLAUDE.md §Runtime concurrency model), 多线程并发安全.
     """
-    # 把 arm_kwargs 从 mm 预转 m (composite_run 接口要 m)
-    # 注: composite_run 内部已经做了转换 (composite.py:64), 这里直接传
-    payload: Optional[Dict[str, Any]] = None
-    if arm_kwargs:
-        payload = dict(arm_kwargs)
-        payload.setdefault("speed", 100)
-        payload.setdefault("timeout", timeout)
+    # 2026-08-06: 底盘移动前也遵循大臂转动的安全区限制 (Y ∈ [-200,-90], X ∈ [-300,-200])
+    # 这保证底盘移动期间 X/Y 已在安全区, 与大臂 3 阶段共享同一约束.
+    # 若同时转大臂, 3 阶段 phase1 已是 no-op (X/Y 已就位).
+    if abs(target_dx_m) > 1e-3:
+        _ensure_xy_in_safe_zone(arm_client, runner, timeout=timeout)
 
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
+        # 底盘 move_for 与 臂 3 阶段序列并发 (修复 2026-08-06 bug:
+        # 之前 early return 让底盘完全没动)
         if abs(target_dx_m) > 1e-3:
             tasks.append(ex.submit(_chassis_move_for, arm_client, target_dx_m, timeout))
-        if payload:
-            tasks.append(ex.submit(runner.client.composite_run, **payload))
+
+        # 2026-08-06: 大臂转动必须分 3 阶段, 转的时候只有大臂和末端可以动
+        # 阶段 1: X/Y 调到安全区 (无 arm 变化, 已有不动, X 在 [-150,-10] 先 X, 否则先 Y)
+        # 阶段 2: arm + hand 转动 (X/Y 冻结)
+        # 阶段 3: X/Y 到目标 (无 arm 变化, Y 先 X 后)
+        if arm_kwargs and arm_kwargs.get("arm") is not None:
+            tasks.append(ex.submit(_safe_arm_rotation_sequence, arm_client,
+                                    runner, arm_kwargs=arm_kwargs, timeout=timeout))
+        else:
+            # 不转大臂时, 直接 composite_run (单步)
+            payload = dict(arm_kwargs) if arm_kwargs else {}
+            payload.setdefault("speed", 100)
+            payload.setdefault("timeout", timeout)
+            if payload:
+                tasks.append(ex.submit(runner.client.composite_run, **payload))
+
         for t in tasks:
             t.result()
+
+
+def _safe_arm_rotation_sequence(
+    arm_client: ArmClient,
+    runner: ArmRunner,
+    *,
+    arm_kwargs: Dict[str, Any],
+    timeout: float = 10.0,
+) -> None:
+    """2026-08-06 大臂转动 3 阶段序列 (task2 专用).
+
+    用户规定 (2026-08-06):
+      - 大臂转动必须满足 Y ∈ [-200, -90] 且 X ∈ [-300, -200]
+      - 已满足的不动; X/Y 都不满足时, X 在 [-150, -10] 先动 X, 否则先动 Y
+      - 大臂转动期间只有大臂 + 末端可以动, X/Y 必须冻结
+      - 转动完成后 X/Y 才能继续到目标
+
+    实现:
+      阶段 1: composite_run X/Y (无 arm/hand, 已有不动)
+      阶段 2: composite_run arm + hand (X/Y 冻结在安全位)
+      阶段 3: composite_run X/Y 到目标 (无 arm 变化)
+
+    注: 阶段 1 用 composite_run 不用 move_x 是因为 move_x 受 Y 保护区 (-30~0)
+    限制, composite_run 无 client-side _check_y_protected.
+    """
+    try:
+        state = arm_client.get_state()
+    except Exception as exc:
+        logger.warning("_safe_arm_rotation_sequence: 读不到状态, 跳过 (%s)", exc)
+        return
+
+    cur_y = float(state.y_mm) if state.y_mm is not None else None
+    cur_x = float(state.x_mm) if state.x_mm is not None else None
+    if cur_y is None or cur_x is None:
+        return
+
+    target_y = arm_kwargs.get("y_mm")
+    target_x = arm_kwargs.get("x_mm")
+    target_arm = arm_kwargs.get("arm")
+    target_hand = arm_kwargs.get("hand")
+
+    Y_LO, Y_HI = -200.0, -90.0
+    X_LO, X_HI = -300.0, -200.0
+
+    y_in = Y_LO <= cur_y <= Y_HI                              # Y 已在安全区
+    x_in = X_LO <= cur_x <= X_HI                              # X 已在安全区
+
+    # 安全位: 已满足 = 当前值; 不满足 = clamp 到范围边界
+    safe_y = cur_y if y_in else max(Y_LO, min(Y_HI, cur_y))
+    safe_x = cur_x if x_in else max(X_LO, min(X_HI, cur_x))
+
+    logger.info(
+        "大臂 3 阶段: 当前 Y=%.1f X=%.1f → 安全位 Y=%.1f X=%.1f "
+        "(y∈[%.0f,%.0f], x∈[%.0f,%.0f]) → 目标 Y=%s X=%s arm=%s hand=%s",
+        cur_y, cur_x, safe_y, safe_x, Y_LO, Y_HI, X_LO, X_HI,
+        target_y, target_x, target_arm, target_hand,
+    )
+
+    # 阶段 1: X/Y 调到安全位 (已有不动, 顺序: X 在 [-150,-10] 先 X, 否则先 Y)
+    _ensure_xy_in_safe_zone(arm_client, runner, timeout=timeout)
+
+    # 阶段 2: arm + hand (X/Y 冻结在安全位)
+    if target_arm is not None or target_hand is not None:
+        logger.info("  阶段 2: arm=%s hand=%s (X/Y 冻结)", target_arm, target_hand)
+        runner.client.composite_run(arm=target_arm, hand=target_hand,
+                                     speed=100, timeout=timeout)
+
+    # 阶段 3: X/Y 到目标 (从安全位到目标, 无 arm 变化)
+    # 2026-08-06 用户规定: Y 先 X 后 (X 移动到 -110 等伸出位前必须 Y 降到目标,
+    # 防止大臂转后高 Y + 伸出 X 撞车)
+    # 注意: 这里的 target_x/target_y 是原始 arm_kwargs 里的最终目标
+    if target_y is not None and abs(target_y - safe_y) > 1.0:
+        logger.info("  阶段 3: Y=%.1f (从安全位到目标, 先 Y)", target_y)
+        runner.client.composite_run(y_mm=target_y, timeout=timeout)
+    if target_x is not None and abs(target_x - safe_x) > 1.0:
+        logger.info("  阶段 3: X=%.1f (从安全位到目标, 后 X)", target_x)
+        runner.client.composite_run(x_mm=target_x, timeout=timeout)
+
+
+def _ensure_xy_in_safe_zone(
+    arm_client: ArmClient,
+    runner: ArmRunner,
+    *,
+    timeout: float = 10.0,
+) -> None:
+    """2026-08-06 把 X/Y 调到安全区 (底盘移动 / 大臂转动 共用).
+
+    安全范围: Y ∈ [-200, -90], X ∈ [-300, -200].
+    - 已满足的不动
+    - 都不满足时, X 在 [-150, -10] 先动 X, 否则先动 Y
+    - 用 composite_run (无 client-side y_protected) 调 X/Y
+
+    调用点:
+      1. _parallel_chassis_arm 入口 (底盘 move_for 前, 同步执行)
+      2. _safe_arm_rotation_sequence 阶段 1 (大臂 3 阶段第 1 步)
+    """
+    try:
+        state = arm_client.get_state()
+    except Exception as exc:
+        logger.warning("_ensure_xy_in_safe_zone: 读不到状态, 跳过 (%s)", exc)
+        return
+
+    cur_y = float(state.y_mm) if state.y_mm is not None else None
+    cur_x = float(state.x_mm) if state.x_mm is not None else None
+    if cur_y is None or cur_x is None:
+        return
+
+    Y_LO, Y_HI = -200.0, -90.0
+    X_LO, X_HI = -300.0, -200.0
+
+    y_in = Y_LO <= cur_y <= Y_HI
+    x_in = X_LO <= cur_x <= X_HI
+    safe_y = cur_y if y_in else max(Y_LO, min(Y_HI, cur_y))
+    safe_x = cur_x if x_in else max(X_LO, min(X_HI, cur_x))
+
+    need_y_adj = not y_in
+    need_x_adj = not x_in
+
+    if need_y_adj or need_x_adj:
+        logger.info(
+            "X/Y 调安全区: Y=%.1f X=%.1f → Y=%.1f X=%.1f "
+            "(y∈[%.0f,%.0f], x∈[%.0f,%.0f])",
+            cur_y, cur_x, safe_y, safe_x, Y_LO, Y_HI, X_LO, X_HI,
+        )
+
+    if need_x_adj and need_y_adj:
+        if -150.0 <= cur_x <= -10.0:
+            if abs(safe_x - cur_x) > 1.0:
+                runner.client.composite_run(x_mm=safe_x, timeout=timeout)
+            if abs(safe_y - cur_y) > 1.0:
+                runner.client.composite_run(y_mm=safe_y, timeout=timeout)
+        else:
+            if abs(safe_y - cur_y) > 1.0:
+                runner.client.composite_run(y_mm=safe_y, timeout=timeout)
+            if abs(safe_x - cur_x) > 1.0:
+                runner.client.composite_run(x_mm=safe_x, timeout=timeout)
+    elif need_x_adj:
+        if abs(safe_x - cur_x) > 1.0:
+            runner.client.composite_run(x_mm=safe_x, timeout=timeout)
+    elif need_y_adj:
+        if abs(safe_y - cur_y) > 1.0:
+            runner.client.composite_run(y_mm=safe_y, timeout=timeout)
+    # else: 都在安全区, 直接返回
 
 
 def _detect_tower_count(client: RuntimeApiClient) -> Optional[int]:
@@ -175,6 +332,7 @@ def _align_to_tower(
         kp=track_cfg.get("kp", 0.50),
         v_max=track_cfg.get("v_max", 0.25),
         v_slew=track_cfg.get("v_slew", 0.02),  # 每帧速度变化限幅 (2026-08-03 实测太急 → 调缓)
+        hz=track_cfg.get("hz", 20.0),  # 2026-08-06: 控制频率 (yaml 可配, 默认 20)
         deadband=track_cfg.get("deadband", 0.08),
         hold_frames=track_cfg.get("hold_frames", 3),
         max_lost_frames=track_cfg.get("max_lost_frames", 30),
@@ -285,30 +443,6 @@ def _pick_cube(
         runner.move_y(lift_y)
 
 
-def _deliver_cube(
-    arm_client: ArmClient,
-    runner: ArmRunner,
-    cfg: Dict[str, Any],
-    cube_index: int = 0,
-) -> None:
-    """将吸住的水方块投放到水塔内.
-
-    2026-08-06 提速: run() 已通过 _parallel_chassis_arm 把臂切到 carry 姿态
-    (arm=-95°, hand=per-cube, X=carry.x_mm=-100, Y=-75), 底盘也回到塔位。
-    这里只需要:
-      1) move_y 到投放深度 (-10/-55/-75), move_y 不受保护区限制
-      2) grasp off 释放方块
-    取消原来 3 阶段 (composite_run → move_x → move_y), 单 move_y 直接投放.
-    省: stage1 composite_run X=carry.x_mm (-100, ~2.5s) + stage2 move_x(-100, ~2.5s)
-        ≈ 5s/块 × 6 块 = 30s.
-    """
-    deliver_ys = cfg.get("deliver_y_by_index", [-50.0, -65.0, -80.0])
-    deliver_y = deliver_ys[min(cube_index, len(deliver_ys) - 1)]
-
-    # 单步下降: 从 Y=-75 到投放深度. move_y 不受 [-30, 0] 保护区限制, 直接到底.
-    runner.client.move_y(float(deliver_y), timeout=5.0)
-    # 关真空释放方块
-    runner.grasp(on=False)
 
 
 # ── 主入口 ────────────────────────────────────────────────────────
@@ -349,6 +483,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     track_cfg = cfg.get("track_align", {})
     timeout = cfg["chassis_move_timeout_s"]
     group_forward_m = cfg["group_forward_m"]
+    # 2026-08-06: 第二座塔 3 块时回退距离单独配置 (不走 0.35, 用 0.33)
+    group_backward_m = cfg.get("group_backward_m", group_forward_m)
     tower_spacing_m = cfg.get("tower_spacing_m", 0.65)
     detect_retry_step_m = cfg.get("detect_retry_step_m", 0.2)
     detect_retry_max = cfg.get("detect_retry_max", 1)
@@ -439,7 +575,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             while picked < needed:
                 try:
                     group = picked // 2  # 每 2 块一组
-                    target_offset = direction * group * group_forward_m
+                    target_offset = direction * group * (
+                        group_forward_m if direction > 0 else group_backward_m
+                    )
                     pick_x = first_x if (picked % 2 == 0) else second_x
                     deliver_hands = cfg.get("deliver_hand_by_index",
                                             [float(carry["hand_angle_deg"])])
@@ -491,12 +629,20 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     chassis_at_tower_m = 0.0
 
                     # 投放: 单步 move_y → grasp off (Y=-75 → deliver_y)
+                    # 2026-08-06: 到位就放, 不等待. move_y 用 v_max=150mm/s 加速;
+                    # 第 3 块 (deliver_y=-75 == 当前 Y) 跳过 move_y, 直接 grasp off.
                     deliver_ys = cfg.get("deliver_y_by_index",
                                          [-50.0, -65.0, -80.0])
                     deliver_y = deliver_ys[min(picked, len(deliver_ys) - 1)]
                     logger.info("第 %d 块: 投放 Y=%.0f mm + grasp off",
                                 picked + 1, deliver_y)
-                    runner.client.move_y(float(deliver_y), timeout=5.0)
+                    try:
+                        cur_y = arm_client.get_state().y_mm
+                    except Exception:
+                        cur_y = None
+                    if cur_y is None or abs(cur_y - deliver_y) > 1.0:
+                        runner.client.move_y(float(deliver_y),
+                                              v_max_mms=100.0, timeout=3.0)
                     runner.grasp(on=False)
 
                 except Exception:
@@ -504,6 +650,12 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 picked += 1
 
             completed.append("tower_{}".format(tower_label))
+
+        # 2026-08-06: 任务结束前把 X/Y 调到大臂安全区 (X∈[-300,-200], Y∈[-200,-90])
+        # 防止 orchestrator arm-home reset 接手时 X/Y 不在安全区撞车.
+        # 用 _ensure_xy_in_safe_zone: 已满足 no-op, 不满足时按规则调.
+        logger.info("任务结束: 把 X/Y 调到大臂安全区")
+        _ensure_xy_in_safe_zone(arm_client, runner, timeout=10.0)
 
     except Exception as exc:
         logger.exception("water_tower_task 失败: %s", exc)

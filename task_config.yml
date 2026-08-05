@@ -89,10 +89,11 @@ task_cfg:
 
     source_position_order: [1, 2]
 
-    tower_spacing_m: 0.66        # 2026-08-04: 0.65 → 0.66 (实测两塔间距)
-    group_forward_m: 0.33        # 2026-08-04: 0.32 → 0.33 (实测组间距)
+    tower_spacing_m: 0.68        # 2026-08-06: 0.66 → 0.68 (实测两塔间距)
+    group_forward_m: 0.35        # 2026-08-06: 0.33 → 0.35 (tower 1 前向组间距)
+    group_backward_m: 0.33       # 2026-08-06: tower 2 后向用 0.33 (3 块回退距离, 不走 0.35)
 
-    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前移 0.1m 再 cam2 检测)
+    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 后退 0.2m 再 cam2 检测)
     detect_retry_step_m: -0.20
     detect_retry_max: 2
 
@@ -132,8 +133,9 @@ task_cfg:
       kp: 0.22
       v_max: 0.11
       v_slew: 0.011
-      deadband: 0.08
-      hold_frames: 3
+      hz: 25.0                      # 2026-08-06: 控制频率 20→25 Hz (40ms/帧, task_feed 上限)
+      deadband: 0.06                # 2026-08-06: 0.08→0.06 (收紧容错, ~3.8% 画面偏差)
+      hold_frames: 4                # 2026-08-06: 3→4 (锁死更严)
       max_lost_frames: 30
       max_seconds: 6.0
 
@@ -175,14 +177,13 @@ task_cfg:
       servo_y_mm: -150          # 视觉伺服起始 Y (与 pick_pose.y_transition_mm 对齐)
       grasp_y_mm: -50           # 吸附高度 (2026-08-04: -75 → -50, 抓时更贴方块)
       descend_hand_deg: 0       # 2026-08-04: 下降到位后手爪转 0° (吸嘴朝下贴方块顶面)
-      timeout: 15.0             # 视觉伺服超时 (仅对齐阶段; 对齐后下降/吸附/抬回是独立动作)
-      hz: 20.0
-      # 2026-08-04: 对齐 task1 标定值 (task1_seeding.py:235). 之前 0.4/0.08/0.03/3
-      # 太慢 + 太严, trace_hits 起不来, 改 task1 的 2.5/0.55/0.06/1.
-      gain_arm: 1.2             # 2026-08-04: 2.5 → 1.2 (大臂增量减半; 防冲过头)
-      gain_x: 0.25              # 2026-08-04: 0.55 → 0.25 (x 速度减半; 防 x 轴来回抖)
-      deadzone: 0.10            # 2026-08-04: 0.06 → 0.10 (放宽到 ~64px; 单帧移动 < 死区对应物理距离)
-      max_vel: 0.03             # 2026-08-04: 0.05 → 0.03 (上限砍到 30mm/s; 1.5mm/帧)
+      timeout: 3.5              # 2026-08-06: 15 → 8 → 5 → 3.5 (视觉对齐, 实测够用)
+      hz: 25.0                  # 2026-08-06: 20 → 25 (闭环频率↑, 同样帧数收敛更快)
+      # 2026-08-06: 提速放宽标准 (对齐时间太久)
+      gain_arm: 1.6             # 2026-08-06: 1.2 → 1.6 (大臂增量更大, 对齐更快)
+      gain_x: 0.35              # 2026-08-06: 0.25 → 0.35 (x 速度更快, 对齐更快)
+      deadzone: 0.15            # 2026-08-06: 0.10 → 0.12 → 0.15 (放宽死区到 ~96px, 更快锁死)
+      max_vel: 0.05             # 2026-08-06: 0.03 → 0.04 → 0.05 (视觉对齐, 50mm/s 上限)
       # sign_arm: 沿用 +1 (task1 标定), 但 task2 arm_start=+95° 与 task1 的 -90°
       # 几何相反, 若水立方在 cam2 里被推向画面边缘, 改 -1.
       sign_arm: 1
@@ -191,8 +192,8 @@ task_cfg:
       sign_x: 1                 # dy>0 → x 往右; 跟 task1 标定值相反
       arm_min: 60               # 大臂 +95° ±35° clamp; 给 PID 足够余量
       arm_max: 130              # 大臂 +95° ±35° clamp
-      settle_hits: 3            # 2026-08-04: 1 → 3 (连续 3 帧在死区内才算 settle; 防单帧噪声误判)
-      hold_s: 0.05              # 吸附后保持时间; task1 标定
+      settle_hits: 4            # 2026-08-06: 3 → 2 → 4 (连续 4 帧死区即锁, 放宽+严帧数)
+      hold_s: 0.02              # 2026-08-06: 0.05 → 0.02 (吸附保持时间压缩)
 
     carry_pose:
       x_mm: -110                # 2026-08-06: -105 → -100 → -110
@@ -201,7 +202,7 @@ task_cfg:
 
     v_max_arm_x_mms: 80
 
-    vacuum_settle_s: 0.5
+    vacuum_settle_s: 0.2            # 2026-08-06: 0.5 → 0.2 (吸气等待压缩, 实测够用)
     chassis_move_timeout_s: 30
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
@@ -240,7 +241,7 @@ waypoints:
     task_module: main.task.task2_water_tower
     ir_side: both                 # 2026-08-06: 两侧 IR 都到位才触发
     ir_threshold_m: null          # 不设共用阈值, 走 per-side
-    ir_threshold_left_m: 0.30     # 左 IR: 0.3m 内触发
+    ir_threshold_left_m: 0.40     # 左 IR: 0.4m 内触发
     ir_threshold_right_m: 0.60    # 右 IR: 0.6m 内触发
     dis_at_least_m: null           # 2026-08-06: 不在基地开始测, dis 不参与触发
     trigger_op: AND              # ir_ok AND True = 只看 IR
