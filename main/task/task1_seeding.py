@@ -64,6 +64,14 @@ logger = logging.getLogger("task.task1_seeding")
 
 # 每列允许看到的源头 label: 三个圆柱 (1=大/2=中/3=小)
 SOURCE_LABELS: tuple = ("cylinder_1", "cylinder_2", "cylinder_3")
+
+# 吸嘴 setpoint (2026-08-02 标定): 目标在吸嘴正下方时其 bbox 中心坐标; 按 label 分组查表
+# (cylinder_1/2/3 → (0.161,-0.519), ball_* 各自分档, 未知回落全局默认).
+TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
+    "cylinder_1": (0.161, -0.519),
+    "cylinder_2": (0.161, -0.519),
+    "cylinder_3": (0.161, -0.519),
+}
 def _scan_cylinder_label(
     client: RuntimeApiClient,
     valid_labels: List[str],
@@ -172,6 +180,7 @@ def _pick_at_source(
     client: RuntimeApiClient,
     cfg: Dict[str, Any],
     column_idx: int,
+    seen: Dict[str, Any],
 ) -> str:
     """第 i 列: 移到源列, 扫描, 视觉伺服对准, 抓.
 
@@ -182,15 +191,18 @@ def _pick_at_source(
       4. timeout 15→25s 给 servo 足够时间
       5. servo 失败 → 写死 fallback (低吸, 不对齐也要拿起来, 跑完全程)
 
+    Args:
+        seen: run() 传入的本次运行共享 dict, 记录首次识别 label 供 1↔3 纠错。
+              2026-08-03: 从函数属性 _pick_at_source._seen_first 挪进来 ——
+              函数属性会跨测试/跨运行泄漏状态 (测试互相污染的根因)。
+
     Returns: 抓到的 cylinder label (1/2/3).
     """
     # 2026-08-02: scan 1 retry, no backoff; 多 cylinder 视野取最近 setpoint
-    setpoint_xy = (arm_client.origin.nozzle_offset_x_norm,
-                   arm_client.origin.nozzle_offset_y_norm)
-    if setpoint_xy == (0.0, 0.0):
-        setpoint_xy = None
+    # scan 阶段 label 未知, 先取任意 cylinder 的 setpoint 当默认（task1 只扫 cylinder）
+    setpoint_xy = next(iter(TASK1_NOZZLE_OFFSET_MAP.values()))
     logger.info("[S%d] 视觉扫描源头 cylinder label (setpoint=%s)",
-                column_idx, setpoint_xy or "(未标定)")
+                column_idx, setpoint_xy)
     label = _scan_cylinder_label(
         client, list(SOURCE_LABELS),
         retries=1, backoff_s=0.0,
@@ -203,14 +215,15 @@ def _pick_at_source(
 
     # 用户 22:40: 全场只有 1 个 cylinder, 1 和 3 容易认错.
     # 第一次识别到啥就是啥; 之后如果又识别到同一个, 自动 swap 1↔3.
-    if hasattr(_pick_at_source, "_seen_first"):
-        first = _pick_at_source._seen_first
+    # (seen 是 run() 内的本次运行 holder, 不再用函数属性)
+    first = seen.get("first")
+    if first is not None:
         if label == first and first in ("cylinder_1", "cylinder_3"):
             corrected = "cylinder_3" if first == "cylinder_1" else "cylinder_1"
             logger.info("  label 纠错: %s → %s (全场只有一个, 和第一次重复)", label, corrected)
             label = corrected
     else:
-        _pick_at_source._seen_first = label
+        seen["first"] = label
         logger.info("  首次识别: %s (后续 1↔3 自动纠错)", label)
 
     logger.info("  -> 抓到 %s, 智能定位抓取 (arm 控 cx + x 十字控 cy)", label)
@@ -223,6 +236,8 @@ def _pick_at_source(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
         arm_start=pick_arm_start, hand_start=0.0,
+        setpoint_x_norm=TASK1_NOZZLE_OFFSET_MAP[label][0],
+        setpoint_y_norm=TASK1_NOZZLE_OFFSET_MAP[label][1],
         timeout=cfg.get("pick_track_timeout_s", 2.0),
         hz=20.0,
         gain_arm=2.5, gain_x=0.55,
@@ -320,13 +335,17 @@ def _init_step1_place_align(
     _switch_to_place_pose(arm_client, x_mm=-320.0)
 
     # (b) 跑 track_chassis (用户 20:38 实机验证 33 帧 arrived; 不要再做其他事)
+    # 2026-08-03: max_seconds 从 cfg 读 (yaml 之前写 12.0 但代码硬编码 2.0, 配置撒谎),
+    # 缺省回落 2.0; 想调直接改 task_config.yml chassis_align.max_seconds。
     marker_label = cfg.get("marker_label", "cylinder_set")
+    align_max_s = float(cfg.get("chassis_align", {}).get("max_seconds", 2.0))
     from main.chassis import track_chassis, track_trace
-    logger.info("  track_chassis(target=%r, dry_run=False, max_seconds=15)", marker_label)
+    logger.info("  track_chassis(target=%r, dry_run=False, max_seconds=%.1f)",
+                marker_label, align_max_s)
     result = track_chassis(
         marker_label,
         dry_run=False,
-        max_seconds=2.0,
+        max_seconds=align_max_s,
         on_tick=track_trace(1),
     )
     logger.info("  track_chassis result: arrived=%s reason=%s frames=%d",
@@ -433,6 +452,23 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         raise RuntimeError("机械臂 runtime 未在线, 请检查 arm_feed 守护进程")
     runner = ArmRunner(arm_client)
 
+    def _odom_curr_x_y_theta() -> Tuple[float, float, float]:
+        """读 odom_state (轮编码器反馈) 拿 chassis 当前 x, y (m), theta (rad).
+
+        2026-08-03: theta 必须一起读 —— run.py 全流程到场时巡线累积了航向
+        (实车实测一圈可到 0.39 rad)。移动目标 theta 硬写 0 会让 move_to_position
+        先把车头转正到「任务启动时航向」, 那不是到场时的 S/T 列方向 → 底盘一动车
+        就转头 + 斜着跑 (S2 乱跑根因)。theta=None (odom feed idle) 回落 0.0。
+        """
+        try:
+            resp = arm_client.http.get("/v1/realtime/odom/state", timeout=3)
+            odom = (resp or {}).get("odom_state") or {}
+            theta = odom.get("theta")
+            return (float(odom.get("x", 0.0)), float(odom.get("y", 0.0)),
+                    float(theta) if theta is not None else 0.0)
+        except Exception:
+            return 0.0, 0.0, 0.0
+
     completed: List[str] = []
 
     # 用户 22:54: 不用 reset_x / reset_position, 直接到 S 姿态开始
@@ -453,7 +489,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             align_arrived, align_odom_x = _init_step1_place_align(arm_client, cfg)
         else:
             logger.info("step 1: PLACE visual align 已禁用 (chassis_align.enabled=False)")
-            align_odom_x, _ = _odom_curr_x_y()
+            align_odom_x, _, _ = _odom_curr_x_y_theta()
 
         # ===== 初始化: 直接到 S 姿态开始 (用户 22:56: 不要 reset_x!) =====
         #   注意: 主循环 _pick_at_source 前也会调用 _init_step2_s_pose 来切换到 S 姿态.
@@ -466,6 +502,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         chassis_move_timeout = cfg["chassis_move_timeout_s"]
 
         last_chassis_col: Optional[int] = None
+
+        # 1↔3 纠错的本次运行状态 (每轮 run() 独立, 不跨运行/测试泄漏)
+        seen_state: Dict[str, Any] = {}
 
         # 2026-08-02 (3) (5): 真底盘位置记账 (米), 加并发 chassis+arm 调度.
         # 2026-08-02 (用户报 chassis 漂移不是直线):
@@ -482,38 +521,39 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         s_arm       = float(cfg["arm_pick_pose"]["arm_angle_deg"])  # -90
         s_x_mm      = float(cfg["arm_pick_pose"]["x_mm"])           # -100
 
-        def _odom_curr_x_y() -> Tuple[float, float]:
-            """读 odom_state (轮编码器反馈) 拿 chassis 当前 x, y (m)."""
-            try:
-                resp = arm_client.http.get("/v1/realtime/odom/state", timeout=3)
-                odom = (resp or {}).get("odom_state") or {}
-                return float(odom.get("x", 0.0)), float(odom.get("y", 0.0))
-            except Exception:
-                return 0.0, 0.0
+        # 底盘纵向记账: 沿车头方向的物理相对位移 (m), S1 列为 0.
+        # 2026-08-03: 旧版用「目标 odom x = align_odom_x + k*0.15」, 把 0.15 当成
+        # odom x 轴增量。但全流程到场时 odom theta 漂到 ~0.97 rad (mecanum 横滑误
+        # 积分; theta 对现实是垃圾, odom x/y/theta 三者却自洽), 轨道方向在 odom 系
+        # 里是 theta 方向, 物理 15cm 只投影 0.15*cos(theta) ≈ 0.085 到 odom x →
+        # 目标系统性偏远 1/cos(theta) ≈ 1.75 倍; 且 place 列移动后 curr_x 已含上次
+        # 推进, 下一列再按网格算会重复记账 (实测 S2 列多走了 6.4cm, 全靠臂伺服补)。
+        # 改成自记账: move_for([dx,0,0]) 沿车头闭环, dx = 目标相对位移 - 记账值,
+        # 网格用真实物理间距, 不依赖 odom 绝对值/theta (theta≈0 的 standalone 等价)。
+        pos_along = [0.0]
 
-        def _chassis_goto(target_x_m: float) -> None:
-            """闭环 chassis 到绝对 x (m). 用 move_to_position (PID + odom 反馈).
+        def _chassis_goto(target_along_m: float) -> None:
+            """闭环 chassis: 沿车头移动到相对位移 target_along_m (m, S1 列 = 0).
 
-            2026-08-03: 改回 move_to_position 闭环. 之前用 move_for([dx, 0, 0]) 开环
-            累计 theta 漂移, 3 轮跑完 chassis 偏了 5-10cm 而且朝某个方向旋转.
-            move_to_position([target_x, curr_y, 0]) 强制闭环到世界坐标 + theta=0,
-            SDK 会自己修 theta 漂移.
-
-            用户 (2026-08-02 21:00): 如果 |target - curr| < 5cm, 跳过 move_to_position
-            (避免 theta 校正旋转 — 微调底盘时不该转).
+            move_for([dx,0,0]) 内部 = 偏移按当前 theta 旋转成绝对目标再走
+            move_to_position 闭环; 世界→车速度转换用同一个 theta 逆变换, odom theta
+            的漂移误差**互相抵消** → 轮速纯前进 → 物理上沿车头 (≈ 行方向) 直走,
+            不转头不斜走 (2026-08-03 实车验证)。
             """
-            curr_x, curr_y = _odom_curr_x_y()
-            if abs(target_x_m - curr_x) < 0.05:
-                logger.info("  底盘已在 %.3f m (距离 target %.3f < 5cm), 跳过移动",
-                            curr_x, target_x_m)
+            dx = target_along_m - pos_along[0]
+            if abs(dx) < 0.05:
+                logger.info("  底盘已在相对 %.3f m (|dx|=%.3f < 5cm), 跳过移动",
+                            target_along_m, abs(dx))
                 return
-            # 闭环: 走到 (target_x, curr_y, 0) — 强制 theta=0 让车头归正.
-            logger.info("  底盘闭环 → (%.3f, %.3f, 0) (move_to_position)",
-                        target_x_m, curr_y)
+            curr_x, curr_y, curr_theta = _odom_curr_x_y_theta()
+            logger.info("  底盘闭环: move_for(dx=%+.3f, 0, 0) → 相对 %.3f m "
+                        "(odom x=%.3f y=%.3f theta=%.3f)",
+                        dx, target_along_m, curr_x, curr_y, curr_theta)
             arm_client.http.execute_car_action(
-                "move_to_position", [target_x_m, curr_y, 0.0],
+                "move_for", [dx, 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
             )
+            pos_along[0] = target_along_m
 
         def _parallel_chassis_arm(target_x_m: Optional[float],
                                  arm_kwargs: dict) -> None:
@@ -530,18 +570,16 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     t.result()
 
         for i, column_idx in enumerate(source_position_order):
-            curr_x, _ = _odom_curr_x_y()
-            logger.info("=== 处理底盘列 %d (S%d, odom=%.3f m) ===",
-                        i + 1, column_idx, curr_x)
+            curr_x, _, curr_theta = _odom_curr_x_y_theta()
+            logger.info("=== 处理底盘列 %d (S%d, odom x=%.3f m, theta=%.3f rad) ===",
+                        i + 1, column_idx, curr_x, curr_theta)
 
-            # (1) 底盘闭环移到本列源 (用 align_odom_x 偏移, 世界坐标 0,0.15,0.30 → odom)
+            # (1) 底盘闭环移到本列源 (物理相对位移: S1=0, S2=0.15, S3=0.30)
             # 用户 (2026-08-02 21:02): "step2 不调用 chassis-goto, 只用动机械臂"
             # step 1 align 后 chassis 已经在 S1=T1 列. 第 0 列 (i=0) 跳过底盘移动, 直接 S 姿态.
             if i > 0:
-                target_s_world = SOURCE_POSITIONS_M[column_idx]
-                target_s = align_odom_x + target_s_world
-                logger.info("  底盘 → S%d (world=%.3f → odom target %.3f m, align=%.3f)",
-                            column_idx, target_s_world, target_s, align_odom_x)
+                target_s = SOURCE_POSITIONS_M[column_idx]
+                logger.info("  底盘 → S%d (相对 %.3f m)", column_idx, target_s)
                 _chassis_goto(target_s)
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
@@ -560,7 +598,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
             # (2) 抓 — 优化#5: 超时直接跳过该列, 不走 fallback
             try:
-                label = _pick_at_source(runner, arm_client, client, cfg, column_idx)
+                label = _pick_at_source(runner, arm_client, client, cfg, column_idx,
+                                        seen_state)
             except Exception as exc:
                 picked_so_far = set(completed)
                 remaining = [l for l in SOURCE_LABELS if l not in picked_so_far]
@@ -576,8 +615,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             #     y抬 + 底盘移T + arm切PLACE + x到place位
             # 用户 00:07: 唯一条件 — y<-30 才可以并发移动底盘和机械臂!
             slot_idx = int(target_slot_map[label])
-            target_t_world = SLOT_POSITIONS_M[slot_idx]
-            target_t = align_odom_x + target_t_world
+            target_t = SLOT_POSITIONS_M[slot_idx]   # 物理相对位移; 与 S 列同网格 (S_i↔T_i 同列)
             place_x_override = float(cfg.get("place_x_overrides", {}).get(label, place_x_mm))
             # 用户 01:05: y<-30 绝对不能删! 防撞!
             st = arm_client.get_state()
@@ -631,9 +669,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # 用户 00:07: y<-30 才可以并发!
             if i + 1 < len(source_position_order):
                 next_col_idx = source_position_order[i + 1]
-                next_source_world = SOURCE_POSITIONS_M[next_col_idx]
-                next_source = align_odom_x + next_source_world
-                logger.info("  最后一列完成, 底盘留在 %.3f m", align_odom_x + SOURCE_POSITIONS_M[source_position_order[-1]])
+                logger.info("  列 %d 完成, 底盘相对位移 %.3f m (下一列 S%d)",
+                            column_idx, pos_along[0], next_col_idx)
 
     except Exception as exc:
         logger.exception("task1_seeding 失败: %s", exc)

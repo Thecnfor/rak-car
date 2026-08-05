@@ -104,20 +104,25 @@ task_cfg:
       hand_angle_deg: -90
 
     detection_pose:
-      x_mm: -240
+      x_mm: -200                # 2026-08-04: -240 → -200 (init X 起始位置)
       arm_angle_deg: -95
       hand_angle_deg: -60
       y_mm: -20
 
-    first_cube_x_mm: -155
-    second_cube_x_mm: -265
+    first_cube_x_mm: -165
+    # 2026-08-04: 第二块 X 从 -265 改 -210 (用户实测摆放位置).
+    # 识别/视觉对齐前姿态 X 由 cube_x_mm 决定, 见 _pick_cube.init_x_mm.
+    second_cube_x_mm: -210
 
     # cam2 视觉闭环: 底盘对齐到水塔等级标 (track_chassis 参数)
     track_align:
       target: "water"            # 等级标 group (water_l1/l2/l3 全家)
-      setpoint_cxcy: [0.0, 0.0]  # 等级标居中
-      # 2026-08-03 规定: task2 的 track_chassis 只控 vx(前后), vy 恒 0 (横向不做闭环)
-      vx_only: true
+      # 2026-08-04 实测: 底盘真对齐时 cam2 看到的 water 等级标在 (0.345, 0.243),
+      # 不是画面中心. 这是 cam2 相对车体中线的安装偏移. 闭环要让 chassis 把
+      # 等级标拉到这一点, 而不是 (0,0). 5 帧 x 锁死 0.3453, y 在 0.242~0.244 抖动.
+      setpoint_cxcy: [0.136, 0.308]  # 2026-08-06: 重测 (cx=0.345→0.136, cy=0.243→0.308)
+      # 2026-08-06 试开 vy 横移闭环 (车不在道中央时让 track_chassis 自纠横向)
+      vx_only: true                # 2026-08-06: 关闭 vy, 只让底盘前后调
       # 轴符号: -1/+1 是 2026-08-02 cylinder 标定值。水塔实测方向反了 →
       #   前后反 (该进反退) 改 sign_vx=+1; 左右反 (该左反右) 改 sign_vy=-1
       # 2026-08-03 实测: 前后反 → sign_vx=+1; 横向未观测 (vx_only 后不控 vy, sign_vy 不生效)
@@ -135,14 +140,24 @@ task_cfg:
       max_seconds: 6.0
 
     # 同一水塔内第 1/2/3 块的投放 Y 深度梯度 (避免堆叠碰撞)
-    deliver_y_by_index: [-60, -75, -95]
+    # 2026-08-06: -40/-60/-80 → -10/-55/-75 (用户新规定)
+    deliver_y_by_index: [-10, -55, -75]
+    # 同一水塔内第 1/2/3 块的投放手爪角度梯度 (2026-08-06 用户新规定)
+    # 第 1 块 -60°, 第 2 块 -70°, 第 3 块 -80° (越深越前倾, 适配堆叠)
+    deliver_hand_by_index: [-60, -70, -80]
 
     pick_pose:
-      y_transition_mm: -120
-      y_descend_mm: -75
-      y_lift_mm: -150
-      arm_angle_deg: 95
-      hand_angle_deg: 0
+      # 2026-08-04: 抓取 init 姿态 (S 形态, 视觉伺服起点).
+      # 实测: 在 x=-150, y=-150, arm=90, hand=-10 姿态下,
+      # cam2 看到水方块 bbox 中心 (0.0875, -0.236) — 5 帧锁死.
+      # 这是 "吸嘴正对水方块" 时的 cam2 标定点, 即 setpoint_cxcy.
+      # 注: 视觉伺服起始 X 由 cube_x_mm 决定 (per-cube), 见 _pick_cube.init_x_mm.
+      # pick_pose 不再单独定义 x_mm, 走 first_cube_x_mm / second_cube_x_mm.
+      y_transition_mm: -150       # 视觉伺服起始 Y (运输高度)
+      y_descend_mm: -50           # 吸附高度 (2026-08-04: -75 → -50, 抓时更贴方块)
+      y_lift_mm: -150             # 抬升高度
+      arm_angle_deg: 90           # 大臂角度 (init / 抓取同)
+      hand_angle_deg: -10         # 手爪角度 (轻微前倾, 让 cam2 看到吸嘴下方)
 
     # cam2 视觉伺服抓水立方 (2026-08-03):
     #   手爪转 0° → cam2 识别水立方 → 视觉定位到吸嘴正下方 → move_y 到吸附高度 → 吸附 → 抬回.
@@ -181,7 +196,7 @@ task_cfg:
       hold_s: 0.02              # 2026-08-06: 0.05 → 0.02 (吸附保持时间压缩)
 
     carry_pose:
-      x_mm: -105
+      x_mm: -110                # 2026-08-06: -105 → -100 → -110
       arm_angle_deg: -95
       hand_angle_deg: -90
 
