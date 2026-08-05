@@ -93,8 +93,8 @@ task_cfg:
     group_forward_m: 0.33        # 2026-08-04: 0.32 → 0.33 (实测组间距)
 
     # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前移 0.1m 再 cam2 检测)
-    detect_retry_step_m: 0.10
-    detect_retry_max: 1
+    detect_retry_step_m: -0.20
+    detect_retry_max: 2
 
     init_pose:
       y_mm: -150
@@ -119,9 +119,9 @@ task_cfg:
       # 2026-08-04 实测: 底盘真对齐时 cam2 看到的 water 等级标在 (0.345, 0.243),
       # 不是画面中心. 这是 cam2 相对车体中线的安装偏移. 闭环要让 chassis 把
       # 等级标拉到这一点, 而不是 (0,0). 5 帧 x 锁死 0.3453, y 在 0.242~0.244 抖动.
-      setpoint_cxcy: [0.345, 0.243]  # cam2 安装偏移 (label=water_l3 标定值)
-      # 2026-08-03 规定: task2 的 track_chassis 只控 vx(前后), vy 恒 0 (横向不做闭环)
-      vx_only: true
+      setpoint_cxcy: [0.136, 0.308]  # 2026-08-06: 重测 (cx=0.345→0.136, cy=0.243→0.308)
+      # 2026-08-06 试开 vy 横移闭环 (车不在道中央时让 track_chassis 自纠横向)
+      vx_only: true                # 2026-08-06: 关闭 vy, 只让底盘前后调
       # 轴符号: -1/+1 是 2026-08-02 cylinder 标定值。水塔实测方向反了 →
       #   前后反 (该进反退) 改 sign_vx=+1; 左右反 (该左反右) 改 sign_vy=-1
       # 2026-08-03 实测: 前后反 → sign_vx=+1; 横向未观测 (vx_only 后不控 vy, sign_vy 不生效)
@@ -138,8 +138,11 @@ task_cfg:
       max_seconds: 6.0
 
     # 同一水塔内第 1/2/3 块的投放 Y 深度梯度 (避免堆叠碰撞)
-    # 2026-08-04: -60/-75/-95 → -50/-65/-80 → -40/-60/-80 (第 1 块更深, 塔口位置)
-    deliver_y_by_index: [-40, -60, -80]
+    # 2026-08-06: -40/-60/-80 → -10/-55/-75 (用户新规定)
+    deliver_y_by_index: [-10, -55, -75]
+    # 同一水塔内第 1/2/3 块的投放手爪角度梯度 (2026-08-06 用户新规定)
+    # 第 1 块 -60°, 第 2 块 -70°, 第 3 块 -80° (越深越前倾, 适配堆叠)
+    deliver_hand_by_index: [-60, -70, -80]
 
     pick_pose:
       # 2026-08-04: 抓取 init 姿态 (S 形态, 视觉伺服起点).
@@ -192,7 +195,7 @@ task_cfg:
       hold_s: 0.05              # 吸附后保持时间; task1 标定
 
     carry_pose:
-      x_mm: -105
+      x_mm: -110                # 2026-08-06: -105 → -100 → -110
       arm_angle_deg: -95
       hand_angle_deg: -90
 
@@ -235,10 +238,13 @@ waypoints:
   - name: task2_water_tower
     task_id: 2
     task_module: main.task.task2_water_tower
-    ir_threshold_m: 0.70
-    ir_side: right
-    dis_at_least_m: 4.5
-    trigger_op: AND
+    ir_side: both                 # 2026-08-06: 两侧 IR 都到位才触发
+    ir_threshold_m: null          # 不设共用阈值, 走 per-side
+    ir_threshold_left_m: 0.30     # 左 IR: 0.3m 内触发
+    ir_threshold_right_m: 0.60    # 右 IR: 0.6m 内触发
+    dis_at_least_m: null           # 2026-08-06: 不在基地开始测, dis 不参与触发
+    trigger_op: AND              # ir_ok AND True = 只看 IR
+    settle_before_pause_s: 1.5   # 2026-08-06: 出弯后让外环多跑 1.5s 把车拉直
 
   # ----- task4 -----
   - name: task4_harvest

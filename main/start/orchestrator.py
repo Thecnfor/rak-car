@@ -45,11 +45,18 @@ class Waypoint:
         task_id:        任务编号 (1..7), 用于 TASK_RUNNERS[id] 查表. None 表示纯导航/finish.
         task_module:    (兼容旧字段,实际不再用 —— orchestrator 走 TASK_RUNNERS).
         ir_threshold_m: IR 接近阈值 (None 表示不参与 IR 判断).
-        ir_side:        IR 哪一侧触发: "left" / "right" / "any" (默认 "right").
+        ir_side:        IR 哪一侧触发: "left" / "right" / "any" (任一侧) /
+                            "both" (两侧都触发, 用于窄通道) (默认 "right").
+        ir_threshold_left_m:  左侧 IR 单独阈值 (None 走 ir_threshold_m).
+                              用于 ir_side="both" 时左右阈值不同.
+        ir_threshold_right_m: 右侧 IR 单独阈值 (None 走 ir_threshold_m).
         dis_at_least_m: 累计里程计 ≥ 该值才算"到了这个点" (None 表示不参与).
         trigger_op:     "AND" (默认,严格防误触) / "OR".
         pause_before_s: 触发后、调 task 前的停顿.
         pause_after_s:  任务跑完、恢复巡线前的停顿.
+        settle_before_pause_s: trigger 满足后、pause 外环前的等待.
+            这段时间 lane 外环继续跑,把车从弯道偏航 / 偏横向状态拉直.
+            用于 trigger 紧接弯道出口的任务 (如 task2 出弯后车身偏左+车头偏航).
         is_finish:      True = 这是终点 (里程计达到即整个流程结束).
     """
     name: str
@@ -57,10 +64,13 @@ class Waypoint:
     task_module: Optional[str] = None
     ir_threshold_m: Optional[float] = None
     ir_side: str = "right"
+    ir_threshold_left_m: Optional[float] = None
+    ir_threshold_right_m: Optional[float] = None
     dis_at_least_m: Optional[float] = None
     trigger_op: str = "AND"
     pause_before_s: float = 0.0
     pause_after_s: float = 0.0
+    settle_before_pause_s: float = 0.0
     is_finish: bool = False
 
 
@@ -74,8 +84,8 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
              ir_threshold_m=2.00, ir_side="left",
              dis_at_least_m=2.33, trigger_op="AND"),
     Waypoint("task2_water_tower",  task_id=2,
-             ir_threshold_m=0.70, ir_side="right",
-             dis_at_least_m=4.5, trigger_op="AND"),
+             ir_threshold_m=0.70, ir_side="left",
+             dis_at_least_m=4.5, trigger_op="OR"),
     Waypoint("task4_harvest",     task_id=4,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=9.00, trigger_op="AND"),
@@ -130,9 +140,12 @@ class Orchestrator:
                 task_id=w.get("task_id"),
                 task_module=w.get("task_module"),  # 保留旧字段, 不参与 _run_task
                 ir_threshold_m=w.get("ir_threshold_m"),
+                ir_threshold_left_m=w.get("ir_threshold_left_m"),
+                ir_threshold_right_m=w.get("ir_threshold_right_m"),
                 ir_side=w.get("ir_side", "right"),
                 dis_at_least_m=w.get("dis_at_least_m"),
                 trigger_op=w.get("trigger_op", "AND"),
+                settle_before_pause_s=w.get("settle_before_pause_s", 0.0),
                 is_finish=w.get("is_finish", False),
             ))
         wp_summary = ", ".join(
@@ -233,6 +246,13 @@ class Orchestrator:
                 logger.info("=== navigating to %s ===", wp.name)
                 self._wait_until_triggered(wp, api, dis_buf, tui_buf,
                                            interval_s=self.ir_interval_s)
+                # settle_before_pause_s: trigger 满足后不立刻 pause 外环,
+                # 让 lane-following 多跑一会把车身 + 车头拉直.
+                # 出弯后触发任务用 (e.g. task2 出弯车身偏左+车头偏航).
+                if wp.settle_before_pause_s > 0:
+                    logger.info("[settle] %s 外环多跑 %.2fs 拉直车身/车头",
+                                wp.name, wp.settle_before_pause_s)
+                    time.sleep(wp.settle_before_pause_s)
                 if wp.is_finish:
                     logger.info("finish waypoint reached (dis=%.2fm), mission done",
                                 dis_buf[0])
@@ -352,7 +372,8 @@ class Orchestrator:
         """轮询 IR + 里程计，直到 wp 的触发条件满足（默认 AND）。
 
         任一条件字段为 None 时视为「已满足」，避免任务永不触发。
-        IR 分左右：wp.ir_side 取 left / right，"any" 表示两侧任一触发即可。
+        IR 分左右：wp.ir_side 取 left / right，"any" 表示两侧任一触发即可，
+        "both" 表示两侧都要触发 (窄通道用).
         每轮更新 tui_buf 供 TUI 线程读取。
         """
         # 诊断(#task2-not-stop): 目标 IR 侧每次从"高于阈值"→"低于阈值"打一条日志,
@@ -374,13 +395,34 @@ class Orchestrator:
                           "ir_left": left, "ir_right": right,
                           "state": "nav"}
 
-            if wp.ir_threshold_m is None:
+            if (wp.ir_threshold_m is None
+                    and wp.ir_threshold_left_m is None
+                    and wp.ir_threshold_right_m is None):
+                # 2026-08-06: 三种阈值都没设才跳过 IR 检查.
+                # 旧逻辑只看 ir_threshold_m, 设了 per-side 也被短路成 True.
                 ir_ok = True
             elif wp.ir_side == "left":
                 ir_ok = left is not None and left < wp.ir_threshold_m
             elif wp.ir_side == "any":
                 ir_ok = ((left is not None and left < wp.ir_threshold_m) or
                          (right is not None and right < wp.ir_threshold_m))
+            elif wp.ir_side == "both":
+                # 2026-08-06: 两侧 IR 都 < 各自阈值才触发.
+                # 阈值优先用 per-side (ir_threshold_left_m / _right_m),
+                # None 时 fallback 到 ir_threshold_m.
+                left_th = (wp.ir_threshold_left_m
+                           if wp.ir_threshold_left_m is not None
+                           else wp.ir_threshold_m)
+                right_th = (wp.ir_threshold_right_m
+                            if wp.ir_threshold_right_m is not None
+                            else wp.ir_threshold_m)
+                ir_ok = (
+                    (left is not None and left_th is not None
+                     and left < left_th)
+                    and
+                    (right is not None and right_th is not None
+                     and right < right_th)
+                )
             else:  # "right"
                 ir_ok = right is not None and right < wp.ir_threshold_m
 

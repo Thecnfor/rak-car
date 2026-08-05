@@ -316,31 +316,40 @@ def _deliver_cube(
 ) -> None:
     """将吸住的水方块投放到水塔内.
 
-    执行顺序 (2026-08-04 改, 防撞塔):
+    执行顺序 (2026-08-06 改, 先降到中间高度 -75 再 move_x 再降到投放深度):
       0. (前置: run() 在 chassis 回塔前已 runner.move_x(detection_pose.x_mm)=-200)
-      1. 阶段1: composite_run 转大臂到 -95° + 手爪 -90° + 降 Y (X 留在 -200 不动)
-                → 此时水方块在车体 back-left, 远离 +X 侧水塔, 旋转零碰撞
-      2. 阶段2: move_x 到投递位 -105 (大臂已锁 -95°, 水方块沿车体左侧平移, 不甩)
-      3. grasp off 释放方块
+      1. 阶段1: composite_run 转大臂 -95° + 手爪 -90° + 降 Y 到中间高度 -75
+                → -75 在保护区外 (-30 之外), 但还没到底, 给 move_x 留余量
+      2. 阶段2: move_x 到投递位 (-100), 此时 Y=-75 安全
+      3. 阶段3: move_y 到投放深度 (-10/-55/-75), move_y 不受保护区限制
+      4. grasp off 释放方块
     """
     carry = cfg["carry_pose"]
     deliver_ys = cfg.get("deliver_y_by_index", [-50.0, -65.0, -80.0])
     deliver_y = deliver_ys[min(cube_index, len(deliver_ys) - 1)]
+    # 2026-08-06: per-cube 手爪梯度 (跟 Y 一起避免堆叠碰撞)
+    deliver_hands = cfg.get("deliver_hand_by_index",
+                            [float(carry["hand_angle_deg"])] * len(deliver_ys))
+    deliver_hand = deliver_hands[min(cube_index, len(deliver_hands) - 1)]
 
     safe_x_mm = float(cfg["detection_pose"]["x_mm"])   # -200 (init/检测位, 远离水塔)
-    deliver_x_mm = float(carry["x_mm"])                 # -105 (投递位)
+    deliver_x_mm = float(carry["x_mm"])                 # -100 (投递位)
+    TRANSIT_Y_MM = -75.0  # 中间过渡高度 (保护区外, 给 move_x 留余量)
 
-    # 阶段 1: 大臂转 + 手爪转 + Y 降并发, X 留在 safe 位置 (-200)
+    # 阶段 1: 转大臂 + 手爪 + 降 Y 到 -40, X 留在 safe 位
     runner.client.composite_run(
         arm=float(carry["arm_angle_deg"]),
-        hand=float(carry["hand_angle_deg"]),
+        hand=float(deliver_hand),                # 2026-08-06: per-cube 手爪梯度
         x_mm=safe_x_mm,
-        y_mm=float(deliver_y),
+        y_mm=TRANSIT_Y_MM,
     )
 
-    # 阶段 2: 大臂已 -95° (水方块在 back-left), 平移 X 到投递位
+    # 阶段 2: 平移 X 到投递位 (此时 Y=-40, move_x 不会被安全保护区拒)
     if abs(deliver_x_mm - safe_x_mm) > 1.0:
         runner.move_x(deliver_x_mm)
+
+    # 阶段 3: 降 Y 到投放深度 (move_y 不受 [-30, 0] 保护区限制, 可以到 -10)
+    runner.client.move_y(float(deliver_y))
 
     # 关真空释放方块
     runner.grasp(on=False)
@@ -385,7 +394,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     timeout = cfg["chassis_move_timeout_s"]
     group_forward_m = cfg["group_forward_m"]
     tower_spacing_m = cfg.get("tower_spacing_m", 0.65)
-    detect_retry_step_m = cfg.get("detect_retry_step_m", 0.10)
+    detect_retry_step_m = cfg.get("detect_retry_step_m", 0.2)
     detect_retry_max = cfg.get("detect_retry_max", 1)
     x_target_mm = float(detection["x_mm"])
 

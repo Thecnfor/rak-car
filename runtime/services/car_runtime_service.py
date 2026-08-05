@@ -255,7 +255,7 @@ class CarRuntimeService(
             self._realtime_check_locked()
             car = self.car
         out = {}
-        # 角度软限位 (°) — arm 对齐业务层 [-150, +150] (2026-08-06).
+# 角度软限位 (°) — arm 对齐业务层 [-150, +150] (2026-08-06).
         # 实时路径走 _realtime_gate 不进 job_queue, 跳过 main/arm/api/safety.py 校验,
         # 这里的常量是 main/arm/api/safety.py:SafetyMixin._ARM_ANGLE_MIN/_MAX/_HAND_ANGLE_MIN/_MAX 的镜像;
         # runtime 与 main 是两个独立包, 不跨包 import 常量, 改任何一边另一处必须同步.
