@@ -207,36 +207,6 @@ def main(argv: list[str] | None = None) -> None:
              "StaircaseTurn θ 闭环 45→90→120° 连续转，lane 回正后交还直道巡航。\n"
              "转弯底层在 controllers/odom_turn.py。"
     )
-    parser.add_argument(
-        "--turn-exit-window", type=float, default=None,
-        help="StaircaseTurn 出口判定窗口 (deg)：只有 |θ_target-θ|≤此值才信 lane 判回正/过转。\n"
-             "默认 None=原版单帧判定；设 3.0 才加固（十字路口弯）。"
-    )
-    parser.add_argument(
-        "--turn-exit-sustain", type=int, default=None,
-        help="StaircaseTurn 出口判定连续帧数：窗内同结论连满 N 帧才 done。默认 1（单帧）。"
-    )
-    parser.add_argument(
-        "--turn-rearm-clean", type=int, default=None,
-        help="CurveDetector 触发后冷却帧数：连续 N 帧干净直道(|ea|≤20°)才允许再触发。\n"
-             "默认 0=关（原版）；十字路口弯建议 20。"
-    )
-    parser.add_argument(
-        "--crossroad-turn", type=int, default=None,
-        help="第几个转弯的出口紧接着十字路口（= task_config.yml 的 crossroad_turn，\n"
-             "默认 None=不启用）。配合 --turn：那个弯自动换加固 detector/turn\n"
-             "（低阈值短信号触发 + 里程碑窗口出口 + 触发后冷却），其余弯走原版。\n"
-             "实车验证与 run.py 用同一套逻辑。"
-    )
-    parser.add_argument(
-        "--crossroad-tol-deg", type=float, default=None,
-        help="十字路口弯识别阈值 (deg)。实测弯道 3 帧 error_angle 只有 ~0.3rad\n"
-             "(≈17°)，默认 20° 判不进 → 降 12°（仍高于直道噪声）。默认 12。"
-    )
-    parser.add_argument(
-        "--crossroad-sustain", type=int, default=None,
-        help="十字路口弯识别连续帧数。信号只有 ~3 帧，默认 3。"
-    )
     args = parser.parse_args(argv)
 
     profile = _build_profile(args)
@@ -303,13 +273,8 @@ def main(argv: list[str] | None = None) -> None:
     if args.turn:
         from ..controllers.odom_turn import CurveDetector, StaircaseTurn
 
-        # 默认走原版逻辑；加固参数只在显式传了才开（正常跑道不需要 —— 十字路口弯由
-        # DoubleLoopRunner 的 crossroad_turn 按弯号自动换加固对，见 orchestrator）。
-        detector = CurveDetector(rearm_clean=args.turn_rearm_clean or 0)
-        turn = StaircaseTurn(
-            exit_window_deg=args.turn_exit_window,     # None = 原版单帧出口
-            exit_sustain=args.turn_exit_sustain or 1,
-        )
+        detector = CurveDetector()
+        turn = StaircaseTurn()
 
     use_tui = bool(args.tui) and not args.straight_follow
     if use_tui:
@@ -333,12 +298,7 @@ def main(argv: list[str] | None = None) -> None:
         calibrator=calibrator,
         turn=turn,
         detector=detector,
-        crossroad_turn=args.crossroad_turn,
     )
-    if args.crossroad_tol_deg is not None:
-        _runner_kwargs["crossroad_tol_deg"] = args.crossroad_tol_deg
-    if args.crossroad_sustain is not None:
-        _runner_kwargs["crossroad_sustain"] = args.crossroad_sustain
     runner = DoubleLoopRunner(**_runner_kwargs)
     try:
         if use_tui:
