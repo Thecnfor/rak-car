@@ -89,12 +89,13 @@ task_cfg:
 
     source_position_order: [1, 2]
 
-    tower_spacing_m: 0.65
-    group_forward_m: 0.32
+    tower_spacing_m: 0.68        # 2026-08-06: 0.66 → 0.68 (实测两塔间距)
+    group_forward_m: 0.35        # 2026-08-06: 0.33 → 0.35 (tower 1 前向组间距)
+    group_backward_m: 0.33       # 2026-08-06: tower 2 后向用 0.33 (3 块回退距离, 不走 0.35)
 
-    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前移 0.1m 再 cam2 检测)
-    detect_retry_step_m: 0.10
-    detect_retry_max: 1
+    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 后退 0.2m 再 cam2 检测)
+    detect_retry_step_m: -0.20
+    detect_retry_max: 2
 
     init_pose:
       y_mm: -150
@@ -127,8 +128,9 @@ task_cfg:
       kp: 0.22
       v_max: 0.11
       v_slew: 0.011
-      deadband: 0.08
-      hold_frames: 3
+      hz: 25.0                      # 2026-08-06: 控制频率 20→25 Hz (40ms/帧, task_feed 上限)
+      deadband: 0.06                # 2026-08-06: 0.08→0.06 (收紧容错, ~3.8% 画面偏差)
+      hold_frames: 4                # 2026-08-06: 3→4 (锁死更严)
       max_lost_frames: 30
       max_seconds: 6.0
 
@@ -152,20 +154,31 @@ task_cfg:
     pick_vision:
       enabled: true
       label: "water"            # 水立方检测标签 (20 类里无 cube, 默认水容器; 实车识别为其他类改这里)
-      servo_y_mm: -120          # 视觉伺服起始 Y (cam2 能看清水立方的抬升高度, 同 y_transition_mm)
-      grasp_y_mm: -75           # 吸附高度 (同 pick_pose.y_descend_mm)
-      timeout: 15.0             # 视觉伺服超时 (仅对齐阶段; 对齐后下降/吸附/抬回是独立动作)
-      hz: 20.0
-      gain_arm: 0.4             # 大臂增量增益 (dx → arm)
-      gain_x: 0.08              # x 十字速度增益 (dy → x_vel)
-      deadzone: 0.03            # 归一化死区 (|dx|,|dy| < 死区视为收敛)
-      max_vel: 0.20             # x 十字最大速度 (m/s)
-      sign_arm: 1               # task1 标定: dx>0 → arm 更负; 方向反则 -1
-      sign_x: -1                # task1 标定: dy>0 → x 往左; 方向反则 +1
-      arm_min: 80               # 大臂 +95° 附近的 clamp 下界 (偏死则收紧)
-      arm_max: 110              # 大臂 +95° 附近的 clamp 上界
-      settle_hits: 3            # 末段连续收敛帧数
-      hold_s: 0.3               # 吸附后保持时间
+      # 2026-08-04 实测: 在 pick_pose init 姿态 (x=-150, y=-150, arm=90, hand=-10)
+      # 下, 水方块 bbox 中心在 cam2 画面 (0.0875, -0.236), 5 帧锁死. 换 cam2 安装位
+      # 或换车体必须重测 (放水方块在 x=-150 正下方, 跑
+      # `curl -X POST -H "Content-Type: application/json" -d '{}' http://<JETSON_IP>:5050/v1/vision/task`).
+      setpoint_cxcy: [0.0875, -0.236]  # cam2 安装偏移 (label=water 标定, [-1, +1] 中心化)
+      servo_y_mm: -150          # 视觉伺服起始 Y (与 pick_pose.y_transition_mm 对齐)
+      grasp_y_mm: -50           # 吸附高度 (2026-08-04: -75 → -50, 抓时更贴方块)
+      descend_hand_deg: 0       # 2026-08-04: 下降到位后手爪转 0° (吸嘴朝下贴方块顶面)
+      timeout: 3.5              # 2026-08-06: 15 → 8 → 5 → 3.5 (视觉对齐, 实测够用)
+      hz: 25.0                  # 2026-08-06: 20 → 25 (闭环频率↑, 同样帧数收敛更快)
+      # 2026-08-06: 提速放宽标准 (对齐时间太久)
+      gain_arm: 1.6             # 2026-08-06: 1.2 → 1.6 (大臂增量更大, 对齐更快)
+      gain_x: 0.35              # 2026-08-06: 0.25 → 0.35 (x 速度更快, 对齐更快)
+      deadzone: 0.15            # 2026-08-06: 0.10 → 0.12 → 0.15 (放宽死区到 ~96px, 更快锁死)
+      max_vel: 0.05             # 2026-08-06: 0.03 → 0.04 → 0.05 (视觉对齐, 50mm/s 上限)
+      # sign_arm: 沿用 +1 (task1 标定), 但 task2 arm_start=+95° 与 task1 的 -90°
+      # 几何相反, 若水立方在 cam2 里被推向画面边缘, 改 -1.
+      sign_arm: 1
+      # 2026-08-04: task2 的 servo_y_mm=-120, 相机几何与 task1 的 y=-180 相反;
+      # 实测目标在画面上方时 x 往反方向走 (目标飞出 cam2 FOV), 反转.
+      sign_x: 1                 # dy>0 → x 往右; 跟 task1 标定值相反
+      arm_min: 60               # 大臂 +95° ±35° clamp; 给 PID 足够余量
+      arm_max: 130              # 大臂 +95° ±35° clamp
+      settle_hits: 4            # 2026-08-06: 3 → 2 → 4 (连续 4 帧死区即锁, 放宽+严帧数)
+      hold_s: 0.02              # 2026-08-06: 0.05 → 0.02 (吸附保持时间压缩)
 
     carry_pose:
       x_mm: -105
@@ -174,7 +187,7 @@ task_cfg:
 
     v_max_arm_x_mms: 80
 
-    vacuum_settle_s: 0.5
+    vacuum_settle_s: 0.2            # 2026-08-06: 0.5 → 0.2 (吸气等待压缩, 实测够用)
     chassis_move_timeout_s: 30
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
@@ -211,10 +224,13 @@ waypoints:
   - name: task2_water_tower
     task_id: 2
     task_module: main.task.task2_water_tower
-    ir_threshold_m: 0.70
-    ir_side: right
-    dis_at_least_m: 4.5
-    trigger_op: AND
+    ir_side: both                 # 2026-08-06: 两侧 IR 都到位才触发
+    ir_threshold_m: null          # 不设共用阈值, 走 per-side
+    ir_threshold_left_m: 0.40     # 左 IR: 0.4m 内触发
+    ir_threshold_right_m: 0.60    # 右 IR: 0.6m 内触发
+    dis_at_least_m: null           # 2026-08-06: 不在基地开始测, dis 不参与触发
+    trigger_op: AND              # ir_ok AND True = 只看 IR
+    settle_before_pause_s: 1.5   # 2026-08-06: 出弯后让外环多跑 1.5s 把车拉直
 
   # ----- task4 -----
   - name: task4_harvest
