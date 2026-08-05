@@ -252,7 +252,7 @@ class Orchestrator:
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
                 time.sleep(wp.pause_after_s)
                 # 2026-08-03: 每个任务结束后强制 reset 机械臂到 home 姿态
-                # (x=0, y=-150, arm=+90, hand=90), 边重置边巡航 ——
+                # (x=0, y=-150, arm=+90, hand=-90), 边重置边巡航 ——
                 # reset 在后台线程跑, 不阻塞 _resume_lane。
                 self._schedule_arm_home_reset()
                 self._resume_lane(runner)
@@ -413,7 +413,7 @@ class Orchestrator:
     def _schedule_arm_home_reset() -> None:
         """每个任务结束后, 把机械臂强制 reset 到 home 姿态。
 
-        home 姿态: x=0, y=-150, arm=+90, hand=90。
+        home 姿态: x=0, y=-150, arm=+90, hand=-90。
         走后台线程, 不阻塞 orchestrator 主线程 (_resume_lane 继续巡航)。
         失败 / 超时仅打 warning, 不影响后续任务。
         """
@@ -446,10 +446,10 @@ class Orchestrator:
                                  dict(target=0.0, v_max_mms=100.0,
                                       out_time=10.0, timeout=15.0),
                                  wait_s=15.0)
-                # 3) arm=+90° (左边) + hand=+90° (下垂, hand 坐标系 +90 是下垂方向)
+                # 3) arm=+90° (左边) + hand=-90° (正前面)
                 #    一发 composite_run 并发
                 _wait_job_silent("composite_run",
-                                 dict(arm=90.0, x=None, y=None, hand=90.0,
+                                 dict(arm=90.0, x=None, y=None, hand=-90.0,
                                       speed=100, timeout=15.0),
                                  wait_s=15.0)
                 logger.info("  [arm-home] reset 完成")
