@@ -118,7 +118,7 @@ def goto_pose_p(client, runner, *, log_prefix: str = "[goto_pose_p]") -> dict:
         x_mm=POSE_P_X_MM,
         y_mm=POSE_P_Y_MM,
         hand=POSE_P_HAND_DEG,
-        speed=80,
+        speed=200,
         timeout=30.0,
     )
     actual_y = None

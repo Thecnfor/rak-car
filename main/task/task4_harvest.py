@@ -26,13 +26,36 @@ from main.arm import ArmClient, ArmRunner
 
 # ---- 默认值 (跟 target4.py 保持一致, 改这里等于改业务默认) ----
 
+# ---- 姿态参数 (集中管理, 现场快速调整) ----
+
+# P 姿态 (准备/搜索位姿)
+POSE_P_Y_MM: float = -130.0
+POSE_P_X_MM: float = -300.0
+POSE_P_ARM_DEG: float = 90.0
+POSE_P_HAND_DEG: float = 10.0
+
+# 中转姿态 (放 bin 过程中的过渡位姿)
+TRANSIT_Y_MM: float = -130.0
+TRANSIT_X_MM: float = -150.0
+
+# 抓取姿态 (盲降抓球位姿)
+PICK_Y_MM: float = -58.0
+PICK_X_MM: float = -240.0
+
+# 放 bin 姿态
+PUT_Y_MM: float = -110.0
+BIN_X_BLUE_MM: float = 0.0
+BIN_X_YELLOW_MM: float = -65.0
+
+# ---- 业务参数 ----
+
 _DEFAULT_MAX_PICKS: int = 8
 _DEFAULT_MAX_SECONDS: float = 180.0
 _DEFAULT_MAX_CREEP_M: float = 0.8
-_DEFAULT_CREEP_SPEED_MPS: float = 0.05
-_DEFAULT_TRACK_MAX_SECONDS: float = 8.0
+_DEFAULT_CREEP_SPEED_MPS: float = 0.0225
+_DEFAULT_TRACK_MAX_SECONDS: float = 6.0
 _DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
-_DEFAULT_RETURN_X_MM: Optional[float] = -300.0   # POSE_P_X_MM, 放 bin 后回 P 姿态 x
+_DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM   # 放 bin 后回 P 姿态 x
 _DEFAULT_PICK_TIMEOUT_S: float = 60.0
 
 
@@ -58,6 +81,18 @@ def run(
     # 调试
     dry_run: bool = False,
     debug_recognition: bool = False,
+    # ---- 姿态参数 (默认值在顶部常量, 现场可快速改) ----
+    pose_p_y_mm: float = POSE_P_Y_MM,
+    pose_p_x_mm: float = POSE_P_X_MM,
+    pose_p_arm_deg: float = POSE_P_ARM_DEG,
+    pose_p_hand_deg: float = POSE_P_HAND_DEG,
+    pick_y_mm: float = PICK_Y_MM,
+    pick_x_mm: float = PICK_X_MM,
+    transit_y_mm: float = TRANSIT_Y_MM,
+    transit_x_mm: float = TRANSIT_X_MM,
+    put_y_mm: float = PUT_Y_MM,
+    bin_x_blue_mm: float = BIN_X_BLUE_MM,
+    bin_x_yellow_mm: float = BIN_X_YELLOW_MM,
 ) -> Dict[str, Any]:
     """任务四主入口: 薄封装 step_target4, 参数全透传.
 
@@ -104,6 +139,18 @@ def run(
         do_prep=do_prep,
         dry_run=dry_run,
         debug_recognition=debug_recognition,
+        # 姿态参数 (从顶部常量透传)
+        pose_p_y_mm=pose_p_y_mm,
+        pose_p_x_mm=pose_p_x_mm,
+        pose_p_arm_deg=pose_p_arm_deg,
+        pose_p_hand_deg=pose_p_hand_deg,
+        pick_x_mm=pick_x_mm,
+        pick_y_mm=pick_y_mm,
+        transit_y_mm=transit_y_mm,
+        transit_x_mm=transit_x_mm,
+        put_y_mm=put_y_mm,
+        bin_x_blue_mm=bin_x_blue_mm,
+        bin_x_yellow_mm=bin_x_yellow_mm,
     )
 
     ok = bool(detail.get("ok")) if isinstance(detail, dict) else bool(detail)

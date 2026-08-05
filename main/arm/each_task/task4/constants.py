@@ -97,25 +97,19 @@ TARGET_AREA_MIN: float = 0.15
 
 TARGET_AREA_MAX: float = 0.60
 """最大归一化面积。
+- 2026-07-29 之前 0.50 → 2026-07-30 退到 0.30 → 现场拒大球 → 改回 0.50
 - 历史 baseline 0.246-0.265 是 target1 y=-150 校准的, 留 0.04 buffer
 - 2026-07-30: 现场 2 球实测, 右球 area=0.457 完全可见, 0.30 会拒掉右球
   → 放宽到 0.50 (留 0.043 buffer 兼容近/远)
-<<<<<<< Updated upstream
 - 2026-08-03 P 姿态 (y=-100/x=-270) 实测: 球框 area=0.529, 0.50 拒掉
   → 放宽到 0.60 (留 0.07 buffer 兼容 P 姿态下的大球)
 - 0.60 已接近帧噪声框范围, 现场如有误检再考虑 aspect_tol 收紧
-"""
-
-# ---------- 检测 / 选择策略 ----------
-=======
-- 2026-07-29 之前 0.50 → 2026-07-30 退到 0.30 → 现场拒大球 → 改回 0.50
 
 ⚠️ 2026-08-02 取消 BALL_VERIFIED_* 7 项位置验证 (用户要求 "识别到球就抓, 不用在
-   最佳抓取位置"): TARGET_* 4 项基础过滤 (score / aspect / area) 仍生效, 但
-   target2.fetch_balls 不再调用 _verify_ball_in_target1_pose。球检测只要过
-   TARGET_* 4 项 + color 是蓝/黄就视为有效候选。
+最佳抓取位置"): TARGET_* 4 项基础过滤 (score / aspect / area) 仍生效, 但
+target2.fetch_balls 不再调用 _verify_ball_in_target1_pose。球检测只要过
+TARGET_* 4 项 + color 是蓝/黄就视为有效候选。
 """
->>>>>>> Stashed changes
 
 # ---------- 检测 / 选择策略 ----------
 TARGET_DEDUP_NORM_MIN: float = 0.05

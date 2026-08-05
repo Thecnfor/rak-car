@@ -14,6 +14,7 @@ from .controllers.curvature_adaptive import CurvatureAdaptiveOuterLoop
 from .controllers.calibration import ErrorCalibrator
 from .controllers.odom_turn import OdomTurnPID, wrap_pi
 from .controllers.visual_align import VisualAlignOuterLoop
+from .controllers.move_along_lane import move_along_lane
 from .loops.closed_loop import DoubleLoopRunner
 from .loops.safety import EmergencyWatchdog, LostLineDetector
 from .loops.telemetry import lane_trace
@@ -184,6 +185,7 @@ def subscribe_visual_align(
         with_trace - True 时每帧打印目标 label/score/area/err + 4 轮速。
         on_tick    - 覆盖 with_trace 的自定义回调。
     """
+
     api = ChassisClient.connect()
     outer = VisualAlignOuterLoop(kp=kp, v_max=v_max, deadband=deadband)
     if on_tick is None and with_trace:
@@ -219,6 +221,7 @@ __all__ = [
     "CurvatureAdaptiveOuterLoop",  # 循迹主力
     "StraightOuterLoop",
     "VisualAlignOuterLoop",        # 面积对准控制器
+    "move_along_lane",             # 沿中心车道线只前进/后退
     "ErrorCalibrator",
     "OdomTurnPID",
     "wrap_pi",

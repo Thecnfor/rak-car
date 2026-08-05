@@ -78,7 +78,7 @@ from main.arm import (  # noqa: E402
     ArmClient, ArmRunner,
 )
 from main.arm.each_task.common import (  # noqa: E402
-    goto_pose_p,
+    goto_pose_p, POSE_P_X_MM, POSE_P_Y_MM,
 )
 from main.chassis import track_chassis  # noqa: E402
 
@@ -91,9 +91,10 @@ LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
 DEFAULT_MAX_PICKS: int = 8
 """最多抓取数 (比赛正常 6-8 球, 给 buffer)。"""
 
-DEFAULT_CREEP_SPEED_MPS: float = 0.045
+DEFAULT_CREEP_SPEED_MPS: float = 0.01
 """creep 搜索前移速度 (m/s)。慢 = 帧覆盖密, 不漏球; 快 = 省时间。
-2026-08-03 用户现场反馈 0.03 太慢, ×1.5 → 0.045。"""
+2026-08-03 用户现场反馈 0.03 太慢, ×1.5 → 0.045。
+2026-08-06 用户: 再减半 → 0.0225。"""
 
 DEFAULT_MAX_CREEP_M: float = 0.8
 """累计前移距离预算 (m, 开环 速度×时间 记账)。旧版总行程 0.56m + 余量。"""
@@ -230,14 +231,21 @@ class _CreepThread:
             except Exception:
                 pass
 
+# ---- P 姿态参数 (可由外部覆盖) ----
+
+TASK4_POSE_P_Y_MM: float = -130.0
+TASK4_POSE_P_X_MM: float = -300.0
+TASK4_POSE_P_ARM_DEG: float = 90.0
+TASK4_POSE_P_HAND_DEG: float = 10.0
+
 # ---- 放 bin 参数 (2026-08-05 用户拍板: 新放球序列) ----
 
 BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -65.0}
 """蓝 bin x=0, 黄 bin x=-65。"""
 
-X_PICK_MM: float = -280.0
-"""盲降前 x (2026-08-05 用户拍板)。从 P 姿态 x=-300 → -280 (靠中间)。
-⚠️ 待现场测: 横移距离短 = belt-slip 风险低; x=-280 是否能让吸嘴落在球心
+X_PICK_MM: float = -248.0
+"""盲降前 x (2026-08-06 用户: -280 → -240)。从 P 姿态 x=-300 → -240 (更靠中间)。
+⚠️ 待现场测: 横移距离短 = belt-slip 风险低; x=-240 是否能让吸嘴落在球心
 上方需要 13_nozzle_align_pose_p.py 标定的 (sx, sy) 配合验证。
 如果 (sx, sy) 偏移明显, 球径 4cm 仍允许小偏差抓到, 不用回伺服。"""
 
@@ -246,7 +254,7 @@ Y_PICK_MM: float = -58.0
 
 Y_TRANSIT_MM: float = -130.0
 """中转 y (2026-08-05 用户拍板 -190 → -130, 不需要那么深的中转位)。
-留出 y=-130 是放仓位 y=-100 之前的过渡 — y_gate 上界 -145, 中转位高于
+留出 y=-130 是放仓位 y=-110 之前的过渡 — y_gate 上界 -145, 中转位高于
 gate 上界, 业务层 OK (开仓舵机在 y ∈ [-205,-145] 才卡; 我们不放仓,
 只在这里横移)。"""
 
@@ -254,10 +262,8 @@ X_TRANSIT_MM: float = -150.0
 """中转 x (2026-08-05 用户拍板)。从 P 姿态 x=-300 → 中转 -150 (车体中线
 附近), 然后再横移到 bin x=0/-65。两次小位移, belt-slip 风险低。"""
 
-Y_PUT_MM: float = -100.0
-"""放球 y (2026-08-05 用户拍板 -155 → -100, 离 bin 顶面更近)。
-⚠️ 待现场测: y=-100 是否真的进 bin (bin 顶面 y 未知, 历史实测 -155 进;
-缩短到 -100 后是否还进需要校准)。"""
+Y_PUT_MM: float = -110.0
+"""放球 y (2026-08-06 用户: -100 → -110, 再深 10mm)。"""
 
 Y_FINAL_MM: float = -133.0
 """最终 y (识别位姿, 历史值, 下一阶段 target 识别用)。"""
@@ -345,17 +351,19 @@ def _track_leftmost_ball(*, max_seconds: float, dry_run: bool):
     内部 finally 自动零速。返回 TrackChassisResult
     (arrived / reason / final_frame.label=cx 最小的球 label)。
     """
-    # 2026-08-05 (用户: 再快一点): 现场验证 0.30/0.18/3/0.03 仍偏慢,
-    # 提速档 kp=0.40 / v_max=0.25 / hold=2 / slew=0.05。
-    # ⚠️ 若真机出现左右振荡不收敛 → 把 kp/v_max 往回调。
+    # 2026-08-06 (用户: 底盘抖动严重, 大幅回调稳):
+    #   kp 0.40 → 0.10 (保守增益, 消除振荡)
+    #   v_max 0.25 → 0.08 (低速对齐, 稳)
+    #   v_slew 0.05 → 0.02 (极平滑加减速)
+    #   hold_frames 2 → 3 (连续3帧才判到, 防误判)
     return track_chassis(
         target=BALL_LABELS,
         select_mode="leftmost",
         setpoint_cxcy=(0.0, 0.0),
-        kp=0.40,            # 0.30 → 0.40 (更快拉回中心)
-        v_max=0.25,         # 0.18 → 0.25 (更快的底盘速度)
-        hold_frames=2,      # 3 → 2 (带内 2 帧即判到)
-        v_slew=0.05,        # 0.03 → 0.05 (加速度更激进)
+        kp=0.10,
+        v_max=0.08,
+        hold_frames=3,
+        v_slew=0.02,
         max_seconds=max_seconds,
         dry_run=dry_run,
     )
@@ -385,6 +393,12 @@ def _pick_and_store(
     color: str,
     return_x_mm: Optional[float],
     pick_timeout_s: float,  # noqa: ARG001 — 保留参数兼容性, 当前同步流程不直接用
+    pick_x_mm: float = X_PICK_MM,
+    pick_y_mm: float = Y_PICK_MM,
+    transit_y_mm: float = Y_TRANSIT_MM,
+    transit_x_mm: float = X_TRANSIT_MM,
+    put_y_mm: float = Y_PUT_MM,
+    bin_x_mm: float = BIN_X_MM[COLOR_BLUE],
 ) -> dict:
     """底盘对齐后盲降抓球 + 同步放 bin (2026-08-05 用户拍板: 新放球序列)。
 
@@ -395,17 +409,17 @@ def _pick_and_store(
       - **2026-08-05 v2 (当前)**: 用户拍板, 进一步优化:
         1. 中转位 (y=-130, x=-150) 取代原 y=-190, x=-300 (车体中线过渡,
            两次小位移代替一次大位移, belt-slip 风险更低)
-        2. 放仓位 y=-100 (原来 -155, 离 bin 顶面更近)
-        3. 盲降前 x=-280 横移 (待现场测, 球心可能在这个 x 上方)
+        2. 放仓位 y=-110 (原来 -100, 再深 10mm)
+        3. 盲降前 x=-240 横移 (待现场测, 球心可能在这个 x 上方)
         4. **两个 grasp 后不要 sleep, 直接下一动作** (真空建立靠 SDK 自闭环)
 
     新流程 (同步, 6 步, 无 sleep):
-      0. composite_run x=-280                盲降前横移到 -280
+      0. composite_run x=-240                盲降前横移到 -240
       1. composite_run y=Y_PICK              盲降到抓球位
       2. grasp(True)                         真空开 (无 sleep)
       3. composite_run y=Y_TRANSIT, x=X_TRANSIT  抬到中转 (-130, -150)
       4. composite_run x=bin_x               横移到 bin 上方
-      5. composite_run y=Y_PUT               降到放仓位 (-100)
+      5. composite_run y=Y_PUT               降到放仓位 (-110)
       6. grasp(False)                        放气 (无 sleep)
 
     Returns:
@@ -413,23 +427,23 @@ def _pick_and_store(
     """
     bin_x = BIN_X_MM[color]
 
-    # 0. 盲降前横移到 -280 (待现场测; 短距, belt-slip 风险低)
-    print(f"  [{LOG_PREFIX}] [0/6] composite_run(x={X_PICK_MM:+.0f})  盲降前横移到 -280")
+    # 0. 盲降前横移到 pick_x (待现场测; 短距, belt-slip 风险低)
+    print(f"  [{LOG_PREFIX}] [0/6] composite_run(x={pick_x_mm:+.0f})  盲降前横移到 {pick_x_mm}")
     try:
-        arm_client.composite_run(x_mm=X_PICK_MM, speed=80, timeout=30.0)
+        arm_client.composite_run(x_mm=pick_x_mm, speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"composite_run(x={X_PICK_MM}) 横移失败: "
+                "error": f"composite_run(x={pick_x_mm}) 横移失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
     # 1. 盲降到抓球位
-    print(f"  [{LOG_PREFIX}] [1/6] composite_run(y={Y_PICK_MM:+.0f})  盲降到抓球位")
+    print(f"  [{LOG_PREFIX}] [1/6] composite_run(y={pick_y_mm:+.0f})  盲降到抓球位")
     try:
-        arm_client.composite_run(y_mm=Y_PICK_MM, speed=80, timeout=10.0)
+        arm_client.composite_run(y_mm=pick_y_mm, speed=80, timeout=10.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"composite_run(y={Y_PICK_MM}) 盲降失败: "
+                "error": f"composite_run(y={pick_y_mm}) 盲降失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
@@ -442,19 +456,19 @@ def _pick_and_store(
                 "error": f"grasp(True) 失败: {type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
-    # 3. 抬到中转位 (y=-130) ∥ 横移到中转位 x=-150 (composite_run 并行)
-    print(f"  [{LOG_PREFIX}] [3/6] composite_run(y={Y_TRANSIT_MM:+.0f}, x={X_TRANSIT_MM:+.0f})  "
+    # 3. 抬到中转位 (y=transit_y) ∥ 横移到中转位 x=transit_x (composite_run 并行)
+    print(f"  [{LOG_PREFIX}] [3/6] composite_run(y={transit_y_mm:+.0f}, x={transit_x_mm:+.0f})  "
           f"抬升+横移到中转位")
     try:
-        arm_client.composite_run(y_mm=Y_TRANSIT_MM, x_mm=X_TRANSIT_MM,
+        arm_client.composite_run(y_mm=transit_y_mm, x_mm=transit_x_mm,
                                  speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"composite_run(y={Y_TRANSIT_MM}, x={X_TRANSIT_MM}) 中转失败: "
+                "error": f"composite_run(y={transit_y_mm}, x={transit_x_mm}) 中转失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
-    # 4. 横移到 bin 上方 (中转 -150 → bin_x)
+    # 4. 横移到 bin 上方 (中转 x=transit_x → bin_x)
     print(f"  [{LOG_PREFIX}] [4/6] composite_run(x={bin_x:+.0f})  横移到 {color} bin 上方")
     try:
         arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
@@ -464,13 +478,13 @@ def _pick_and_store(
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
-    # 5. 降到放仓位 (中转 y=-130 → bin y=-100)
-    print(f"  [{LOG_PREFIX}] [5/6] composite_run(y={Y_PUT_MM:+.0f})  降到放仓位")
+    # 5. 降到放仓位 (中转 y=transit_y → bin y=put_y)
+    print(f"  [{LOG_PREFIX}] [5/6] composite_run(y={put_y_mm:+.0f})  降到放仓位")
     try:
-        arm_client.composite_run(y_mm=Y_PUT_MM, speed=80, timeout=10.0)
+        arm_client.composite_run(y_mm=put_y_mm, speed=80, timeout=10.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"composite_run(y={Y_PUT_MM}) 降放仓位失败: "
+                "error": f"composite_run(y={put_y_mm}) 降放仓位失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
@@ -504,6 +518,18 @@ def step_target4(
     do_prep: bool = True,
     dry_run: bool = False,
     debug_recognition: bool = False,
+    # ---- 姿态参数 (默认值在模块级常量, 可由外部覆盖) ----
+    pose_p_y_mm: float = TASK4_POSE_P_Y_MM,
+    pose_p_x_mm: float = TASK4_POSE_P_X_MM,
+    pose_p_arm_deg: float = TASK4_POSE_P_ARM_DEG,
+    pose_p_hand_deg: float = TASK4_POSE_P_HAND_DEG,
+    pick_x_mm: float = X_PICK_MM,
+    pick_y_mm: float = Y_PICK_MM,
+    transit_y_mm: float = Y_TRANSIT_MM,
+    transit_x_mm: float = X_TRANSIT_MM,
+    put_y_mm: float = Y_PUT_MM,
+    bin_x_blue_mm: float = BIN_X_MM[COLOR_BLUE],
+    bin_x_yellow_mm: float = BIN_X_MM[COLOR_YELLOW],
 ) -> dict:
     """慢速前移搜索 + 底盘视觉定位 (最左球) + 吸嘴中心抓取 + 放 bin。
 
@@ -623,8 +649,18 @@ def step_target4(
                 release_thread.join(timeout=15.0)
             if not dry_run:
                 try:
-                    goto_pose_p(arm_client, runner,
-                                log_prefix=f"{LOG_PREFIX}/球{ball_idx}")
+                    print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿态 "
+                          f"(composite_run 4 轴同步: y={pose_p_y_mm} → x={pose_p_x_mm} "
+                          f"arm={pose_p_arm_deg}°/hand={pose_p_hand_deg}°) ==========")
+                    arm_client.composite_run(
+                        arm=pose_p_arm_deg,
+                        x_mm=pose_p_x_mm,
+                        y_mm=pose_p_y_mm,
+                        hand=pose_p_hand_deg,
+                        speed=60,
+                        timeout=30.0,
+                    )
+                    print(f"========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿态完成 ==========\n")
                 except Exception as e:
                     print(f"  [{LOG_PREFIX}] ⚠️ 恢复 P 姿态失败: "
                           f"{type(e).__name__}: {str(e)[:120]}, 继续")
@@ -691,6 +727,12 @@ def step_target4(
                 color=color,
                 return_x_mm=return_x_mm,
                 pick_timeout_s=pick_timeout_s,
+                pick_x_mm=pick_x_mm,
+                pick_y_mm=pick_y_mm,
+                transit_y_mm=transit_y_mm,
+                transit_x_mm=transit_x_mm,
+                put_y_mm=put_y_mm,
+                bin_x_mm=bin_x_blue_mm if color == COLOR_BLUE else bin_x_yellow_mm,
             )
             release_thread = res.get("release_thread")  # 记录放仓线程, 下轮回P前 join
             history.append({"ball": ball_idx,
