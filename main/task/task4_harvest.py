@@ -6,30 +6,74 @@
 (移植自 am 分支; 2026-08 P1 重写为 pick_by_vision 视觉伺服 + composite_run 并行放 bin).
 
 完整业务流程概览:
-  1. 摆臂到初始姿态 target1 (Y=-133, 大臂=+90°, 手爪=0°)
+  1. 摆臂到 P 姿态 (y=-120, x=-300, arm=90°, hand=10°)
   2. 进入循环: 底盘前移 → 视觉识别作物 → 抓取作物 → 放入存储
-  3. 多轮抓取完毕后, 机械臂回到 init 等待位
+  3. 多轮抓取完毕后, 机械臂回到 P 姿态 + 关仓
 
-本文件职责: 纯薄封装. 只负责:
-  - 新建或复用 RuntimeApiClient (orchestrator 传 client 场景下不复用新连接)
-  - 新建 ArmClient + ArmRunner
-  - lazy import 并调用 step_target4
-
-失败语义: step_target4 内部抛出的任何异常都直接向上抛出, 由 orchestrator 统一捕获.
+本文件职责: 薄封装 + 参数透传. 暴露 step_target4 核心参数,
+  让 orchestrator / 手动调用都能一眼看到可调项.
 """
 from __future__ import annotations
 
+import argparse
+import sys
+import time
 from typing import Any, Dict, Optional
 
 from main.api_client import RuntimeApiClient
 from main.arm import ArmClient, ArmRunner
 
 
-def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
-    """任务四主入口: 薄封装 step_target4.
+# ---- 默认值 (跟 target4.py 保持一致, 改这里等于改业务默认) ----
+
+_DEFAULT_MAX_PICKS: int = 8
+_DEFAULT_MAX_SECONDS: float = 180.0
+_DEFAULT_MAX_CREEP_M: float = 0.8
+_DEFAULT_CREEP_SPEED_MPS: float = 0.05
+_DEFAULT_TRACK_MAX_SECONDS: float = 8.0
+_DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
+_DEFAULT_RETURN_X_MM: Optional[float] = -300.0   # POSE_P_X_MM, 放 bin 后回 P 姿态 x
+_DEFAULT_PICK_TIMEOUT_S: float = 60.0
+
+
+def run(
+    client: Optional[RuntimeApiClient] = None,
+    *,
+    # 抓取预算
+    max_picks: int = _DEFAULT_MAX_PICKS,
+    max_seconds: float = _DEFAULT_MAX_SECONDS,
+    max_creep_m: float = _DEFAULT_MAX_CREEP_M,
+    # 搜索速度 (m/s)
+    creep_speed_mps: float = _DEFAULT_CREEP_SPEED_MPS,
+    # 底盘视觉伺服收敛预算 (s)
+    track_max_seconds: float = _DEFAULT_TRACK_MAX_SECONDS,
+    # 连续 pick 失败容忍 (命中即退出, 防死循环)
+    max_consecutive_pick_failures: int = _DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
+    # 放 bin 后 x 回位 (mm); None = 不回; 默认 -300 = P 姿态 x
+    return_x_mm: Optional[float] = _DEFAULT_RETURN_X_MM,
+    # pick_by_vision 总超时 (s)
+    pick_timeout_s: float = _DEFAULT_PICK_TIMEOUT_S,
+    # 准备位姿 (当前 target4 已内嵌 P 姿态恢复, 此参数保留兼容)
+    do_prep: bool = False,
+    # 调试
+    dry_run: bool = False,
+    debug_recognition: bool = False,
+) -> Dict[str, Any]:
+    """任务四主入口: 薄封装 step_target4, 参数全透传.
 
     Args:
         client: 复用 RuntimeApiClient; None 时内部新建连接 (orchestrator 场景走复用).
+        max_picks: 最多抓取数 (比赛正常 6-8 球).
+        max_seconds: 任务总时长预算 (s).
+        max_creep_m: 累计前移距离预算 (m), 耗尽无球 = 采区走完.
+        creep_speed_mps: creep 前移速度 (m/s), 第一球用此值, 后续减半.
+        track_max_seconds: 单球底盘视觉伺服收敛预算 (s).
+        max_consecutive_pick_failures: 连续 pick 失败容忍, 默认 1 (失败一次就退出).
+        return_x_mm: 放 bin 后 x 回位 (mm); None = 不回; 默认 -300 (P 姿态 x).
+        pick_timeout_s: pick_by_vision 总超时 (s).
+        do_prep: True 时开头跑 target1 准备位姿 (当前 target4 已删, 保留兼容).
+        dry_run: True 不动硬件 (仍轮询视觉排练流程).
+        debug_recognition: fetch_balls 打印每条检测的过滤原因.
 
     Returns:
         Dict: {
@@ -49,7 +93,86 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         arm_client=arm,
         http_client=cli,
         runner=runner,
+        max_picks=max_picks,
+        max_seconds=max_seconds,
+        max_creep_m=max_creep_m,
+        creep_speed_mps=creep_speed_mps,
+        track_max_seconds=track_max_seconds,
+        max_consecutive_pick_failures=max_consecutive_pick_failures,
+        return_x_mm=return_x_mm,
+        pick_timeout_s=pick_timeout_s,
+        do_prep=do_prep,
+        dry_run=dry_run,
+        debug_recognition=debug_recognition,
     )
 
     ok = bool(detail.get("ok")) if isinstance(detail, dict) else bool(detail)
     return {"ok": ok, "task": "task4_harvest", "detail": detail}
+
+
+# ---- CLI (方便 python -m main.task.task4_harvest 快速调试) ----
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="task4_harvest: 作物抓取 (薄封装, 参数全透传)",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument("--max-picks", type=int, default=_DEFAULT_MAX_PICKS,
+                   help="最多抓取数")
+    p.add_argument("--max-seconds", type=float, default=_DEFAULT_MAX_SECONDS,
+                   help="任务总时长预算 (s)")
+    p.add_argument("--max-creep-m", type=float, default=_DEFAULT_MAX_CREEP_M,
+                   help="累计前移距离预算 (m)")
+    p.add_argument("--creep-speed", type=float, default=_DEFAULT_CREEP_SPEED_MPS,
+                   help="creep 前移速度 (m/s), 第一球用此值, 后续减半")
+    p.add_argument("--track-max-seconds", type=float, default=_DEFAULT_TRACK_MAX_SECONDS,
+                   help="单球底盘视觉伺服收敛预算 (s)")
+    p.add_argument("--max-consecutive-pick-failures", type=int,
+                   default=_DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
+                   help="连续 pick 失败容忍 (命中即退出)")
+    p.add_argument("--return-x", type=float, default=_DEFAULT_RETURN_X_MM,
+                   help="放 bin 后 x 回位 (mm); -300 = P 姿态 x; None = 不回 (传 --no-return)")
+    p.add_argument("--no-return", action="store_true",
+                   help="放 bin 后 x 不回位")
+    p.add_argument("--pick-timeout", type=float, default=_DEFAULT_PICK_TIMEOUT_S,
+                   help="pick_by_vision 总超时 (s)")
+    p.add_argument("--do-prep", action="store_true",
+                   help="开头跑 target1 准备位姿 (当前 target4 已删, 保留兼容)")
+    p.add_argument("--dry-run", action="store_true",
+                   help="dry-run 模式 (只打印不动硬件)")
+    p.add_argument("--debug-recognition", action="store_true",
+                   help="fetch_balls 打印每条检测的过滤原因")
+    return p
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
+
+    if args.no_return:
+        return_x_mm: Optional[float] = None
+    else:
+        return_x_mm = args.return_x
+
+    t0 = time.monotonic()
+    result = run(
+        max_picks=args.max_picks,
+        max_seconds=args.max_seconds,
+        max_creep_m=args.max_creep_m,
+        creep_speed_mps=args.creep_speed,
+        track_max_seconds=args.track_max_seconds,
+        max_consecutive_pick_failures=args.max_consecutive_pick_failures,
+        return_x_mm=return_x_mm,
+        pick_timeout_s=args.pick_timeout,
+        do_prep=args.do_prep,
+        dry_run=args.dry_run,
+        debug_recognition=args.debug_recognition,
+    )
+    elapsed = time.monotonic() - t0
+
+    print(f"\n[{__name__}] 完成: ok={result['ok']}  elapsed={elapsed:.1f}s")
+    print(f"  detail: {result['detail']}")
+    return 0 if result["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

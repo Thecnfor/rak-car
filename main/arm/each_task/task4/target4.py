@@ -12,10 +12,10 @@
         总时长 / 最大抓取数 任一命中即结束。
 
 流程:
-  1. target1.step_target1(client, runner)  —— 识别/抓取准备位姿 (y=-133, x=-260, arm=90°, hand=0°)
+  1. target1.step_target1(client, runner)  —— 识别/抓取准备位姿 (y=-133, x=-260, arm=90°, hand=-5°)
   2. 循环 (直到预算耗尽):
        ① creep 搜索    /v1/realtime/chassis-velocity 慢速前移, 10Hz 轮询 fetch_balls, 见到即停
-       ② track_chassis  select_mode="leftmost", 把最左球拉到画面中心
+       ② track_chassis  select_mode="leftmost", 把最左球拉到画面中心 (2026-08-05 摄像头视野左右反, 先用 leftmost)
        ③ pick_by_vision 吸嘴中心对准球 (粗定位 → PID 精调 → composite_pick → 吸)
        ④ 放 bin        composite_run (抬 y=-190 ∥ 移 bin) → 降 y=-155 → 放气 → 回识别位姿
   3. 返回 summary
@@ -93,10 +93,14 @@ LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
 DEFAULT_MAX_PICKS: int = 8
 """最多抓取数 (比赛正常 6-8 球, 给 buffer)。"""
 
-DEFAULT_CREEP_SPEED_MPS: float = 0.045
-"""creep 搜索前移速度 (m/s)。慢 = 帧覆盖密, 不漏球; 快 = 省时间。
-2026-08-03 用户现场反馈 0.03 太慢, ×1.5 → 0.045。"""
-
+DEFAULT_CREEP_SPEED_MPS: float = 0.05
+"""creep 搜索前移速度 (m/s) — 第一球。 慢 = 帧覆盖密, 不漏球; 快 = 省时间。
+2026-08-05 用户: 0.045→0.09→0.05, 最后一轮调慢 (现场发现 0.09 太快要前冲过球, 0.05 平衡)。"""
+DEFAULT_CREEP_SPEED_LATER_MPS: float = 0.045
+"""后续球的 creep 速度 (m/s) — 第一球之后。 2026-08-05 用户: "只在任务开始时到抓了第一个球的时候用现在的速度, 其他时候速度减半"。
+第一球 0.05, 后续球 0.045。"""
+"""后续球的 creep 速度 (m/s) — 第一球之后。 2026-08-05 用户: "只在任务开始时到抓了
+第一个球的时候用现在的速度, 其他时候速度减半"。 第一球用 0.09, 后续球用 0.045。"""
 DEFAULT_MAX_CREEP_M: float = 0.8
 """累计前移距离预算 (m, 开环 速度×时间 记账)。旧版总行程 0.56m + 余量。"""
 
@@ -148,8 +152,12 @@ class _CreepThread:
         self.distance_m = 0.0
         self.elapsed_s = 0.0
         self.balls = None
-        self.found_ball = False   # 2026-08-04: 见球退出 → 不零速, 交给 track_chassis
         self._t0 = 0.0
+
+    def set_speed(self, speed_mps: float) -> None:
+        """运行时改速度 (线程安全: float 赋值原子, _loop 每帧重读 self.speed_mps)。
+        用于 "第一球用 0.09, 之后用 0.045" 的速度切换 (2026-08-05 用户)。"""
+        self.speed_mps = float(speed_mps)
 
     def start(self) -> None:
         self._t0 = time.monotonic()
@@ -191,19 +199,15 @@ class _CreepThread:
                 except Exception:
                     pass
         finally:
-            # 2026-08-04 (用户: 看见球别停一下): 见球退出 → 不零速, 保持 creep
-            #   前移交给 track_chassis 无缝接管 (track_chassis finally 自己零速)。
-            #   只有未见球 (预算耗尽/被叫停) 才零速 —— 那条路没有接管者。
-            if not self.found_ball:
-                try:
-                    self.http.post(
-                        "/v1/realtime/chassis-velocity",
-                        {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                        timeout=1.0,
-                    )
-                except Exception:
-                    pass
-
+            # 看到球立刻 0 速 (主线程 stop_and_join 兜底, 这里提前发避免惯性前冲)
+            try:
+                self.http.post(
+                    "/v1/realtime/chassis-velocity",
+                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
     def wait_for_ball(self, timeout_s: float) -> dict:
         """阻塞等见球, 见球或超时返回。"""
         got = self.ball_event.wait(timeout=timeout_s)
@@ -232,8 +236,8 @@ class _CreepThread:
 
 # ---- 放 bin 参数 (沿用 P1 版, 现场已调) ----
 
-BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -65.0}
-"""蓝 bin x=0, 黄 bin x=-65。"""
+BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -45.0}
+"""蓝 bin x=0, 黄 bin x=-45 (2026-08-05 用户: blue 改回 0, yellow -65→-45)。"""
 
 Y_PICK_MM: float = -58.0
 """抓球 y (吸盘贴近球面)。"""
@@ -269,92 +273,40 @@ def _set_chassis_vel(http_client, vx: float, vy: float = 0.0) -> None:
               f"({type(e).__name__}: {str(e)[:60]})")
 
 
-def _creep_search(
-    http_client,
-    *,
-    speed_mps: float,
-    max_distance_m: float,
-    max_seconds_s: float,
-    dry_run: bool = False,
-    debug: bool = False,
-) -> dict:
-    """慢速前移 + 轮询 fetch_balls; 见到蓝/黄球立即停车返回。
+def _track_target_ball(*, select_mode: str, max_seconds: float, dry_run: bool):
+    """底盘视觉伺服: 把画面选定的球拉回到画面中心。
 
-    Args:
-        speed_mps: 前移速度 (m/s)。
-        max_distance_m: 剩余前移预算 (m, 开环记账)。
-        max_seconds_s: 本段 creep 时间上限 (s)。
-        dry_run: True 不下发速度, 但仍轮询视觉 (流程排练)。
-        debug: 透传 fetch_balls 打印过滤原因。
-
-    Returns:
-        {"balls": list|None,    # 见到球时的 fetch_balls 全量返回; None=预算耗尽没见球
-         "distance_m": float,   # 实际累计前移 (速度×时间)
-         "elapsed_s": float}
+    select_mode ("leftmost" / "rightmost" / "smallest_area" / ...):
+      - "leftmost": 画面 cx 最小 (最左球)
+      - "rightmost": 画面 cx 最大 (最右球)
+      - "smallest_area": 画面面积最小 (最远球, 2026-08-05 用户: 选最最那边那个)
+    2026-08-05 用户: 摄像头视野左右反了 (cy 仍在帧底侧但 cx 符号反向),
+    暂用 smallest_area 选最远; 长期应在 calibration / axis sign 上根因修。
+    内部 finally 自动零速。
     """
-    period = 1.0 / CREEP_POLL_HZ
-    t0 = time.monotonic()
-    dist = 0.0
-    balls_seen: Optional[list] = None
-    try:
-        while (time.monotonic() - t0) < max_seconds_s and dist < max_distance_m:
-            if not dry_run:
-                _set_chassis_vel(http_client, speed_mps)
-            time.sleep(period)
-            dist += speed_mps * period
-            try:
-                balls = target2.fetch_balls(
-                    http_client, color_filter=None, debug=debug,
-                )
-            except Exception as e:
-                print(f"  [{LOG_PREFIX}] ⚠️ fetch_balls 异常: "
-                      f"{type(e).__name__}: {str(e)[:80]}")
-                continue
-            if any(b.get("color") in (COLOR_BLUE, COLOR_YELLOW) for b in balls):
-                balls_seen = balls
-                break
-    finally:
-        if not dry_run:
-            _set_chassis_vel(http_client, 0.0)
-    return {
-        "balls": balls_seen,
-        "distance_m": dist,
-        "elapsed_s": time.monotonic() - t0,
-    }
-
-
-def _track_leftmost_ball(*, max_seconds: float, dry_run: bool):
-    """底盘视觉伺服: 把画面最左 (cx 最小) 的球拉到画面中心。
-
-    走 main.chassis.track_chassis (2026-08-02 现场标定的 sign/kp/v_max/slew),
-    内部 finally 自动零速。返回 TrackChassisResult
-    (arrived / reason / final_frame.label=cx 最小的球 label)。
-    """
-    # 2026-08-04 (用户: 压缩延迟快速收敛): task4 专属提速档。
-    #   共享默认 kp=0.20/v_max=0.12/hold=5 是 2026-08-02 防振荡的保守档,
-    #   task4 球距近 + 只采一次, 提 kp/v_max + 降 hold_frames 更快收敛。
-    #   ⚠️ 若真机出现左右振荡不收敛 → 把 kp/v_max 往回调。
+    # 2026-08-04 (用户: 削弱对齐幅度, 但速度要快):
+    #   第二轮调: kp 0.30→0.18 仍偏大, 球在画面里仍前后跑幅度可观;
+    #   降 kp 0.18→0.12 再削 33%; v_slew 0.04→0.025 进一步放缓起步/减速,
+    #   避免单帧大跳。 v_max 0.20 保持 (单帧输出上限不变, 总速度感不变)。
     return track_chassis(
         target=BALL_LABELS,
-        select_mode="leftmost",
+        select_mode=select_mode,
         setpoint_cxcy=(0.0, 0.0),
-        kp=0.30,            # 0.20 → 0.30 (更快拉回中心)
-        v_max=0.18,         # 0.12 → 0.18 (更快的底盘速度)
-        hold_frames=3,      # 5 → 3 (带内 3 帧即判到, 省 0.1s)
-        v_slew=0.03,        # 0.02 → 0.03 (加速度略提, 仍限幅防爆冲)
+        kp=0.12,            # 0.30 → 0.18 → 0.12 (持续削弱幅度)
+        v_max=0.20,         # 0.18 → 0.20 (略提速, 弥补 kp 下降带来的收敛慢)
+        hold_frames=3,      # 3 帧带内即判到
+        v_slew=0.025,       # 0.03 → 0.04 → 0.025 (放缓起步, 防单帧大跳)
         max_seconds=max_seconds,
         dry_run=dry_run,
     )
 
-
 def _color_from_track(track_res) -> Optional[str]:
-    """从 track 结果 final_frame.label 提球色 (ball_blue → "blue")。"""
+    """从 track 结果 final_frame.label 提球色 (ball_blue → "blue", ball_yellow → "yellow")。"""
     ff = getattr(track_res, "final_frame", None)
     label = getattr(ff, "label", None) if ff is not None else None
     if label in BALL_LABELS:
         return label.split("_", 1)[1]
     return None
-
 
 def _pick_best_ball(balls: list) -> Optional[dict]:
     """从 fetch_balls 结果选 1 球: score 最高, 平局取第一个 (兜底判色用)。"""
@@ -371,6 +323,7 @@ def _pick_and_store(
     color: str,
     return_x_mm: Optional[float],
     pick_timeout_s: float,
+    bin_arm_deg: float = 90.0,
 ) -> dict:
     """底盘对齐后 + 臂精准定位抓取 + composite_run 并行放 bin。
 
@@ -400,7 +353,7 @@ def _pick_and_store(
     #    find_target_arm_cross 不接受 sign_y (sign_y 只在 find_target_4dof),
     #    用 task1 同款参数 + sign_x=-1 + sign_arm=+1 默认就行。
     print(f"  [{LOG_PREFIX}] [0/3] find_target_arm_cross(label={label!r}, "
-          f"arm_start=90, hand_start=0)")
+          f"arm_start=90, hand_start=-5)")
     sx, sy = runner._resolve_nozzle_setpoint(None, None, label=label) or (0.0, 0.0)
     selector = TargetSelector.for_label(
         label, strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
@@ -435,39 +388,33 @@ def _pick_and_store(
     if result.hits <= 0:
         return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
     print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
-
-    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球) - 必须同步, 等真空建立
-    print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
-    arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
-    runner.grasp(True, timeout=5.0)
-    time.sleep(0.3)  # 让真空建立
-
-    # 0.6 抬 y=-140 (2026-08-04 用户: -40→-140, 很必要 —— 把球抬高防横移拖飞)
-    print(f"  [{LOG_PREFIX}] 中间姿态 y=-140 (抬球)")
-    arm_client.composite_run(y_mm=-140.0, speed=80, timeout=10.0)
-
-    # 后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
-    #    - 移到 bin 上方 (保持 -140 高位 ∥ x=bin)
-    #    - 降到 y=-120 + grasp(False) 放球 (2026-08-04 用户: -30→-120)
-    #    - 不回 P (2026-08-04 用户): 下一球 goto_pose_p 统一回, 避免重复移动。
-    #      ⚠️ 返回的线程须由调用方在下一轮 goto_pose_p 前 join, 防臂命令竞争。
-    import threading
-    def _bg_release():
-        try:
-            # 移到 bin 上方 (保持 -140 高位横移)
-            arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
-            # 降到 bin 开口 y=-120 + grasp(False) 放球
-            arm_client.composite_run(y_mm=-120.0, speed=80, timeout=10.0)
-            runner.grasp(False, timeout=5.0)
-            time.sleep(0.2)
-            # 不回 P —— 下一球 goto_pose_p 统一回
-        except Exception as e:
-            print(f"  [{LOG_PREFIX}] [bg_release] FAIL: {type(e).__name__}: {e}")
-
-    release_thread = threading.Thread(target=_bg_release, daemon=True,
-                                      name="task4-release")
-    release_thread.start()
-    return {"ok": True, "error": None, "release_thread": release_thread}
+    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -45 抓球) - 必须同步, 等真空建立
+    #    2026-08-05 用户: -50→-45, 略浅 5mm (球吸口够, 不撞任务模型)
+    try:
+        print(f"  [{LOG_PREFIX}] 下探 y=-45 + grasp(True)")
+        arm_client.composite_run(y_mm=-45.0, speed=80, timeout=10.0)
+        runner.grasp(True, timeout=5.0)
+        # 同步: grasp() 返回时已吸气, 无需 sleep 等真空
+        # 0.6 抬 y=-125 (2026-08-05 用户: 三段连续恢复 — 抬升 ≥ bin y, 简化: 直接开仓)
+        #    三段连续: -45 抓球 → -125 抬升 → bg_release: composite_run(x=bin, arm=arm) → set_storage_angle(75°) → grasp(False)
+        #    ⚠️ y=-125 在 gate [-205,-145] 外, 75° 在此物理开仓现场已确认可用 (2026-08-04)
+        print(f"  [{LOG_PREFIX}] 中间姿态 y=-125 (抬升)")
+        arm_client.composite_run(y_mm=-125.0, speed=80, timeout=10.0)
+    except Exception as e:
+        # 2026-08-05 网络超时保护: 仅警告, 继续 bg_release (球已在手上, 同步码仍可能 OK)
+        print(f"  [{LOG_PREFIX}] ⚠️ 抓球/抬升异常 ({type(e).__name__}: {str(e)[:80]}), 继续")
+    try:
+        # 转移到 bin 上方 (保持 -125 高位横移, 防球蹭地) + 旋到 bin 姿态大臂
+        arm_client.composite_run(
+            x_mm=bin_x, arm=bin_arm_deg, speed=80, timeout=30.0)
+        # 直接开仓 (y=-125, 75° 已在 step_target4 开头常开, 此处重发确保 state 一致)
+        arm_client.set_storage_angle(
+            STORAGE_OPEN_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
+        runner.grasp(False, timeout=5.0)
+    except Exception as e:
+        print(f"  [{LOG_PREFIX}] ⚠️ 放球异常 ({type(e).__name__}: "
+              f"{str(e)[:80]}), 继续")
+    return {"ok": True, "error": None}
 
 
 # ---------- 核心 step ----------
@@ -545,8 +492,9 @@ def step_target4(
     t_start = time.monotonic()
 
     try:
-        # ---- 0. 打开存储仓 (2026-08-04 用户: task4 开始开仓, 结束关仓) ----
-        #    纯舵机动作 (set_storage_angle 75°), 不碰臂/底盘, 边采边存常开。
+        # ---- 0. 任务一开始就打开存储仓 (2026-08-05 用户回退) ----
+        #    开头 75° 常开 → 期间不关 → finally 关仓。
+        #    放球时不再重复开仓 (放球已同步, 2026-08-05)。
         if not dry_run:
             try:
                 print(f"  [{LOG_PREFIX}] 打开存储仓 (angle={STORAGE_OPEN_ANGLE_DEG}°)")
@@ -569,7 +517,7 @@ def step_target4(
         #      c) 再恢复 P 姿态 + creep 继续, 循环到 8 球
         #      d) 失败一次就退出, 不死循环
         ball_idx = 0
-        release_thread = None  # 2026-08-04: 上一球放仓后台线程, 回P前需 join
+
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
             if elapsed >= max_seconds:
@@ -590,21 +538,21 @@ def step_target4(
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
-            # 2.0 P 姿态 + creep 并发:
-            #    - 后台线程保前移 (chassis-velocity realtime 通道, 见球或超时即停)
-            #    - 主线程同步摆臂到 P 姿态 (composite_run)
-            #    - 见球 → 主线程通知后台停 → 等后台清理
+            # 2.0 P 姿态 + creep —— 收窄并发 (2026-08-05 最终版):
+            #    放球已改同步 (_pick_and_store 2026-08-05 注释), 无后台线程需 join。
+            #    同时启动 creep_thread + goto_pose_p —— 仅 "进入 P 姿态" 期间并发
+            #    (摆臂时底盘在前移, 总耗时 ≈ max(摆臂, creep 起跑) 而非相加)。
+            #    2026-08-05 用户: 第一球用 DEFAULT_CREEP_SPEED_MPS (0.09),
+            #    之后用 DEFAULT_CREEP_SPEED_LATER_MPS (0.045), "其他时候速度减半"。
+            effective_creep_speed = (
+                creep_speed_mps if n_picks == 0
+                else DEFAULT_CREEP_SPEED_LATER_MPS)
             creep_thread = _CreepThread(
-                http_client, speed_mps=creep_speed_mps,
+                http_client, speed_mps=effective_creep_speed,
                 max_distance_m=remaining_m,
                 poll_hz=CREEP_POLL_HZ,
             )
-            creep_thread.start()
-            # 2026-08-04: 先等上一球放仓后台线程结束, 再回 P 姿态 ——
-            #   放仓线程不回 P, 由这里统一回; 不 join 会与其臂命令竞争。
-            #   (chassis 的 creep 已在上面 start, join 期间底盘照常前移不浪费时间)
-            if release_thread is not None and release_thread.is_alive():
-                release_thread.join(timeout=15.0)
+            creep_thread.start()  # 底盘开始前移
             if not dry_run:
                 try:
                     goto_pose_p(arm_client, runner,
@@ -615,32 +563,17 @@ def step_target4(
             else:
                 print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 P 姿态")
 
-            # 2.1 等后台见球 / 见 ball 见 fetch_balls 触发停 + 累计前移记账
             creep_res = creep_thread.wait_for_ball(
                 timeout_s=max(1.0, max_seconds - elapsed))
             creep_thread.stop_and_join()
-            total_creep_m += creep_res["distance_m"]
-            print(f"  [{LOG_PREFIX}] creep 结束: 前移 {creep_res['distance_m']:.3f}m "
-                  f"/ {creep_res['elapsed_s']:.1f}s → "
-                  f"{'见球' if creep_res['balls'] is not None else '未见球'}")
-            if creep_res["balls"] is None:
-                final_reason = "zone_cleared"
-                print(f"  [{LOG_PREFIX}] 🏁 前移预算内未见球, 视作采区走完")
-                break
-
-            # 2.2 底盘视觉定位 (最左球 → 画面中心)
-            #    2026-08-03 现场: 'P 姿态 + 底盘对齐之后直接抓手姿态 + grasp'
-            #    只用底盘对齐 (track_chassis), 跳过臂侧 find_target /
-            #    move_to_vision_target —— 假设底盘对齐后吸嘴已在球正上方,
-            #    直接 composite_run(y_bin高位) → y 下 → grasp 即可。
             print(f"  [{LOG_PREFIX}] 🎯 track_chassis(leftmost, "
-                  f"≤{track_max_seconds:.0f}s) — 仅底盘对齐, 跳过臂视觉伺服")
-            track_res = _track_leftmost_ball(
+                  f"≤{track_max_seconds:.0f}s) — 视野内出现多球时选最左")
+            track_res = _track_target_ball(
+                select_mode="leftmost",
                 max_seconds=track_max_seconds, dry_run=dry_run,
             )
             print(f"  [{LOG_PREFIX}] track 结束: arrived={track_res.arrived} "
                   f"reason={track_res.reason}")
-
             # 2.3 定颜色 (track label 优先; 兜底再识别一帧)
             color = _color_from_track(track_res)
             if color is None and not dry_run:
@@ -673,13 +606,21 @@ def step_target4(
                 n_consecutive_failures = 0
                 continue
 
+            # 决定 bin 段大臂 (2026-08-05 用户):
+            #   yellow bin → arm=+95° (仓口斜对车体, 球入 bin 更稳)
+            #   blue bin   → arm=+100° (仓口斜对车体, 球入 bin 更稳)
+            if color == COLOR_YELLOW:
+                bin_arm = 95.0
+            else:
+                bin_arm = 100.0
             res = _pick_and_store(
                 arm_client, runner,
                 color=color,
                 return_x_mm=return_x_mm,
                 pick_timeout_s=pick_timeout_s,
+                bin_arm_deg=bin_arm,
             )
-            release_thread = res.get("release_thread")  # 记录放仓线程, 下轮回P前 join
+            # 放球已在 _pick_and_store 内同步完成, 返回即球已入 bin (2026-08-05)
             history.append({"ball": ball_idx,
                             "action": "picked" if res["ok"] else "pick_failed",
                             "color": color, "error": res["error"]})
@@ -718,9 +659,23 @@ def step_target4(
                 _dipan._stop_chassis_quietly(http_client)
             except Exception:
                 pass
-            # 2026-08-04: 最后一球的放仓线程收尾, 再关仓 (防臂还在动就关舵机)
-            if release_thread is not None and release_thread.is_alive():
-                release_thread.join(timeout=15.0)
+            # 2026-08-05 用户: 任务结束强制回到 P 姿态, 准备重新标定 find_target_arm_cross 的 setpoint
+            #    完整 4 轴同步 composite_run (y/x/arm/hand 一次下发), 让车停在 P 姿态待人工放球
+            try:
+                print(f"  [{LOG_PREFIX}] 全量回到 P 姿态 (y={POSE_P_Y_MM} x={POSE_P_X_MM} "
+                      f"arm={POSE_P_ARM_DEG}° hand={POSE_P_HAND_DEG}°)")
+                arm_client.composite_run(
+                    arm=POSE_P_ARM_DEG,
+                    x_mm=POSE_P_X_MM,
+                    y_mm=POSE_P_Y_MM,
+                    hand=POSE_P_HAND_DEG,
+                    speed=80,
+                    timeout=30.0,
+                )
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] ⚠️ 收尾 P 姿态失败: "
+                      f"{type(e).__name__}: {str(e)[:80]}")
+            # 放球已同步完成 (2026-08-05), 无后台线程需收尾
             # ---- 关闭存储仓 (2026-08-04 用户: task4 结束关仓) ----
             try:
                 print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")
@@ -753,7 +708,7 @@ def step_target4(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="task4 target4: 慢速前移搜索 + 底盘视觉定位 (最左球) + "
+                    "task4 target4: 慢速前移搜索 + 底盘视觉定位 (最左球) + "
                     "吸嘴中心抓取 (--dry-run 只打印)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
