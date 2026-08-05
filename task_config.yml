@@ -45,7 +45,7 @@ task_cfg:
       x_mm: -100
       arm_angle_deg: -90
       y_mm: -100           # 上下输送时的中间高度 (现在 main loop 已不单独走, 留字段向后兼容)
-      hand_angle_deg: -10
+      hand_angle_deg: -15
 
     arm_place_pose_T2:
       x_mm: -285           # 2026-08-03 00:38 用户: place x=-285
@@ -213,7 +213,7 @@ task_cfg:
 #   第几个转弯的出口紧接着十字路口 = 那个弯用加固转弯逻辑
 #   (里程碑窗口出口判定 + 触发后冷却), 其余弯走原版单帧判定.
 #   None/删掉 = 所有弯道原版. 2026-08-05: 第 2 个弯是 45° 弯出口接十字路口.
-crossroad_turn: 2
+crossroad_turn: 0
 
 waypoints:
 
