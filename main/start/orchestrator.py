@@ -251,6 +251,16 @@ class Orchestrator:
                     if not ok:
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
                 time.sleep(wp.pause_after_s)
+                # task1 播种用 move_to_position 闭环跑格点, 结束时 odom 累积漂移
+                # (实车实测 x=1.40 y=0.31 vs 期望 x≈0.30 y=0). 清零给下一段巡航干净基线.
+                # 只清零底盘里程 (car.reset_position), 不碰机械臂; read_dis 的单调保护
+                # 会保持上次读数, 不污染后续 waypoint 的累计 dis 阈值.
+                if wp.task_id == 1:
+                    try:
+                        client.execute("car", "reset_position", sync=True, timeout=10.0)
+                        logger.info("odometry reset after task1: next segment from distance 0")
+                    except Exception as exc:
+                        logger.warning("odom reset after task1 failed: %s", exc)
                 # 2026-08-03: 每个任务结束后强制 reset 机械臂到 home 姿态
                 # (x=0, y=-150, arm=+90, hand=90), 边重置边巡航 ——
                 # reset 在后台线程跑, 不阻塞 _resume_lane。
