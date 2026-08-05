@@ -88,7 +88,7 @@ class SafetyMixin:
     _ARM_ANGLE_MIN = -150.0
     _ARM_ANGLE_MAX = 90.0
     _HAND_ANGLE_MIN = -90.0
-    _HAND_ANGLE_MAX = 0.0
+    _HAND_ANGLE_MAX = 10.0
     _ARM_SAFE_BAND_MIN = -30.0
     _ARM_SAFE_BAND_MAX = 30.0
 

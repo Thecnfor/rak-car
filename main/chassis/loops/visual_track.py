@@ -121,12 +121,21 @@ def _select_target(
         return None
     if mode == "largest_area":
         return max(matched, key=lambda d: _bbox_area(d))
+    if mode == "smallest_area":
+        # 2026-08-05 用户: 选最远球 (面积最小); 追最远目标能多前移一些
+        return min(matched, key=lambda d: _bbox_area(d))
     if mode == "leftmost":
         # 画面横向 cx 最小 (画面最左); 平局取面积大的 (更可信)
         with_c = [(d, c) for d in matched for c in [_bbox_cx_cy(d)] if c is not None]
         if not with_c:
             return matched[0]
         return min(with_c, key=lambda dc: (dc[1][0], -_bbox_area(dc[0])))[0]
+    if mode == "rightmost":
+        # 画面横向 cx 最大 (画面最右); 平局取面积大的 (更可信)
+        with_c = [(d, c) for d in matched for c in [_bbox_cx_cy(d)] if c is not None]
+        if not with_c:
+            return matched[0]
+        return max(with_c, key=lambda dc: (dc[1][0], -_bbox_area(dc[0])))[0]
     best_d2: Optional[float] = None
     best_det: Optional[Dict[str, Any]] = None
     for d in matched:

@@ -75,8 +75,8 @@ POSE_P_X_MM: float = -300.0
 POSE_P_ARM_DEG: float = 90.0
 """P 姿态大臂角度 (°, MID / 复位位, 业务硬限上界)。"""
 
-POSE_P_HAND_DEG: float = 0.0
-"""P 姿态手爪角度 (°, DOWN, 需先 arm >= +30° 出联动保护区)。"""
+POSE_P_HAND_DEG: float = 10.0
+"""P 姿态手爪角度 (°, 2026-08-05 用户: 0°→-5°→+5°→+10°; DOWN 偏后 10°)。"""
 
 POSE_P_GRAB_Y_MM: float = -160.0
 """P 姿态下抓球 y (mm, 4cm 球球心高度)。"""
