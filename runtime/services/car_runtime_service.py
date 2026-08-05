@@ -255,10 +255,12 @@ class CarRuntimeService(
             self._realtime_check_locked()
             car = self.car
         out = {}
-        # 角度软限位 (°) — arm 对齐业务层 [-150, 90] (2026-08-02).
-        # 之前 -90 过严: 吸嘴中心 cx=0.161 对应 arm≈-97 (实机标定), 被卡住.
-        ARM_MIN, ARM_MAX = -150.0, 90.0
-        HAND_MIN, HAND_MAX = -90.0, 0.0
+        # 角度软限位 (°) — arm 对齐业务层 [-150, +150] (2026-08-06).
+        # 实时路径走 _realtime_gate 不进 job_queue, 跳过 main/arm/api/safety.py 校验,
+        # 这里的常量是 main/arm/api/safety.py:SafetyMixin._ARM_ANGLE_MIN/_MAX/_HAND_ANGLE_MIN/_MAX 的镜像;
+        # runtime 与 main 是两个独立包, 不跨包 import 常量, 改任何一边另一处必须同步.
+        ARM_MIN, ARM_MAX = -150.0, 150.0
+        HAND_MIN, HAND_MAX = -90.0, 10.0
         # 十字速度软限位 (m)
         X_MIN_M, X_MAX_M = -0.30, 0.0
         Y_MIN_M, Y_MAX_M = -0.20, 0.0

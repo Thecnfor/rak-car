@@ -166,9 +166,9 @@ class ArmRunner:
 
     def set_arm_angle(self, angle: float, speed: int = 80,
                       timeout: Optional[float] = None) -> dict:
-        """大臂角度控制（业务层硬限 [+90, -150]°，2026-07-27 重定义）。
+        """大臂角度控制（业务层硬限 [+150, -150]°，2026-08-05 用户放宽 +90→+150）。
 
-        +90 是复位位（reset_position 用），-150 是结构极限。
+        +90 是复位位（reset_position 用），-150 是结构极限，+150 是新对称上界。
         """
         return self.client.set_arm_angle(
             angle, speed=speed,
@@ -230,8 +230,8 @@ class ArmRunner:
         业务前置（必须满足，违反会抛 ValueError）：
           - 当前 y 必须 < -30mm(出保护区)。
             大臂舵机在 y ∈ [0, -30] 摆动会撞车,client wrapper 会拒绝。
-          - 大臂角度 arm_angle ∈ [+90, -150]°。
-          - 手爪角度 hand ∈ [-90, 0]°。
+          - 大臂角度 arm_angle ∈ [+150, -150]°。
+          - 手爪角度 hand ∈ [-90, +10]°。
 
         Returns:
             {"ok": bool, "steps": {"arm": bool, "position": bool, "hand": bool, "grasp": bool}}

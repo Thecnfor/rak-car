@@ -21,7 +21,7 @@ class SettersMixin:
             raise ValueError(
                 f"set_arm_angle({a}) 超出业务硬限 [{self._ARM_ANGLE_MIN}, "
                 f"{self._ARM_ANGLE_MAX}]°。\n"
-                f"  规则: 大臂角度 ∈ [+90, -150]°"
+                f"  规则: 大臂角度 ∈ [+150, -150]° (对称硬限, 2026-08-05 用户放宽 +90→+150)"
             )
         skip_y_protect = self._is_arm_safe_position()
         if skip_y_protect:
@@ -42,7 +42,7 @@ class SettersMixin:
             raise ValueError(
                 f"set_hand_angle({a}) 超出业务硬限 [{self._HAND_ANGLE_MIN}, "
                 f"{self._HAND_ANGLE_MAX}]°。\n"
-                f"  规则: 手爪角度 ∈ [-90, 0]°"
+                f"  规则: 手爪角度 ∈ [-90, +10]° (UP=-90, DOWN=0, P 姿态上限 +10, 2026-08-05)"
             )
         try:
             st = self.get_state()

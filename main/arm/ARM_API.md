@@ -62,7 +62,7 @@ from main.arm import (
 | `reset_x(direction="right", reset_velocity_mms=50.0, timeout=25.0)` | x 撞墙定原点 | mm/s | `arm.reset_x` | **2026-08-01 重写**：编码器位移是撞墙唯一凭证,单档正向驱动 + 窗口制 stall 检测(STALL_WINDOW_S=0.3s, 阈值 1mm, 连续 3 窗口不动=撞墙)。belt-slip 状态走满 seek_timeout=25s 后超时退出 |
 | `reset_all(arm_angle=0, hand_angle=-90, x_direction="right", reset_x_velocity_mms=20.0, timeout=120)` | 复合复位（**大臂+手爪+x 并行 → y 串行**） | — | `arm.reset_all` | ThreadPoolExecutor 并行三个独立动作，as_completed 后串行 `reset_y` 触底 |
 | `set_arm_angle(angle, speed, timeout)` | 大臂角度（**业务硬限 [+150, -150]° + y 保护区，2026-08-05 放宽 +90→+150；+90 是复位位，-150 是结构极限**） | float（**必填**） | `arm.set_arm_angle` | angle > +150 / < -150 报 ValueError；+90° (复位位) / 0° (MID) 是 init 位置（保护区允许） |
-| `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, 0]° + y 保护区**） | float（**必填**） | `arm.set_hand_angle` | angle > 0 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
+| `set_hand_angle(angle, speed, timeout)` | 手爪角度（**业务硬限 [-90, +10]° + y 保护区，2026-08-05 上限 0→+10 (P 姿态放宽)**） | float（**必填**） | `arm.set_hand_angle` | angle > +10 / < -90 报 ValueError；-90° (UP) 是 init 位置（保护区允许） |
 | `grasp(on, timeout=10)` | 吸盘抓/放 | bool | `arm.grasp` | — |
 | `set_storage(side, timeout=10)` | 存储仓档位（写死 -42°/90°） | enum | **`car.set_storage`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；实际角度走 `ServoPwm` wrapper，参见 §6 |
 | `set_storage_angle(angle, speed=100, timeout=10)` | 存储仓**任意角度**（绕开两档写死，调试/标定用） | float（**必填**） | **`car.set_storage_angle`（注意是 car）** | **无软限制**（2026-07-17 取消 y 安全门）；合法区间 `angle ∈ [-90, 90]`；调完 `get_storage()` 回 "UNKNOWN"，参见 §6 |
@@ -241,17 +241,17 @@ class TrajectoryPlan:
 
 ```bash
 # 走 arm action
-curl -X POST http://192.168.6.231:5050/v1/execute \
+curl -X POST http://192.168.5.230:5050/v1/execute \
   -H 'Content-Type: application/json' \
   -d '{"target":"arm","name":"goto_position","args":[],"kwargs":{"x":0.1,"y":0.04}}'
 
 # 走 car action（注意 set_storage 是 car 不是 arm）
-curl -X POST http://192.168.6.231:5050/v1/execute \
+curl -X POST http://192.168.5.230:5050/v1/execute \
   -H 'Content-Type: application/json' \
   -d '{"target":"car","name":"set_storage","args":[],"kwargs":{"state":true}}'
 
 # 读 car.get_arm_state
-curl -X POST http://192.168.6.231:5050/v1/execute \
+curl -X POST http://192.168.5.230:5050/v1/execute \
   -H 'Content-Type: application/json' \
   -d '{"target":"car","name":"get_arm_state","args":[],"kwargs":{}}'
 ```
@@ -263,7 +263,7 @@ curl -X POST http://192.168.6.231:5050/v1/execute \
 runtime 启动时由 `arm_feed` 守护线程（默认 20Hz）持续把机械臂 y/x 位置刷到 `streamer.arm_state`。`/v1/realtime/arm/state` 直接读这份缓存，**不进 job_queue、不打 ZMQ、不抢 car_lock**，调试/UI 轮询 20Hz+ 安全。
 
 ```bash
-curl http://192.168.6.231:5050/v1/realtime/arm/state
+curl http://192.168.5.230:5050/v1/realtime/arm/state
 ```
 
 返回：
@@ -310,7 +310,7 @@ curl http://192.168.6.231:5050/v1/realtime/arm/state
 
 ```python
 from main.ws_client import RuntimeWsClient
-client = RuntimeWsClient("ws://192.168.6.231:5050/v1/ws")
+client = RuntimeWsClient("ws://192.168.5.230:5050/v1/ws")
 client.connect()
 
 def on_arm(state):
@@ -327,7 +327,7 @@ stop()  # 断开订阅
 
 ```python
 from main.api_client import RuntimeApiClient
-client = RuntimeApiClient("http://192.168.6.231:5050")
+client = RuntimeApiClient("http://192.168.5.230:5050")
 state = client.get_arm_state()["arm_state"]
 print(state["y_mm"], state["x_mm"])
 ```
@@ -708,7 +708,7 @@ POST /v1/execute
 
 ```python
 from main.api_client import RuntimeApiClient
-client = RuntimeApiClient("http://192.168.6.231:5050")
+client = RuntimeApiClient("http://192.168.5.230:5050")
 result = client.execute("arm", "composite_run",
     arm=30, x=0.10, y=-0.13, hand=0, timeout=30)
 # result 是 job dict；拿到 .result 即上述 {"ok": ..., "steps": ...}
