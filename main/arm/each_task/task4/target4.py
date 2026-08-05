@@ -75,12 +75,10 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
     )
 
 from main.arm import (  # noqa: E402
-    ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
+    ArmClient, ArmRunner,
 )
 from main.arm.each_task.common import (  # noqa: E402
     goto_pose_p,
-    POSE_P_X_MM, POSE_P_Y_MM,
-    POSE_P_GRAB_Y_MM, POSE_P_ARM_DEG, POSE_P_HAND_DEG,
 )
 from main.chassis import track_chassis  # noqa: E402
 
@@ -370,104 +368,94 @@ def _pick_and_store(
     *,
     color: str,
     return_x_mm: Optional[float],
-    pick_timeout_s: float,
+    pick_timeout_s: float,  # noqa: ARG001 — 保留参数兼容性, 当前同步流程不直接用
 ) -> dict:
-    """底盘对齐后 + 臂精准定位抓取 + composite_run 并行放 bin。
+    """底盘对齐后盲降抓球 + 同步放 bin (2026-08-05 用户决定: 省掉吸嘴对齐)。
 
-    2026-08-03 现场 (用户): '现在是两个定位 — 底盘对齐然后精准追踪'。
-      step 2.2 底盘对齐 (track_chassis) 已做了;
-      本函数加回 step 2.5: track_velocity_pick 精准追踪 (P 姿态吸嘴 setpoint),
-      之后才进入放仓固定两位置。
+    2026-08-03 旧流程: track_chassis (底盘对齐到画面中心) → find_target_arm_cross
+      (吸嘴 setpoint PID 闭环, 把画面中心球拉到吸嘴正下方) → 下探 + grasp。
+    2026-08-05 用户决策: 砍掉 find_target_arm_cross 这一段。
+      - 理由: 底盘对齐后画面中心球已落到画面中央, 球心相对吸嘴的偏移 (sx, sy)
+        仍存在但不补偿; 球的 4cm 半径允许小偏移吸到, 省下 ~3-5s PID 闭环。
+      - 隐含假设: P 姿态 (x=-300, y=-140, arm=+90°, hand=0°) + 盲降 y=-58
+        时, 吸嘴基本落在球心高度 + 球水平投影附近。
 
-    流程:
-      0. track_velocity_pick(label, skip_pose_align=True) — 已在 P 姿态, 跳过入口
-         composite_run, 直接走 arm 控 cx + x 十字控 cy + 吸嘴 setpoint
-         → y 降到 grasp_y → grasp(True) → 自动回抬
-      1. composite_run 升 y (出保护区) ∥ x 横移到 bin 上方 (固定两位置)
-      2. composite_run y 降到 Y_PUT_MM (放仓位) → grasp(False)
-      3. 恢复到 return_x_mm (默认 POSE_P_X = -300)
+    新流程 (同步, 5 步):
+      0. composite_run y=-58            盲降到抓球位
+      1. grasp(True) + sleep 0.3s       真空建立
+      2. composite_run y=-190           抬到中转位 (出 gate)
+      3. composite_run x=bin_x          横移到 bin 上方 (高位 ∥ 移)
+      4. composite_run y=-155           降到放仓位
+      5. grasp(False) + sleep 0.2s      放气 + 球稳定
+      6. (return_x_mm 不回 — 由下轮 goto_pose_p 统一回 P 姿态)
 
     Returns:
-        {"ok": bool, "error": str|None}
+        {"ok": bool, "error": str|None, "release_thread": None}
     """
-    label = f"ball_{color}"
     bin_x = BIN_X_MM[color]
 
-    # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
-    #    2026-08-03 现场 (用户): track_velocity_pick 默认 arm_start=-90 是 task1 init,
-    #    任务4 要传 arm=+90; grasp_y=-20 才抓到 (球心高度); lift_back=True 会把球带着跑,
-    #    业务层管抬回。
-    #    find_target_arm_cross 不接受 sign_y (sign_y 只在 find_target_4dof),
-    #    用 task1 同款参数 + sign_x=-1 + sign_arm=+1 默认就行。
-    print(f"  [{LOG_PREFIX}] [0/3] find_target_arm_cross(label={label!r}, "
-          f"arm_start=90, hand_start=0)")
-    sx, sy = runner._resolve_nozzle_setpoint(None, None, label=label) or (0.0, 0.0)
-    selector = TargetSelector.for_label(
-        label, strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
-    )
+    # 0. 盲降到抓球位 (从 P 姿态 y=-140 落到 y=-58, 落 82mm)
+    print(f"  [{LOG_PREFIX}] [0/5] composite_run(y={Y_PICK_MM:+.0f})  盲降到抓球位 (无吸嘴对齐)")
     try:
-        result = runner.client._make_vision_with_move().find_target_arm_cross(
-            label, timeout=min(pick_timeout_s, 5.0), hz=20,
-            # 2026-08-04 (用户: 压缩延迟快速收敛, 第 2 个对齐):
-            #   收敛提前退出 — 连续 3 帧 |dx|,|dy|<0.04 即停, 不等满 timeout。
-            #   单测里球 ~2.5s 就收敛, 之前却傻等满 6s。现在收敛即走。
-            settle_frames=3, settle_tol=0.04,
-            # 2026-08-04 现场 (单测): task1 默认 gain_x=0.55 太激进,
-            # 4s 内 x 走了 62mm 过头。task4 改:
-            #   gain_x  0.55 → 0.10
-            #   gain_arm 2.5 → 1.5
-            #   max_vel 0.70 → 0.15
-            #   deadzone 0.06 → 0.04
-            # 实测 4s 内 ball 从 dy=+0.61 收敛到 dy=+0.008 (误差 < 1% 视野)。
-            gain_arm=1.5, gain_x=0.10,
-            deadzone=0.04, max_vel=0.15,
-            arm_start=POSE_P_ARM_DEG,  # +90
-            # 2026-08-03 (用户): task4 arm=+90 与 task1 arm=-90 差 180° 旋转,
-            # 视野坐标反向 → x 物理方向也要反过来。task1 默认 sign_x=-1,
-            # task4 用 sign_x=+1。
-            sign_arm=1.0, sign_x=+1.0,
-            setpoint_x_norm=sx, setpoint_y_norm=sy,
-            selector=selector,
-        )
+        arm_client.composite_run(y_mm=Y_PICK_MM, speed=80, timeout=10.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"find_target_arm_cross: {type(e).__name__}: {str(e)[:120]}"}
-    if result.hits <= 0:
-        return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
-    print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
+                "error": f"composite_run(y={Y_PICK_MM}) 盲降失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球) - 必须同步, 等真空建立
-    print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
-    arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
-    runner.grasp(True, timeout=5.0)
-    time.sleep(0.3)  # 让真空建立
+    # 1. grasp + 等真空建立
+    print(f"  [{LOG_PREFIX}] [1/5] grasp(True) + sleep 0.3s  真空建立")
+    try:
+        runner.grasp(True, timeout=5.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"grasp(True) 失败: {type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
+    time.sleep(0.3)
 
-    # 0.6 抬 y=-140 (2026-08-04 用户: -40→-140, 很必要 —— 把球抬高防横移拖飞)
-    print(f"  [{LOG_PREFIX}] 中间姿态 y=-140 (抬球)")
-    arm_client.composite_run(y_mm=-140.0, speed=80, timeout=10.0)
+    # 2. 抬到中转位 (持球抬升, 出 y gate 上界)
+    print(f"  [{LOG_PREFIX}] [2/5] composite_run(y={Y_TRANSIT_MM:+.0f})  抬到中转位")
+    try:
+        arm_client.composite_run(y_mm=Y_TRANSIT_MM, speed=80, timeout=10.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(y={Y_TRANSIT_MM}) 抬升失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    # 后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
-    #    - 移到 bin 上方 (保持 -140 高位 ∥ x=bin)
-    #    - 降到 y=-120 + grasp(False) 放球 (2026-08-04 用户: -30→-120)
-    #    - 不回 P (2026-08-04 用户): 下一球 goto_pose_p 统一回, 避免重复移动。
-    #      ⚠️ 返回的线程须由调用方在下一轮 goto_pose_p 前 join, 防臂命令竞争。
-    import threading
-    def _bg_release():
-        try:
-            # 移到 bin 上方 (保持 -140 高位横移)
-            arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
-            # 降到 bin 开口 y=-120 + grasp(False) 放球
-            arm_client.composite_run(y_mm=-120.0, speed=80, timeout=10.0)
-            runner.grasp(False, timeout=5.0)
-            time.sleep(0.2)
-            # 不回 P —— 下一球 goto_pose_p 统一回
-        except Exception as e:
-            print(f"  [{LOG_PREFIX}] [bg_release] FAIL: {type(e).__name__}: {e}")
+    # 3. 横移到 bin 上方 (高位 ∥ x=bin, 防横移拖飞)
+    print(f"  [{LOG_PREFIX}] [3/5] composite_run(x={bin_x:+.0f})  横移到 {color} bin 上方")
+    try:
+        arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(x={bin_x}) 横移失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    release_thread = threading.Thread(target=_bg_release, daemon=True,
-                                      name="task4-release")
-    release_thread.start()
-    return {"ok": True, "error": None, "release_thread": release_thread}
+    # 4. 降到放仓位 (命中 y gate 上界 -145)
+    print(f"  [{LOG_PREFIX}] [4/5] composite_run(y={Y_PUT_MM:+.0f})  降到放仓位 (命中 y gate 上界)")
+    try:
+        arm_client.composite_run(y_mm=Y_PUT_MM, speed=80, timeout=10.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(y={Y_PUT_MM}) 降放仓位失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
+
+    # 5. 放气 + 等球稳定
+    print(f"  [{LOG_PREFIX}] [5/5] grasp(False) + sleep 0.2s  放气 + 球稳定")
+    try:
+        runner.grasp(False, timeout=5.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"grasp(False) 失败: {type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
+    time.sleep(0.2)
+
+    # 不回 P —— 下一轮 goto_pose_p 统一回, 避免重复移动。
+    return {"ok": True, "error": None, "release_thread": None}
 
 
 # ---------- 核心 step ----------
