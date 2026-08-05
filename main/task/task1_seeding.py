@@ -64,6 +64,14 @@ logger = logging.getLogger("task.task1_seeding")
 
 # 每列允许看到的源头 label: 三个圆柱 (1=大/2=中/3=小)
 SOURCE_LABELS: tuple = ("cylinder_1", "cylinder_2", "cylinder_3")
+
+# 吸嘴 setpoint (2026-08-02 标定): 目标在吸嘴正下方时其 bbox 中心坐标; 按 label 分组查表
+# (cylinder_1/2/3 → (0.161,-0.519), ball_* 各自分档, 未知回落全局默认).
+TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
+    "cylinder_1": (0.161, -0.519),
+    "cylinder_2": (0.161, -0.519),
+    "cylinder_3": (0.161, -0.519),
+}
 def _scan_cylinder_label(
     client: RuntimeApiClient,
     valid_labels: List[str],
@@ -191,12 +199,13 @@ def _pick_at_source(
     Returns: 抓到的 cylinder label (1/2/3).
     """
     # 2026-08-02: scan 1 retry, no backoff; 多 cylinder 视野取最近 setpoint
-    setpoint_xy = (arm_client.origin.nozzle_offset_x_norm,
-                   arm_client.origin.nozzle_offset_y_norm)
-    if setpoint_xy == (0.0, 0.0):
-        setpoint_xy = None
+    # 按 task1 标定值查表 (不再依赖 origin 全局默认，防止退回到画面中心)
+    setpoint_xy = TASK1_NOZZLE_OFFSET_MAP.get(label) if label else None
+    if setpoint_xy is None:
+        # label 未知时先取任意 cylinder 的 setpoint 当默认（task1 只扫 cylinder）
+        setpoint_xy = next(iter(TASK1_NOZZLE_OFFSET_MAP.values()))
     logger.info("[S%d] 视觉扫描源头 cylinder label (setpoint=%s)",
-                column_idx, setpoint_xy or "(未标定)")
+                column_idx, setpoint_xy)
     label = _scan_cylinder_label(
         client, list(SOURCE_LABELS),
         retries=1, backoff_s=0.0,
@@ -230,6 +239,8 @@ def _pick_at_source(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
         arm_start=pick_arm_start, hand_start=0.0,
+        setpoint_x_norm=TASK1_NOZZLE_OFFSET_MAP[label][0],
+        setpoint_y_norm=TASK1_NOZZLE_OFFSET_MAP[label][1],
         timeout=cfg.get("pick_track_timeout_s", 2.0),
         hz=20.0,
         gain_arm=2.5, gain_x=0.55,
