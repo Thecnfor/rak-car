@@ -163,3 +163,4 @@ track_trace_*.jsonl
 vel_trace_*.jsonl
 servo4_trace_*.jsonl
 .claude/worktrees/
+main/chassis/tests/test_move_along_lane.py
