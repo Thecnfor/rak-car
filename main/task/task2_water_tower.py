@@ -353,6 +353,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     detect_retry_step_m = cfg.get("detect_retry_step_m", 0.2)
     detect_retry_max = cfg.get("detect_retry_max", 1)
     x_target_mm = float(detection["x_mm"])
+    pick = cfg["pick_pose"]
+    carry = cfg["carry_pose"]
+    vision = cfg.get("pick_vision") or {}
 
     try:
         # ===== 初始化: composite_run 4 轴并发到 detection 姿态 (transport Y=-150) =====
