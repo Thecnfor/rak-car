@@ -4,6 +4,7 @@ from .stanley import StanleyOuterLoop
 from .curvature_adaptive import CurvatureAdaptiveOuterLoop
 from .calibration import ErrorCalibrator
 from .visual_align import VisualAlignOuterLoop
+from .move_along_lane import move_along_lane  # 沿中心车道线只前进/后退（vy 锁死 + ω 视觉对齐）
 
 __all__ = [
     "OuterLoop",
@@ -13,4 +14,5 @@ __all__ = [
     "CurvatureAdaptiveOuterLoop",
     "ErrorCalibrator",
     "VisualAlignOuterLoop",
+    "move_along_lane",
 ]
