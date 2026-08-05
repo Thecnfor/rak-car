@@ -75,12 +75,10 @@ except ImportError:  # pragma: no cover —— 直接 python target4.py 时无�
     )
 
 from main.arm import (  # noqa: E402
-    ArmClient, ArmRunner, TargetSelector, SelectionStrategy,
+    ArmClient, ArmRunner,
 )
 from main.arm.each_task.common import (  # noqa: E402
     goto_pose_p,
-    POSE_P_X_MM, POSE_P_Y_MM,
-    POSE_P_GRAB_Y_MM, POSE_P_ARM_DEG, POSE_P_HAND_DEG,
 )
 from main.chassis import track_chassis  # noqa: E402
 
@@ -103,9 +101,11 @@ DEFAULT_MAX_CREEP_M: float = 0.8
 DEFAULT_MAX_SECONDS: float = 180.0
 """任务总时长预算 (s)。"""
 
-DEFAULT_TRACK_MAX_SECONDS: float = 8.0
-"""单球底盘视觉伺服收敛预算 (s)。超时但目标仍在画面 → 照样试抓 (臂伺服补残差)。
-2026-08-04: 12→8, 配合下面 kp/v_max 提速, 正常 3-5s 收敛。"""
+DEFAULT_TRACK_MAX_SECONDS: float = 6.0
+"""单球底盘视觉伺服收敛预算 (s)。超时但目标仍在画面 → 照样试抓 (盲降)。
+2026-08-04: 12→8, 配合下面 kp/v_max 提速, 正常 3-5s 收敛。
+2026-08-05: 8→6, 配合进一步提速档 (kp=0.40/v_max=0.25/hold=2/slew=0.05),
+正常 2-3s 收敛, 给 6s 已留 buffer。"""
 
 DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
 """连续 pick 失败超过此数 → 退出 (单个球抓不起不应拖垮全场)。
@@ -230,22 +230,37 @@ class _CreepThread:
             except Exception:
                 pass
 
-# ---- 放 bin 参数 (沿用 P1 版, 现场已调) ----
+# ---- 放 bin 参数 (2026-08-05 用户拍板: 新放球序列) ----
 
 BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -65.0}
 """蓝 bin x=0, 黄 bin x=-65。"""
 
+X_PICK_MM: float = -280.0
+"""盲降前 x (2026-08-05 用户拍板)。从 P 姿态 x=-300 → -280 (靠中间)。
+⚠️ 待现场测: 横移距离短 = belt-slip 风险低; x=-280 是否能让吸嘴落在球心
+上方需要 13_nozzle_align_pose_p.py 标定的 (sx, sy) 配合验证。
+如果 (sx, sy) 偏移明显, 球径 4cm 仍允许小偏差抓到, 不用回伺服。"""
+
 Y_PICK_MM: float = -58.0
 """抓球 y (吸盘贴近球面)。"""
 
-Y_TRANSIT_MM: float = -190.0
-"""中转 y (持球抬升, 出 gate)。"""
+Y_TRANSIT_MM: float = -130.0
+"""中转 y (2026-08-05 用户拍板 -190 → -130, 不需要那么深的中转位)。
+留出 y=-130 是放仓位 y=-100 之前的过渡 — y_gate 上界 -145, 中转位高于
+gate 上界, 业务层 OK (开仓舵机在 y ∈ [-205,-145] 才卡; 我们不放仓,
+只在这里横移)。"""
 
-Y_PUT_MM: float = -155.0
-"""放球 y (命中开仓 y gate 上界)。"""
+X_TRANSIT_MM: float = -150.0
+"""中转 x (2026-08-05 用户拍板)。从 P 姿态 x=-300 → 中转 -150 (车体中线
+附近), 然后再横移到 bin x=0/-65。两次小位移, belt-slip 风险低。"""
+
+Y_PUT_MM: float = -100.0
+"""放球 y (2026-08-05 用户拍板 -155 → -100, 离 bin 顶面更近)。
+⚠️ 待现场测: y=-100 是否真的进 bin (bin 顶面 y 未知, 历史实测 -155 进;
+缩短到 -100 后是否还进需要校准)。"""
 
 Y_FINAL_MM: float = -133.0
-"""最终 y (识别位姿)。"""
+"""最终 y (识别位姿, 历史值, 下一阶段 target 识别用)。"""
 
 BALL_LABELS = ["ball_blue", "ball_yellow"]
 """track_chassis 目标集 (PaddleDet 模型标签)。"""
@@ -330,18 +345,17 @@ def _track_leftmost_ball(*, max_seconds: float, dry_run: bool):
     内部 finally 自动零速。返回 TrackChassisResult
     (arrived / reason / final_frame.label=cx 最小的球 label)。
     """
-    # 2026-08-04 (用户: 压缩延迟快速收敛): task4 专属提速档。
-    #   共享默认 kp=0.20/v_max=0.12/hold=5 是 2026-08-02 防振荡的保守档,
-    #   task4 球距近 + 只采一次, 提 kp/v_max + 降 hold_frames 更快收敛。
-    #   ⚠️ 若真机出现左右振荡不收敛 → 把 kp/v_max 往回调。
+    # 2026-08-05 (用户: 再快一点): 现场验证 0.30/0.18/3/0.03 仍偏慢,
+    # 提速档 kp=0.40 / v_max=0.25 / hold=2 / slew=0.05。
+    # ⚠️ 若真机出现左右振荡不收敛 → 把 kp/v_max 往回调。
     return track_chassis(
         target=BALL_LABELS,
         select_mode="leftmost",
         setpoint_cxcy=(0.0, 0.0),
-        kp=0.30,            # 0.20 → 0.30 (更快拉回中心)
-        v_max=0.18,         # 0.12 → 0.18 (更快的底盘速度)
-        hold_frames=3,      # 5 → 3 (带内 3 帧即判到, 省 0.1s)
-        v_slew=0.03,        # 0.02 → 0.03 (加速度略提, 仍限幅防爆冲)
+        kp=0.40,            # 0.30 → 0.40 (更快拉回中心)
+        v_max=0.25,         # 0.18 → 0.25 (更快的底盘速度)
+        hold_frames=2,      # 3 → 2 (带内 2 帧即判到)
+        v_slew=0.05,        # 0.03 → 0.05 (加速度更激进)
         max_seconds=max_seconds,
         dry_run=dry_run,
     )
@@ -370,104 +384,106 @@ def _pick_and_store(
     *,
     color: str,
     return_x_mm: Optional[float],
-    pick_timeout_s: float,
+    pick_timeout_s: float,  # noqa: ARG001 — 保留参数兼容性, 当前同步流程不直接用
 ) -> dict:
-    """底盘对齐后 + 臂精准定位抓取 + composite_run 并行放 bin。
+    """底盘对齐后盲降抓球 + 同步放 bin (2026-08-05 用户拍板: 新放球序列)。
 
-    2026-08-03 现场 (用户): '现在是两个定位 — 底盘对齐然后精准追踪'。
-      step 2.2 底盘对齐 (track_chassis) 已做了;
-      本函数加回 step 2.5: track_velocity_pick 精准追踪 (P 姿态吸嘴 setpoint),
-      之后才进入放仓固定两位置。
+    历史迭代:
+      - 2026-08-03 (旧): track_chassis → find_target_arm_cross (吸嘴对齐, 3-5s) →
+        下探 + grasp + 后台放球
+      - 2026-08-05 v1: 砍吸嘴对齐, 同步放球 (5 步)
+      - **2026-08-05 v2 (当前)**: 用户拍板, 进一步优化:
+        1. 中转位 (y=-130, x=-150) 取代原 y=-190, x=-300 (车体中线过渡,
+           两次小位移代替一次大位移, belt-slip 风险更低)
+        2. 放仓位 y=-100 (原来 -155, 离 bin 顶面更近)
+        3. 盲降前 x=-280 横移 (待现场测, 球心可能在这个 x 上方)
+        4. **两个 grasp 后不要 sleep, 直接下一动作** (真空建立靠 SDK 自闭环)
 
-    流程:
-      0. track_velocity_pick(label, skip_pose_align=True) — 已在 P 姿态, 跳过入口
-         composite_run, 直接走 arm 控 cx + x 十字控 cy + 吸嘴 setpoint
-         → y 降到 grasp_y → grasp(True) → 自动回抬
-      1. composite_run 升 y (出保护区) ∥ x 横移到 bin 上方 (固定两位置)
-      2. composite_run y 降到 Y_PUT_MM (放仓位) → grasp(False)
-      3. 恢复到 return_x_mm (默认 POSE_P_X = -300)
+    新流程 (同步, 6 步, 无 sleep):
+      0. composite_run x=-280                盲降前横移到 -280
+      1. composite_run y=Y_PICK              盲降到抓球位
+      2. grasp(True)                         真空开 (无 sleep)
+      3. composite_run y=Y_TRANSIT, x=X_TRANSIT  抬到中转 (-130, -150)
+      4. composite_run x=bin_x               横移到 bin 上方
+      5. composite_run y=Y_PUT               降到放仓位 (-100)
+      6. grasp(False)                        放气 (无 sleep)
 
     Returns:
-        {"ok": bool, "error": str|None}
+        {"ok": bool, "error": str|None, "release_thread": None}
     """
-    label = f"ball_{color}"
     bin_x = BIN_X_MM[color]
 
-    # 0. 臂精准定位抓取 (P 姿态吸嘴 setpoint, blue/yellow 共用同一组)
-    #    2026-08-03 现场 (用户): track_velocity_pick 默认 arm_start=-90 是 task1 init,
-    #    任务4 要传 arm=+90; grasp_y=-20 才抓到 (球心高度); lift_back=True 会把球带着跑,
-    #    业务层管抬回。
-    #    find_target_arm_cross 不接受 sign_y (sign_y 只在 find_target_4dof),
-    #    用 task1 同款参数 + sign_x=-1 + sign_arm=+1 默认就行。
-    print(f"  [{LOG_PREFIX}] [0/3] find_target_arm_cross(label={label!r}, "
-          f"arm_start=90, hand_start=0)")
-    sx, sy = runner._resolve_nozzle_setpoint(None, None, label=label) or (0.0, 0.0)
-    selector = TargetSelector.for_label(
-        label, strategy=SelectionStrategy.CLOSEST_TO_CENTER.value,
-    )
+    # 0. 盲降前横移到 -280 (待现场测; 短距, belt-slip 风险低)
+    print(f"  [{LOG_PREFIX}] [0/6] composite_run(x={X_PICK_MM:+.0f})  盲降前横移到 -280")
     try:
-        result = runner.client._make_vision_with_move().find_target_arm_cross(
-            label, timeout=min(pick_timeout_s, 5.0), hz=20,
-            # 2026-08-04 (用户: 压缩延迟快速收敛, 第 2 个对齐):
-            #   收敛提前退出 — 连续 3 帧 |dx|,|dy|<0.04 即停, 不等满 timeout。
-            #   单测里球 ~2.5s 就收敛, 之前却傻等满 6s。现在收敛即走。
-            settle_frames=3, settle_tol=0.04,
-            # 2026-08-04 现场 (单测): task1 默认 gain_x=0.55 太激进,
-            # 4s 内 x 走了 62mm 过头。task4 改:
-            #   gain_x  0.55 → 0.10
-            #   gain_arm 2.5 → 1.5
-            #   max_vel 0.70 → 0.15
-            #   deadzone 0.06 → 0.04
-            # 实测 4s 内 ball 从 dy=+0.61 收敛到 dy=+0.008 (误差 < 1% 视野)。
-            gain_arm=1.5, gain_x=0.10,
-            deadzone=0.04, max_vel=0.15,
-            arm_start=POSE_P_ARM_DEG,  # +90
-            # 2026-08-03 (用户): task4 arm=+90 与 task1 arm=-90 差 180° 旋转,
-            # 视野坐标反向 → x 物理方向也要反过来。task1 默认 sign_x=-1,
-            # task4 用 sign_x=+1。
-            sign_arm=1.0, sign_x=+1.0,
-            setpoint_x_norm=sx, setpoint_y_norm=sy,
-            selector=selector,
-        )
+        arm_client.composite_run(x_mm=X_PICK_MM, speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"find_target_arm_cross: {type(e).__name__}: {str(e)[:120]}"}
-    if result.hits <= 0:
-        return {"ok": False, "error": "find_target_arm_cross: no ball detected"}
-    print(f"  [{LOG_PREFIX}] align 完成 hits={result.hits}")
+                "error": f"composite_run(x={X_PICK_MM}) 横移失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    # 0.5 下探 + grasp (y 从 P 姿态 -120 到 -20 抓球) - 必须同步, 等真空建立
-    print(f"  [{LOG_PREFIX}] 下探 y=-20 + grasp(True)")
-    arm_client.composite_run(y_mm=-20.0, speed=80, timeout=10.0)
-    runner.grasp(True, timeout=5.0)
-    time.sleep(0.3)  # 让真空建立
+    # 1. 盲降到抓球位
+    print(f"  [{LOG_PREFIX}] [1/6] composite_run(y={Y_PICK_MM:+.0f})  盲降到抓球位")
+    try:
+        arm_client.composite_run(y_mm=Y_PICK_MM, speed=80, timeout=10.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(y={Y_PICK_MM}) 盲降失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    # 0.6 抬 y=-140 (2026-08-04 用户: -40→-140, 很必要 —— 把球抬高防横移拖飞)
-    print(f"  [{LOG_PREFIX}] 中间姿态 y=-140 (抬球)")
-    arm_client.composite_run(y_mm=-140.0, speed=80, timeout=10.0)
+    # 2. grasp + 直接下一动作 (无 sleep, SDK 真空建立自闭环)
+    print(f"  [{LOG_PREFIX}] [2/6] grasp(True)  真空开 (无 sleep)")
+    try:
+        runner.grasp(True, timeout=5.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"grasp(True) 失败: {type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    # 后台跑, 主线程立刻 return 不阻塞底盘下一轮 creep:
-    #    - 移到 bin 上方 (保持 -140 高位 ∥ x=bin)
-    #    - 降到 y=-120 + grasp(False) 放球 (2026-08-04 用户: -30→-120)
-    #    - 不回 P (2026-08-04 用户): 下一球 goto_pose_p 统一回, 避免重复移动。
-    #      ⚠️ 返回的线程须由调用方在下一轮 goto_pose_p 前 join, 防臂命令竞争。
-    import threading
-    def _bg_release():
-        try:
-            # 移到 bin 上方 (保持 -140 高位横移)
-            arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
-            # 降到 bin 开口 y=-120 + grasp(False) 放球
-            arm_client.composite_run(y_mm=-120.0, speed=80, timeout=10.0)
-            runner.grasp(False, timeout=5.0)
-            time.sleep(0.2)
-            # 不回 P —— 下一球 goto_pose_p 统一回
-        except Exception as e:
-            print(f"  [{LOG_PREFIX}] [bg_release] FAIL: {type(e).__name__}: {e}")
+    # 3. 抬到中转位 (y=-130) ∥ 横移到中转位 x=-150 (composite_run 并行)
+    print(f"  [{LOG_PREFIX}] [3/6] composite_run(y={Y_TRANSIT_MM:+.0f}, x={X_TRANSIT_MM:+.0f})  "
+          f"抬升+横移到中转位")
+    try:
+        arm_client.composite_run(y_mm=Y_TRANSIT_MM, x_mm=X_TRANSIT_MM,
+                                 speed=80, timeout=30.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(y={Y_TRANSIT_MM}, x={X_TRANSIT_MM}) 中转失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
 
-    release_thread = threading.Thread(target=_bg_release, daemon=True,
-                                      name="task4-release")
-    release_thread.start()
-    return {"ok": True, "error": None, "release_thread": release_thread}
+    # 4. 横移到 bin 上方 (中转 -150 → bin_x)
+    print(f"  [{LOG_PREFIX}] [4/6] composite_run(x={bin_x:+.0f})  横移到 {color} bin 上方")
+    try:
+        arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(x={bin_x}) 横移失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
+
+    # 5. 降到放仓位 (中转 y=-130 → bin y=-100)
+    print(f"  [{LOG_PREFIX}] [5/6] composite_run(y={Y_PUT_MM:+.0f})  降到放仓位")
+    try:
+        arm_client.composite_run(y_mm=Y_PUT_MM, speed=80, timeout=10.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"composite_run(y={Y_PUT_MM}) 降放仓位失败: "
+                         f"{type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
+
+    # 6. 放气 (无 sleep, 直接让下一球 goto_pose_p 回 P 姿态)
+    print(f"  [{LOG_PREFIX}] [6/6] grasp(False)  放气 (无 sleep)")
+    try:
+        runner.grasp(False, timeout=5.0)
+    except Exception as e:
+        return {"ok": False,
+                "error": f"grasp(False) 失败: {type(e).__name__}: {str(e)[:120]}",
+                "release_thread": None}
+
+    return {"ok": True, "error": None, "release_thread": None}
 
 
 # ---------- 核心 step ----------
@@ -641,16 +657,13 @@ def step_target4(
             print(f"  [{LOG_PREFIX}] track 结束: arrived={track_res.arrived} "
                   f"reason={track_res.reason}")
 
-            # 2.3 定颜色 (track label 优先; 兜底再识别一帧)
+            # 2.3 定颜色 (并发策略 2026-08-05):
+            #    creep 阶段已经把当前帧 balls 拿到 (creep_res['balls']),
+            #    直接复用 — 不再 track 完再 fetch_balls 一次, 省 1 个 HTTP RTT。
+            #    优先用 creep 看到的 balls; track label 兜底; 都没有就 skip。
             color = _color_from_track(track_res)
             if color is None and not dry_run:
-                try:
-                    balls = target2.fetch_balls(
-                        http_client, color_filter=None, debug=debug_recognition,
-                    )
-                except Exception:
-                    balls = []
-                best = _pick_best_ball(balls)
+                best = _pick_best_ball(creep_res["balls"] or [])
                 color = best["color"] if best else None
             if dry_run and color is None:
                 color = COLOR_BLUE  # dry-run 无视觉时的占位, 走通流程
