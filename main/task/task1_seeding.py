@@ -65,12 +65,13 @@ logger = logging.getLogger("task.task1_seeding")
 # 每列允许看到的源头 label: 三个圆柱 (1=大/2=中/3=小)
 SOURCE_LABELS: tuple = ("cylinder_1", "cylinder_2", "cylinder_3")
 
-# 吸嘴 setpoint (2026-08-02 标定): 目标在吸嘴正下方时其 bbox 中心坐标; 按 label 分组查表
+# 吸嘴 setpoint (2026-08-02 标定, hand=0°): 目标在吸嘴正下方时其 bbox 中心坐标; 按 label 分组查表
 # (cylinder_1/2/3 → (0.161,-0.519), ball_* 各自分档, 未知回落全局默认).
+# 2026-08-06: S 姿态 hand=-10° 后吸嘴倾斜, setpoint 需重新标定, 此处先占位.
 TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
-    "cylinder_1": (0.161, -0.519),
-    "cylinder_2": (0.161, -0.519),
-    "cylinder_3": (0.161, -0.519),
+    "cylinder_1": (0.050, -0.525),  # TODO: hand=-10° 后重定位
+    "cylinder_2": (0.140, -0.520),  # TODO: hand=-10° 后重定位
+    "cylinder_3": (0.020, -0.510),  # TODO: hand=-10° 后重定位
 }
 def _scan_cylinder_label(
     client: RuntimeApiClient,
@@ -235,7 +236,7 @@ def _pick_at_source(
     result = runner.track_velocity_pick(
         label,
         x_start=state.x_mm, y_start=init_y_mm,
-        arm_start=pick_arm_start, hand_start=0.0,
+        arm_start=pick_arm_start, hand_start=-10.0,
         setpoint_x_norm=TASK1_NOZZLE_OFFSET_MAP[label][0],
         setpoint_y_norm=TASK1_NOZZLE_OFFSET_MAP[label][1],
         timeout=cfg.get("pick_track_timeout_s", 2.0),
@@ -417,7 +418,7 @@ def _init_step2_s_pose(runner: ArmRunner, arm_client: ArmClient, cfg: Dict[str, 
         arm=float(pick["arm_angle_deg"]),
         x_mm=float(pick["x_mm"]),
         y_mm=init_y_mm,
-        hand=float(pick["hand_angle_deg"]),
+        hand=-10.0,  # 2026-08-06: S 姿态 hand 固定 -10°
         speed=80, timeout=20.0,
     )
 
