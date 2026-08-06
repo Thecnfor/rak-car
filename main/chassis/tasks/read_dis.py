@@ -59,6 +59,7 @@ def read_dis(
     max_seconds: Optional[float] = None,
     on_tick: Optional[DisTickCallback] = None,
     timeout: float = 2.0,
+    reset_epoch: Optional[list] = None,
 ) -> None:
     """实时轮询车端里程计累计距离，每帧调用 on_tick。
 
@@ -68,6 +69,9 @@ def read_dis(
         max_seconds: 最大运行时长，None 表示一直跑（依赖 Ctrl-C 终止）。
         on_tick: 每帧回调，签名 `(value)`，读取失败传 float("nan")。
         timeout: 单次 HTTP 调用超时秒数。
+        reset_epoch: 可选共享 `[int]`。外部里程计清零 (reset_position) 时递增,
+            本线程同步把 last_value 归零, 让 dis_buf 从新基线起算 ——
+            单调保护默认把清零挡在 dis_buf 外, 需要新基线的场景显式递增它.
     """
     if hz <= 0:
         raise ValueError("hz must be > 0")
@@ -76,7 +80,10 @@ def read_dis(
 
     # 单调保护：累计距离只能增大。读到更小的值（读取失败回落 0 / 里程计被清零）
     # 一律保持上次读数，避免 dis_buf 中途掉到 0 污染 waypoint 触发判定。
+    # 但外部显式清零 (reset_position + reset_epoch 递增) 时, last_value 归零,
+    # dis_buf 从新基线起算 —— 供「任务后清零、按新距离触发下一 waypoint」的场景.
     last_value: float = 0.0
+    seen_epoch: int = 0 if reset_epoch is None else reset_epoch[0]
 
     try:
         while True:
@@ -84,6 +91,10 @@ def read_dis(
 
             if deadline is not None and t0 >= deadline:
                 break
+
+            if reset_epoch is not None and reset_epoch[0] != seen_epoch:
+                seen_epoch = reset_epoch[0]
+                last_value = 0.0
 
             value: float
             try:

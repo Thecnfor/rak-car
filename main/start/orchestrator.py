@@ -258,9 +258,11 @@ class Orchestrator:
 
         # 后台 B：里程计（全程累计，写共享 buffer）
         dis_buf = [0.0]
+        dis_epoch = [0]   # 里程计清零信号: 递增即让 read_dis 重新起算基线
         threading.Thread(target=read_dis,
                          kwargs={"api": api, "hz": 20.0,
-                                 "on_tick": lambda v: dis_buf.__setitem__(0, v)},
+                                 "on_tick": lambda v: dis_buf.__setitem__(0, v),
+                                 "reset_epoch": dis_epoch},
                          daemon=True, name="distance").start()
 
         # 后台 C：TUI 状态栏（200ms 刷新）
@@ -340,6 +342,15 @@ class Orchestrator:
                 # 注意: _pause_lane 已经在 trigger 满足后立即调过 (settle_forward/
                 # back_off 之前), 这里不再重复 pause (幂等但冗余).
                 time.sleep(wp.pause_before_s)
+                # task3_pest_scout 触发时清零里程计 distance, 识别段从 0 起算,
+                # 跑满 odom_stop_m (0.66m) 即任务完成. read_dis 有单调保护,
+                # dis_buf 保持上次读数, 不污染后续 waypoint 的 dis 阈值.
+                if wp.task_id == 3:
+                    try:
+                        client.execute("car", "reset_position", sync=True, timeout=10.0)
+                        logger.info("odometry reset at task3 trigger: distance from 0")
+                    except Exception as exc:
+                        logger.warning("odom reset at task3 trigger failed: %s", exc)
                 if wp.task_module:
                     tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
                                   "ir_left": None, "ir_right": None,
@@ -348,18 +359,21 @@ class Orchestrator:
                     if not ok:
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
                 time.sleep(wp.pause_after_s)
-                # task1 播种用 move_to_position 闭环跑格点, 结束时 odom 累积漂移
-                # (实车实测 x=1.40 y=0.31 vs 期望 x≈0.30 y=0). 清零给下一段巡航干净基线.
-                # 只清零底盘里程 (car.reset_position), 不碰机械臂; read_dis 的单调保护
-                # 会保持上次读数, 不污染后续 waypoint 的累计 dis 阈值.
                 if wp.task_id == 1:
-                    try:
-                        client.execute("car", "reset_position", sync=True, timeout=10.0)
-                        logger.info("odometry reset after task1: next segment from distance 0")
-                    except Exception as exc:
-                        logger.warning("odom reset after task1 failed: %s", exc)
                     if post_task1 is not None:
                         self._post_task1_maneuver(api, post_task1)
+                # task2 结束后: 清零里程计 distance + 重挂 dis_buf 基线.
+                # 后续 waypoint (task3_shoot dis_at_least_m=2.70) 从新基线起算.
+                # dis_epoch 递增让 read_dis 重新起算 —— 否则单调保护把清零挡在 dis_buf 外,
+                # task3_shoot 会用清零前的旧 dis 立即误触发.
+                if wp.task_id == 2:
+                    try:
+                        client.execute("car", "reset_position", sync=True, timeout=10.0)
+                        dis_epoch[0] += 1
+                        dis_buf[0] = 0.0
+                        logger.info("odometry reset after task2: distance from 0")
+                    except Exception as exc:
+                        logger.warning("odom reset after task2 failed: %s", exc)
                 # task6 读完订单后: 清零里程 → 切断视觉 → 直行 → θ 顺时针转 120° → 恢复视觉.
                 # 复用 _post_task1_maneuver (同款盲转段), 参数走 task_cfg.post_task6.
                 if wp.task_id == 6:

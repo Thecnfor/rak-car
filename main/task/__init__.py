@@ -35,6 +35,7 @@ from main.task.task6_get_order import run as run_task6_get_order
 
 # 新增 task (3/4/5/7) —— 新建占位或包装
 from main.task.task3_pest_scout import run as run_task3_pest_scout
+from main.task.task3_shoot import run as run_task3_shoot
 from main.task.task4_harvest import run as run_task4_harvest
 from main.task.task5_sort import run as run_task5_sort
 from main.task.task7_deliver import run as run_task7_deliver
@@ -47,6 +48,7 @@ TASK_RUNNERS: Dict[int, Callable[[Optional[RuntimeApiClient]], Dict[str, Any]]] 
     5: run_task5_sort,
     6: run_task6_get_order,
     7: run_task7_deliver,
+    8: run_task3_shoot,
 }
 
 __all__ = [
@@ -54,6 +56,7 @@ __all__ = [
     "run_task1_seeding",
     "run_task2_water_tower",
     "run_task3_pest_scout",
+    "run_task3_shoot",
     "run_task4_harvest",
     "run_task5_sort",
     "run_task6_get_order",

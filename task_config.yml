@@ -268,10 +268,10 @@ waypoints:
     task_id: 8
     task_module: main.task.task3_shoot
     # 触发靠 dis_at_least_m, IR 不参与 (跟 task1_ir 类似, 远距离触发靠 dis)
-    # dis 数值需实测: 应该是从基地沿巡线路径到射击区位的累计距离.
+    # task2 结束后里程计清零 (orchestrator 显式 reset + dis_epoch), 该 dis 相对 task2 出口起算.
     ir_threshold_m: null
     ir_side: any
-    dis_at_least_m: 14.0         # TODO: 实车标定, 沿巡线从基地到射击区位的距离
+    dis_at_least_m: 2.70         # 相对 task2 出口: 里程计 distance=2.70m 时触发
     trigger_op: AND
 
   # ----- task4 -----

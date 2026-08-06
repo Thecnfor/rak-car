@@ -337,7 +337,7 @@ def main():
     parser.add_argument("--max-travel", type=float, default=4.0,
                         help="safety cap: stop driving after this many meters even if "
                              "fewer than target-count targets were recorded")
-    parser.add_argument("--odom-stop-m", type=float, default=1.77,
+    parser.add_argument("--odom-stop-m", type=float, default=0.66,
                         help="stop driving once odometer distance delta from recognition start reaches this (m)")
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     parser.add_argument("--center-tol", type=float, default=DEFAULT_CENTER_TOL)
