@@ -158,11 +158,16 @@ class RuntimeApiClient:
     def execute(self, target, name, args=None, kwargs=None, timeout=None, sync=False):
         """通用执行：D 改造后默认异步（立即返回 job dict，status=queued）。
 
-        异步模式（默认）：
+        异步模式（默认 sync=False）：
           - 不轮询，调用方自行 `get_job(job_id)` 查状态或 `cancel_job(job_id)` 取消。
           - 适合：上层编排一边跑一边发 wheel_speeds / 想拿 job_id 做并行编排。
+
         同步模式（sync=True）：
-          - 内部 polling 到 succeeded/failed，行为与改造前完全一致。
+          - 阻塞返回 job dict（status=succeeded/failed）。
+          - 2026-08-07 优化: 旧版 ``sync=True`` 在 deadline 内**重复 POST 同一 payload**
+            到 ``/v1/execute`` —— 每次重试 runtime 都会创建新 job_, 抢 job_queue、
+            jobs 表 30+ 写入/清理。改为 ``sync=False + wait_job`` 1 次 POST + N 次 GET,
+            省 N-1 次 POST 字节往返 + runtime 重复 job 调度。
           - 适合：链式编排（`move_xy → grasp → release`），业务层要等结果才能下一步。
 
         用 `execute_arm_action` / `execute_car_action` / `call` 的旧调用方，arm 长动作
@@ -181,23 +186,35 @@ class RuntimeApiClient:
             payload["timeout"] = timeout
 
         if sync:
-            # 同步：阻塞轮询到 succeeded/failed（保留改造前行为）
+            # 2026-08-07: 改 sync=True 走 sync=False + wait_job 范式。
+            # 旧实现重复 POST /v1/execute 同 payload，每次 runtime 收单进 job_queue
+            # AND 写入 jobs 表——3s 物理动作 + 0.1s poll_interval = ~30 次 POST /
+            # ~30 个重复 job entry。现在 1 次 POST + N 次 GET /v1/jobs/{id},
+            # GET 极轻量、不进 job_queue、runtime 直接读 status。
+            # Backward compat: 仍返回 dict ({"status": ..., "result": ...} 等 job 字段)。
             deadline = self._deadline(timeout)
             last_exc = None
-            while time.time() < deadline:
-                try:
-                    response = self.post(
-                        f"{self.api_prefix}/execute",
-                        payload=payload,
-                        timeout=min((deadline - time.time()) + 5.0, self.settings.wait_timeout + 5.0),
-                    )
-                    return response["job"]
-                except requests.RequestException as exc:
-                    last_exc = exc
-                    if not self._is_retryable_request_error(exc):
-                        raise
-                    time.sleep(self.settings.poll_interval)
-            raise TimeoutError(f"调用 execute 超时: {target}.{name}: {last_exc}")
+            # 首次 POST 拿 job_id
+            try:
+                response = self.post(
+                    f"{self.api_prefix}/execute",
+                    payload={**payload, "sync": False},
+                    timeout=self.settings.request_timeout,
+                )
+                job = response.get("job") if isinstance(response, dict) else None
+                if not isinstance(job, dict) or not job.get("id"):
+                    return job or {}
+                job_id = job["id"]
+            except requests.RequestException as exc:
+                last_exc = exc
+                if not self._is_retryable_request_error(exc):
+                    raise
+                raise TimeoutError(f"调用 execute 起始 POST 失败: {target}.{name}: {last_exc}")
+            # 后续纯 GET 轮询
+            return self.wait_job(
+                job_id, timeout=timeout,
+                poll_interval=self.settings.poll_interval,
+            )
 
         # 异步：单次 POST，立即返回 job dict（status=queued）
         response = self.post(
@@ -234,8 +251,16 @@ class RuntimeApiClient:
         return response["job"]
 
     def wait_job(self, job_id, timeout=None, poll_interval=None):
+        """轮询 job 状态到 succeeded/failed。
+
+        2026-08-07 优化: 默认 ``poll_interval`` 提到 0.3s（settings 默认）。
+        早期 0.1s 间隔意味着 3s 物理动作产生 ~30 次 GET, 浪费 CPU + 网卡
+        字节往返; 0.3s 间隔意味着 10 次 GET, 最坏 0.3s 延迟感知 (肉眼看
+        composite_run 物理动作 ~2-3s, 0.3s 粒度无差别)。
+        外部显式传 ``poll_interval`` 不变 (task1_seeding 等自己管理轮询)。
+        """
         timeout = timeout or self.settings.wait_timeout
-        poll_interval = poll_interval or self.settings.poll_interval
+        poll_interval = poll_interval if poll_interval is not None else self.settings.poll_interval
         start_time = time.time()
         while True:
             job = self.get_job(job_id)

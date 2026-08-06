@@ -34,37 +34,52 @@ class StateIOMixin:
         仅当缓存不可用时退回原路径（``_read_raw_state`` 2 HTTP calls + ``get_arm_state`` 1 HTTP call）。
         ``y_origin_valid`` 在 fast-path 下依赖 ``get_arm_state`` 返回的 ``y_limit`` 字段，
         若该字段不可用则置 ``False``。
+
+        2026-08-07 二次优化：fast-path 1 次 HTTP GET 拿 dict 一次解析出
+        x_mm / y_mm / arm_angle / hand_angle / side / y_limit, 替代
+        之前两次冗余 ``get_arm_state()`` 调用 (省 50% HTTP)。
         """
-        # ---- fast-path: 优先读 arm_feed 缓存 (1 HTTP GET) ----
-        x_mm_rt = self._read_x_mm_realtime()
-        y_mm_rt = self._read_y_mm_realtime()
-        rt_err = self.last_realtime_error()
+        # ---- fast-path: 1 HTTP GET 拿 arm_feed 缓存, 一次解析多字段 ----
+        try:
+            st = self.http.get_arm_state()
+        except Exception as e:
+            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
+            st = {}
 
-        origin = self.origin or ArmOrigin()
-
-        if x_mm_rt is not None and y_mm_rt is not None and rt_err is None:
-            # 双轴缓存都就绪：拿 side/hand/arm_angle/y_origin_valid
-            try:
-                st = self.http.get_arm_state()
-                st_data = st.get("arm_state") if isinstance(st, dict) else {}
-            except Exception:
-                st_data = {}
-            side = str(st_data.get("side", "MID"))
-            hand = str(st_data.get("hand_angle", "UP"))
-            arm_angle = st_data.get("arm_angle")
-            hand_angle = st_data.get("hand_angle")
-            y_origin_valid = bool(st_data.get("y_limit", False))
-            return ArmState(
-                x_mm=x_mm_rt, y_mm=y_mm_rt,
-                side=side, hand=hand, grasping=False,
-                y_origin_valid=y_origin_valid, x_origin_valid=False,
-                soft_y_max_mm=origin.soft_y_max_mm,
-                soft_x_min_mm=None, soft_x_max_mm=None,
-                raw_x_m=x_mm_rt / 1000.0, raw_y_m=y_mm_rt / 1000.0,
-                arm_angle=arm_angle, hand_angle=hand_angle,
+        result = st.get("arm_state") if isinstance(st, dict) else None
+        if not isinstance(result, dict) or not result.get("active"):
+            self._last_rt_err = (
+                f"arm_feed 未启 (active={result.get('active') if isinstance(result, dict) else 'N/A'})"
             )
+            return self._get_state_slow()
 
-        # ---- fallback: 原路径 (3 HTTP calls) ----
+        x_mm = result.get("x_mm")
+        y_mm = result.get("y_mm")
+        if x_mm is None or y_mm is None:
+            self._last_rt_err = "arm_feed active 但 x_mm / y_mm 至少有一个 None"
+            return self._get_state_slow()
+
+        x_mm = float(x_mm)
+        y_mm = float(y_mm)
+        side = str(result.get("side", "MID"))
+        hand = str(result.get("hand_angle", "UP"))
+        arm_angle = result.get("arm_angle")
+        hand_angle = result.get("hand_angle")
+        y_origin_valid = bool(result.get("y_limit", False))
+        origin = self.origin or ArmOrigin()
+        self._last_rt_err = None
+        return ArmState(
+            x_mm=x_mm, y_mm=y_mm,
+            side=side, hand=hand, grasping=False,
+            y_origin_valid=y_origin_valid, x_origin_valid=False,
+            soft_y_max_mm=origin.soft_y_max_mm,
+            soft_x_min_mm=None, soft_x_max_mm=None,
+            raw_x_m=x_mm / 1000.0, raw_y_m=y_mm / 1000.0,
+            arm_angle=arm_angle, hand_angle=hand_angle,
+        )
+
+    def _get_state_slow(self) -> ArmState:
+        """get_state 慢路径（arm_feed 不可用时兜底）。原 3 HTTP calls 路径。"""
         raw = self._read_raw_state()
         st_job = self._call_car("get_arm_state", timeout=10.0, sync=True)
         st_data = st_job.get("result") if isinstance(st_job, dict) else {}
@@ -72,6 +87,7 @@ class StateIOMixin:
             st_data = {}
         side = str(st_data.get("side", "MID"))
         hand = str(st_data.get("hand_angle", "UP"))
+        origin = self.origin or ArmOrigin()
         return ArmState(
             x_mm=_m_to_mm(raw["raw_x_m"]),
             y_mm=_m_to_mm(raw["raw_y_m"]),
