@@ -50,8 +50,11 @@ _TOKEN_PLACEHOLDER = "REPLACE_YOUR_ACCESS_TOKEN_HERE"
 
 
 def _repo_root() -> Path:
-    """main/task/task3/llm_ernie.py → 仓库根(rak-car/)。"""
-    return Path(__file__).resolve().parents[2]
+    """main/task/task3/llm_ernie.py → 仓库根(rak-car/)。
+
+    parents[3] = rak-car (parents[2] 是 main/, 读到 main/config_car.yml 不存在)。
+    """
+    return Path(__file__).resolve().parents[3]
 
 
 def _sanitize_key(k: str) -> str:

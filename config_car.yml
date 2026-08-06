@@ -90,4 +90,4 @@ infer_cfg:
   port: 5004
   img_size: null
   run_mode: paddle
-ernie_access_token: REPLACE_YOUR_ACCESS_TOKEN_HERE
+ernie_access_token: "47bcf191634805f4dd1fbd105c62f9756c752c7e"
