@@ -106,3 +106,25 @@ def load_waypoints() -> List[Dict[str, Any]]:
             f"现有顶层 keys: {list(all_cfg.keys())}"
         )
     return wp
+
+
+def load_post_task1() -> Optional[Dict[str, Any]]:
+    """读取 task_config.yml 中 task_cfg.post_task1 段 (task1 结束后一段位移+转弯).
+
+    返回 None = 未配置 / enabled=false (orchestrator 跳过该段)。
+    字段:
+      straight_m: task1 后直行距离 (m, move_for 里程计闭环, 0=不走)。
+      turn_deg:   原地里程计 θ 转弯角度 (度, OdomTurnPID; 实车方向反了取负, 0=不转)。
+    """
+    path = _config_path()
+    if not path.is_file():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        all_cfg = yaml.safe_load(f)
+    if not isinstance(all_cfg, dict):
+        return None
+    task_cfg = all_cfg.get("task_cfg", {})
+    seg = task_cfg.get("post_task1")
+    if not isinstance(seg, dict) or not seg.get("enabled"):
+        return None
+    return seg
