@@ -133,17 +133,18 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
 
     def _call_arm(self, name: str, timeout: float = 20.0, *args,
                   sync: bool = True, **kwargs) -> dict:
-        # 2026-08-07 0-copy: 任何 arm action 后自动 invalidate 短 TTL 缓存,
-        # 避免业务层下一行 _read_*_realtime 读到动作发起前的状态。
-        self.invalidate_arm_state_cache()
+        # 2026-08-07 0-copy: 不自动 invalidate 缓存 — 50ms TTL + arm_feed 20Hz
+        # 刷新间隔, 自然会让下一次 read 拿到最新值。
+        # 反例: watchdog 100ms 周期里 _call_arm("x_speed", 0) → 立即 _read_x_mm_realtime
+        # 期望新位置; 若自动 invalidate 反而强制 1 HTTP (击败 0-copy 收益).
+        # 业务层需要"动作后立即读真值"显式调 invalidate_arm_state_cache().
         return self.http.execute_arm_action(
             name, *args, timeout=timeout, sync=sync, **kwargs
         )
 
     def _call_car(self, name: str, timeout: float = 20.0, *args,
                   sync: bool = False, **kwargs) -> dict:
-        # 2026-08-07 0-copy: 同 _call_arm,加自动 invalidate。
-        self.invalidate_arm_state_cache()
+        # 2026-08-07 0-copy: 同步说明 _call_arm —— 不自动 invalidate.
         return self.http.execute_car_action(
             name, *args, timeout=timeout, sync=sync, **kwargs
         )
