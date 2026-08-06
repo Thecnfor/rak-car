@@ -592,4 +592,8 @@ async def _handle_websocket_message(service, payload):
     if handler is None:
         raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
     import asyncio as _asyncio
-    return await _asyncio.to_thread(handler, service, payload)
+    # 2026-08-07 修复: to_thread 是 Python 3.9+ 才有的 API, Jetson /usr/bin/python3
+    # 是 3.8 → AttributeError, 所有 WS realtime op 返回 ok=False, 外环 wheel_speeds
+    # 静默失败, 车不走。get_event_loop().run_in_executor() 3.6+ 通用, 语义等价。
+    loop = _asyncio.get_event_loop()
+    return await loop.run_in_executor(None, handler, service, payload)

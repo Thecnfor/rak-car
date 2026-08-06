@@ -235,7 +235,12 @@ class ChassisClient:
         speeds = [float(s) for s in speeds]
         if self.ws_ready:
             try:
-                return self.ws.realtime_wheel_speeds(speeds, timeout=timeout)
+                r = self.ws.realtime_wheel_speeds(speeds, timeout=timeout)
+                # 2026-08-07: runtime WS handler 出错时 ok=False 静默返回, 不 raise,
+                # 外环会误以为已下发 → 车不走。显式检查, 失败回退 HTTP。
+                if isinstance(r, dict) and not r.get("ok"):
+                    raise RuntimeError(r.get("error", "ws ok=False"))
+                return r
             except Exception:
                 self.ws_ready = False
         return self.http.realtime_wheel_speeds(speeds)
@@ -248,8 +253,11 @@ class ChassisClient:
         """
         if self.ws_ready:
             try:
-                return self.ws.realtime_chassis_velocity(
+                r = self.ws.realtime_chassis_velocity(
                     vx, vy, wz, timeout=timeout)
+                if isinstance(r, dict) and not r.get("ok"):
+                    raise RuntimeError(r.get("error", "ws ok=False"))
+                return r
             except Exception:
                 self.ws_ready = False
         return self.http.post(
