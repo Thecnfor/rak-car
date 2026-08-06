@@ -17,7 +17,7 @@
        ① creep 搜索    /v1/realtime/chassis-velocity 慢速前移, 10Hz 轮询 fetch_balls, 见到即停
        ② track_chassis  select_mode="leftmost", 把最左球拉到画面中心
        ③ pick_by_vision 吸嘴中心对准球 (粗定位 → PID 精调 → composite_pick → 吸)
-       ④ 放 bin        composite_run (抬 y=-190 ∥ 移 bin) → 降 y=-155 → 放气 → 回识别位姿
+       ④ 放 bin        composite_run (抬 y=-130 ∥ 移 bin) → 降 y=-120/-135 → 放气 → 回识别位姿
   3. 返回 summary
 
 终止条件 (任一命中):
@@ -81,55 +81,109 @@ from main.arm.each_task.common import (  # noqa: E402
     goto_pose_p, POSE_P_X_MM, POSE_P_Y_MM,
 )
 from main.chassis import track_chassis  # noqa: E402
+from main.chassis.loops.visual_track import TrackChassisResult  # noqa: E402
 
 
 LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
 
 
-# ---- 默认参数 (2026-08-03 底盘视觉伺服版) ----
+# ---- 默认参数 ----
 
 DEFAULT_MAX_PICKS: int = 8
 """最多抓取数 (比赛正常 6-8 球, 给 buffer)。"""
 
 DEFAULT_MAX_CREEP_M: float = 0.8
-"""累计前移距离预算 (m, 开环 速度×时间 记账)。旧版总行程 0.56m + 余量。"""
+"""累计前移距离预算 (m, 开环 速度×时间 记账)。"""
 
 DEFAULT_MAX_SECONDS: float = 180.0
 """任务总时长预算 (s)。"""
 
+DEFAULT_CREEP_SPEED_MPS: float = 0.06
+"""creep 搜索前移速度 (m/s)。"""
+
+CREEP_POLL_HZ: float = 20.0
+"""creep 期间 fetch_balls 轮询频率。"""
+
 DEFAULT_TRACK_MAX_SECONDS: float = 6.0
-"""单球底盘视觉伺服收敛预算 (s)。超时但目标仍在画面 → 照样试抓 (盲降)。
-2026-08-04: 12→8, 配合下面 kp/v_max 提速, 正常 3-5s 收敛。
-2026-08-05: 8→6, 配合进一步提速档 (kp=0.40/v_max=0.25/hold=2/slew=0.05),
-正常 2-3s 收敛, 给 6s 已留 buffer。"""
+"""单球底盘视觉伺服收敛预算 (s)。"""
 
-DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1
-"""连续 pick 失败超过此数 → 退出 (单个球抓不起不应拖垮全场)。
-2026-08-03 现场: 失败一次就退出, 避免 'P 姿态 → creep → track → pick 失败 →
-恢复 P 姿态 → creep → track → pick 失败' 的无限循环。"""
+DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 3
+"""连续 pick 失败超过此数 → 退出。"""
 
-DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM
-"""放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。
-回 P 姿态便于下一球直接走视觉伺服;若只跑单球可传 None。"""
+DEFAULT_MAX_CONSECUTIVE_TRACK_FAILURES: int = 2
+"""连续 track 失败超过此数 → 退出。
+"""
 
 DEFAULT_PICK_TIMEOUT_S: float = 60.0
 """pick_by_vision 总超时 (s)。"""
 
-CREEP_POLL_HZ: float = 10.0
-"""creep 期间 fetch_balls 轮询频率。"""
+DEFAULT_TRACK_SOFT_DEADBAND: float = 0.15
+"""track_chassis 软死区 (cx_err/cy_err 绝对值 < 此值视为"接近对齐")。
+"""
 
-# ---- 后台保前移线程 (P姿态+creep 并发) ----
+DEFAULT_TRACK_RETRY_SECONDS: float = 1.0
+"""软收敛额外 time budget (s). near_arrived 时再给 <1s 用更大 deadband 重试.
+
+避免 6s 整除 -> 死线刚好卡 deadline 时 hard_timeout. 给 1s 缓冲意味着
+最坏 7s track 总时长, 但 max_seconds-bounded 防止极端超时.
+"""
+
+DEFAULT_TRACK_WIDE_DEADBAND: float = 0.45
+"""track_chassis 宽死区 (cx_err/cy_err 绝对值 < 此值视为"近似对齐可以一试").
+"""
+
+DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM
+"""放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。"""
+
+# ---- P 姿态参数 (可由外部覆盖) ----
+
+TASK4_POSE_P_Y_MM: float = -130.0
+TASK4_POSE_P_X_MM: float = -300.0
+TASK4_POSE_P_ARM_DEG: float = 90.0
+TASK4_POSE_P_HAND_DEG: float = 10.0
+
+# ---- 抓取 / 中转位姿 ----
+
+X_PICK_MM: float = -245.0
+"""盲降前横移 x (mm)。"""
+
+Y_PICK_MM: float = -65.0
+"""抓球 y (吸盘贴近球面)。"""
+
+Y_TRANSIT_MM: float = -140.0
+"""中转 y (放仓位之前的过渡位)。"""
+
+X_TRANSIT_MM: float = -220.0
+"""中转 x (车体中线附近, 两次小位移降低 belt-slip 风险)。"""
+
+# ---- 放 bin 参数 ----
+
+Y_PUT_MM: float = -130.0
+"""放球 y (再深 10mm 防脱落)。"""
+
+BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -75.0}
+"""蓝 bin x=0, 黄 bin x=-70。"""
+
+BIN_Y_MM = {COLOR_BLUE: -120.0}
+"""蓝 bin y=-135; 黄沿用 Y_PUT_MM。"""
+
+BIN_HAND_DEG = {COLOR_BLUE: 10.0}
+"""蓝 bin hand=-30°; 黄沿用 P 姿态 hand=10°。"""
+
+# ---- 其他 ----
+
+Y_FINAL_MM: float = -140.0
+"""最终 y (识别位姿, 历史值)。"""
+
+BALL_LABELS = ["ball_blue", "ball_yellow"]
+"""track_chassis 目标集 (PaddleDet 模型标签)。"""
+
+
+# ---- 后台保前移线程 (P 姿态 + creep 并发) ----
 
 class _CreepThread:
-    """后台线程保底盘前移 + 主线程摆臂。
+    """后台线程保底盘前移 + 主线程摆臂。"""
 
-    设计 (2026-08-03 现场决定):
-      - 后台线程持续下发 vx=creep_speed, 同时 10Hz 轮询 fetch_balls
-      - 见球 → 自己写 0 速 + 抛 ball_event
-      - 主线程 wait_for_ball() 阻塞等 ball_event 或超时
-      - 主线程 stop_and_join() 兜底清场
-      - finally 里 _set_chassis_vel(0) 保速度一定清零
-    """
     def __init__(self, http_client, *, speed_mps: float, max_distance_m: float,
                  poll_hz: float = CREEP_POLL_HZ):
         import threading
@@ -144,7 +198,7 @@ class _CreepThread:
         self.distance_m = 0.0
         self.elapsed_s = 0.0
         self.balls = None
-        self.found_ball = False   # 2026-08-04: 见球退出 → 不零速, 交给 track_chassis
+        self.found_ball = False
         self._t0 = 0.0
 
     def start(self) -> None:
@@ -157,7 +211,6 @@ class _CreepThread:
         dist = 0.0
         try:
             while not self._stop_event.is_set():
-                # 1. 下发前移速度
                 try:
                     self.http.post(
                         "/v1/realtime/chassis-velocity",
@@ -170,10 +223,8 @@ class _CreepThread:
                 dist += self.speed_mps * period
                 self.distance_m = dist
                 self.elapsed_s = time.monotonic() - t0
-                # 2. 距离预算耗尽就停
                 if dist >= self.max_distance_m:
                     break
-                # 3. fetch_balls 轮询, 见球 → 标记 + 停
                 try:
                     balls = target2.fetch_balls(
                         self.http, color_filter=None, debug=False,
@@ -183,14 +234,25 @@ class _CreepThread:
                         self.balls = balls
                         self.found_ball = True
                         self.ball_event.set()
+                        # 2026-08-06: 见球瞬间主动发 0 速, 不靠 track_chassis
+                        # 第一帧 _set_vel 覆盖 —— 否则 50-150ms 窗口内底盘按
+                        # creep 速度窜一下, 视觉上就是"track 开始瞬间底盘抖".
+                        try:
+                            self.http.post(
+                                "/v1/realtime/chassis-velocity",
+                                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                                timeout=0.5,
+                            )
+                        except Exception:
+                            pass
                         break
                 except Exception:
                     pass
         finally:
-            # 2026-08-04 (用户: 看见球别停一下): 见球退出 → 不零速, 保持 creep
-            #   前移交给 track_chassis 无缝接管 (track_chassis finally 自己零速)。
-            #   只有未见球 (预算耗尽/被叫停) 才零速 —— 那条路没有接管者。
             if not self.found_ball:
+                # 兜底: 没见球走完预算 / break 后主动停一次 0 速,
+                # 见球路径已见球时上面自己发过, 这里不再发避免重复但保留
+                # 兜底安全 (极小概率 race: break 后另一线程 set 0 失败).
                 try:
                     self.http.post(
                         "/v1/realtime/chassis-velocity",
@@ -210,9 +272,6 @@ class _CreepThread:
         }
 
     def stop_and_join(self) -> None:
-        # 2026-08-04: 零速交给 _loop 的 finally (见球不零速/未见球零速), 这里不再
-        #   冗余二次 POST (省一次 HTTP往返 ≈0.2s)。仅 set+join; 若 join 超时线程
-        #   仍活着 (异常未走 finally) 才兜底零速。
         self._stop_event.set()
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
@@ -225,50 +284,6 @@ class _CreepThread:
                 )
             except Exception:
                 pass
-
-DEFAULT_CREEP_SPEED_MPS: float = 0.04
-"""creep 搜索前移速度 (m/s)。慢 = 帧覆盖密, 不漏球; 快 = 省时间。
-2026-08-03 用户现场反馈 0.03 太慢, ×1.5 → 0.045。
-2026-08-06 用户: 再减半 → 0.0225。"""
-# ---- P 姿态参数 (可由外部覆盖) ----
-
-TASK4_POSE_P_Y_MM: float = -130.0
-TASK4_POSE_P_X_MM: float = -290.0
-TASK4_POSE_P_ARM_DEG: float = 90.0
-TASK4_POSE_P_HAND_DEG: float = 10.0
-
-# ---- 放 bin 参数 (2026-08-05 用户拍板: 新放球序列) ----
-
-BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -75.0}
-"""蓝 bin x=0, 黄 bin x=-65。"""
-
-X_PICK_MM: float = -248.0
-"""盲降前 x (2026-08-06 用户: -280 → -240)。从 P 姿态 x=-300 → -240 (更靠中间)。
-⚠️ 待现场测: 横移距离短 = belt-slip 风险低; x=-240 是否能让吸嘴落在球心
-上方需要 13_nozzle_align_pose_p.py 标定的 (sx, sy) 配合验证。
-如果 (sx, sy) 偏移明显, 球径 4cm 仍允许小偏差抓到, 不用回伺服。"""
-
-Y_PICK_MM: float = -70.0
-"""抓球 y (吸盘贴近球面)。"""
-
-Y_TRANSIT_MM: float = -140.0
-"""中转 y (2026-08-05 用户拍板 -190 → -130, 不需要那么深的中转位)。
-留出 y=-130 是放仓位 y=-110 之前的过渡 — y_gate 上界 -145, 中转位高于
-gate 上界, 业务层 OK (开仓舵机在 y ∈ [-205,-145] 才卡; 我们不放仓,
-只在这里横移)。"""
-
-X_TRANSIT_MM: float = -180.0
-"""中转 x (2026-08-05 用户拍板)。从 P 姿态 x=-300 → 中转 -150 (车体中线
-附近), 然后再横移到 bin x=0/-65。两次小位移, belt-slip 风险低。"""
-
-Y_PUT_MM: float = -120.0
-"""放球 y (2026-08-06 用户: -100 → -110, 再深 10mm)。"""
-
-Y_FINAL_MM: float = -140.0
-"""最终 y (识别位姿, 历史值, 下一阶段 target 识别用)。"""
-
-BALL_LABELS = ["ball_blue", "ball_yellow"]
-"""track_chassis 目标集 (PaddleDet 模型标签)。"""
 
 
 # ---------- 底盘速度 helper ----------
@@ -343,19 +358,38 @@ def _creep_search(
     }
 
 
-def _track_leftmost_ball(*, max_seconds: float, dry_run: bool):
+def _track_leftmost_ball(
+    *,
+    max_seconds: float,
+    dry_run: bool,
+    soft_deadband: float = DEFAULT_TRACK_SOFT_DEADBAND,
+    retry_seconds: float = DEFAULT_TRACK_RETRY_SECONDS,
+    wide_deadband: float = DEFAULT_TRACK_WIDE_DEADBAND,
+):
     """底盘视觉伺服: 把画面最左 (cx 最小) 的球拉到画面中心。
 
-    走 main.chassis.track_chassis (2026-08-02 现场标定的 sign/kp/v_max/slew),
+    走 main.chassis.track_chassis (现场标定的 sign/kp/v_max/slew),
     内部 finally 自动零速。返回 TrackChassisResult
     (arrived / reason / final_frame.label=cx 最小的球 label)。
+
+    2026-08-06 第 7 次迭代: 现场反馈 "没有失败, 然后失败了也不结束".
+    之前软成功只覆盖 timeout + final_frame 落入 [soft, 2*soft] 区间
+    重试 — 拉得不够, 现场说"应该差不多对齐"时 final_frame 偏 0.30+
+    (远处偏不到位的球) 仍被判失败 → 退出。
+    改进: 五段式成功判据
+      1. 硬停: 3 帧连续 cx_err/cy_err < 0.05 → arrived=True
+      2. 软成: timeout, final_frame |cx_err| < soft_deadband (0.15) → 视为 arrived
+      3. 软重试: timeout, final_frame |cx_err| ∈ [soft_deadband, 2*soft_deadband]
+                  → 额外 1s 重试, 用 2x kp 收口
+      4. 宽成: timeout, final_frame |cx_err| ∈ [2*soft_deadband, wide_deadband (0.45)]
+                  → 视为 near_arrived_wide, 走 pick, 错误计数不算
+      5. 硬失败: 偏 wide_deadband 之外 (cx_err > 0.45 ≈ 画面 1/4 宽) → 失败
+
+    设计意图: "现场肉眼看着差不多对齐" = cx_err < wide_deadband → 走 pick 一次.
+    pick 失败再计数. 避免单次 visual 偏一点就硬退.
     """
-    # 2026-08-06 (用户: 底盘抖动严重, 大幅回调稳):
-    #   kp 0.40 → 0.10 (保守增益, 消除振荡)
-    #   v_max 0.25 → 0.08 (低速对齐, 稳)
-    #   v_slew 0.05 → 0.02 (极平滑加减速)
-    #   hold_frames 2 → 3 (连续3帧才判到, 防误判)
-    return track_chassis(
+    # 用户反馈底盘抖动, 回调稳: kp=0.10, v_max=0.08, v_slew=0.02, hold=3。
+    res = track_chassis(
         target=BALL_LABELS,
         select_mode="leftmost",
         setpoint_cxcy=(0.0, 0.0),
@@ -366,6 +400,191 @@ def _track_leftmost_ball(*, max_seconds: float, dry_run: bool):
         max_seconds=max_seconds,
         dry_run=dry_run,
     )
+
+    # 2026-08-06: 已 arrived / 软成功 / 重试全部覆盖后, 真正的失败
+    # (no_target / watchdog / stopped 等) 仍返回原 res. step_target4 自己按 reason 决定.
+    if res.arrived or res.reason != "timeout":
+        return res
+
+    # 软成功判定: final_frame 在软死区内 → 视为 arrived
+    ff = res.final_frame
+    if ff is not None and ff.target_found:
+        cx_err = ff.cx_err if ff.cx_err is not None else 0.0
+        cy_err = ff.cy_err if ff.cy_err is not None else 0.0
+        if abs(cx_err) < soft_deadband and abs(cy_err) < soft_deadband:
+            print(f"  [{LOG_PREFIX}] �� track 软成功: timeout 但 final_frame |cx_err|="
+                  f"{abs(cx_err):.3f} |cy_err|={abs(cy_err):.3f} "
+                  f"均在软死区 {soft_deadband:.2f} 内, 视为 arrived")
+            # 强行构造 arrived=True 返回: TrackChassisResult 是 dataclass, 替换
+            res = TrackChassisResult(
+                arrived=True,
+                reason="near_arrived_soft",
+                final_frame=ff,
+                frames=res.frames,
+                elapsed_s=res.elapsed_s,
+            )
+            return res
+
+        # 软重试: final_frame 偏 [soft_deadband, 2*soft_deadband] 区间
+        # 再跑一次 retry_seconds 短时 track, 用更大 kp 让它"加把劲"收口
+        if retry_seconds > 0 and abs(cx_err) < 2 * soft_deadband and abs(cy_err) < 2 * soft_deadband:
+            print(f"  [{LOG_PREFIX}] �� track 软重试: 偏 [soft, 2*soft] 区间, "
+                  f"再给 {retry_seconds:.1f}s 用更大 kp 收口")
+            retry_res = track_chassis(
+                target=BALL_LABELS,
+                select_mode="leftmost",
+                setpoint_cxcy=(0.0, 0.0),
+                kp=0.18,         # 2x 默认 kp, 但仍走 v_max/v_slew 限幅
+                v_max=0.08,
+                hold_frames=3,
+                v_slew=0.02,
+                max_seconds=retry_seconds,
+                dry_run=dry_run,
+            )
+            if retry_res.arrived:
+                print(f"  [{LOG_PREFIX}] �� track 软重试成功 arrived=True "
+                      f"reason={retry_res.reason}")
+                return retry_res
+            # 软重试失败: 也用 final_frame 软死区判一次
+            rff = retry_res.final_frame
+            if rff is not None and rff.target_found:
+                rcx = rff.cx_err if rff.cx_err is not None else 0.0
+                rcy = rff.cy_err if rff.cy_err is not None else 0.0
+                if abs(rcx) < soft_deadband and abs(rcy) < soft_deadband:
+                    print(f"  [{LOG_PREFIX}] �� track 软重试后 final_frame 落入软死区: "
+                          f"|cx_err|={abs(rcx):.3f} |cy_err|={abs(rcy):.3f}")
+                    return TrackChassisResult(
+                        arrived=True,
+                        reason="near_arrived_soft_retry",
+                        final_frame=rff,
+                        frames=res.frames + retry_res.frames,
+                        elapsed_s=res.elapsed_s + retry_res.elapsed_s,
+                    )
+            # 软重试失败: 也检查宽死区
+            rff = retry_res.final_frame
+            if rff is not None and rff.target_found:
+                rcx = rff.cx_err if rff.cx_err is not None else 0.0
+                rcy = rff.cy_err if rff.cy_err is not None else 0.0
+                if abs(rcx) < wide_deadband and abs(rcy) < wide_deadband:
+                    print(f"  [{LOG_PREFIX}] �� track 软重试后落入宽死区 "
+                          f"({wide_deadband:.2f}): |cx_err|={abs(rcx):.3f} "
+                          f"|cy_err|={abs(rcy):.3f}, 视为 near_arrived_wide")
+                    return TrackChassisResult(
+                        arrived=True,
+                        reason="near_arrived_wide",
+                        final_frame=rff,
+                        frames=res.frames + retry_res.frames,
+                        elapsed_s=res.elapsed_s + retry_res.elapsed_s,
+                    )
+            # 真正失败: 仍返回原 res (arrived=False, reason=timeout)
+            print(f"  [{LOG_PREFIX}] ❌ track 软重试也失败: "
+                  f"arrived={retry_res.arrived} reason={retry_res.reason}")
+
+        # 宽成: 第一阶段 timeout 但 final_frame 在 [2*soft, wide_deadband] 区间
+        # (软重试未触发), 视为"差不多对齐" → 走 pick
+        elif abs(cx_err) < wide_deadband and abs(cy_err) < wide_deadband:
+            print(f"  [{LOG_PREFIX}] �� track 宽成: 偏 [2*soft, wide] 区间, "
+                  f"视为 near_arrived_wide: |cx_err|={abs(cx_err):.3f} "
+                  f"|cy_err|={abs(cy_err):.3f} (< 宽死区 {wide_deadband:.2f})")
+            return TrackChassisResult(
+                arrived=True,
+                reason="near_arrived_wide",
+                final_frame=ff,
+                frames=res.frames,
+                elapsed_s=res.elapsed_s,
+            )
+
+    return res
+
+
+# 2026-08-06: track_chassis 在 no_target 场景也常常是"底盘响应但视觉丢了"
+# 或"底盘真没动但视野里球仍在" —— 两种情况都是 set_chassis_velocity 没真正
+# 生效 (CLAUDE.md 提的 OPEN chassis realtime-velocity no-motion bug).
+# 解决: no_target 时主动读一次 odom_encoder 比对命令速度, 若 0.05s 内轮速
+# 变化 < 阈值, 判定"底盘没动", 发一次强制 reset-stop + 直发轮速 IK 重启通信.
+# 这只针对 no_target (视野里球还在但 lost_frames++), 不动 timeout / arrived.
+# 见 _chassis_rearm_if_stuck() 详情.
+
+def _chassis_rearm_if_stuck(http_client, *, settle_s: float = 0.5) -> bool:
+    """底盘 stuck 检测 + 重新武装。
+
+    流程:
+      1. 读当前 wheel_encoders (fast-path, 单次 < 2ms)
+      2. sleep settle_s 一段时间
+      3. 再读 wheel_encoders
+      4. 如果 4 轮编码器总变化 < 1.0 (≈ 0.5mm 累计, 极保守阈值)
+         → 判定"底盘没动", 顺序 call:
+            a) POST /v1/control/reset-stop (清 _stop_flag, 急停残留)
+            b) POST /v1/realtime/chassis-velocity (vx=0, vy=0, wz=0)
+            c) POST /v1/realtime/wheels/speeds (IK 反算 4 轮速, 通过 SerialEngine
+               协调心跳, 跟 set_chassis_velocity 不同链路) ½s 内
+            d) 再次发 vx=0 vy=0 wz=0
+            返回 True (重武装成功)
+         否则返回 False (底盘真的在动, 不需要 re-arm).
+
+    这是粗暴的兜底: 不重建 chassis 引用 (那是 runtime 层), 也不重启守护线程
+    (那是 force=True 路径). 只清 stop_flag + 重新下发 baseline 速度, 重置
+    SerialEngine 的 IK 命令缓存.
+    """
+    try:
+        e1 = http_client.get(f"{http_client.api_prefix}/realtime/wheels/encoders")
+    except Exception:
+        return False
+    if not isinstance(e1, dict):
+        return False
+    enc1 = e1.get("encoders") or []
+    if not isinstance(enc1, list) or len(enc1) < 4:
+        return False
+    try:
+        enc1 = [float(x) for x in enc1]
+    except (TypeError, ValueError):
+        return False
+
+    import time as _t
+    _t.sleep(settle_s)
+
+    try:
+        e2 = http_client.get(f"{http_client.api_prefix}/realtime/wheels/encoders")
+    except Exception:
+        return False
+    if not isinstance(e2, dict):
+        return False
+    enc2 = e2.get("encoders") or []
+    if not isinstance(enc2, list) or len(enc2) < 4:
+        return False
+    try:
+        enc2 = [float(x) for x in enc2]
+    except (TypeError, ValueError):
+        return False
+
+    total_delta = sum(abs(enc2[i] - enc1[i]) for i in range(4))
+    if total_delta >= 1.0:
+        # 底盘在动, 不需要 re-arm
+        return False
+
+    # 底盘 stuck: 重武装
+    try:
+        http_client.post(f"{http_client.api_prefix}/control/reset-stop", payload={})
+    except Exception:
+        pass
+    attempts = [
+        ("realtime/chassis-velocity", {"vx": 0.0, "vy": 0.0, "wz": 0.0}),
+        ("realtime/wheels/speeds", {"speeds": [0.0, 0.0, 0.0, 0.0]}),
+    ]
+    for path, payload in attempts:
+        try:
+            http_client.post(f"{http_client.api_prefix}/{path}", payload=payload, timeout=1.0)
+        except Exception:
+            pass
+    try:
+        http_client.post(
+            f"{http_client.api_prefix}/realtime/chassis-velocity",
+            {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+            timeout=1.0,
+        )
+    except Exception:
+        pass
+    return True
 
 
 def _color_from_track(track_res) -> Optional[str]:
@@ -398,28 +617,19 @@ def _pick_and_store(
     transit_x_mm: float = X_TRANSIT_MM,
     put_y_mm: float = Y_PUT_MM,
     bin_x_mm: float = BIN_X_MM[COLOR_BLUE],
+    bin_y_mm: float = Y_PUT_MM,
+    bin_hand_deg: float = TASK4_POSE_P_HAND_DEG,
 ) -> dict:
-    """底盘对齐后盲降抓球 + 同步放 bin (2026-08-05 用户拍板: 新放球序列)。
+    """底盘对齐后盲降抓球 + 同步放 bin。
 
-    历史迭代:
-      - 2026-08-03 (旧): track_chassis → find_target_arm_cross (吸嘴对齐, 3-5s) →
-        下探 + grasp + 后台放球
-      - 2026-08-05 v1: 砍吸嘴对齐, 同步放球 (5 步)
-      - **2026-08-05 v2 (当前)**: 用户拍板, 进一步优化:
-        1. 中转位 (y=-130, x=-150) 取代原 y=-190, x=-300 (车体中线过渡,
-           两次小位移代替一次大位移, belt-slip 风险更低)
-        2. 放仓位 y=-110 (原来 -100, 再深 10mm)
-        3. 盲降前 x=-240 横移 (待现场测, 球心可能在这个 x 上方)
-        4. **两个 grasp 后不要 sleep, 直接下一动作** (真空建立靠 SDK 自闭环)
-
-    新流程 (同步, 6 步, 无 sleep):
-      0. composite_run x=-240                盲降前横移到 -240
-      1. composite_run y=Y_PICK              盲降到抓球位
-      2. grasp(True)                         真空开 (无 sleep)
-      3. composite_run y=Y_TRANSIT, x=X_TRANSIT  抬到中转 (-130, -150)
-      4. composite_run x=bin_x               横移到 bin 上方
-      5. composite_run y=Y_PUT               降到放仓位 (-110)
-      6. grasp(False)                        放气 (无 sleep)
+    流程 (同步, 6 步, 无 sleep):
+      0. composite_run x=pick_x                盲降前横移
+      1. composite_run y=Y_PICK                盲降到抓球位
+      2. grasp(True)                           真空开
+      3. composite_run y=Y_TRANSIT, x=X_TRANSIT  抬到中转位
+      4. composite_run x=bin_x                 横移到 bin 上方
+      5. composite_run y=bin_y, hand=bin_hand  降到放仓位
+      6. grasp(False)                          放气
 
     Returns:
         {"ok": bool, "error": str|None, "release_thread": None}
@@ -477,13 +687,14 @@ def _pick_and_store(
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
-    # 5. 降到放仓位 (中转 y=transit_y → bin y=put_y)
-    print(f"  [{LOG_PREFIX}] [5/6] composite_run(y={put_y_mm:+.0f})  降到放仓位")
+    # 5. 降到放仓位 (中转 y=transit_y → bin y=bin_y_mm, 同时调整 hand=bin_hand_deg)
+    print(f"  [{LOG_PREFIX}] [5/6] composite_run(y={bin_y_mm:+.0f}, hand={bin_hand_deg:+.0f})  降到放仓位")
     try:
-        arm_client.composite_run(y_mm=put_y_mm, speed=80, timeout=10.0)
+        arm_client.composite_run(y_mm=bin_y_mm, hand=bin_hand_deg,
+                                 speed=80, timeout=10.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"composite_run(y={put_y_mm}) 降放仓位失败: "
+                "error": f"composite_run(y={bin_y_mm}, hand={bin_hand_deg}) 降放仓位失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
@@ -529,6 +740,10 @@ def step_target4(
     put_y_mm: float = Y_PUT_MM,
     bin_x_blue_mm: float = BIN_X_MM[COLOR_BLUE],
     bin_x_yellow_mm: float = BIN_X_MM[COLOR_YELLOW],
+    bin_y_blue_mm: float = BIN_Y_MM.get(COLOR_BLUE, Y_PUT_MM),
+    bin_y_yellow_mm: float = Y_PUT_MM,
+    bin_hand_blue_deg: float = BIN_HAND_DEG.get(COLOR_BLUE, TASK4_POSE_P_HAND_DEG),
+    bin_hand_yellow_deg: float = TASK4_POSE_P_HAND_DEG,
 ) -> dict:
     """慢速前移搜索 + 底盘视觉定位 (最左球) + 吸嘴中心抓取 + 放 bin。
 
@@ -586,7 +801,43 @@ def step_target4(
     t_start = time.monotonic()
 
     try:
-        # ---- 0. 打开存储仓 (2026-08-04 用户: task4 开始开仓, 结束关仓) ----
+        # ---- 0. 停 arm_feed 守护线程 (2026-08-06 修):
+        #    模块 docstring 自己写了"视觉伺服前置必须停 arm_feed (20Hz 轮询
+        #    会饿 arm_queue / composite_run 4 路并发会跟 arm_feed 抢
+        #    SerialEngine share_key)", 但代码一直没真停. 实际现场跑过的
+        #    "composite_run 卡 200-500ms" 大概率就是 arm_feed 抢 share_key 引起.
+        #    stop_arm_feed(force=True) 是真停守护线程; force=False 默认 NOOP
+        #    (消费者生命周期不能杀生产者守护线程的设计原则), 所以必须 force=True.
+        arm_feed_was_running = False
+        if not dry_run:
+            try:
+                stop_res = http_client.call(
+                    "car", "stop_arm_feed", force=True, timeout=5.0, sync=True,
+                )
+                # sync=True 会阻塞到 job 结束, 但 stop_arm_feed 在 runtime
+                # 是注册到 car target 的 sync action (actions.py:29), 立刻返回.
+                # sync 路径返回结构: {"ok": bool, "job": {"status":..., "result":...}}
+                # (见 runtime/api/routers/_helpers.py:242), 不是 {"result": ...} 直接外层.
+                stop_job = (
+                    (stop_res or {}).get("job", {})
+                    if isinstance(stop_res, dict) else {}
+                )
+                stop_result = stop_job.get("result") or {}
+                if not isinstance(stop_result, dict):
+                    stop_result = {}
+                arm_feed_was_running = bool(
+                    stop_result.get("stopped", False)
+                    or stop_result.get("reason")
+                       not in ("noop_without_force", "never_started")
+                )
+                print(f"  [{LOG_PREFIX}] �� stop_arm_feed(force=True) "
+                      f"result={stop_result} "
+                      f"ok={(stop_res or {}).get('ok') if isinstance(stop_res, dict) else None}")
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] ⚠️ stop_arm_feed 失败 "
+                      f"({type(e).__name__}: {str(e)[:80]}), 继续")
+
+        # ---- 0.b 打开存储仓 (task4 开始开仓, 结束关仓) ----
         #    纯舵机动作 (set_storage_angle 75°), 不碰臂/底盘, 边采边存常开。
         if not dry_run:
             try:
@@ -599,18 +850,17 @@ def step_target4(
             print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过开仓")
 
         # ---- 1. 准备位姿: 已删 ----
-        #    2026-08-04 (用户): 开头那个 target1 准备位姿 (~8s) 是冗余 legacy —
-        #    主循环第一球立刻 goto_pose_p 覆盖它。P 姿态才是真正的搜索姿态。
+        #    开头 target1 准备位姿 (~8s) 是冗余 legacy — 主循环第一球立刻 goto_pose_p 覆盖。
         #    直接从 P 姿态开始 creep, 省 ~8s。
 
-        # ---- 2. 主循环: P姿态+creep 并发 → 见球 → 抓取 → 放仓 → 循环 ----
-        #    2026-08-03 现场 (用户拍板):
+        # ---- 2. 主循环: P 姿态 + creep 并发 → 见球 → 抓取 → 放仓 → 循环 ----
+        #    现场拍板:
         #      a) P 姿态 + creep 并发 (背景线程保前移, 主线程摆臂)
         #      b) 见球 → creep 停 → track → pick → 放仓固定两位置
-        #      c) 再恢复 P 姿态 + creep 继续, 循环到 8 球
+        #      c) 再恢复 P 姿态 + creep 继续, 循环到 max_picks
         #      d) 失败一次就退出, 不死循环
         ball_idx = 0
-        release_thread = None  # 2026-08-04: 上一球放仓后台线程, 回P前需 join
+        release_thread = None  # 上一球放仓后台线程, 回 P 前需 join
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
             if elapsed >= max_seconds:
@@ -631,19 +881,20 @@ def step_target4(
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
-            # 2.0 P 姿态 + creep 并发:
-            #    - 后台线程保前移 (chassis-velocity realtime 通道, 见球或超时即停)
-            #    - 主线程同步摆臂到 P 姿态 (composite_run)
-            #    - 见球 → 主线程通知后台停 → 等后台清理
-            creep_thread = _CreepThread(
-                http_client, speed_mps=creep_speed_mps,
-                max_distance_m=remaining_m,
-                poll_hz=CREEP_POLL_HZ,
-            )
-            creep_thread.start()
-            # 2026-08-04: 先等上一球放仓后台线程结束, 再回 P 姿态 ——
-            #   放仓线程不回 P, 由这里统一回; 不 join 会与其臂命令竞争。
-            #   (chassis 的 creep 已在上面 start, join 期间底盘照常前移不浪费时间)
+            # 2.0 P 姿态 + creep 重排 (2026-08-06 现场拍板):
+            #    - 先 release_thread.join (上一球放仓后台线程收尾)
+            #    - 再 composite_run 回 P 姿态 (主线程同步, 此时**没有任何后台推 vx**)
+            #    - 然后才启动 creep_thread 后台推 vx
+            #    旧版并行有 3 个 bug:
+            #      a) creep_thread 与 composite_run 同时跑 → 4 路臂命令 + 底盘 vx
+            #         抢 SerialEngine, composite_run 内部 y 下降偶尔卡 200-500ms,
+            #         视觉上"卡住";
+            #      b) 见球瞬间 creep 没主动发 0 速, 靠 track_chassis 第一帧覆盖,
+            #         50-150ms 窗口内底盘按 creep 速度窜一下 → "track 开始瞬间抖";
+            #      c) arm_feed 守护线程 20Hz 轮询 y/x/arm_angle 跟 composite_run
+            #         4 路并发抢 share_key, 进一步加长 composite_run 时间.
+            #    新版顺序: composite_run 单独跑 30s (无任何后台竞争),
+            #    creep 启动时臂已稳态, 见球即停, track_chassis 直接接管.
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=15.0)
             if not dry_run:
@@ -666,6 +917,14 @@ def step_target4(
             else:
                 print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 P 姿态")
 
+            # 2.0.b 启动 creep (在 composite_run 完成后, 见球即停 → track)
+            creep_thread = _CreepThread(
+                http_client, speed_mps=creep_speed_mps,
+                max_distance_m=remaining_m,
+                poll_hz=CREEP_POLL_HZ,
+            )
+            creep_thread.start()
+
             # 2.1 等后台见球 / 见 ball 见 fetch_balls 触发停 + 累计前移记账
             creep_res = creep_thread.wait_for_ball(
                 timeout_s=max(1.0, max_seconds - elapsed))
@@ -680,7 +939,6 @@ def step_target4(
                 break
 
             # 2.2 底盘视觉定位 (最左球 → 画面中心)
-            #    2026-08-03 现场: 'P 姿态 + 底盘对齐之后直接抓手姿态 + grasp'
             #    只用底盘对齐 (track_chassis), 跳过臂侧 find_target /
             #    move_to_vision_target —— 假设底盘对齐后吸嘴已在球正上方,
             #    直接 composite_run(y_bin高位) → y 下 → grasp 即可。
@@ -691,8 +949,80 @@ def step_target4(
             )
             print(f"  [{LOG_PREFIX}] track 结束: arrived={track_res.arrived} "
                   f"reason={track_res.reason}")
+            # 2026-08-06: 软成功 / 宽成 提示. arrived=True 但 reason 是 near_arrived_*
+            # 表示 timeout 内没硬停但 final_frame 落入软/宽死区, 视为对齐.
+            if track_res.arrived and track_res.reason in (
+                "near_arrived_soft", "near_arrived_soft_retry", "near_arrived_wide",
+            ):
+                ff = track_res.final_frame
+                if ff is not None:
+                    th = (DEFAULT_TRACK_WIDE_DEADBAND
+                          if track_res.reason == "near_arrived_wide"
+                          else DEFAULT_TRACK_SOFT_DEADBAND)
+                    print(f"  [{LOG_PREFIX}] ✨ 软成功对齐 ({track_res.reason}): "
+                          f"label={ff.label} "
+                          f"|cx_err|={abs(ff.cx_err or 0):.3f} "
+                          f"|cy_err|={abs(ff.cy_err or 0):.3f} "
+                          f"(< 阈值 {th:.2f})")
 
-            # 2.3 定颜色 (并发策略 2026-08-05):
+            # 2026-08-06 第 6 次迭代: no_target 现场反馈 "看到之后动都不动".
+            #   这是 CLAUDE.md 顶部提的 OPEN chassis realtime-velocity no-motion bug
+            #   的一种表现: track_chassis 期间 _set_vel 多次成功 (没抛), 但轮速
+            #   实际没下发 (SerialEngine 队列 / _stop_flag / 串口抢锁各种原因).
+            #   lost_frames++ 是因为 "球在视野里没动 → cx_err 不收敛 → 选取失败"
+            #   而不是 "球真的消失". 救治思路: 在 no_target 退出后, 主动检查
+            #   encoder 是否真没动, 若没动 → 一次 reset-stop + 强制 0 速重下发
+            #   ("重武装"), 给下一拍 set_chassis_velocity 一次干净的环境.
+            if (not track_res.arrived and track_res.reason == "no_target"
+                    and not dry_run):
+                rear = _chassis_rearm_if_stuck(http_client, settle_s=0.5)
+                if rear:
+                    print(f"  [{LOG_PREFIX}] [REARM] 检测到底盘无响应, 已重武装 "
+                          f"(reset-stop + 0 速下发), 重试一次 track")
+                    # 重试 1 次: 拿 3s 给一次集中机会, 若再 no_target 就硬失败
+                    retry = track_chassis(
+                        target=BALL_LABELS,
+                        select_mode="leftmost",
+                        setpoint_cxcy=(0.0, 0.0),
+                        kp=0.10,
+                        v_max=0.08,
+                        hold_frames=3,
+                        v_slew=0.02,
+                        max_seconds=min(3.0, track_max_seconds),
+                        dry_run=dry_run,
+                    )
+                    if retry.arrived:
+                        track_res = retry
+                        print(f"  [{LOG_PREFIX}] [REARM] 重试 track 成功: "
+                              f"arrived=True reason={retry.reason}")
+                else:
+                    print(f"  [{LOG_PREFIX}] [REARM] 底盘有响应 (encoder 在动), "
+                          f"no_target 是视觉真丢, 不重武装")
+
+            # 2026-08-06: track 失败要计入 n_consecutive_failures, 否则
+            # 永不触发 max_consecutive_pick_failures 退出 —— 这是 task4
+            # "卡住 + 跳过"的隐性根因之一. reason ∈ {arrived} 视为成功,
+            # 其他 {timeout, no_target, watchdog, stopped} 全算失败.
+            track_ok = bool(track_res.arrived)
+            if not track_ok and not dry_run:
+                n_consecutive_failures += 1
+                n_pick_failures += 1
+                history.append({
+                    "ball": ball_idx, "action": "track_failed",
+                    "color": None,
+                    "error": f"track reason={track_res.reason}",
+                })
+                print(f"  [{LOG_PREFIX}] ❌ track 失败 (reason={track_res.reason}); "
+                      f"连续失败 {n_consecutive_failures}/{max_consecutive_pick_failures}")
+                if n_consecutive_failures >= max_consecutive_pick_failures:
+                    final_reason = "pick_error_exceeded"
+                    print(f"  [{LOG_PREFIX}] ❌ 连续失败达到 "
+                          f"{max_consecutive_pick_failures}, 退出循环")
+                    break
+                # 兜底: track 失败本轮不再走 pick, 直接下一轮 (creep 继续搜)
+                continue
+
+            # 2.3 定颜色:
             #    creep 阶段已经把当前帧 balls 拿到 (creep_res['balls']),
             #    直接复用 — 不再 track 完再 fetch_balls 一次, 省 1 个 HTTP RTT。
             #    优先用 creep 看到的 balls; track label 兜底; 都没有就 skip。
@@ -732,6 +1062,8 @@ def step_target4(
                 transit_x_mm=transit_x_mm,
                 put_y_mm=put_y_mm,
                 bin_x_mm=bin_x_blue_mm if color == COLOR_BLUE else bin_x_yellow_mm,
+                bin_y_mm=bin_y_blue_mm if color == COLOR_BLUE else bin_y_yellow_mm,
+                bin_hand_deg=bin_hand_blue_deg if color == COLOR_BLUE else bin_hand_yellow_deg,
             )
             release_thread = res.get("release_thread")  # 记录放仓线程, 下轮回P前 join
             history.append({"ball": ball_idx,
@@ -746,7 +1078,7 @@ def step_target4(
                 n_consecutive_failures += 1
                 print(f"  [{LOG_PREFIX}] ❌ 抓取失败 ({res['error']}); "
                       f"连续 {n_consecutive_failures} 次")
-                # 2026-08-03 现场: pick 失败后下一轮又 goto_pose_p → creep → track → pick,
+                # pick 失败后下一轮又 goto_pose_p → creep → track → pick,
                 # 但 vision 阈值/PID 还没调通时, 每球都失败会无限循环在 '恢复P → 找球 →
                 # 抓 → 失败 → 恢复P'。失败一次就退出, 避免循环浪费现场时间。
                 if n_consecutive_failures >= max_consecutive_pick_failures:
@@ -772,16 +1104,39 @@ def step_target4(
                 _dipan._stop_chassis_quietly(http_client)
             except Exception:
                 pass
-            # 2026-08-04: 最后一球的放仓线程收尾, 再关仓 (防臂还在动就关舵机)
+            # 最后一球的放仓线程收尾, 再关仓 (防臂还在动就关舵机)
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=15.0)
-            # ---- 关闭存储仓 (2026-08-04 用户: task4 结束关仓) ----
+            # ---- 关闭存储仓 (task4 结束关仓) ----
             try:
                 print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")
                 arm_client.set_storage_angle(
                     STORAGE_CLOSE_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
             except Exception as e:
                 print(f"  [{LOG_PREFIX}] ⚠️ 关仓失败 ({type(e).__name__}: {str(e)[:80]})")
+            # ---- 恢复 arm_feed (2026-08-06 修) ----
+            #    start_arm_feed 幂等, 任务前 stop 后 start 不丢状态.
+            #    没在任务前 stop 的场景 (force=False 静默 noop, 或本来就没启)
+            #    start 也无害 (同 hz 的 already_running fast-path).
+            #    sync 路径返回结构: {"ok": bool, "job": {"status":..., "result":...}}
+            #    (见 runtime/api/routers/_helpers.py:242), 不是 {"result": ...} 直接外层.
+            try:
+                start_res = http_client.call(
+                    "car", "start_arm_feed", hz=20.0, timeout=5.0, sync=True,
+                )
+                start_job = (
+                    (start_res or {}).get("job", {})
+                    if isinstance(start_res, dict) else {}
+                )
+                start_result = start_job.get("result") or {}
+                if not isinstance(start_result, dict):
+                    start_result = {}
+                started = start_result.get("started", None)
+                print(f"  [{LOG_PREFIX}] ▶️ start_arm_feed(hz=20) started={started} "
+                      f"ok={(start_res or {}).get('ok') if isinstance(start_res, dict) else None}")
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] ⚠️ start_arm_feed 失败 "
+                      f"({type(e).__name__}: {str(e)[:80]})")
 
     elapsed = time.monotonic() - t_start
     print(f"\n========== {LOG_PREFIX} 完成 ==========")
