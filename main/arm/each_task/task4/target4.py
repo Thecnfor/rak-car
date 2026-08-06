@@ -91,11 +91,6 @@ LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
 DEFAULT_MAX_PICKS: int = 8
 """最多抓取数 (比赛正常 6-8 球, 给 buffer)。"""
 
-DEFAULT_CREEP_SPEED_MPS: float = 0.01
-"""creep 搜索前移速度 (m/s)。慢 = 帧覆盖密, 不漏球; 快 = 省时间。
-2026-08-03 用户现场反馈 0.03 太慢, ×1.5 → 0.045。
-2026-08-06 用户: 再减半 → 0.0225。"""
-
 DEFAULT_MAX_CREEP_M: float = 0.8
 """累计前移距离预算 (m, 开环 速度×时间 记账)。旧版总行程 0.56m + 余量。"""
 
@@ -231,16 +226,20 @@ class _CreepThread:
             except Exception:
                 pass
 
+DEFAULT_CREEP_SPEED_MPS: float = 0.04
+"""creep 搜索前移速度 (m/s)。慢 = 帧覆盖密, 不漏球; 快 = 省时间。
+2026-08-03 用户现场反馈 0.03 太慢, ×1.5 → 0.045。
+2026-08-06 用户: 再减半 → 0.0225。"""
 # ---- P 姿态参数 (可由外部覆盖) ----
 
 TASK4_POSE_P_Y_MM: float = -130.0
-TASK4_POSE_P_X_MM: float = -300.0
+TASK4_POSE_P_X_MM: float = -290.0
 TASK4_POSE_P_ARM_DEG: float = 90.0
 TASK4_POSE_P_HAND_DEG: float = 10.0
 
 # ---- 放 bin 参数 (2026-08-05 用户拍板: 新放球序列) ----
 
-BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -65.0}
+BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -75.0}
 """蓝 bin x=0, 黄 bin x=-65。"""
 
 X_PICK_MM: float = -248.0
@@ -249,23 +248,23 @@ X_PICK_MM: float = -248.0
 上方需要 13_nozzle_align_pose_p.py 标定的 (sx, sy) 配合验证。
 如果 (sx, sy) 偏移明显, 球径 4cm 仍允许小偏差抓到, 不用回伺服。"""
 
-Y_PICK_MM: float = -58.0
+Y_PICK_MM: float = -70.0
 """抓球 y (吸盘贴近球面)。"""
 
-Y_TRANSIT_MM: float = -130.0
+Y_TRANSIT_MM: float = -140.0
 """中转 y (2026-08-05 用户拍板 -190 → -130, 不需要那么深的中转位)。
 留出 y=-130 是放仓位 y=-110 之前的过渡 — y_gate 上界 -145, 中转位高于
 gate 上界, 业务层 OK (开仓舵机在 y ∈ [-205,-145] 才卡; 我们不放仓,
 只在这里横移)。"""
 
-X_TRANSIT_MM: float = -150.0
+X_TRANSIT_MM: float = -180.0
 """中转 x (2026-08-05 用户拍板)。从 P 姿态 x=-300 → 中转 -150 (车体中线
 附近), 然后再横移到 bin x=0/-65。两次小位移, belt-slip 风险低。"""
 
-Y_PUT_MM: float = -110.0
+Y_PUT_MM: float = -120.0
 """放球 y (2026-08-06 用户: -100 → -110, 再深 10mm)。"""
 
-Y_FINAL_MM: float = -133.0
+Y_FINAL_MM: float = -140.0
 """最终 y (识别位姿, 历史值, 下一阶段 target 识别用)。"""
 
 BALL_LABELS = ["ball_blue", "ball_yellow"]

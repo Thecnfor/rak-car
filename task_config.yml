@@ -205,6 +205,13 @@ task_cfg:
     vacuum_settle_s: 0.0            # 2026-08-06: 0.5 → 0.2 → 0.0 (删除 sleep, grasp 后立即下一步)
     chassis_move_timeout_s: 30
 
+  # task1 结束后 (orchestrator 层): 清零里程 → 切断巡线视觉 → 直行 → 里程计 θ 转 45° → 恢复视觉 → 继续巡线
+  # 盲转段不依赖 lane, stop_lane_feed 让 lane_state 失效, 转完再恢复并等新鲜 (防 watchdog 误急停).
+  post_task1:
+    enabled: true
+    straight_m: 0.55        # 直行距离 (m, move_for 里程计闭环)
+    turn_deg: -45.0         # 原地里程计 θ 转弯角度 (度, OdomTurnPID); 实车方向反了取负
+
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
 # 触发条件: IR (红外接近) + dis_at_least_m (累计里程计) AND/OR.
 # 换场地改这里, 业务代码不动.

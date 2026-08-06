@@ -1,30 +1,36 @@
-# 百度智能车 2026 项目
+# XRAK Autonomous Robot Platform
 
-## 项目简介
+## 系统概览
 
-本项目基于百度 PaddlePaddle 深度学习平台和 WhalesBot 智能车硬件平台开发，实现了完整的智慧农业赛道竞赛任务。智能车能够自主完成播种、灌溉、射击除害、作物采收、分类储存及订单配送等一系列农业自动化任务。
+XRAK 是一个基于 NVIDIA Jetson 与 WhalesBot 硬件平台打造的全栈自主移动机器人系统。它集成了实时感知、自主导航、精密操作与物流自动化能力，能够在复杂动态环境中完成端到端的自主任务。
 
-## Runtime API 快速入口
+本系统采用分布式客户端-服务端架构：车端运行时（Runtime）独占硬件资源并对外暴露标准 API，上层业务逻辑（Mission Client）通过 HTTP/WebSocket 远程调用，实现了解耦的软硬件分离设计。
 
-如果你是局域网内联调同学，优先看这几份文档:
+---
+
+## 快速启动
+
+### 局域网联调入口
+
+如果你正在局域网内联调，优先查阅以下文档：
 
 - [API_USAGE.md](file:///home/jetson/workspace/rak-car/API_USAGE.md)
 - [runtime/README.md](file:///home/jetson/workspace/rak-car/runtime/README.md)
 - [main/README.md](file:///home/jetson/workspace/rak-car/main/README.md)
 
-当前默认局域网地址:
+当前默认局域网地址：
 
-- API: `http://192.168.6.231:5050`
-- FastAPI 文档: `http://192.168.6.231:5050/docs`
-- 视频流: `http://192.168.6.231:5000/`
+- API 服务：`http://192.168.6.231:5050`
+- FastAPI 交互文档：`http://192.168.6.231:5050/docs`
+- 实时视频流：`http://192.168.6.231:5050/stream/`
 
-如果要快速修改 IP/端口，只改:
+如需快速修改监听地址或端口，仅需调整：
 
 ```python
-/home/jetson/workspace/rak-car/runtime/config.py
+/home/jetson/workspace/rak-car/runtime/core/settings.py
 ```
 
-推荐启动方式:
+推荐生产启动方式：
 
 ```bash
 cd /home/jetson/workspace/rak-car
@@ -33,244 +39,270 @@ pm2 start ecosystem.config.js
 pm2 save
 ```
 
-## 硬件平台
+---
 
-| 组件 | 说明 |
+## 硬件架构
+
+| 组件 | 规格 |
 |------|------|
-| 上位机 | Jetson Nano |
-| 下位机 | MC602 控制器 |
-| 底盘 | WhalesBot 麦克纳姆轮底盘 |
-| 前置摄像头 | 车道检测（LaneInfer 模型） |
-| 侧面摄像头 | 目标检测（YoloeInfer 模型） |
-| 机械臂 | 夹取、放置、气泵吸取 |
-| 其他 | 蜂鸣器、储物架、射击机构 |
+| 上位机 | NVIDIA Jetson Orin Nano / Nano（JetPack/L4T） |
+| 下位机 | MC602 运动控制器（USB 串口，1M baud） |
+| 底盘 | WhalesBot 麦克纳姆轮全向移动平台 |
+| 感知层 | 前置摄像头（车道检测）+ 侧向摄像头（目标检测） |
+| 操作臂 | 4-DOF 机械臂（夹取 / 放置 / 气泵吸取） |
+| 执行器 | 蜂鸣器、储物架伺服、射击机构 |
+| 遥测 | 双摄像头 MJPEG 实时流、轮速里程计 |
 
-## 项目结构
+---
+
+## 软件架构
 
 ```
-baidu_smartcar_2026/
-├── car_start_2026.py        # 主启动脚本，执行完整任务流程
-├── car_task_function.py     # 任务函数（8个竞赛任务）
-├── car_wrap_2026.py         # MyCar 核心控制类
-├── config_car.yml           # 硬件参数、PID参数、推理服务配置
-├── collect_data.py          # 数据采集脚本
-├── smartcar/
-│   ├── paddlebaidu/
-│   │   ├── ernie_bot/       # 文心一言 API 封装
-│   │   ├── infer_cs/        # 推理服务接口
-│   │   ├── models/          # 视觉模型（task2026、front_model2 等）
-│   │   └── paddle_jetson/   # Jetson 平台部署工具
-│   └── whalesbot/
-│       ├── vehicle/         # 车辆底层驱动
-│       └── tools/           # PID、摄像头、日志等工具
-└── README.md
+├── runtime/                 # 车端运行时（FastAPI 服务）
+│   ├── api/                 # 路由层：/v1/execute、/v1/vision、/v1/realtime、/v1/ws
+│   ├── core/                # 配置管理（settings.py）与动作注册表（actions.py）
+│   ├── services/            # MyCar 单例聚合 + 运行时服务（队列、锁、守护线程）
+│   └── hardware/            # MC602 USB 会话状态机 + 自动恢复
+│
+├── main/                    # 业务客户端（仅通过 HTTP/WS 与 runtime 通信）
+│   ├── start/               # 任务编排器：50Hz 循迹外环 + 航点状态机
+│   ├── task/                # 任务注册表（TASK_RUNNERS 1–7）+ 任务逻辑
+│   ├── arm/                 # 机械臂业务：视觉伺服、PID 闭环、S 曲线、软限位
+│   ├── chassis/             # 底盘控制：50Hz 主循环、P/Stanley/curvature 控制器
+│   └── misc/                # 独立脚本（射击、边走边打等）
+│
+├── smartcar/                # 硬件 SDK + 深度学习推理封装
+│   ├── whalesbot/           # 车辆/机械臂驱动、SerialEngine、PID、摄像头工具
+│   └── paddlebaidu/         # YOLO / OCR / Lane 推理 + ZMQ REQ/REP 通信
+│
+├── config_car.yml           # 摄像头通道、PID 增益、推理服务配置
+├── task_config.yml          # 任务级校准：机械臂姿态、仓储位姿、航点列表
+├── ecosystem.config.js      # PM2 生产进程定义 + 环境变量
+├── run.py                   # 任务入口：完整任务流 / 单任务调试
+└── test/                    # MC602 协议实验室（独立包，真实硬件在 --dangerous 模式下运行）
 ```
+
+---
 
 ## 技术栈
 
-- **编程语言**：Python 3
-- **深度学习推理**：百度 PaddlePaddle Inference
-- **目标检测模型**：YoloeInfer（任务目标）、LaneInfer（车道线）
-- **OCR 识别**：百度 PP-OCRv3
-- **自然语言处理**：百度文心一言 API
-- **控制算法**：麦克纳姆轮运动控制、PID 控制
-- **硬件接口**：WhalesBot SDK
+- **运行时**：Python 3 / FastAPI / uvicorn / ZMQ
+- **深度学习推理**：百度 PaddlePaddle Inference（TensorRT FP16/FP32）
+- **视觉模型**：YOLOE（目标检测）、LaneBlend（车道线）、PP-OCRv3（文字识别）
+- **自然语言处理**：ERNIE Bot（订单解析 / 语义理解）
+- **控制算法**：麦克纳姆轮运动解算、PID 位置/速度闭环、S 曲线加减速
+- **硬件接口**：WhalesBot SDK（MC602 串口协议、4-DOF 机械臂、舵机 PWM）
+- **遥测与调试**：MJPEG 视频流、WebSocket 实时状态订阅、PM2 进程守护
 
-## 任务流程
+---
 
-`car_start_2026.py` 中的 `main()` 函数按顺序执行以下8个任务：
+## 核心能力
 
-```
-init()                      → 系统初始化（机械臂复位、里程计清零）
-    ↓
-auto_seeding()             → 自动播种（3个大/中/小圆柱体）
-    ↓
-target_shooting_detection() → 虫害侦察（识别4个靶标，判断有害/有益动物）
-    ↓
-water_tower_task()         → 水塔灌溉（2个水塔，各需不同水量）
-    ↓
-target_shooting()          → 射击除害（在射击区击倒有害动物靶标）
-    ↓
-crop_harvesting()          → 作物采收（2种颜色×4个果实，吸取到储物架）
-    ↓
-sort_and_store()           → 分类储存（按颜色分拣到存储仓）
-    ↓
-get_order()                → 获取订单（OCR识别+大模型解析，按序取货）
-    ↓
-order_delivery()           → 订单配送（将货物送到对应住户格口）
-```
+### 1. 自主导航
 
-## 目标检测标签
+- 50 Hz 车道线外环循迹（双环架构：主循环 + 里程计线程）
+- Stanley / Pure Pursuit / 自适应曲率控制器可切换
+- 航点列表驱动，支持 IR 传感器 + 里程计双重触发
+- 相对位移导航（`move_for`）规避麦克纳姆轮 odometry theta 漂移
 
-程序中使用以下目标检测标签进行视觉识别：
+### 2. 视觉感知
 
-| 类别 | 说明 |
-|------|------|
-| cylinder_1/2/3 | 播种用圆柱体（大/中/小） |
-| water_l1/l2/l3 | 水塔水量指示牌（1/2/3滴水） |
-| ball_yellow / ball_blue | 果实（黄色/蓝色） |
-| lable_yellow / lable_blue | 颜色标签 |
-| animal | 动物靶标 |
-| order | 订单标签 |
-| name | 住户姓名标签 |
-| storage | 储物架 |
+- 实时目标检测（侧向摄像头，YOLOE，30 Hz 缓存）
+- 车道线检测（前置摄像头，128×128 推理，50 Hz 缓存）
+- OCR 文字识别（订单 / 住户标签）
+- 所有推理后端独立运行于子进程（ZMQ 通信），支持 LRU 自动卸载与 OOM 治理
 
-## 安装配置
+### 3. 精密操作
+
+- 4-DOF 机械臂：位置模式（goto_position）与速度模式（velocity mode）双回路
+- 视觉伺服闭环：bbox → TargetSelector → depth-aware PID → S 曲线 → 复合动作
+- 复合动作并行执行（ThreadPoolExecutor），支持夹取、放置、真空吸取
+- 软限位 + 磁 safety gate + 目标丢失自动降速
+
+### 4. 任务编排
+
+- 完整任务流由 `Orchestrator` 驱动：循迹到触发点 → 暂停主循环 → 执行任务 → 恢复
+- 单任务调试：`python run.py --task N`
+- 循环频率可调：`python run.py --lane-hz 30`
+
+---
+
+## 配置说明
 
 ### 1. 环境要求
 
-- Python 3.8+
-- PaddlePaddle Inference（需配合 Jetson Nano 的 CUDA 版本）
-- WhalesBot SDK
+- Python 3.8+（Jetson 系统 Python）
+- PaddlePaddle Inference（配合 JetPack CUDA 版本）
+- PM2 进程管理器（生产环境）
 
-### 2. 配置文件
+### 2. 关键参数
 
-编辑 `config_car.yml` 中的关键参数：
+编辑 `config_car.yml` 校准场地参数：
 
 ```yaml
-# 摄像头通道
+# 摄像头通道（OpenCV 索引）
 camera:
-  front: 1    # 前视摄像头
-  side: 2     # 侧视摄像头
+  front: 1    # 前视 / 车道
+  side: 2     # 侧视 / 目标
 
-# 速度限制
+# 速度限制（m/s 或 rad/s）
 speed:
   x:
-    limit: 0.7    # 横向 m/s
+    limit: 0.7    # 横向
   y:
-    limit: 0.7    # 纵向 m/s
+    limit: 0.7    # 纵向
   angle:
-    limit: 3      # 角速度 rad/s
+    limit: 3      # 角速度
+
+# 推理后端端口
+infer_cfg:
+  lane: 5001
+  task: 5002
+  ocr: 5004
 ```
 
-### 3. 文心一言 API
+编辑 `task_config.yml` 校准任务级参数：
 
-访问令牌已配置在 `config_car.yml` 的 `ernie_access_token` 字段。
+```yaml
+task_cfg:
+  task1:
+    arm_pose: { arm_angle: 45, pitch: 90, side: "LEFT" }
+    slot_map: [ ... ]
+  waypoints:
+    - { x: 0.0, y: 0.0, task: 1 }
+    - { x: 1.2, y: 0.5, task: 2 }
+```
 
-## 使用方法
+### 3. 大模型 API
 
-### 完整任务流程
+ERNIE 访问令牌配置于 `config_car.yml` 的 `ernie_access_token` 字段，或通过环境变量 `ERNIE_ACCESS_TOKEN` 注入。
+
+---
+
+## 核心 API
+
+### MyCar 控制接口（通过 `/v1/execute` 调用）
+
+| 动作 | 参数 | 说明 |
+|------|------|------|
+| `reset_position` | — | 里程计清零 |
+| `get_odometry` | — | 获取当前坐标 (x, y, theta) |
+| `move_for` | `[dx, dy, dz]` | 相对移动（米 / 弧度） |
+| `lane_dis_offset` | `speed, dis_hold` | 巡线行驶指定距离 |
+| `move_to_detection_target` | label | 视觉伺服对准目标 |
+| `get_detection_results` | — | 获取最新检测框列表 |
+| `get_ocr` | label, time_out | OCR 文字识别 |
+| `set_storage` | state | 储物架抬升 / 下降 |
+| `start_lane_feed` | — | 启动 50 Hz 车道缓存守护线程 |
+| `stop_arm_feed` | force | 停止机械臂缓存（释放串口） |
+| `start_arm_feed` | — | 启动 20 Hz 机械臂状态缓存 |
+
+### 机械臂动作
+
+| 动作 | 参数 | 说明 |
+|------|------|------|
+| `reset_position` | — | 机械臂复位（零点标定） |
+| `set_arm_pose` | arm_id, pitch, side | 设置大臂姿态 |
+| `grasp` | state | 气泵吸取（True）/ 释放（False） |
+| `move_x_position` | mm | X 轴绝对位置移动 |
+| `move_y_position` | mm | Y 轴绝对位置移动 |
+
+**实时控制（bypass 队列，µs 级响应）**：
 
 ```bash
-python car_start_2026.py
+POST /v1/realtime/arm-velocity
+{"x_vel": 0.0, "y_vel": 0.0}   # m/s，视觉伺服推荐模式
 ```
 
-### 单独测试某个任务
+---
 
-在 `car_start_2026.py` 中注释掉不需要的任务：
+## 遥测与数据采集
 
-```python
-def main():
-    init()
-    auto_seeding()                          # 保留要测试的任务
-    # target_shooting_detection()            # 注释掉其他任务
-    # water_tower_task()
-    # ...
-```
+### 实时视频流
 
-## 核心类与方法
+车端启动后自动提供双路 MJPEG 流：
 
-### MyCar 类（car_wrap_2026.py）
+- cam1（前置 / 车道）：`/video_feed/cam1`
+- cam2（侧向 / 目标）：`/video_feed/cam2`
 
-核心控制类，继承麦克纳姆轮驱动，提供所有硬件操作接口：
+浏览器访问 `http://<JETSON_IP>:5050/stream/` 可同时查看双路画面。
 
-| 方法 | 说明 |
-|------|------|
-| `beep()` | 鸣笛提示 |
-| `reset_position()` | 复位里程计 |
-| `get_odometry()` | 获取当前坐标 (x, y, z) |
-| `move_for([dx, dy, dz])` | 相对移动 |
-| `lane_dis_offset(speed, dis_hold)` | 巡线行驶指定距离 |
-| `move_to_position(coords)` | 移动到绝对坐标 |
-| `move_to_detection_target()` | 视觉对准目标 |
-| `get_detection_results()` | 获取检测结果列表 |
-| `get_ocr(label, time_out)` | OCR 文字识别 |
-| `set_storage(state)` | 控制储物架抬升/下降 |
+### WebSocket 实时状态
 
-### 机械臂操作
+订阅 `/v1/ws` 可接收：
 
-| 方法 | 说明 |
-|------|------|
-| `arm.reset_position()` | 机械臂复位 |
-| `arm.set_arm_pose()` | 设置机械臂姿态（左右臂、俯仰角） |
-| `arm.grasp(state)` | 气泵吸取/释放（True=吸气，False=放气） |
-| `arm.move_x_position()` | 机械臂 X 轴移动 |
-| `arm.move_y_position()` | 机械臂 Y 轴移动 |
+- `lane_state`（车道线偏移、曲率）
+- `arm_state`（x/y 位置、编码器值）
+- `task_state`（检测结果缓存）
+- `ir_state`（红外传感器原始值）
+- `odom_state`（轮速里程计）
 
-## 推理服务
+### 数据采集模式
 
-项目使用 ZMQ 通信的后端推理服务，各模型独立运行在不同端口：
-
-| 模型 | 类型 | 端口 | 说明 |
-|------|------|------|------|
-| lane | LaneInfer | 5001 | 车道线检测 |
-| task | YoloeInfer | 5002 | 任务目标检测 |
-| front | YoloeInfer | 5003 | 前方目标检测 |
-| ocr | OCRReco | 5004 | 文字识别 |
-
-推理服务随 MyCar 初始化时自动启动，无需手动启动。
-
-## 重要说明
-
-本程序仅对任务可行性做了初步验证，并未针对不同赛场的差异性进行全面测试。项目中的任务解法不一定是全局最优解，实际比赛中需要选手根据各自的场地条件进行调试和优化。里程计参数、视觉识别的阈值、机械臂位置偏移等均需结合实际情况校准，必要时可对函数逻辑进行大幅调整甚至重写，以增强程序在不同环境下的鲁棒性和运行效率。
-
-### 数据采集控制
-
-运行 `smartcar/whalesbot/tools/collect_control.py` 启动双摄像头数据采集系统：
+运行以下命令启动双摄像头数据采集与网页遥控：
 
 ```bash
 python -m smartcar.whalesbot.tools.collect_control
 ```
 
-系统自动启动局域网双摄流媒体服务，打开浏览器访问：
+浏览器访问 `http://<JETSON_IP>:5000/`，通过网页虚拟手柄或实体游戏手柄实时遥控机械臂，并保存图像数据集到 `./dataset/`。
 
-```
-http://<智能车IP>:5000/
-```
+---
 
-可同时查看 cam1（车道摄像头）和 cam2（目标摄像头）的实时画面，支持网页键盘事件反馈显示。
+## 并发模型（关键设计）
 
-**遥控器按键功能表：**
+Runtime 采用双层引用锁 + 双队列 worker 架构，避免旧式单锁导致的资源争抢：
 
-| 按键 | 功能 |
-|------|------|
-| **左摇杆** | 控制智能车在 X/Y 方向移动 |
-| **右摇杆左右** | 控制车身旋转 |
-| **△** | 机械臂向上移动 |
-| **▽** | 机械臂向下移动 |
-| **◁** | 机械臂向左移动 |
-| **▷** | 机械臂向右移动 |
-| **^** | 机械臂手爪向上 |
-| **V** | 机械臂手爪向下 |
-| **<** | 机械臂整体向左 |
-| **>** | 机械臂整体向右 |
-| **□** | 切换气泵吸取/释放 |
-| **○** | 切换舵机角度 |
-| **按键3** | cam1（车道摄像头）开始采集数据 |
-| **按键4** | cam2（目标摄像头）开始采集数据 |
-| **L1+V** | 删除 cam1 最近 30 张图片 |
-| **L1+O** | 清空 cam1 所有数据 |
-| **L2+▽** | 删除 cam2 最近 30 张图片 |
-| **L2+□** | 清空 cam2 所有数据 |
-| **L1+L2** | 安全退出程序 |
+- **`_ref_lock`**：仅保护 `self.car` 引用替换（init / recover / close），微秒级
+- **`_realtime_gate`**：`/v1/realtime/*` 端点入口直接取引用，绕过队列
+- **`arm_queue` + `car_queue`**：机械臂长动作（1–3s PID 闭环）与底盘短动作隔离
+- **SerialEngine**：单 IO 线程 + 帧队列，写合并（coalesce）+ 读共享（share）+ URGENT 插队
 
-**摄像头配置：**
-- cam1：前置车道摄像头（320×240），保存到 `./dataset/image_set_lane/`
-- cam2：侧向目标摄像头（640×480），保存到 `./dataset/image_set_object/`
+急停 / 取消后，必须 `POST /v1/control/reset-stop` + 重启 `start_lane_feed`，守护线程才会恢复。
+
+---
 
 ## 故障排查
 
-| 现象 | 可能原因 |
-|------|---------|
-| 摄像头读取失败 | 摄像头通道配置错误或连接不良 |
-| 巡线偏离车道 | 光照变化或场地纹路干扰；尝试降低巡线速度 |
-| 目标检测失败 | 摄像头角度偏差；目标不在视野范围内 |
-| 机械臂抓取失败 | 气泵管路漏气；位置偏差导致未对准目标 |
-| 大模型解析失败 | 网络波动；API 超时 |
+| 现象 | 可能原因 | 处置建议 |
+|------|----------|----------|
+| 摄像头读取失败 | 通道配置错误 / 连接不良 | 检查 `config_car.yml` 与物理连接 |
+| 循迹偏离车道 | 光照突变 / 场地纹理干扰 | 降低巡线速度或调整 PID 增益 |
+| 目标检测失败 | 摄像头角度偏移 / 目标超出视场 | 重新校准姿态，检查 `task_config.yml` |
+| 机械臂抓取失败 | 气泵管路漏气 / 位置偏差 | 检查气密性，微调 arm_pose |
+| 大模型解析超时 | 网络波动 / API 限流 | 检查 `ERNIE_ACCESS_TOKEN` 有效性 |
+| MC602 掉线 | USB 重枚举 / 串口冲突 | Runtime 会自动恢复；检查 `RAK_CAR_AUTO_INIT` |
+
+---
+
+## 开发与测试
+
+### 单元测试（离线，无需硬件）
+
+```bash
+# 机械臂业务（141 项）
+/usr/bin/python3 -m unittest discover -s main/arm/tests -p 'test_*.py'
+
+# 任务编排（14 项）
+/usr/bin/python3 -m unittest discover -s main/task/tests -p 'test_*.py'
+
+# 串口引擎（16 项，模拟模式）
+RAK_CAR_SERIAL_AUTO_CONNECT=0 /usr/bin/python3 -m unittest smartcar.test.test_serial_engine -v
+```
+
+### 健康检查
+
+```bash
+curl -s http://192.168.6.231:5050/health           # 服务存活
+curl -s http://192.168.6.231:5050/v1/infer/state   # 推理后端状态
+curl -s http://192.168.6.231:5050/stream/health    # 视频流状态
+```
+
+---
 
 ## 贡献
 
-欢迎提交 Issue 或 Pull Request 对项目进行改进。
+欢迎提交 Issue 或 Pull Request。所有代码变更需通过单元测试，并在真车上完成物理验证。
 
 ## 许可证
 

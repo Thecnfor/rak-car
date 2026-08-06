@@ -228,7 +228,7 @@ class Orchestrator:
         # crossroad_turn（task_config.yml 顶层声明）：第几个弯出口紧接着十字路口，
         # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
         from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
-        from main.task._config import load_crossroad_turn
+        from main.task._config import load_crossroad_turn, load_post_task1
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -240,6 +240,9 @@ class Orchestrator:
             detector=CurveDetector(),
             crossroad_turn=load_crossroad_turn(),
         )
+        # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
+        # None = task_config.yml 未配 / enabled=false → 保持现状 (只清零里程).
+        post_task1 = load_post_task1()
 
         # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）
         # max_seconds=inf：常驻，由 runner.stop() 终止
@@ -352,6 +355,8 @@ class Orchestrator:
                         logger.info("odometry reset after task1: next segment from distance 0")
                     except Exception as exc:
                         logger.warning("odom reset after task1 failed: %s", exc)
+                    if post_task1 is not None:
+                        self._post_task1_maneuver(api, post_task1)
                 # 2026-08-03: 每个任务结束后强制 reset 机械臂到 home 姿态
                 # (x=0, y=-150, arm=+90, hand=-90), 边重置边巡航 ——
                 # reset 在后台线程跑, 不阻塞 _resume_lane。
@@ -529,6 +534,97 @@ class Orchestrator:
                             wp.name, left, right, dis)
                 return
             time.sleep(interval_s)
+
+    # ── task1 结束后: 盲转段位移 (2026-08-06) ─────────────────────
+
+    def _post_task1_maneuver(self, api: ChassisClient,
+                             seg: Dict[str, Any]) -> None:
+        """task1 结束后: 切断视觉 → 里程计直行 → θ 转 turn_deg → 恢复视觉.
+
+        巡线外环此时已暂停, 车停着. 盲转段不依赖 lane 帧, 先 stop_lane_feed
+        让 lane_state 失效; 转完 start_lane_feed 并**等 lane 新鲜**再交还外环
+        —— 否则 resume 首帧 age_ms>500ms 触发 watchdog 急停 (closed_loop.py).
+        参数走 task_config.yml task_cfg.post_task1 (straight_m / turn_deg).
+        """
+        straight_m = float(seg.get("straight_m", 0.0))
+        turn_deg = float(seg.get("turn_deg", 0.0))
+        try:
+            api.stop_lane_feed()
+            logger.info("[post-task1] 切断视觉 (stop_lane_feed)")
+        except Exception as exc:
+            logger.warning("[post-task1] stop_lane_feed 失败: %s", exc)
+        if straight_m:
+            try:
+                api.move_for(dx_m=straight_m)
+                logger.info("[post-task1] 直行 %.2f m (里程计闭环 move_for)", straight_m)
+            except Exception as exc:
+                logger.warning("[post-task1] move_for %.2f 失败: %s", straight_m, exc)
+        if turn_deg:
+            self._turn_theta_deg(api, turn_deg)
+        try:
+            api.start_lane_feed(hz=self.lane_hz)
+            logger.info("[post-task1] 恢复视觉 (start_lane_feed)")
+        except Exception as exc:
+            logger.warning("[post-task1] start_lane_feed 失败: %s", exc)
+        if not self._wait_lane_fresh(api):
+            logger.warning("[post-task1] lane 未在超时内新鲜, resume 可能触发 watchdog 急停")
+
+    @staticmethod
+    def _turn_theta_deg(api: ChassisClient, turn_deg: float,
+                        *, hz: float = 50.0, timeout_s: float = 15.0) -> None:
+        """里程计 θ 闭环原地转弯 turn_deg (度), 转完自动零速.
+
+        复用 odom_turn.OdomTurnPID (纯控制器无 IO) + realtime/chassis-velocity
+        下发 (走 _realtime_gate, 不占 job_queue). turn_deg>0 = theta 增大
+        (odom 逆时针); 实车方向反了在 task_config.yml 里取负.
+        """
+        from main.chassis.controllers.odom_turn import OdomTurnPID
+        try:
+            _, _, theta0 = api.get_odometry()
+        except Exception:
+            theta0 = 0.0
+        turn = OdomTurnPID(turn_deg=turn_deg)
+        turn.start(theta0)
+        dt = 1.0 / max(hz, 1.0)
+        deadline = time.monotonic() + max(timeout_s, 1.0)
+        done = False
+        while time.monotonic() < deadline:
+            try:
+                _, _, theta = api.get_odometry()
+            except Exception:
+                theta = theta0
+            omega, done = turn.step(theta, dt)
+            try:
+                api.set_chassis_velocity(0.0, 0.0, omega)
+            except Exception:
+                pass
+            if done:
+                break
+            time.sleep(dt)
+        try:
+            api.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
+        except Exception:
+            pass
+        theta_end = 0.0
+        try:
+            _, _, theta_end = api.get_odometry()
+        except Exception:
+            pass
+        logger.info("odom turn %+.1f° done=%s: theta %.3f→%.3f rad",
+                    turn_deg, done, theta0, theta_end)
+
+    @staticmethod
+    def _wait_lane_fresh(api: ChassisClient, timeout_s: float = 5.0) -> bool:
+        """start_lane_feed 后轮询 lane_state 直到新鲜 (age_ms<500ms)."""
+        deadline = time.monotonic() + max(timeout_s, 0.5)
+        while time.monotonic() < deadline:
+            try:
+                if api.read_lane().is_fresh:
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.05)
+        return False
 
     # ── 任务后机械臂归位 (2026-08-03) ───────────────────────────
 
