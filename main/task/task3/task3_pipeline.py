@@ -185,6 +185,8 @@ def recognize_phase(client, args, token, streamer_url, output_dir):
 
     底盘走 /v1/realtime/chassis-velocity (realtime 门, 不进 job_queue),
     每 poll_interval 秒下发一次速度 + 读一帧检测; 开环 速度×时间 记账里程。
+    里程停止条件: odom 从识别开始快照起算的增量 (不受触发点/巡航里程影响),
+    creep 满 odom_stop_m 即停; 触发点浮动不影响实际扫描长度。
     finally 保证速度清零, 再补一个 car.stop 兜底。
     """
     records = []
@@ -336,7 +338,7 @@ def main():
                         help="safety cap: stop driving after this many meters even if "
                              "fewer than target-count targets were recorded")
     parser.add_argument("--odom-stop-m", type=float, default=1.77,
-                        help="stop driving once odometer distance delta reaches this (m)")
+                        help="stop driving once odometer distance delta from recognition start reaches this (m)")
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     parser.add_argument("--center-tol", type=float, default=DEFAULT_CENTER_TOL)
     parser.add_argument("--unlock-tol", type=float, default=DEFAULT_UNLOCK_TOL)
@@ -349,6 +351,9 @@ def main():
     parser.add_argument("--dry-run-steps", type=int, default=10,
                         help="safety limit used only with --dry-run")
     parser.add_argument("--no-pause", action="store_true", help="start shooting immediately after recognition")
+    parser.add_argument("--no-shoot", action="store_true",
+                        help="recognition only: skip pause & shooting, return after saving json "
+                             "(orchestrator 编排模式, 射击由 task3_shoot waypoint 负责)")
     args = parser.parse_args()
 
     if args.target_count < 1 or not 0 < args.creep_speed <= 0.2 or args.dry_run_steps < 1 \
@@ -373,6 +378,10 @@ def main():
     beneficial = [t["number"] for t in targets if t["result"] == 1]
     print(f"[recognition] pests={pests or 'none'} beneficial={beneficial or 'none'}")
 
+    if args.no_shoot:
+        print("[recognition] --no-shoot: recognition done, return to orchestrator "
+              "(shooting deferred to task3_shoot waypoint)", flush=True)
+        return 0
     if not args.no_pause and not args.dry_run:
         input("[pause] 请将车辆移动到射击区并摆正，准备好后按 Enter 继续射击: ")
     if pests and run_arm_pose(args, "shooting pose", SHOOTING_ARM) != 0:

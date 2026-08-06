@@ -7,11 +7,11 @@ shoot_target 三段式流水线。本文件只是 orchestrator registry 期望�
 (run(client=None) -> Dict),实际跑 subprocess 调 task3_pipeline.main()。
 
 容错语义: 与占位期一致, 但不再抛 NotImplementedError —— 任何子进程失败
-仍以 subprocess 非零退出码冒泡, orchestrator 看到的 status 决定后续动作。
+仍以 subprocess 非零退出码冒泡, orchestrator 看到的 ok 决定后续动作。
 
-注意: task3_pipeline 自身会 await 用户按 Enter 切射击姿态, 第一次跑会
-停在 "[pause] 请将车辆移动到射击区..."。用 --no-pause 可以跳过人工确认
-(实机 8 球压测时再开)。
+编排模式: 默认带 --no-shoot —— 只做识别 + 存 json, 不 pause 不射击, 返回后
+orchestrator 恢复巡线继续走 task2。射击由 task3_shoot waypoint (task_id 8)
+读识别 json 负责。手动全流程 (识别→pause→射击) 直接跑 task3_pipeline 本体。
 """
 from __future__ import annotations
 
@@ -34,15 +34,16 @@ def run(
         extra_args: 透传给 task3_pipeline 的额外 CLI 参数,例如 ["--no-pause"]
 
     Returns:
-        {"status": "ok"|"failed", "exit_code": int, "args": [...]}
+        {"ok": bool, "status": "ok"|"failed", "exit_code": int, "args": [...]}
     """
-    cmd = [sys.executable, "-m", "main.task.task3.task3_pipeline"]
+    cmd = [sys.executable, "-m", "main.task.task3.task3_pipeline", "--no-shoot"]
     if extra_args:
         cmd.extend(extra_args)
 
     print(f"[task3] launching: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd, check=False)
     return {
+        "ok": proc.returncode == 0,
         "status": "ok" if proc.returncode == 0 else "failed",
         "exit_code": proc.returncode,
         "args": cmd,
