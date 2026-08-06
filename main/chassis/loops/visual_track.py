@@ -113,10 +113,29 @@ def _select_target(
         except Exception:
             return 0.0
 
-    matched: List[Dict[str, Any]] = [
-        d for d in detections
-        if isinstance(d, dict) and (d.get("label", "") or "") in labels
-    ]
+    # 2026-08-05 v15 (用户: task4 检测到了但不对齐/直接抓): 部分模型只输出
+    #   cls_id 不含 label 字符串 (task4 实测 16=ball_blue/17=ball_yellow)。
+    #   label 精确匹配失败 → no_target。加 cls_id 兜底: 若 det 有 cls_id 且
+    #   映射到任一目标 label 的已知类别, 也匹配。向后兼容 (label 匹配优先)。
+    label_to_cls: dict = {
+        "ball_blue": {2, 16},      # LABEL_GROUPS cls 2 + task4 实测 16
+        "ball_yellow": {3, 17},
+    }
+    matched_cls_ids: set = set()
+    for lab in labels:
+        matched_cls_ids |= label_to_cls.get(lab, set())
+
+    def _det_matches(d: Dict[str, Any]) -> bool:
+        if not isinstance(d, dict):
+            return False
+        if (d.get("label", "") or "") in labels:
+            return True
+        try:
+            return int(d.get("cls_id", -1)) in matched_cls_ids
+        except (TypeError, ValueError):
+            return False
+
+    matched: List[Dict[str, Any]] = [d for d in detections if _det_matches(d)]
     if not matched:
         return None
     if mode == "largest_area":
@@ -252,6 +271,15 @@ def track_chassis(
     hold_frames: int = 5,       # 连续 5 帧带内 → arrival（3 帧擦过不算）
     # 限速/平滑
     v_slew: Optional[float] = 0.02,     # 每帧 vx/vy 最多变 ±0.02 m/s（20Hz=0.4m/s²，不会爆冲）
+    # ---- 2026-08-05 双区增益 (近距离丝滑) ----
+    # 远距离保持原 kp/v_max/slew; 近距离 (|err| 之和 < near_threshold) 自动切到
+    # 更低增益 + 更小 slew, 解决 "creep 收尾后残余误差小但被大增益拉爆振荡" 的问题。
+    # task4 现场验证: 远区 0.40 / 近区 0.15 丝滑+快速, 远距离 ~0.5s 收敛到近区,
+    # 然后近区 ~1.5s 收尾, 不冲过目标。
+    kp_near: Optional[float] = None,
+    v_max_near: Optional[float] = None,
+    slew_near: Optional[float] = None,
+    near_threshold: float = 0.15,
     max_lost_frames: int = 60,          # 连续丢 60 帧(≈3s@20Hz) → 停
     recover_after_lost: bool = True,    # 短时丢帧后 1 帧反向小搜
     watchdog_ms: Optional[float] = 2000.0,  # task_feed 2s 没刷 → 停
@@ -364,27 +392,37 @@ def track_chassis(
 
             cx_err = frm.cx_err if frm.cx_err is not None else 0.0
             cy_err = frm.cy_err if frm.cy_err is not None else 0.0
+            # ---- 2026-08-05 双区增益 (近距离丝滑) ----
+            # 远区: kp/v_max/v_slew (粗调, 快速)
+            # 近区 (|cx_err|+|cy_err| < near_threshold): kp_near/v_max_near/slew_near
+            #   (细调, 阻尼高, 不冲过)
+            # 没传 _near 参数 → 全程用远区 (向后兼容)
+            err_mag = abs(cx_err) + abs(cy_err)
+            in_near_zone = err_mag < near_threshold
+            _kp = kp_near if (in_near_zone and kp_near is not None) else kp
+            _vmax = v_max_near if (in_near_zone and v_max_near is not None) else v_max
+            _slew = slew_near if (in_near_zone and slew_near is not None) else v_slew
             # 控制律（含 sign_vx / sign_vy，2026-08-02 现场调好）
-            vx = float(sign_vx) * float(kp) * float(cx_err)
+            vx = float(sign_vx) * float(_kp) * float(cx_err)
             if vx_only:
                 vy = 0.0                                    # 只控前后, 横向冻结 (task2 水塔)
             else:
-                vy = float(sign_vy) * float(kp) * float(cy_err)
-            if vx > v_max:
-                vx = v_max
-            elif vx < -v_max:
-                vx = -v_max
-            if vy > v_max:
-                vy = v_max
-            elif vy < -v_max:
-                vy = -v_max
-            if v_slew is not None:
+                vy = float(sign_vy) * float(_kp) * float(cy_err)
+            if vx > _vmax:
+                vx = _vmax
+            elif vx < -_vmax:
+                vx = -_vmax
+            if vy > _vmax:
+                vy = _vmax
+            elif vy < -_vmax:
+                vy = -_vmax
+            if _slew is not None:
                 dvx = vx - last_vx
-                if abs(dvx) > v_slew:
-                    vx = last_vx + v_slew if dvx > 0 else last_vx - v_slew
+                if abs(dvx) > _slew:
+                    vx = last_vx + _slew if dvx > 0 else last_vx - _slew
                 dvy = vy - last_vy
-                if abs(dvy) > v_slew:
-                    vy = last_vy + v_slew if dvy > 0 else last_vy - v_slew
+                if abs(dvy) > _slew:
+                    vy = last_vy + _slew if dvy > 0 else last_vy - _slew
 
             if vx_only:
                 in_deadband = abs(cx_err) < deadband        # vx_only: 到达只看前后
