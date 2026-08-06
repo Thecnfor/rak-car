@@ -180,7 +180,31 @@ def _set_chassis_vel(client, vx):
         print(f"[warn] chassis-velocity: {exc}", file=sys.stderr)
 
 
-def recognize_phase(client, args, token, streamer_url, output_dir):
+def judge_records(token, records, llm_timeout):
+    """逐张对已记录目标做 LLM 判定, 返回带 species/result/analysis 的 judged 列表.
+
+    从 recognize_phase 拆出 (2026-08-07): orchestrator 编排时判定放后台线程跑,
+    识别段存 pending json 后立即返回, 不阻塞车. 手动全流程仍在本进程同步判定.
+    """
+    judged = []
+    for record in records:
+        verdict = classify_target(token, record["image_path"], llm_timeout)
+        entry = dict(record)
+        entry.pop("detection", None)
+        entry.update({
+            "species": verdict["name"],
+            "classification": "pest" if verdict["result"] == 0 else "beneficial" if verdict["result"] == 1 else "unknown",
+            "result": verdict["result"],
+            "analysis": verdict["analysis"],
+        })
+        judged.append(entry)
+        print(f"  -> target #{entry['number']}: {entry['species']} / "
+              f"{entry['classification']} | {entry['analysis']}", flush=True)
+    return judged
+
+
+def recognize_phase(client, args, token, streamer_url, output_dir,
+                    defer_judge: bool = False):
     """creep 识别: 持续低速前移 + 连续读检测, 记满 target_count 立即停车。
 
     底盘走 /v1/realtime/chassis-velocity (realtime 门, 不进 job_queue),
@@ -269,40 +293,34 @@ def recognize_phase(client, args, token, streamer_url, output_dir):
     if not args.dry_run:
         safe_car_call(client, "stop", timeout=args.job_timeout)
 
+    if defer_judge:
+        # 2026-08-07: LLM 判定放后台, 识别段只存 raw 记录 (status=pending) 立即返回,
+        # 不阻塞车. task3_pest_scout 后台线程读到 pending json 后逐张判定并回写 done.
+        print(f"[recognition] driving complete; deferring LLM judging "
+              f"({len(records)} targets, status=pending)")
+        return records, traveled
     print(f"[recognition] driving complete; judging {len(records)} recorded targets")
-    judged = []
-    for record in records:
-        verdict = classify_target(token, record["image_path"], args.llm_timeout)
-        entry = dict(record)
-        entry.pop("detection", None)
-        entry.update({
-            "species": verdict["name"],
-            "classification": "pest" if verdict["result"] == 0 else "beneficial" if verdict["result"] == 1 else "unknown",
-            "result": verdict["result"],
-            "analysis": verdict["analysis"],
-        })
-        judged.append(entry)
-        print(f"  -> target #{entry['number']}: {entry['species']} / "
-              f"{entry['classification']} | {entry['analysis']}", flush=True)
+    judged = judge_records(token, records, args.llm_timeout)
     if len(judged) != args.target_count:
         print(f"[warn] recorded {len(judged)}/{args.target_count} targets", file=sys.stderr)
     return judged, traveled
 
 
-def save_result(path_text, args, targets, traveled):
+def save_result(path_text, args, targets, traveled, *, status: str = "done"):
     path = Path(path_text)
     if not path.is_absolute():
         path = Path(__file__).resolve().parent / path
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": vars(args),
+        "status": status,
         "targets": targets,
-        "pest_numbers": [t["number"] for t in targets if t["result"] == 0],
-        "beneficial_numbers": [t["number"] for t in targets if t["result"] == 1],
+        "pest_numbers": [t["number"] for t in targets if t.get("result") == 0],
+        "beneficial_numbers": [t["number"] for t in targets if t.get("result") == 1],
         "traveled_m": round(traveled, 4),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[recognition] saved: {path}")
+    print(f"[recognition] saved: {path} (status={status})")
     return path
 
 
@@ -354,15 +372,23 @@ def main():
     parser.add_argument("--no-shoot", action="store_true",
                         help="recognition only: skip pause & shooting, return after saving json "
                              "(orchestrator 编排模式, 射击由 task3_shoot waypoint 负责)")
+    parser.add_argument("--defer-judge", action="store_true",
+                        help="recognition only, 且 LLM 判定推迟到后台线程: 存 raw targets "
+                             "(status=pending) 立即返回, 不阻塞车. 配合 --no-shoot 给 orchestrator 用")
     args = parser.parse_args()
 
     if args.target_count < 1 or not 0 < args.creep_speed <= 0.2 or args.dry_run_steps < 1 \
             or args.odom_stop_m <= 0:
         parser.error("target-count/creep-speed/dry-run-steps/odom-stop-m values are invalid")
-    token = load_token(args.token)
-    print(f"[ready] token={mask_token(token)}")
-    if not args.dry_run:
-        check_health(token, timeout=args.llm_timeout)
+    # --defer-judge: 识别段完全不碰 LLM (token/health 都省), 判定由后台线程做.
+    if args.defer_judge:
+        token = ""
+        print("[ready] --defer-judge: LLM 判定推迟到后台线程, 识别段不调 token/health")
+    else:
+        token = load_token(args.token)
+        print(f"[ready] token={mask_token(token)}")
+        if not args.dry_run:
+            check_health(token, timeout=args.llm_timeout)
     client = RuntimeApiClient()
     if not args.dry_run:
         client.wait_until_ready()
@@ -371,11 +397,13 @@ def main():
         return 1
     image_dir = Path(__file__).resolve().parent / "audit" / "task3_pipeline" / "targets"
     targets, traveled = recognize_phase(
-        client, args, token, settings.streamer_url, image_dir
+        client, args, token, settings.streamer_url, image_dir,
+        defer_judge=args.defer_judge,
     )
-    result_path = save_result(args.save, args, targets, traveled)
-    pests = [t["number"] for t in targets if t["result"] == 0]
-    beneficial = [t["number"] for t in targets if t["result"] == 1]
+    status = "pending" if args.defer_judge else "done"
+    result_path = save_result(args.save, args, targets, traveled, status=status)
+    pests = [t["number"] for t in targets if t.get("result") == 0]
+    beneficial = [t["number"] for t in targets if t.get("result") == 1]
     print(f"[recognition] pests={pests or 'none'} beneficial={beneficial or 'none'}")
 
     if args.no_shoot:

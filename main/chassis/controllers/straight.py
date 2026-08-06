@@ -63,7 +63,7 @@ class StraightOuterLoop(OuterLoop):
     def __init__(
         self,
         *,
-        vx_cruise: float = 0.25,
+        vx_cruise: float = 0.35,  # 巡线段直线速度 (0.25→0.30, 2026-08-07 用户: 任务间直线加快, 转向不变)
         deadband_y: float = 0.3,
         kp_y: float = 0.2,
         kd_y: float = 0.2,

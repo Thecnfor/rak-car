@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """任务三射击: 读识别 json, 射确认害虫 (thin wrapper over shoot_target).
 
-task3_pest_scout (识别段) 以 --no-shoot 跑 task3_pipeline, 把识别结果存到
-audit/task3_pipeline.json (含 pest_numbers, 1-based 板上编号)。本模块读该
-json, 取 pest_numbers 射确认害虫; 无确认害虫直接返回。
+task3_pest_scout (识别段) 以 --no-shoot --defer-judge 跑 task3_pipeline, 先存 raw
+targets (status=pending) 立即返回; 后台线程判定完回写 status=done + pest_numbers
+(1-based 板上编号)。本模块读该 json, 等 status=done (后台判定还没跑完则轮询等),
+取 pest_numbers 射确认害虫; 无确认害虫直接返回。
 
 容错语义: 读 json 失败 / 子进程非零退出码 → ok=False, orchestrator 记录并继续。
 """
@@ -13,6 +14,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -22,6 +24,33 @@ from main.api_client import RuntimeApiClient
 DEFAULT_MANIFEST = (
     Path(__file__).resolve().parent / "task3" / "audit" / "task3_pipeline.json"
 )
+
+# 后台 LLM 判定最大等待: task2 在 task3_pest_scout 和 task3_shoot 之间跑, 正常已 done;
+# 兜底等 max_wait_s (4 张 × 15s timeout 的最坏上界).
+MAX_JUDGE_WAIT_S = 90.0
+
+
+def _load_done_manifest(timeout: float = MAX_JUDGE_WAIT_S) -> Dict[str, Any]:
+    """读识别 json, 直到 status=done (后台判定完成) 或超时返回当前内容.
+
+    pending 期间逐秒轮询; 超时仍 pending → 返回内容 (pest_numbers 为空,
+    调用方走"无确认害虫跳过"路径).
+    """
+    deadline = time.time() + timeout
+    payload: Optional[Dict[str, Any]] = None
+    while time.time() < deadline:
+        try:
+            payload = json.loads(DEFAULT_MANIFEST.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"[task3_shoot] 读识别 json 失败: {exc}", file=sys.stderr)
+            payload = None
+        if payload is not None and payload.get("status") == "done":
+            return payload
+        time.sleep(1.0)
+    print(f"[task3_shoot] 后台判定 {timeout:.0f}s 超时, 用当前内容继续 "
+          f"(status={payload.get('status') if payload else 'unreadable'})",
+          file=sys.stderr)
+    return payload or {}
 
 
 def run(
@@ -38,12 +67,8 @@ def run(
     Returns:
         {"ok": bool, "status": "ok"|"failed", "exit_code": int, "pest_numbers": [...]}
     """
-    try:
-        payload = json.loads(DEFAULT_MANIFEST.read_text(encoding="utf-8"))
-        pests = [int(n) for n in payload.get("pest_numbers") or []]
-    except (OSError, ValueError, json.JSONDecodeError) as exc:
-        print(f"[task3_shoot] 读识别 json 失败: {exc}", file=sys.stderr)
-        return {"ok": False, "status": "failed", "error": str(exc)}
+    payload = _load_done_manifest()
+    pests = [int(n) for n in payload.get("pest_numbers") or []]
 
     if not pests:
         print("[task3_shoot] 无确认害虫, 跳过射击", flush=True)

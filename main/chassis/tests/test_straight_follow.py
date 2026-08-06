@@ -31,26 +31,27 @@ class TestStraightCorrection(unittest.TestCase):
         composed = outer.step(LaneState(error_y=0.05, error_angle=0.0), 0.02)
         self.assertEqual(outer.corrections, 1)
         # ey=0.05, deadband=0.01 → vy = sign_y*kp_y*(ey-deadband) = +1*1*(0.04) = +0.04
-        # 合成帧: mecanum_inverse(0.25, +0.04, 0) = [vx+vy, -vx+vy, -vx-vy, vx-vy]
-        self.assertAlmostEqual(composed[0], 0.25 + 0.04, places=6)
-        self.assertAlmostEqual(composed[1], -0.25 + 0.04, places=6)
-        self.assertAlmostEqual(composed[2], -0.25 - 0.04, places=6)
-        self.assertAlmostEqual(composed[3], 0.25 - 0.04, places=6)
+        # 合成帧: mecanum_inverse(vx, +0.04, 0) = [vx+vy, -vx+vy, -vx-vy, vx-vy]
+        vx = outer.vx_cruise
+        self.assertAlmostEqual(composed[0], vx + 0.04, places=6)
+        self.assertAlmostEqual(composed[1], -vx + 0.04, places=6)
+        self.assertAlmostEqual(composed[2], -vx - 0.04, places=6)
+        self.assertAlmostEqual(composed[3], vx - 0.04, places=6)
 
     def test_error_y_within_deadband_no_vy(self):
         outer = StraightOuterLoop(deadband_y=0.01, kp_y=1.0, ea_target=0.0, k_ey_omega=0.0)
         composed = outer.step(LaneState(error_y=0.005, error_angle=0.0), 0.02)
         self.assertEqual(outer.corrections, 0)
         # vy=0 → 纯巡航轮速: mecanum_inverse(vx,0,0) = [vx,-vx,-vx,vx]
-        self.assertEqual(composed[0], 0.25)
-        self.assertEqual(composed[1], -0.25)
+        self.assertEqual(composed[0], outer.vx_cruise)
+        self.assertEqual(composed[1], -outer.vx_cruise)
 
     def test_error_y_clamps_vy_at_strafe_v(self):
         outer = StraightOuterLoop(deadband_y=0.01, kp_y=1.0, strafe_v=0.20, ea_target=0.0, k_ey_omega=0.0)
         composed = outer.step(LaneState(error_y=0.5, error_angle=0.0), 0.02)
         self.assertEqual(outer.corrections, 1)
-        # ey=0.5 → vy=+0.49 → 钳在 strafe_v=+0.20; wheel[1] = -vx+vy = -0.05
-        self.assertAlmostEqual(composed[1], -0.05, places=6)
+        # ey=0.5 → vy=+0.49 → 钳在 strafe_v=+0.20; wheel[1] = -vx+vy
+        self.assertAlmostEqual(composed[1], -outer.vx_cruise + 0.20, places=6)
 
     def test_damping_opposes_overshoot(self):
         # 两帧: 第一帧 ey=0.05 车左移回正; 第二帧 ey=0.048（接近中线、速度沿原方向）。
@@ -59,8 +60,8 @@ class TestStraightCorrection(unittest.TestCase):
         damped = StraightOuterLoop(deadband_y=0.01, kp_y=1.0, kd_y=0.5, ea_target=0.0, k_ey_omega=0.0)
         for o in (plain, damped):
             o.step(LaneState(error_y=0.05, error_angle=0.0), 0.05)
-        vy_plain = plain.step(LaneState(error_y=0.048, error_angle=0.0), 0.05)[0] - 0.25
-        vy_damped = damped.step(LaneState(error_y=0.048, error_angle=0.0), 0.05)[0] - 0.25
+        vy_plain = plain.step(LaneState(error_y=0.048, error_angle=0.0), 0.05)[0] - plain.vx_cruise
+        vy_damped = damped.step(LaneState(error_y=0.048, error_angle=0.0), 0.05)[0] - damped.vx_cruise
         # 纯 P: vy = +kp*(ey-deadband) = +(0.048-0.01) = +0.038
         self.assertAlmostEqual(vy_plain, 0.038, places=6)
         # D: +sign_y*kd*(ey-prev)/dt = +1*0.5*(-0.002/0.05) = -0.02 → vy = +0.018
@@ -71,7 +72,7 @@ class TestStraightCorrection(unittest.TestCase):
         outer = StraightOuterLoop(deadband_y=0.01, kp_y=1.0, kd_y=0.5, ea_target=0.0, k_ey_omega=0.0)
         composed = outer.step(LaneState(error_y=0.05, error_angle=0.0), 0.05)
         # 首帧无历史 ey → 只有 P 项: vy = +(0.05-0.01) = +0.04
-        self.assertAlmostEqual(composed[0], 0.25 + 0.04, places=6)
+        self.assertAlmostEqual(composed[0], outer.vx_cruise + 0.04, places=6)
 
 
 class TestStraightHeadingCorrection(unittest.TestCase):
@@ -91,14 +92,14 @@ class TestStraightHeadingCorrection(unittest.TestCase):
         outer = StraightOuterLoop(ea_deadband=0.01, kp_theta=2.0)
         composed = outer.step(LaneState(error_y=0.0, error_angle=0.005), 0.02)
         # ea 在死区内 → ω=0, 纯巡航: [vx,-vx,-vx,vx]
-        self.assertEqual(composed[0], 0.25)
-        self.assertEqual(composed[1], -0.25)
+        self.assertEqual(composed[0], outer.vx_cruise)
+        self.assertEqual(composed[1], -outer.vx_cruise)
 
     def test_omega_clamps_at_omega_max(self):
         outer = StraightOuterLoop(ea_deadband=0.001, kp_theta=2.0, omega_max=0.2)
         composed = outer.step(LaneState(error_y=0.0, error_angle=0.5), 0.02)
-        # P=2*0.499=0.998 → 钳在 omega_max=0.2 → wheel[0] = 0.25 + 0.3*0.2
-        self.assertAlmostEqual(composed[0], 0.25 + 0.3 * 0.2, places=6)
+        # P=2*0.499=0.998 → 钳在 omega_max=0.2 → wheel[0] = vx + r*0.2
+        self.assertAlmostEqual(composed[0], outer.vx_cruise + outer.r_eff * 0.2, places=6)
 
     def test_omega_integral_decays_when_error_gone(self):
         outer = StraightOuterLoop(ea_deadband=0.001, kp_theta=0.0, ki_theta=1.0)
@@ -124,8 +125,8 @@ class TestStraightHeadingCorrection(unittest.TestCase):
             ea_deadband=0.001, kp_theta=2.0,
         )
         composed = outer.step(LaneState(error_y=0.05, error_angle=0.05), 0.02)
-        # vy=+1*(0.05-0.01)=+0.04; ω≈+0.098 → wheel[0] = 0.25+0.04+0.3*0.098 > 0.25+0.04
-        self.assertGreater(composed[0], 0.25 + 0.04)
+        # vy=+1*(0.05-0.01)=+0.04; ω≈+0.098 → wheel[0] = vx+0.04+0.3*0.098 > vx+0.04
+        self.assertGreater(composed[0], outer.vx_cruise + 0.04)
         self.assertEqual(outer.corrections, 1)
 
 
@@ -139,8 +140,8 @@ class TestStraightHeadingTarget(unittest.TestCase):
         outer = StraightOuterLoop()  # ea_target=0, k_ey_omega=0.5
         composed = outer.step(LaneState(error_y=0.0, error_angle=0.0), 0.02)
         # 线上且车头平行：角度项 e=0，cross-track ey=0 → ω=0，纯巡航
-        self.assertEqual(composed[0], 0.25)
-        self.assertEqual(composed[1], -0.25)
+        self.assertEqual(composed[0], outer.vx_cruise)
+        self.assertEqual(composed[1], -outer.vx_cruise)
 
     def test_cross_track_turns_toward_line_when_angle_blind(self):
         outer = StraightOuterLoop()
