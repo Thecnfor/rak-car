@@ -24,6 +24,7 @@ _cfg_spec = _il.spec_from_file_location(
 _config = _il.module_from_spec(_cfg_spec)
 _cfg_spec.loader.exec_module(_config)
 load_post_task1 = _config.load_post_task1  # noqa: E402
+load_post_task6 = _config.load_post_task6  # noqa: E402
 
 
 class _FakeApi:
@@ -65,8 +66,15 @@ class TestPostTask1Config(unittest.TestCase):
         seg = load_post_task1()
         self.assertIsNotNone(seg)
         self.assertTrue(seg.get("enabled"))
-        self.assertAlmostEqual(float(seg["straight_m"]), 0.1)
-        self.assertAlmostEqual(float(seg["turn_deg"]), 45.0)
+        self.assertAlmostEqual(float(seg["straight_m"]), 0.19)
+        self.assertAlmostEqual(float(seg["turn_deg"]), -45.0)
+
+    def test_load_post_task6_present(self):
+        seg = load_post_task6()
+        self.assertIsNotNone(seg)
+        self.assertTrue(seg.get("enabled"))
+        self.assertAlmostEqual(float(seg["straight_m"]), 0.2)
+        self.assertAlmostEqual(float(seg["turn_deg"]), -120.0)
 
 
 class TestTurnThetaDeg(unittest.TestCase):

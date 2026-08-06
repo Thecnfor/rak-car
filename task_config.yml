@@ -211,6 +211,13 @@ task_cfg:
     straight_m: 0.19        # 直行距离 (m, move_for 里程计闭环)
     turn_deg: -45.0         # 原地里程计 θ 转弯角度 (度, OdomTurnPID); 实车方向反了取负
 
+  # task6 结束后 (orchestrator 层): 清零里程 → 切断巡线视觉 → 直行 → 里程计 θ 顺时针转 120° → 恢复视觉 → 继续巡线
+  # 读订单后掉头去 task7 投放. θ 增=逆时针, 所以顺时针 120° = -120; 实车方向反了再取正.
+  post_task6:
+    enabled: true
+    straight_m: 0.2         # 直行距离 (m, move_for 里程计闭环, 待场地标定)
+    turn_deg: -120.0        # 顺时针 120° (度, OdomTurnPID)
+
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
 # 触发条件: IR (红外接近) + dis_at_least_m (累计里程计) AND/OR.
 # 换场地改这里, 业务代码不动.

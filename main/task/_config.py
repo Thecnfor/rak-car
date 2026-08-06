@@ -108,12 +108,12 @@ def load_waypoints() -> List[Dict[str, Any]]:
     return wp
 
 
-def load_post_task1() -> Optional[Dict[str, Any]]:
-    """读取 task_config.yml 中 task_cfg.post_task1 段 (task1 结束后一段位移+转弯).
+def _load_post_task(cfg_key: str) -> Optional[Dict[str, Any]]:
+    """读取 task_config.yml 中 task_cfg.<cfg_key> 段 (任务结束后一段位移+转弯).
 
     返回 None = 未配置 / enabled=false (orchestrator 跳过该段)。
     字段:
-      straight_m: task1 后直行距离 (m, move_for 里程计闭环, 0=不走)。
+      straight_m: 任务后直行距离 (m, move_for 里程计闭环, 0=不走)。
       turn_deg:   原地里程计 θ 转弯角度 (度, OdomTurnPID; 实车方向反了取负, 0=不转)。
     """
     path = _config_path()
@@ -124,7 +124,22 @@ def load_post_task1() -> Optional[Dict[str, Any]]:
     if not isinstance(all_cfg, dict):
         return None
     task_cfg = all_cfg.get("task_cfg", {})
-    seg = task_cfg.get("post_task1")
+    seg = task_cfg.get(cfg_key)
     if not isinstance(seg, dict) or not seg.get("enabled"):
         return None
     return seg
+
+
+def load_post_task1() -> Optional[Dict[str, Any]]:
+    """读取 task_config.yml 中 task_cfg.post_task1 段 (task1 结束后一段位移+转弯)."""
+    return _load_post_task("post_task1")
+
+
+def load_post_task6() -> Optional[Dict[str, Any]]:
+    """读取 task_config.yml 中 task_cfg.post_task6 段 (task6 结束后一段位移+转弯).
+
+    task6 (读订单) 结束后: 清零里程 → 切断巡线视觉 → 直行 → 里程计 θ 顺时针转
+    120° → 恢复视觉 → 继续巡线。turn_deg 用负值 = 顺时针 (θ 增为逆时针, 见
+    MEMORY turn-sign-calibration)。
+    """
+    return _load_post_task("post_task6")

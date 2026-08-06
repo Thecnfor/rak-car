@@ -228,7 +228,8 @@ class Orchestrator:
         # crossroad_turn（task_config.yml 顶层声明）：第几个弯出口紧接着十字路口，
         # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
         from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
-        from main.task._config import load_crossroad_turn, load_post_task1
+        from main.task._config import (load_crossroad_turn, load_post_task1,
+                                       load_post_task6)
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -243,6 +244,8 @@ class Orchestrator:
         # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
         # None = task_config.yml 未配 / enabled=false → 保持现状 (只清零里程).
         post_task1 = load_post_task1()
+        # task6 结束后同款盲转段 (读订单后掉头 120° 去 task7 投放), 见 post_task6.
+        post_task6 = load_post_task6()
 
         # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）
         # max_seconds=inf：常驻，由 runner.stop() 终止
@@ -357,6 +360,16 @@ class Orchestrator:
                         logger.warning("odom reset after task1 failed: %s", exc)
                     if post_task1 is not None:
                         self._post_task1_maneuver(api, post_task1)
+                # task6 读完订单后: 清零里程 → 切断视觉 → 直行 → θ 顺时针转 120° → 恢复视觉.
+                # 复用 _post_task1_maneuver (同款盲转段), 参数走 task_cfg.post_task6.
+                if wp.task_id == 6:
+                    try:
+                        client.execute("car", "reset_position", sync=True, timeout=10.0)
+                        logger.info("odometry reset after task6: next segment from distance 0")
+                    except Exception as exc:
+                        logger.warning("odom reset after task6 failed: %s", exc)
+                    if post_task6 is not None:
+                        self._post_task1_maneuver(api, post_task6)
                 # 2026-08-03: 每个任务结束后强制 reset 机械臂到 home 姿态
                 # (x=0, y=-150, arm=+90, hand=-90), 边重置边巡航 ——
                 # reset 在后台线程跑, 不阻塞 _resume_lane。
