@@ -98,7 +98,7 @@ S_POSE_HAND_DEG = 0.0   # 主循环切 S 用 hand (deg)
 PLACE_ARM_DEG = 90.0
 PLACE_HAND_DEG = 0.0
 PLACE_Y_MM = -100.0          # 工作平面安全高度 (mm)
-PLACE_X_MM_FALLBACK = -270.0 # cfg 缺省; 实际从 place_x_overrides 读
+PLACE_X_MM_FALLBACK = -275.0 # 唯一依据，禁止从 cfg / overrides 覆盖
 PLACE_ALIGN_X_MM = -320.0    # 视觉对齐时稍收回 (mm)
 
 # ── 释放 y 轨迹 (单位 mm; 负 = 向下) ──────────────────────────────────────
@@ -588,7 +588,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         # 给 place 用的 PLACE 工作平面参数 (cfg 一次性读完)
         place_pose = cfg["arm_place_pose_T2"]
         place_arm   = float(place_pose["arm_angle_deg"])   # 90
-        place_x_mm  = float(place_pose.get("x_mm", PLACE_X_MM_FALLBACK))
+        place_x_mm  = PLACE_X_MM_FALLBACK
         place_hand  = float(place_pose["hand_angle_deg"])  # 0 (保持)
         s_arm       = float(cfg["arm_pick_pose"]["arm_angle_deg"])  # -90
         s_x_mm      = float(cfg["arm_pick_pose"]["x_mm"])           # -100
@@ -664,12 +664,12 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 "arm", "composite_run",
                 kwargs={"arm": s_arm, "x": S_POSE_X_MM / 1000.0,
                         "y": S_POSE_Y_MM / 1000.0, "hand": S_POSE_HAND_DEG,
-                        "speed": COMPOSITE_SPEED_DEFAULT, "timeout": 5},
+                        "speed": COMPOSITE_SPEED_DEFAULT, "timeout": COMPOSITE_TIMEOUT_S_DEFAULT},
                 sync=False,
             )
             job_id = job.get("id")
             if job_id:
-                arm_client.http.wait_job(job_id, timeout=5.0)
+                arm_client.http.wait_job(job_id, timeout=COMPOSITE_TIMEOUT_S_DEFAULT + 10)
 
             # (2) 抓 — 优化#5: 超时直接跳过该列, 不走 fallback
             try:
@@ -691,12 +691,12 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # 用户 00:07: 唯一条件 — y<-30 才可以并发移动底盘和机械臂!
             slot_idx = int(target_slot_map[label])
             target_t = SLOT_POSITIONS_M[slot_idx]   # 物理相对位移; 与 S 列同网格 (S_i↔T_i 同列)
-            place_x_override = float(cfg.get("place_x_overrides", {}).get(label, place_x_mm))
+            place_x_override = place_x_mm
             # 用户 01:05: y<-30 绝对不能删! 防撞!
             st = arm_client.get_state()
             if st.y_mm > CHASSIS_CONCURRENT_Y_THRESHOLD_MM:
                 arm_client.composite_run(arm=None, x_mm=None, y_mm=S_POSE_Y_MM, hand=None,
-                                         speed=COMPOSITE_SPEED_DEFAULT, timeout=2.0)
+                                         speed=COMPOSITE_SPEED_DEFAULT, timeout=COMPOSITE_TIMEOUT_S_DEFAULT)
             logger.info("  → T%d (label=%s, x=%s) 全并发", slot_idx, label, place_x_override)
             # 2026-08-03 优化: 并发改成 sync=False, 否则两个 sync HTTP 同时打 /v1/execute
             # 会让 runtime 队列拥塞 504。
@@ -712,7 +712,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 arm_job = f_arm.result()
                 ajid = arm_job.get("id") if isinstance(arm_job, dict) else None
                 if ajid:
-                    arm_client.http.wait_job(ajid, timeout=5.0)
+                    arm_client.http.wait_job(ajid, timeout=COMPOSITE_TIMEOUT_S_DEFAULT + 10)
 
             # (5) 放: y→-20 + grasp(False) 释放 + y→-40 抬离!
             # 用户 (2026-08-03): "place 之后 y 要上升到 -40! 不然会把圆柱体拖走"
@@ -729,7 +729,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # 2026-08-03: timeout 3→5s. 物理 2-3s 边界, 之前 3s 偶发超时 → grasp 没发
             # → 主循环走兜底盘 504 timeout.
             if jid1:
-                arm_client.http.wait_job(jid1, timeout=5.0)
+                arm_client.http.wait_job(jid1, timeout=COMPOSITE_TIMEOUT_S_DEFAULT + 10)
             # 5b) grasp(False) 释放 — 100ms 即完成
             arm_client.grasp(False)
             # 5c) 立即抬到 -40 (离开保护区更远, 跨列移动时不拖物体)
@@ -741,7 +741,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             )
             jid2 = job2.get("id") if isinstance(job2, dict) else None
             if jid2:
-                arm_client.http.wait_job(jid2, timeout=5.0)
+                arm_client.http.wait_job(jid2, timeout=COMPOSITE_TIMEOUT_S_DEFAULT + 10)
 
             # (6) 优化#3: y抬回 + 底盘移下一列 + 切PLACE对齐 全并发!
             # 用户 00:07: y<-30 才可以并发!

@@ -154,7 +154,7 @@ CFG = {
                           "y_mm": -10,  "hand_angle_deg": 0},
     "arm_carry_pose":   {"x_mm": -100, "arm_angle_deg": -90,
                           "y_mm": -150, "hand_angle_deg": -10},
-    "arm_place_pose_T2":{"x_mm": -270, "arm_angle_deg": 90,
+    "arm_place_pose_T2":{"arm_angle_deg": 90,
                           "y_mm": -30,  "hand_angle_deg": -10},
     "arm_return_S1_pose":{"x_mm": -100, "arm_angle_deg": -90,
                           "y_mm": -100, "hand_angle_deg": -10},
