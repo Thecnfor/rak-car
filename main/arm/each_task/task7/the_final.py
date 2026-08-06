@@ -97,16 +97,22 @@ if _ROOT not in sys.path:
 from main.arm import ArmClient, ArmRunner  # noqa: E402
 
 # task7 编排器, import 包内其他模块 (编排破例, 见 docstring)
+# ⚠️ **2026-08-06 v2 改名**: 用户已删除旧 position{1..6}.py / get_position{1,2}.py 8 个文件,
+# 改用新 ``the_final_*`` 命名家族 (1:1 镜像 / 编排器 / 抓取脚本)。保留 ``as xxx_mod`` 别名
+# 让下游代码 (_POSITION_MODULES / get_position1_mod.run() 调用处) **零改动**。
 from main.arm.each_task.task7 import (  # noqa: E402
     duiying as duiying_mod,
-    get_position1 as get_position1_mod,
-    get_position2 as get_position2_mod,
-    position1 as position1_mod,
-    position2 as position2_mod,
-    position3 as position3_mod,
-    position4 as position4_mod,
-    position5 as position5_mod,
-    position6 as position6_mod,
+    pingcang as pingcang_mod,                                       # 任务起点平仓: 储存仓 → +90° (见 pingcang.py)
+    # ---- 抓取脚本 (替代旧 get_position{1,2}.py) ----
+    the_final_get_position1 as get_position1_mod,                   # 4 步 (composite + y_down + suck + y_up), x=0
+    the_final_get_position2 as get_position2_mod,                   # 4 步 (composite + y_down + suck + y_up), x=-58
+    # ---- 投递脚本 / 编排器 (替代旧 position{1..6}.py, target_id 1-6 → 模块) ----
+    the_final_position1 as position1_mod,                           # 编排器: 后退 → the_final_position2 → 前进
+    the_final_position2 as position2_mod,                           # 纯臂 3 步 (composite + drop + x_return)
+    the_final_position3 as position3_mod,                           # 编排器: 前进 → the_final_position2 → 后退
+    the_final_position4 as position4_mod,                           # 编排器: 后退 → the_final_position5 → 前进
+    the_final_position5 as position5_mod,                           # 纯臂 7 步 (含 push/pull/y_up)
+    the_final_position6 as position6_mod,                           # 编排器: 前进 → the_final_position5 → 后退
 )
 
 
@@ -131,6 +137,38 @@ DEFAULT_CHASSIS_TIMEOUT_S: float = 10.0
 
 DEFAULT_CHASSIS_VELOCITY_MS: float = 0.10
 """底盘最大线速度 (m/s), 与 task7/position1.py / dipan.py 默认一致。"""
+
+# ---------- 平仓预备 (任务起点先把储存仓摆到 +90°, 与 pingcang.py 默认对齐) ----------
+
+DEFAULT_PINGCANG_ANGLE_DEG: float = pingcang_mod.DEFAULT_ANGLE_DEG
+"""平仓角度 (raw 协议值, 度)。默认 +90°, 合法区间 [-128, 127]。
+直接复用 pingcang.py 的 DEFAULT_ANGLE_DEG 常量, 改 pingcang 同步生效。"""
+
+DEFAULT_PINGCANG_SPEED: int = pingcang_mod.DEFAULT_SPEED
+"""平仓舵机速度 (1-100), 默认 100 = 全速。复用 pingcang.py 常量。"""
+
+DEFAULT_PINGCANG_TIMEOUT_S: float = pingcang_mod.DEFAULT_TIMEOUT_S
+"""平仓 HTTP 同步超时 (秒), 默认 10s。复用 pingcang.py 常量。"""
+
+DEFAULT_PINGCANG_ENABLED: bool = True
+"""是否在 run() 开头自动平仓。True (默认) = 每次跑都先平仓;
+CLI ``--skip-pingcang`` 改 False (调试循环时不真动舵机)。"""
+
+DEFAULT_PINGCANG_STRICT: bool = False
+"""平仓失败是否 abort。False (默认, 2026-08-06 改) = pingcang 失败**只警告不阻塞**,
+让主循环照常跑 (duiying → matches → suck → position);
+True = 维持原 abort 策略 (业务层硬要求时用 ``--strict-pingcang`` 打开)。
+
+⚠️ **2026-08-06 v6 鲁棒性改进**:
+原策略 pingcang 失败 (e.g. runtime 504 / MC602 串口卡死) → abort, 但 pingcang 只是
+"任务起点预备", 失败不应阻塞主任务逻辑。
+新策略: 软警告 → 继续 → 主任务如果后面也失败再 abort (避免**基础设施层瞬时故障
+让整个任务直接死掉**, 现场调试时可观察 pingcang 失败 + 主任务照跑, 进一步定位根因)。
+
+⚠️ **业务正确性提醒**: pingcang 失败 = 储存仓角度未复位, 后续投球可能撞车/投偏。
+这是**业务折衷**: 不阻塞 vs 物理安全。
+用户如果"宁可物理撞车也要看到主循环反馈", 开 ``--strict-pingcang=False`` (默认);
+用户如果"宁可死也不撞车", 开 ``--strict-pingcang=True`` (旧行为)。"""
 
 # Dispatch 表: match.target_id (1-6) → 对应 position 模块
 # v3 加: 不再只 dispatch 到 position1/2, 而是根据 target_id 调 position1-6。
@@ -203,7 +241,12 @@ def run(client: ArmClient, runner: ArmRunner,
         max_iterations: int = DEFAULT_MAX_ITERATIONS,
         forward_mm: float = DEFAULT_FORWARD_MM,
         max_velocity_ms: float = DEFAULT_CHASSIS_VELOCITY_MS,
-        timeout: float = DEFAULT_CHASSIS_TIMEOUT_S) -> dict:
+        timeout: float = DEFAULT_CHASSIS_TIMEOUT_S,
+        do_pingcang: bool = DEFAULT_PINGCANG_ENABLED,
+        strict_pingcang: bool = DEFAULT_PINGCANG_STRICT,
+        pingcang_angle_deg: float = DEFAULT_PINGCANG_ANGLE_DEG,
+        pingcang_speed: int = DEFAULT_PINGCANG_SPEED,
+        pingcang_timeout: float = DEFAULT_PINGCANG_TIMEOUT_S) -> dict:
     """任务七编排主循环: duiying 匹配 → 命中 (liaobiao1+target=1) 走投顾, 否则前进重试。
 
     ⚠️ 终止条件:
@@ -218,6 +261,14 @@ def run(client: ArmClient, runner: ArmRunner,
         forward_mm: 未匹配时底盘前进距离 (mm, 正值, 默认 600 = 60cm)
         max_velocity_ms: 底盘限速 (m/s, 默认 0.10)
         timeout: 底盘 move_for HTTP 同步超时下限 (秒, 默认 10)
+        do_pingcang: True (默认) 任务开头先跑一次 pingcang 把储存仓摆到 +90°
+                    (set_storage_angle); False 跳过 (调试主循环用)。
+        strict_pingcang: False (默认, 2026-08-06 改) = pingcang 失败只警告不阻塞,
+                    让主循环继续跑; True = 维持原 abort 策略 (旧硬件安全策略)。
+                    CLI ``--strict-pingcang`` 切到 True。
+        pingcang_angle_deg: 储存仓角度 (度, 默认 +90°), 合法区间 [-128, 127]。
+        pingcang_speed: 舵机速度 1-100, 默认 100。
+        pingcang_timeout: HTTP 同步超时 (秒, 默认 10)。
 
     Returns:
         成功时 (匹配 + 执行完 position1):
@@ -227,11 +278,12 @@ def run(client: ArmClient, runner: ArmRunner,
             "iterations":  int,        # 实际迭代次数
             "results":     list,       # 每轮迭代结果 (dict)
             "duration_s":  float,
+            "pingcang_result":  dict | None,  # pingcang job dict (do_pingcang=False 时 None)
         }
         失败时:
         {
             "ok":           False,
-            "failed_step":  str,        # "iter{N}-duiying" / "iter{N}-forward" / "max_iterations_reached"
+            "failed_step":  str,        # "pingcang" / "iter{N}-duiying" / "iter{N}-forward" / "max_iterations_reached"
             "error":        str | None,
             "iterations":  int,
             "results":      list,
@@ -243,10 +295,49 @@ def run(client: ArmClient, runner: ArmRunner,
           f"forward={forward_mm:.0f}mm) ==========")
     print(f"  循环逻辑: duiying → 匹配 [liaobiao1+target=1] → suck+get_position1+position1 (break)")
     print(f"            未匹配 → 底盘前进 {forward_mm:.0f}mm → 再次 duiying (max {max_iterations} 次)")
+    print(f"  起点预备: 平仓={'开' if do_pingcang else '关'} "
+          f"(angle={pingcang_angle_deg:+.0f}°, speed={pingcang_speed}, "
+          f"timeout={pingcang_timeout:.0f}s, "
+          f"strict={'开 (失败 abort)' if strict_pingcang else '关 (失败软警告, 继续主循环)'})")
     print()
 
     iteration_results: list[dict] = []
     matched_match: dict | None = None
+    pingcang_result: dict | None = None
+
+    # ===== Step 0: 平仓 (任务起点先把储存仓摆到 +90°, 与 pingcang.py 默认对齐) =====
+    # ⚠️ **2026-08-06 v6 鲁棒性改进**: 默认 strict=False, pingcang 失败只警告不阻塞;
+    # strict=True 时维持原 abort 策略 (CLI ``--strict-pingcang``)。
+    if do_pingcang:
+        try:
+            pingcang_result = pingcang_mod._run(
+                client,
+                angle_deg=pingcang_angle_deg,
+                speed=pingcang_speed,
+                timeout=pingcang_timeout,
+            )
+        except Exception as exc:                                # noqa: BLE001
+            print(f"\n  ⚠️ pingcang 平仓异常: {exc!r}")
+            if strict_pingcang:
+                # 旧策略 (strict=True): 硬件安全优先, 立即 abort, 不进主循环
+                print(f"\n========== {LOG_PREFIX} 中止 (pingcang 失败, strict 模式) ==========")
+                return {
+                    "ok": False,
+                    "failed_step": "pingcang",
+                    "error": repr(exc),
+                    "iterations": 0,
+                    "results": [],
+                    "duration_s": time.time() - t0,
+                }
+            # 新策略 (strict=False, 默认): 软警告继续, 让主循环照常跑
+            # 业务正确性提醒: pingcang 失败 = 储存仓角度未复位, 后续投球可能撞车/投偏。
+            # 这是业务折衷: 不阻塞 vs 物理安全。
+            print(f"  ➡️ strict_pingcang=False, 警告继续, 进主循环 "
+                  f"(储存仓角度未复位, 后续投球需谨慎)")
+            pingcang_result = {"ok": False, "error": repr(exc), "strict": False}
+            print()
+        else:
+            print(f"  ➡️ 平仓完成, 进入主循环")
 
     for i in range(1, max_iterations + 1):
         print(f"\n{'=' * 60}")
@@ -394,6 +485,7 @@ def run(client: ArmClient, runner: ArmRunner,
         "total_empty": total_empty,
         "results": iteration_results,
         "duration_s": dt,
+        "pingcang_result": pingcang_result,  # None if do_pingcang=False
     }
 
 
@@ -417,6 +509,22 @@ def build_parser() -> argparse.ArgumentParser:
                    help="底盘最大线速度 (m/s, 默认 0.10)")
     p.add_argument("--timeout", type=float, default=DEFAULT_CHASSIS_TIMEOUT_S,
                    help="底盘 move_for HTTP 同步超时下限 (秒, 默认 10)")
+    p.add_argument("--skip-pingcang", dest="skip_pingcang", action="store_true",
+                   default=False,
+                   help="跳过任务开头的平仓动作 (默认 False = 自动跑 pingcang 把储存仓摆到 +90°)")
+    p.add_argument("--strict-pingcang", dest="strict_pingcang", action="store_true",
+                   default=DEFAULT_PINGCANG_STRICT,
+                   help="平仓失败是否 abort (默认 False = 软警告继续主循环; "
+                        "True = 维持旧 abort 策略, 硬件安全优先)")
+    p.add_argument("--pingcang-angle", type=float,
+                   default=DEFAULT_PINGCANG_ANGLE_DEG,
+                   help=f"平仓角度 (度, 合法区间 [-128, 127], 默认 {DEFAULT_PINGCANG_ANGLE_DEG:+.0f})")
+    p.add_argument("--pingcang-speed", type=int,
+                   default=DEFAULT_PINGCANG_SPEED,
+                   help=f"平仓舵机速度 (1-100, 默认 {DEFAULT_PINGCANG_SPEED})")
+    p.add_argument("--pingcang-timeout", type=float,
+                   default=DEFAULT_PINGCANG_TIMEOUT_S,
+                   help=f"平仓 HTTP 同步超时 (秒, 默认 {DEFAULT_PINGCANG_TIMEOUT_S:.0f})")
     return p
 
 
@@ -428,7 +536,12 @@ def main(argv=None) -> int:
                 max_iterations=args.max_iterations,
                 forward_mm=args.forward,
                 max_velocity_ms=args.max_velocity,
-                timeout=args.timeout)
+                timeout=args.timeout,
+                do_pingcang=not args.skip_pingcang,
+                strict_pingcang=args.strict_pingcang,
+                pingcang_angle_deg=args.pingcang_angle,
+                pingcang_speed=args.pingcang_speed,
+                pingcang_timeout=args.pingcang_timeout)
     return 0 if result["ok"] else 1
 
 

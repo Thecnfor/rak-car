@@ -302,9 +302,9 @@ waypoints:
   - name: task7_deliver
     task_id: 7
     task_module: main.task.task7_deliver
-    ir_threshold_m: 0.50
-    ir_side: right
-    dis_at_least_m: 14.5
+    ir_threshold_m: 0.35
+    ir_side: left
+    dis_at_least_m: 0
     trigger_op: AND
 
   # ----- finish -----

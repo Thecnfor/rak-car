@@ -74,10 +74,20 @@ _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# 注 task7 目录到 sys.path (跟 position*.py / get_position*.py / the_final_position*.py 同款自包含约定),
+# 让下面的 ``import target`` 走**直接模块导入**而不是包导入 —— 避免
+# __init__.py 正在加载时, ``from main.arm.each_task.task7 import target`` 触发循环导入
+# (ImportError: cannot import name ... from partially initialized module ...)。
+_TASK7_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TASK7_DIR not in sys.path:
+    sys.path.insert(0, _TASK7_DIR)
+
 from main.arm import ArmClient, ArmRunner  # noqa: E402
 
-# 跨包 import 破例 (编排角色) — 见模块 docstring 顶部说明
-from main.arm.each_task.task7 import target as task7_target  # noqa: E402
+# 跨模块 import (编排角色) — 见模块 docstring 顶部说明。
+# ⚠️ 不用包导入 ``from main.arm.each_task.task7 import target`` (会循环)。
+# ⚠️ task6/liebiao 在 task6 包, 不在 task7 内, 无循环风险, 保留包导入语法。
+import target as task7_target  # noqa: E402
 from main.arm.each_task.task6 import liebiao as task6_liebiao  # noqa: E402
 
 

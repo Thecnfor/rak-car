@@ -1,6 +1,8 @@
 """task7 / target —— 6 位置扫描 + ERNIE 大模型文字识别 (按位置编号输出 + 落盘记录)
 
 2026-08-03 v2 重构: 从"1 位置 5 步"升级为"6 位置扫描"。
+2026-08-06 v3 改版: 公共 setup 从 4 步串行改成 1 步 4 机联动 composite_run
+                    (仿 ``main/task/task1_seeding.py`` _init_step2_s_pose 同款)。
 
 按用户编号约定:
     上左 (top-left)     = 1     [1] [2] [3]      ← 上排左→右扫描
@@ -12,22 +14,38 @@
 
 流程:
   公共 setup (一次, 所有位置共享):
-    move_y(-80mm) / set_arm_angle(+90°) / set_hand_angle(-90°)
-  按 POSITIONS 顺序扫描 6 个位置:
-    每位 → move_x_with_split(x=POS.x_mm) → ocr_text_with_ernie(cam2)
-          → 输出 `[N] [label] <text>` ← 多行文字每行都加 `[N]` 前缀
-          → 收集到 results 列表
-  收尾:
-    写 JSON 记录到 ~/.remember/logs/task7_ocr_<timestamp>.json
-    控制台打印汇总 (6 条结果一行一条)
+    [1 步 4 机联动] composite_run(arm=+90°, x=0mm, y=-120mm, hand=-76°)
+                    → 4 轴并发到位 (不走 y 保护区 pre-check, composite_run 本身不查)
+  OCR + 网格解析:
+    调一次 ERNIE 多模态 VL, cam2 一帧拍全 6 个名字 → row-major 切 6 名
+  按 POSITIONS 映射输出 + 落盘:
+    → 写 JSON 记录到 ~/.remember/logs/task7_ocr_<timestamp>.json
+    → 控制台打印汇总 (6 条结果一行一条)
 
-⚠️ 本文件**自包含**: 只依赖 `main.arm` (ArmClient/ArmRunner) + main.arm.each_task.common
-   + stdlib + requests/base64, 不 import task7 包内其它模块。原因: task5 目录里的
-   辅助文件曾被外部动作清空过 (见 [[task5-rebuild-2026-07-22]]), 自包含可保证
-   `python target.py` 直接跑不受影响。
+⚠️ **v2 → v3 改版差异** (2026-08-06 用户改):
+  - **公共 setup 4 步 → 1 步 composite_run**: 原 4 步串行 (move_y → set_arm →
+    set_hand → move_x_with_split) 改成 1 步 4 机联动 composite_run,
+    与 ``get_position1.py`` / ``task1_seeding.py`` 同款。
+  - **去掉 move_x_with_split**: composite_run 内部走 move_x_position (SDK 层),
+    **不带 belt-slip retry**。target.py 是"切到观察位", 是状态过渡不是精密抓取,
+    不需要 split 兜底 (与 task1_seeding / get_position1 同款取舍)。
+  - **去掉 y 保护区 pre-check**: composite_run 内部**不调用** _check_y_protected
+    (composite.py:60 注释 "23:31 用户拍板: 不怕撞车! _check_y_protected 去掉! 要速度!"),
+    所以无论当前 y 在不在保护区, 4 轴并发都不会被 hand 校验拦截。pre-check 冗余, 删。
+  - **耗时**: 4 步串行 ~6-8s → 1 步并发 ~2-3s。
 
-⚠️ x 位置一律走 move_x_with_split (belt-slip + wall + overshoot 安全,
-   common.py:174, ARM_API §1.8 选型速查)。
+⚠️ 本文件**自包含**: 只依赖 `main.arm` (ArmClient/ArmRunner)
+   + stdlib + requests/base64, 不 import task7 包内其它模块。
+   (本版不再 import move_x_with_split — 改用 composite_run 后不需要。)
+   原因: task5 目录里的辅助文件曾被外部动作清空过 (见 [[task5-rebuild-2026-07-22]]),
+   自包含可保证 `python target.py` 直接跑不受影响。
+
+⚠️ **业务硬限** (走前要核对, 见 ARM_API §1.1 / §7 + setters.py):
+  - y=-120 ≤ soft_y_max=-200 ✓ (距上限 80mm, 充裕)
+  - x=0 ∈ [-320, +220] mm ✓ (中位)
+  - arm=+90 ∈ [-150, +150]° ✓ (init 位置, 保护区允许)
+  - hand=-76 ∈ [-90, +10]° ✓ (非 init, 但 y=-120 出保护区后允许)
+  - y=-120 ≤ -80 ✓ (保护区外 40mm)
 
 ⚠️ OCR/LLM step 需要:
   - runtime 在线 (cam2 流在跑)
@@ -56,38 +74,44 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
-from main.arm.each_task.common import move_x_with_split  # noqa: E402
 
 
-# ---------- 目标位姿常量 ----------
+# ---------- 目标位姿常量 (v3 改 1 步 composite_run) ----------
 
 LOG_PREFIX: str = "[task7/target]"
 
-TARGET_Y_MM: float = -80.0
-"""y 抬到 -80mm (出 y 保护区 [0, -30], 给 set_arm/hand_angle 和后续 move_x 留安全余量)。
+TARGET_Y_MM: float = -120
+"""composite_run 的 y_mm 终态 (-120mm, 出 y 保护区 [0, -80] 40mm)。
 
 ⚠️ 改这个值需注意:
-   - 必须 ≤ -30 (保护区边界), 否则 set_*_angle 和 move_x 会被 _check_safe 拦截
+   - 必须 ≤ -80 (保护区边界), 否则 set_*_angle 和 move_x 会被 _check_safe 拦截
    - 必须在 soft_y_max_mm (默认 -200) 范围内
 """
 
 TARGET_ARM_DEG: float = 90.0
-"""大臂 +90° (复位位, 业务硬限 [+150, -150]° 上界附近, 保护区允许)。"""
+"""composite_run 的 arm 角度终态 (+90°, 复位位, 业务硬限 [-150, +150]° init 位置)。"""
 
-TARGET_HAND_DEG: float = -90.0
-"""手爪 -90° (init 位置 UP, 业务硬限 [-90, 0]° 下界, 保护区允许)。"""
+TARGET_HAND_DEG: float = -76
+"""composite_run 的 hand 角度终态 (-76°, 非 init)。
+
+⚠️ [-90, +10]° 业务硬限内; -76 < -90 不成立, -76 > +10 不成立, 合法。
+⚠️ 非 init (非 -90): composite_run 本身**不调用** _check_y_protected
+   (composite.py:60 拍板"不怕撞车"), 所以 hand=-76 不会被 y 保护区拦截。
+   终态 y=-120 仍出保护区, 后续动作仍安全。"""
 
 TARGET_X_MM: float = 0
-"""x 走到 -80mm (撞墙=0, 负=向左)。x 软限位 [-320, +220] mm 内, 安全。
+"""composite_run 的 x_mm 终态 (0mm, 中位)。
 
-⚠️ x 轴 belt-slip 风险 → 走 move_x_with_split 分段撞墙检测,
-   与 task5/target.py 一致 (common.py:174)。
-
-⚠️ v2 之后这个值基本不再直接用 — POSITIONS 里的每行 x_mm 是各位置实际目标。
-   保留这个常量只是兼容历史代码与文档。"""
+⚠️ 必须 ∈ [-320, +220] 软限位 ✓; 0 是中位。
+⚠️ v3 不再走 move_x_with_split (composite_run 内部走 move_x_position, 不带 split)。
+⚠️ POSITIONS 里的每行 x_mm (位置扫描用) 与本常量无关, 是另一组坐标。"""
 
 ANGLE_SPEED: int = 80
-"""大臂 / 手爪舵机速度 (默认 80, 与 task5/target.py 一致)。"""
+"""大臂 / 手爪舵机速度 + xy PID speed, 默认 80。与 task5/target.py 一致。"""
+
+COMPOSITE_TIMEOUT_S: float = 30.0
+"""composite_run 同步超时 (秒)。4 轴并发到位一般 ~2-3s, 给 30s 兜底
+(含网络 + job_queue + SDK 内部 4 路 as_completed)。"""
 
 # ---------- 6 位置扫描配置 ----------
 
@@ -138,7 +162,8 @@ DEFAULT_OCR_MODEL: str = "ernie-4.5-turbo-vl"
 
 DEFAULT_OCR_PROMPT: str = (
     "你是一个 OCR 文字识别助手。请仔细观察图片,识别图中所有可见的文字,"
-    "按从左到右、从上到下的顺序逐行输出原文。不要解释、不要翻译、不要添加任何额外内容。"
+    "**严格按从左到右、从上到下顺序**,**每行 3 个名字用半角空格分隔** (2×3 网格布局: 上排 3 个 / 下排 3 个),"
+    "输出**两行原文** (共 6 个名字)。不要解释、不要翻译、不要添加任何额外内容。"
     "如果图中没有可识别的文字, 请只输出 [NO_TEXT]。"
 )
 """OCR 通用 prompt (不限定业务, 适合任意图)。要换成任务专用识别 (e.g. 订单牌/门牌/蔬菜)
@@ -419,6 +444,12 @@ def ocr_text_with_ernie(
 #
 # OCR prompt 必须强制 "按从左到右、从上到下顺序逐行输出" — 默认 DEFAULT_OCR_PROMPT
 # 已经按这个写, row-major 解析才稳。
+#
+# ⚠️ 2026-08-06 修: prompt 强化为 "每行 3 个名字空格分隔" (2 行 × 3 列 = 6 名)。
+#    旧 prompt 只说"逐行"没说每行几个, ERNIE-VL 实际输出 1 列 6 行,
+#    导致 _parse_grid 把每行当 1 row → 6 row, len(out) >= 2 break 后只留 2 行
+#    → 4 个名字丢失 (flat=[name, None, None, name, None, None])。
+#    修法: prompt 显式要求 2×3 布局 + _parse_grid 加 fallback (1 列 N 行自动 row-major 切)
 
 GRID_COLS: int = 3
 """2×3 网格列数 (左/中/右 = 3 列)。"""
@@ -437,32 +468,46 @@ def _parse_grid(text: str, rows: int = GRID_ROWS, cols: int = GRID_COLS) -> list
     """把 OCR 多行文字解析成 rows×cols 网格 (row-major flatten 后端上能填位置)。
 
     假设 (与 DEFAULT_OCR_PROMPT 一致):
-      - OCR 按 "从左到右、从上到下" 输出, 每行是一排
-      - 行内名字用空格分隔
+      - OCR 按 "从左到右、从上到下" 输出, 共 2 行 (上排 / 下排)
+      - 每行 3 个名字用半角空格分隔
       - 名字不会跨行
 
+    鲁棒 fallback (2026-08-06 修):
+      - ERNIE-VL 偶尔输出 1 列 6 行 ("张三\\n熊九\\n..."), 旧代码直接当 6 row 处理
+        → len(out) >= 2 break → 只剩前 2 个名字,后面 4 个丢
+      - 现在如果行数 > rows, 把多出的行依次切到当前 row,row 满 (cols 个) 换下一行
+
     Args:
-        text: OCR 识别原文 (e.g. "张三 熊九 孙八\\n田一 孟三 白七")
+        text: OCR 识别原文 (e.g. "张三 熊九 孙八\\n田一 孟三 白七"
+                              或 1-列 6-行 "张三\\n熊九\\n孙八\\n田一\\n孟三\\n白七")
         rows: 期望行数 (默认 2, 上/下)
         cols: 期望列数 (默认 3, 左/中/右)
 
     Returns:
-        二维 list, grid[r][c] = 名字。长度允许 < rows*cols (不足位置返回 "")。
+        二维 list, grid[r][c] = 名字。长度允许 < rows*cols (不足位置返回 None)。
         e.g. [["张三","熊九","孙八"], ["田一","孟三","白七"]]
     """
     out: list[list[str]] = []
     if not text:
         return out
+    # 把全部 OCR 文字 token 化 (按行 → 每行空格切)
+    all_names: list[str] = []
     for line in text.splitlines():
         line = (line or "").strip()
         if not line:
             continue
-        names = line.split()
-        if not names:
-            continue
-        out.append(names)
-        if len(out) >= rows:
-            break  # 只保留前 rows 行
+        tokens = line.split()
+        all_names.extend(tokens)
+    if not all_names:
+        return out
+    # row-major 切分: 第一个名字进 grid[0][0], 第 cols 个换行 grid[1][0]
+    for idx, name in enumerate(all_names):
+        r, c = divmod(idx, cols)
+        if r >= rows:
+            break  # 已超过期望行数, 丢弃 (防御 OCR 多吐一行)
+        while len(out) <= r:
+            out.append([])
+        out[r].append(name)
     return out
 
 
@@ -558,6 +603,7 @@ def run(client: ArmClient, runner: ArmRunner, *, record_dir: Optional[str] = Non
         {
             "ok": bool,                  # OCR 成功 + 解析出至少 1 个名字
             "shared_pose": {...},
+            "composite_result": dict,   # v3 新增: 1 步 composite_run 原始 job dict
             "ocr_result": dict,
             "grid": list[list[str]],     # 2×3 原始网格
             "flat": list[str|None],      # 长度 6, row-major 顺序
@@ -570,21 +616,46 @@ def run(client: ArmClient, runner: ArmRunner, *, record_dir: Optional[str] = Non
     """
     print(f"\n========== {LOG_PREFIX} run (1×OCR + 2×3 网格) ==========")
 
-    # 1. 公共姿态 (移到观察位) —— 4 步, 与最初用户要求一致
-    print(f"  [setup 1/4] move_y({TARGET_Y_MM}mm)   出 y 保护区")
-    runner.move_y(TARGET_Y_MM, verify=True)
-    print(f"  [setup 2/4] set_arm_angle({TARGET_ARM_DEG}°)   大臂到复位位")
-    runner.set_arm_angle(TARGET_ARM_DEG, speed=ANGLE_SPEED)
-    print(f"  [setup 3/4] set_hand_angle({TARGET_HAND_DEG}°)  手爪到 UP")
-    client.set_hand_angle(
-        TARGET_HAND_DEG, speed=ANGLE_SPEED,
-        timeout=runner.default_timeout_s,
+    # 1. 公共姿态 (移到观察位) —— v3 改 1 步 4 机联动 composite_run
+    #    ⚠️ **不再做 y 保护区 pre-check** (2026-08-06 用户拍板):
+    #    composite_run 内部**不调用** _check_y_protected (composite.py:60 注释
+    #    "23:31 用户拍板: 不怕撞车! _check_y_protected 去掉! 要速度!"),
+    #    所以无论当前 y 在不在保护区, 4 轴并发都不会被 hand 校验拦截。
+    #    旧版 pre-check 仿 task1_seeding 是冗余的, 删掉。
+    print(f"  [setup] composite_run: arm={TARGET_ARM_DEG:+.0f}° x={TARGET_X_MM:.0f}mm "
+          f"y={TARGET_Y_MM:.0f}mm hand={TARGET_HAND_DEG:+.0f}°  speed={ANGLE_SPEED} "
+          f"timeout={COMPOSITE_TIMEOUT_S:.0f}s")
+    composite_result = client.composite_run(
+        arm=TARGET_ARM_DEG,
+        x_mm=TARGET_X_MM,
+        y_mm=TARGET_Y_MM,
+        hand=TARGET_HAND_DEG,
+        speed=ANGLE_SPEED,
+        timeout=COMPOSITE_TIMEOUT_S,
     )
-    print(f"  [setup 4/4] move_x_with_split({TARGET_X_MM}mm)  x 到位 (观察 cam2 用)")
-    move_x_with_split(
-        client, runner, TARGET_X_MM,
-        log_prefix=f"  {LOG_PREFIX} setup",
+    ok_setup = (
+        isinstance(composite_result, dict)
+        and composite_result.get("status") == "succeeded"
+        and isinstance(composite_result.get("result"), dict)
+        and composite_result["result"].get("ok", False)
     )
+    if not ok_setup:
+        print(f"  [setup] ❌ composite_run 失败: {composite_result}")
+        return {
+            "ok": False,
+            "shared_pose": {
+                "y_mm": TARGET_Y_MM,
+                "arm_deg": TARGET_ARM_DEG,
+                "hand_deg": TARGET_HAND_DEG,
+                "angle_speed": ANGLE_SPEED,
+            },
+            "composite_result": composite_result,
+            "ocr_result": None,
+            "grid": [],
+            "flat": [None] * (GRID_ROWS * GRID_COLS),
+            "results": [{"id": pid, "label": plabel, "name": None} for pid, plabel in POSITIONS],
+            "record_path": None,
+        }
 
     # 2. 单次 OCR (一帧图片拍全 6 个名字)
     print(f"\n  [ocr] ocr_text_with_ernie(cam={OCR_CAM}, model={DEFAULT_OCR_MODEL})  "
@@ -643,6 +714,7 @@ def run(client: ArmClient, runner: ArmRunner, *, record_dir: Optional[str] = Non
             "hand_deg": TARGET_HAND_DEG,
             "angle_speed": ANGLE_SPEED,
         },
+        "composite_result": composite_result,
         "ocr_result": ocr,
         "grid": grid,
         "flat": flat,
@@ -656,7 +728,8 @@ def build_parser() -> argparse.ArgumentParser:
     default_record_dir = os.path.join(os.path.expanduser("~"), RECORD_DIRNAME)
     p = argparse.ArgumentParser(
         description=(
-            "task7 target v3: 1×OCR + 2×3 网格解析 → 6 位置映射 → JSON 落盘\n"
+            "task7 target v3: 1 步 4 机联动 composite_run (arm=+90° x=0 y=-120 hand=-76°)\n"
+            "+ 1×OCR + 2×3 网格解析 → 6 位置映射 → JSON 落盘\n"
             "  编号: 上左=1 上中=2 上右=3 下左=4 下中=5 下右=6\n"
             "  cam2 一帧拍全 6 个名字, 按 row-major 切 6 名映射到位置"
         ),

@@ -15,12 +15,12 @@
   task4_harvest        抓取作物 (main.arm.each_task.task4)
   task5_sort           分拣作物 (main.arm.each_task.task5)
   task6_get_order      接单 + 识别 (get_order 既有实现)
-  task7_deliver        投放外卖 (TODO)
+  task7_deliver        投放外卖 (main.arm.each_task.task7.the_final)
 
 调用约定:
   - 业务层只通过 RuntimeApiClient 调 runtime HTTP API
   - orchestrator 通过 TASK_RUNNERS[id](client) 调用
-  - 未实现 task (3/7) 抛 NotImplementedError, orchestrator 捕获后跳过
+  - 未实现 task (3) 抛 NotImplementedError, orchestrator 捕获后跳过 (task7 已实现, 薄封装 the_final.main)
 """
 from __future__ import annotations
 

@@ -63,7 +63,7 @@ from main.arm import ArmClient  # noqa: E402
 
 LOG_PREFIX: str = "[task7/dipan]"
 
-DEFAULT_DIST_MM: float = 600.0
+DEFAULT_DIST_MM: float = 315
 """默认位移 (mm)。正值 = 向前 60cm (= 600mm, 用户 2026-08-03 要求);
 负值 = 向后。对应 ``move_for`` 调用: x_m = dist_mm / 1000。"""
 

@@ -17,7 +17,7 @@ main/task/
 ├── task4_harvest.py           # 抓取作物 → main.arm.each_task.task4.target4
 ├── task5_sort.py              # 分拣作物 → main.arm.each_task.task5.the_final
 ├── task6_get_order.py         # 接单 + 识别 (ArmRunner + composite_run + OCR)
-├── task7_deliver.py           # 投放外卖 (TODO, NotImplementedError)
+├── task7_deliver.py           # 投放外卖 (薄封装 → main.arm.each_task.task7.the_final)
 └── tests/
     ├── test_orchestrator_yaml.py       # task_config.yml waypoints 段加载
     └── test_task1_vision_grasp.py      # task1 视觉抓取流程 (unittest 收 14 用例; `_Scan*` 前缀类是共享夹具,不被收集)
@@ -39,7 +39,7 @@ main/task/
 | 4 | task4_harvest | `main.arm.each_task.task4.target4` | ✅ (am 移植) |
 | 5 | task5_sort | `main.arm.each_task.task5.the_final` | ✅ (am 移植) |
 | 6 | task6_get_order | (本文件, OCR + composite_run) | ✅ |
-| 7 | task7_deliver | (TODO) | ⏳ |
+| 7 | task7_deliver | `main.arm.each_task.task7.the_final` (pingcang + duiying + dispatch, v6 默认 strict=False) | ✅ |
 
 ## 每个 task 现用的现成方法
 
@@ -79,7 +79,8 @@ result = TASK_RUNNERS[1](client)  # task1_seeding.run(client)
 |---|---|
 | `task4/` | **活**：task4_harvest 用 `target4.step_target4` |
 | `task5/` | **活**：task5_sort 用 `the_final.main` |
-| `task1/`, `task2/`, `task6/`, `task7/` | **未接线**（wrapper 自己实现了业务）。⚠️ 这些脚本调用了**已不存在**的 `runner.set_side` / `runner.set_hand`（task5 的 target_yellow/target_blue 还调 `stop_x_speed_safety`），直接 run 会 AttributeError；想复用前先修 |
+| `task1/`, `task2/`, `task6/` | **未接线**（wrapper 自己实现了业务）。⚠️ 这些脚本调用了**已不存在**的 `runner.set_side` / `runner.set_hand`（task5 的 target_yellow/target_blue 还调 `stop_x_speed_safety`），直接 run 会 AttributeError；想复用前先修 |
+| `task7/` | **活**：task7_deliver 用 `the_final.main` (pingcang + duiying 循环 + matches dispatch) |
 
 ## 维护指南
 
