@@ -10,6 +10,7 @@ smartcar/paddlebaidu/models/
 
 # task3 pipeline 识别产物 (targets crop 图, 现场跑出来的, 不提交)
 main/task/task3/audit/task3_pipeline/
+main/task/task3/audit/task3_pipeline.json
 
 
 

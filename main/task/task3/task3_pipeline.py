@@ -57,6 +57,17 @@ def read_detections(client):
         return []
 
 
+def read_odom_distance(client):
+    """读 odom_feed 缓存的累计行驶距离 (m)。odom_feed 未运行/失败返回 None。"""
+    try:
+        odo = (client.get_odom_state() or {}).get("odom_state") or {}
+        distance = odo.get("distance")
+        return float(distance) if distance is not None else None
+    except Exception as exc:
+        print(f"[warn] odom read failed: {exc}", file=sys.stderr)
+        return None
+
+
 def bbox(det):
     return det.get("bbox_norm") or {}
 
@@ -182,6 +193,10 @@ def recognize_phase(client, args, token, streamer_url, output_dir):
     locked = False
     missed_frames = 0
     period = max(args.poll_interval, 0.02)
+    odom_start = None if args.dry_run else read_odom_distance(client)
+    if odom_start is None and not args.dry_run:
+        print("[recognition] odom unavailable; fall back to open-loop max_travel",
+              file=sys.stderr)
     print(f"[recognition] creep at {args.creep_speed} m/s until "
           f"{args.target_count} targets are recorded; record only")
     try:
@@ -191,6 +206,13 @@ def recognize_phase(client, args, token, streamer_url, output_dir):
             time.sleep(period)
             traveled += args.creep_speed * period
             drive_iters += 1
+
+            if odom_start is not None:
+                odom_delta = read_odom_distance(client)
+                if odom_delta is not None and odom_delta - odom_start >= args.odom_stop_m:
+                    print(f"[recognition] odom distance reached "
+                          f"{odom_delta - odom_start:.2f}m >= {args.odom_stop_m}m, stopping")
+                    break
 
             animals = read_detections(client)
             target = pick_center_animal(animals, args.min_score, args.center_tol)
@@ -313,6 +335,8 @@ def main():
     parser.add_argument("--max-travel", type=float, default=4.0,
                         help="safety cap: stop driving after this many meters even if "
                              "fewer than target-count targets were recorded")
+    parser.add_argument("--odom-stop-m", type=float, default=1.77,
+                        help="stop driving once odometer distance delta reaches this (m)")
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)
     parser.add_argument("--center-tol", type=float, default=DEFAULT_CENTER_TOL)
     parser.add_argument("--unlock-tol", type=float, default=DEFAULT_UNLOCK_TOL)
@@ -327,8 +351,9 @@ def main():
     parser.add_argument("--no-pause", action="store_true", help="start shooting immediately after recognition")
     args = parser.parse_args()
 
-    if args.target_count < 1 or not 0 < args.creep_speed <= 0.2 or args.dry_run_steps < 1:
-        parser.error("target-count/creep-speed/dry-run-steps values are invalid")
+    if args.target_count < 1 or not 0 < args.creep_speed <= 0.2 or args.dry_run_steps < 1 \
+            or args.odom_stop_m <= 0:
+        parser.error("target-count/creep-speed/dry-run-steps/odom-stop-m values are invalid")
     token = load_token(args.token)
     print(f"[ready] token={mask_token(token)}")
     if not args.dry_run:

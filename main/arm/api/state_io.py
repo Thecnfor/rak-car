@@ -28,6 +28,43 @@ class StateIOMixin:
                 "raw_y_m": float(y_val) if y_val is not None else 0.0}
 
     def get_state(self) -> ArmState:
+        """读当前机械臂完整状态。
+
+        2026-08-07 优化：优先走 arm_feed 缓存 fast-path（1 HTTP GET），
+        仅当缓存不可用时退回原路径（``_read_raw_state`` 2 HTTP calls + ``get_arm_state`` 1 HTTP call）。
+        ``y_origin_valid`` 在 fast-path 下依赖 ``get_arm_state`` 返回的 ``y_limit`` 字段，
+        若该字段不可用则置 ``False``。
+        """
+        # ---- fast-path: 优先读 arm_feed 缓存 (1 HTTP GET) ----
+        x_mm_rt = self._read_x_mm_realtime()
+        y_mm_rt = self._read_y_mm_realtime()
+        rt_err = self.last_realtime_error()
+
+        origin = self.origin or ArmOrigin()
+
+        if x_mm_rt is not None and y_mm_rt is not None and rt_err is None:
+            # 双轴缓存都就绪：拿 side/hand/arm_angle/y_origin_valid
+            try:
+                st = self.http.get_arm_state()
+                st_data = st.get("arm_state") if isinstance(st, dict) else {}
+            except Exception:
+                st_data = {}
+            side = str(st_data.get("side", "MID"))
+            hand = str(st_data.get("hand_angle", "UP"))
+            arm_angle = st_data.get("arm_angle")
+            hand_angle = st_data.get("hand_angle")
+            y_origin_valid = bool(st_data.get("y_limit", False))
+            return ArmState(
+                x_mm=x_mm_rt, y_mm=y_mm_rt,
+                side=side, hand=hand, grasping=False,
+                y_origin_valid=y_origin_valid, x_origin_valid=False,
+                soft_y_max_mm=origin.soft_y_max_mm,
+                soft_x_min_mm=None, soft_x_max_mm=None,
+                raw_x_m=x_mm_rt / 1000.0, raw_y_m=y_mm_rt / 1000.0,
+                arm_angle=arm_angle, hand_angle=hand_angle,
+            )
+
+        # ---- fallback: 原路径 (3 HTTP calls) ----
         raw = self._read_raw_state()
         st_job = self._call_car("get_arm_state", timeout=10.0, sync=True)
         st_data = st_job.get("result") if isinstance(st_job, dict) else {}
@@ -35,7 +72,6 @@ class StateIOMixin:
             st_data = {}
         side = str(st_data.get("side", "MID"))
         hand = str(st_data.get("hand_angle", "UP"))
-        origin = self.origin or ArmOrigin()
         return ArmState(
             x_mm=_m_to_mm(raw["raw_x_m"]),
             y_mm=_m_to_mm(raw["raw_y_m"]),
@@ -69,7 +105,7 @@ class StateIOMixin:
         except Exception:
             return False
 
-    # ---- arm_feed realtime 接口（替代坏掉的 x_get_position）----
+    # ---- arm_feed realtime 接口（替代坏掉的 x_get_position / y_get_position）----
 
     def _read_x_mm_realtime(self) -> Optional[float]:
         """从 runtime `arm_feed` 守护线程缓存读 x 位置 (mm)。
@@ -122,6 +158,72 @@ class StateIOMixin:
 
         self._last_rt_err = None
         return float(x_mm)
+
+    def _read_y_mm_realtime(self) -> Optional[float]:
+        """从 runtime `arm_feed` 守护线程缓存读 y 位置 (mm)。
+
+        与 ``_read_x_mm_realtime`` 同构：走 `/v1/realtime/arm/state` fast-path
+        (不进 job_queue, 不抢 SerialEngine), 拿 arm_feed 20Hz 缓存的 y_mm。
+
+        2026-08-07 新增：原 ``get_state()`` 调 ``y_get_position`` 走 arm_queue
+        (和 composite_run 抢 worker), 本方法在 step_loss 校验等高频只读场景
+        替代 ``get_state()``, 省 2 HTTP calls (y_get_position + x_get_position)。
+
+        Returns:
+            float: y 业务坐标 (mm); None 表示调用失败 (同 _read_x_mm_realtime)。
+        """
+        try:
+            st = self.http.get_arm_state()
+        except Exception as e:
+            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
+            return None
+
+        result = st.get("arm_state") if isinstance(st, dict) else None
+        if not isinstance(result, dict):
+            self._last_rt_err = (
+                f"get_arm_state 返回无 arm_state (keys="
+                f"{list(st.keys()) if isinstance(st, dict) else 'N/A'})"
+            )
+            return None
+
+        if not result.get("active"):
+            self._last_rt_err = (
+                f"arm_feed 未启 (active=False, mode={result.get('mode')!r})"
+            )
+            return None
+
+        y_mm = result.get("y_mm")
+        if y_mm is None:
+            self._last_rt_err = "arm_feed active 但 y_mm 仍 None (feed 刚启动?)"
+            return None
+
+        self._last_rt_err = None
+        return float(y_mm)
+
+    def _read_arm_angle_realtime(self) -> Optional[int]:
+        """从 runtime `arm_feed` 缓存读大臂角度 (deg, int)。
+
+        2026-08-07 新增：set_hand_angle 安全判断只用到 arm_angle，
+        不必调完整的 ``get_state()`` (3 HTTP calls)。
+        """
+        try:
+            st = self.http.get_arm_state()
+        except Exception as e:
+            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
+            return None
+
+        result = st.get("arm_state") if isinstance(st, dict) else None
+        if not isinstance(result, dict) or not result.get("active"):
+            self._last_rt_err = "arm_feed 不可用"
+            return None
+
+        val = result.get("arm_angle")
+        if val is None:
+            self._last_rt_err = "arm_feed active 但 arm_angle 为 None"
+            return None
+
+        self._last_rt_err = None
+        return int(val)
 
     def wait_for_arm_state_active(
         self,

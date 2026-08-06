@@ -51,30 +51,49 @@ class MotionMixin:
 
     def move_y(self, y_mm: float, v_max_mms: float = 80.0,
                timeout: float = 20.0) -> dict:
-        """单轴 y 移动 (走 y 步进电机, 不动舵机)."""
+        """单轴 y 移动 (走 y 步进电机, 不动舵机).
+
+        2026-08-07 优化: step_loss 校验改用 ``_read_y_mm_realtime`` fast-path
+        (1 HTTP GET → arm_feed 缓存), 替代 ``get_state()`` (3 HTTP calls).
+        若 realtime 不可用则静默跳过校验 (原 try/except 行为).
+        """
         self._check_safe(y_mm=y_mm)
         job = self._call_arm("move_y_position", timeout=timeout,
                              target=_mm_to_m(y_mm))
         from ..state import ArmOrigin
         origin = self.origin or ArmOrigin()
         try:
-            state = self.get_state()
+            y_mm_rt = self._read_y_mm_realtime()  # fast-path: 1 HTTP GET
             near_bottom = abs(y_mm) <= 0.1 * origin.soft_y_max_mm
-            if near_bottom and not state.y_origin_valid:
-                print(
-                    f"[move_y] 警告: 目标 y={y_mm:.1f}mm 接近触底(0mm), "
-                    f"但车端 y_limit 仍为 False (磁感应未触发).",
-                    flush=True,
-                )
-            self._check_step_loss("y", target_mm=y_mm, actual_mm=state.y_mm,
-                                  threshold_mm=origin.step_loss_y_mm)
+            if near_bottom and y_mm_rt is not None:
+                # 补充读一次 arm_state 拿 y_limit (同一次 HTTP response)
+                try:
+                    st = self.http.get_arm_state()
+                    st_data = st.get("arm_state", {}) if isinstance(st, dict) else {}
+                except Exception:
+                    st_data = {}
+                y_limit = bool(st_data.get("y_limit", False))
+                if not y_limit:
+                    print(
+                        f"[move_y] 警告: 目标 y={y_mm:.1f}mm 接近触底(0mm), "
+                        f"但车端 y_limit 仍为 False (磁感应未触发).",
+                        flush=True,
+                    )
+            if y_mm_rt is not None:
+                self._check_step_loss("y", target_mm=y_mm, actual_mm=y_mm_rt,
+                                      threshold_mm=origin.step_loss_y_mm)
         except Exception as e:
             print(f"[move_y] 状态校验读取失败: {e}", flush=True)
         return job
 
     def move_x(self, x_mm: float, v_max_mms: float = 40.0,
                out_time: float = 15.0, timeout: float = 30.0) -> dict:
-        """单轴 x 移动 (编码器闭环)."""
+        """单轴 x 移动 (编码器闭环).
+
+        2026-08-07 优化: step_loss 校验改用 ``_read_x_mm_realtime`` fast-path
+        (1 HTTP GET → arm_feed 缓存), 替代 ``get_state()`` (3 HTTP calls).
+        若 realtime 不可用则静默跳过校验.
+        """
         self._check_y_protected("move_x")
         job = self._call_arm("move_x_position", timeout=timeout,
                              target=_mm_to_m(x_mm), out_time=out_time,
@@ -82,9 +101,10 @@ class MotionMixin:
         from ..state import ArmOrigin
         origin = self.origin or ArmOrigin()
         try:
-            state = self.get_state()
-            self._check_step_loss("x", target_mm=x_mm, actual_mm=state.x_mm,
-                                  threshold_mm=origin.step_loss_x_mm)
+            x_mm_rt = self._read_x_mm_realtime()  # fast-path: 1 HTTP GET
+            if x_mm_rt is not None:
+                self._check_step_loss("x", target_mm=x_mm, actual_mm=x_mm_rt,
+                                      threshold_mm=origin.step_loss_x_mm)
         except Exception as e:
             print(f"[move_x] 状态校验读取失败: {e}", flush=True)
         return job

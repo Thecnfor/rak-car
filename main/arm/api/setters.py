@@ -34,6 +34,8 @@ class SettersMixin:
         return self._call_arm("set_arm_angle", timeout=timeout, angle=a, speed=speed)
 
     def set_hand_angle(self, angle: float, speed: int, timeout: float) -> dict:
+        """2026-08-07 优化: arm_angle 安全判断改用 ``_read_arm_angle_realtime``
+        (1 HTTP GET → arm_feed 缓存), 替代 ``get_state()`` (3 HTTP calls)."""
         try:
             a = float(angle)
         except (TypeError, ValueError):
@@ -45,8 +47,7 @@ class SettersMixin:
                 f"  规则: 手爪角度 ∈ [-90, +10]° (UP=-90, DOWN=0, P 姿态上限 +10, 2026-08-05)"
             )
         try:
-            st = self.get_state()
-            cur_arm = st.arm_angle
+            cur_arm = self._read_arm_angle_realtime()  # fast-path: 1 HTTP GET
         except Exception:
             cur_arm = None
         if cur_arm is not None and self._ARM_SAFE_BAND_MIN <= cur_arm <= self._ARM_SAFE_BAND_MAX:

@@ -60,24 +60,32 @@ class SafetyMixin:
     def _check_y_protected(self, action: str, *,
                            allow_init_position: bool = False,
                            skip: bool = False) -> None:
+        """2026-08-07 优化: 优先读 ``_read_y_mm_realtime`` (1 HTTP GET),
+        仅在 realtime 不可用时退回 ``get_state()``。fail-closed 语义不变. """
         if skip:
             return
         try:
-            st = self.get_state()
-            y_mm = float(st.y_mm)
-        except Exception as exc:
-            logger.warning(
-                "_check_y_protected: 读不到 state, 保守拒绝 (action=%s, err=%s)",
-                action, exc,
-            )
-            raise ValueError(
-                f"[{action}] 无法读取 y 状态, 保守拒绝。runtime 是否在线?"
-            ) from exc
-        if y_mm > self._Y_PROTECTED_THRESHOLD_MM:
+            y_mm = self._read_y_mm_realtime()  # fast-path: 1 HTTP GET
+        except Exception:
+            y_mm = None
+        if y_mm is None:
+            # realtime 不可用，退回完整 get_state() (3 HTTP calls)
+            try:
+                st = self.get_state()
+                y_mm = float(st.y_mm)
+            except Exception as exc:
+                logger.warning(
+                    "_check_y_protected: 读不到 state, 保守拒绝 (action=%s, err=%s)",
+                    action, exc,
+                )
+                raise ValueError(
+                    f"[{action}] 无法读取 y 状态, 保守拒绝。runtime 是否在线?"
+                ) from exc
+        if float(y_mm) > self._Y_PROTECTED_THRESHOLD_MM:
             if allow_init_position:
                 return
             raise ValueError(
-                f"[{action}] y={y_mm:.1f}mm ∈ [0, -30] 安全保护区, 禁止动。\n"
+                f"[{action}] y={float(y_mm):.1f}mm ∈ [0, -30] 安全保护区, 禁止动。\n"
                 f"  规则: 接近触底时舵机摆动会撞车\n"
                 f"  解决: 先 ArmClient.move_y(-150) 或更低, 再试。\n"
                 f"  例外: set_hand('UP'/-90) / set_arm_angle('MID'/0) 初始化姿态允许。"
@@ -117,11 +125,19 @@ class SafetyMixin:
             )
 
     def _is_arm_safe_position(self) -> bool:
+        """2026-08-07 优化: 优先读 ``_read_arm_angle_realtime`` (1 HTTP GET),
+        仅在 realtime 不可用时退回 ``get_state()``。fail-closed 语义不变."""
         try:
-            st = self.get_state()
+            cur = self._read_arm_angle_realtime()  # fast-path: 1 HTTP GET
         except Exception:
-            return False
-        cur = st.arm_angle
+            cur = None
+        if cur is None:
+            # realtime 不可用，退回完整 get_state()
+            try:
+                st = self.get_state()
+                cur = st.arm_angle
+            except Exception:
+                return False
         if cur is None:
             return False
         return cur <= self._ARM_SAFE_BAND_MIN or cur >= self._ARM_SAFE_BAND_MAX
