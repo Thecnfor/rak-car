@@ -1,6 +1,7 @@
 """main/arm/api/state_io.py — 状态读取 / 急停 / ping mixin."""
 from __future__ import annotations
 
+import time
 from typing import Optional, Tuple
 
 from ..state import ArmOrigin, ArmState
@@ -40,17 +41,8 @@ class StateIOMixin:
         之前两次冗余 ``get_arm_state()`` 调用 (省 50% HTTP)。
         """
         # ---- fast-path: 1 HTTP GET 拿 arm_feed 缓存, 一次解析多字段 ----
-        try:
-            st = self.http.get_arm_state()
-        except Exception as e:
-            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
-            st = {}
-
-        result = st.get("arm_state") if isinstance(st, dict) else None
-        if not isinstance(result, dict) or not result.get("active"):
-            self._last_rt_err = (
-                f"arm_feed 未启 (active={result.get('active') if isinstance(result, dict) else 'N/A'})"
-            )
+        result, err = self._read_arm_state_raw()
+        if result is None:
             return self._get_state_slow()
 
         x_mm = result.get("x_mm")
@@ -67,7 +59,6 @@ class StateIOMixin:
         hand_angle = result.get("hand_angle")
         y_origin_valid = bool(result.get("y_limit", False))
         origin = self.origin or ArmOrigin()
-        self._last_rt_err = None
         return ArmState(
             x_mm=x_mm, y_mm=y_mm,
             side=side, hand=hand, grasping=False,
@@ -123,6 +114,65 @@ class StateIOMixin:
 
     # ---- arm_feed realtime 接口（替代坏掉的 x_get_position / y_get_position）----
 
+    # 0-copy: 短 TTL 缓存 + 三个 reader 共享同一 HTTP GET 响应。
+    # 50ms 窗口内所有 _read_x/y/arm_angle_realtime 共用 1 次 HTTP GET。
+    # 50ms 远小于 arm_feed 自身的 20Hz 刷新间隔 (50ms) —— 任何更高频调用
+    # 拿到的都是同一份 arm_feed 缓存, 不会"劣化"实时性。
+    _ARM_STATE_CACHE_TTL_MS = 50.0
+
+    def _read_arm_state_raw(self) -> tuple:
+        """复用 1 次 HTTP GET /v1/realtime/arm/state, 在 50ms 窗口内复用结果。
+
+        Returns:
+            (result_dict, error_str): result_dict = arm_state dict (None 表示
+                不可用) 或 None; error_str = 错误上下文 (None 表示成功)。
+                业务层: result_dict 是 None AND error_str 非 None → 失败。
+        """
+        now_ms = time.time() * 1000.0
+        cache = getattr(self, "_arm_state_cache", None)
+        if cache is not None:
+            age_ms = now_ms - cache.get("ts_ms", 0.0)
+            if age_ms < self._ARM_STATE_CACHE_TTL_MS:
+                return cache.get("result"), cache.get("err")
+
+        # 缓存 miss / 过期 — 重新请求
+        try:
+            st = self.http.get_arm_state()
+        except Exception as e:
+            err = f"{type(e).__name__}: {str(e)[:120]}"
+            self._arm_state_cache = {"ts_ms": now_ms, "result": None, "err": err}
+            self._last_rt_err = err
+            return None, err
+
+        result = st.get("arm_state") if isinstance(st, dict) else None
+        if not isinstance(result, dict):
+            err = (
+                f"get_arm_state 返回无 arm_state (top-level keys="
+                f"{list(st.keys()) if isinstance(st, dict) else 'N/A'})"
+            )
+            self._arm_state_cache = {"ts_ms": now_ms, "result": None, "err": err}
+            self._last_rt_err = err
+            return None, err
+
+        if not result.get("active"):
+            err = (
+                f"arm_feed 未启 (active=False, mode={result.get('mode')!r}) — "
+                f"runtime 可能在 reinit, 或 MyCar() 未构造完成"
+            )
+            self._arm_state_cache = {"ts_ms": now_ms, "result": None, "err": err}
+            self._last_rt_err = err
+            return None, err
+
+        self._arm_state_cache = {"ts_ms": now_ms, "result": result, "err": None}
+        self._last_rt_err = None
+        return result, None
+
+    def invalidate_arm_state_cache(self) -> None:
+        """清 0-copy 缓存。任何 _call_arm / _call_car 完成后应调一次,
+        避免读到的还是动作发起前的状态 (50ms 窗口够小, 但严谨点更好).
+        """
+        self._arm_state_cache = None
+
     def _read_x_mm_realtime(self) -> Optional[float]:
         """从 runtime `arm_feed` 守护线程缓存读 x 位置 (mm)。
 
@@ -131,48 +181,22 @@ class StateIOMixin:
         反映真实位置; arm_feed 守护线程通过 `/v1/realtime/wheels/encoders`
         拿原始编码器, 业务层自行减 ``x_origin_m``, 是当前唯一可信源。
 
+        2026-08-07 0-copy: 复用 _read_arm_state_raw() 50ms 窗口内的
+        同一 HTTP GET 响应, 同帧内的 _read_y_mm_realtime / _read_arm_angle_realtime
+        都从同一 dict 解析, 省多次 HTTP。
+
         Returns:
-            float: x 业务坐标 (mm), 单位米换算后的整毫米值; None 表示
-                调用失败 (网络断 / arm_feed 未启 / runtime 未初始化)。
+            float: x 业务坐标 (mm), None 表示调用失败 (网络断 / arm_feed 未启 / runtime 未初始化)。
                 失败原因存到 ``self._last_rt_err``, 业务层可调
                 ``last_realtime_error()`` 取出来。
-
-        Side effects:
-            设置 ``self._last_rt_err`` (成功置 None, 失败置错误字符串)。
         """
-        try:
-            st = self.http.get_arm_state()
-        except Exception as e:
-            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
+        result, err = self._read_arm_state_raw()
+        if result is None:
             return None
-
-# runtime `/v1/realtime/arm/state` 返回 {"ok": bool, "arm_state": dict, ...}
-        # (见 runtime/api/routers/realtime.py:62 — 注意不是 "result",这是 2026-08-01
-        # 发现的 latent bug: 旧版按 "result" 取永远 None,导致 split 模式总报
-        # "realtime x_mm 读不到"。)
-        result = st.get("arm_state") if isinstance(st, dict) else None
-        if not isinstance(result, dict):
-            self._last_rt_err = (
-                f"get_arm_state 返回无 arm_state (top-level keys="
-                f"{list(st.keys()) if isinstance(st, dict) else 'N/A'})"
-            )
-            return None
-
-        # runtime 正在 init (controller reboot 后) → arm_state 全 None / active=False
-        if not result.get("active"):
-            self._last_rt_err = (
-                f"arm_feed 未启 (active=False, mode={result.get('mode')!r}) — "
-                f"runtime 可能在 reinit,或 MyCar() 未构造完成"
-            )
-            return None
-
         x_mm = result.get("x_mm")
         if x_mm is None:
-            # arm_feed 可能刚启动,x_mm 还未上报
             self._last_rt_err = "arm_feed active 但 x_mm 仍 None (feed 刚启动?)"
             return None
-
-        self._last_rt_err = None
         return float(x_mm)
 
     def _read_y_mm_realtime(self) -> Optional[float]:
@@ -185,35 +209,18 @@ class StateIOMixin:
         (和 composite_run 抢 worker), 本方法在 step_loss 校验等高频只读场景
         替代 ``get_state()``, 省 2 HTTP calls (y_get_position + x_get_position)。
 
+        2026-08-07 0-copy: 复用 _read_arm_state_raw() 50ms 窗口。
+
         Returns:
             float: y 业务坐标 (mm); None 表示调用失败 (同 _read_x_mm_realtime)。
         """
-        try:
-            st = self.http.get_arm_state()
-        except Exception as e:
-            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
+        result, err = self._read_arm_state_raw()
+        if result is None:
             return None
-
-        result = st.get("arm_state") if isinstance(st, dict) else None
-        if not isinstance(result, dict):
-            self._last_rt_err = (
-                f"get_arm_state 返回无 arm_state (keys="
-                f"{list(st.keys()) if isinstance(st, dict) else 'N/A'})"
-            )
-            return None
-
-        if not result.get("active"):
-            self._last_rt_err = (
-                f"arm_feed 未启 (active=False, mode={result.get('mode')!r})"
-            )
-            return None
-
         y_mm = result.get("y_mm")
         if y_mm is None:
             self._last_rt_err = "arm_feed active 但 y_mm 仍 None (feed 刚启动?)"
             return None
-
-        self._last_rt_err = None
         return float(y_mm)
 
     def _read_arm_angle_realtime(self) -> Optional[int]:
@@ -221,24 +228,16 @@ class StateIOMixin:
 
         2026-08-07 新增：set_hand_angle 安全判断只用到 arm_angle，
         不必调完整的 ``get_state()`` (3 HTTP calls)。
+
+        2026-08-07 0-copy: 复用 _read_arm_state_raw() 50ms 窗口。
         """
-        try:
-            st = self.http.get_arm_state()
-        except Exception as e:
-            self._last_rt_err = f"{type(e).__name__}: {str(e)[:120]}"
+        result, err = self._read_arm_state_raw()
+        if result is None:
             return None
-
-        result = st.get("arm_state") if isinstance(st, dict) else None
-        if not isinstance(result, dict) or not result.get("active"):
-            self._last_rt_err = "arm_feed 不可用"
-            return None
-
         val = result.get("arm_angle")
         if val is None:
             self._last_rt_err = "arm_feed active 但 arm_angle 为 None"
             return None
-
-        self._last_rt_err = None
         return int(val)
 
     def wait_for_arm_state_active(

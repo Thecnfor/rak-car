@@ -133,12 +133,17 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
 
     def _call_arm(self, name: str, timeout: float = 20.0, *args,
                   sync: bool = True, **kwargs) -> dict:
+        # 2026-08-07 0-copy: 任何 arm action 后自动 invalidate 短 TTL 缓存,
+        # 避免业务层下一行 _read_*_realtime 读到动作发起前的状态。
+        self.invalidate_arm_state_cache()
         return self.http.execute_arm_action(
             name, *args, timeout=timeout, sync=sync, **kwargs
         )
 
     def _call_car(self, name: str, timeout: float = 20.0, *args,
                   sync: bool = False, **kwargs) -> dict:
+        # 2026-08-07 0-copy: 同 _call_arm,加自动 invalidate。
+        self.invalidate_arm_state_cache()
         return self.http.execute_car_action(
             name, *args, timeout=timeout, sync=sync, **kwargs
         )
