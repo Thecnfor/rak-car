@@ -209,7 +209,7 @@ task_cfg:
   # 盲转段不依赖 lane, stop_lane_feed 让 lane_state 失效, 转完再恢复并等新鲜 (防 watchdog 误急停).
   post_task1:
     enabled: true
-    straight_m: 0.55        # 直行距离 (m, move_for 里程计闭环)
+    straight_m: 0.19        # 直行距离 (m, move_for 里程计闭环)
     turn_deg: -45.0         # 原地里程计 θ 转弯角度 (度, OdomTurnPID); 实车方向反了取负
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
