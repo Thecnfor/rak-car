@@ -579,10 +579,17 @@ _WS_OP_DISPATCH = {
     "realtime/odom_state": _ws_op_realtime_odom_state,
 }
 
-
+# 2026-08-06 无创优化：把同步 realtime / job handler 丢到 threadpool，
+# 不再在 asyncio event loop 内同步执行。realtime/wheel_speeds 等会走
+# SerialEngine round-trip（最坏 time_out+2.0s），串口慢时整条 loop 推迟，
+# lane/arm/ir/odom push 全部跟着抖。to_thread 后 loop 几乎不被阻塞，
+# 客户端的 WS 收帧保持节奏。
+# 接口零变化：handler 签名 (service, payload) -> dict，response 包络不变。
+# 内部 dispatch 表、op 集合、_handle_websocket_message 的调用方都保持原状。
 async def _handle_websocket_message(service, payload):
     op = payload.get("op", "execute")
     handler = _WS_OP_DISPATCH.get(op)
     if handler is None:
         raise HTTPException(status_code=400, detail=f"不支持的 op: {op}")
-    return handler(service, payload)
+    import asyncio as _asyncio
+    return await _asyncio.to_thread(handler, service, payload)

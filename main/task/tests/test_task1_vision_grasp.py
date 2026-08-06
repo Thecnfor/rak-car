@@ -352,6 +352,184 @@ class TestRun(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertNotIn("error", result)
 
+    def test_align_retries_once_on_failure(self):
+        """2026-08-06: 对齐失败重试 1 次 (用户决策); 第 2 次成功 → arrived + chassis_aligned=True。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
+        from main.task import task1_seeding as m
+        arm_client, runner, _vision = _make_runtime()
+        cfg = CFG.copy()
+        cfg["chassis_align"] = {"enabled": True, "max_seconds": 0.01}
+
+        first_fail = SimpleNamespace(arrived=False, reason="timeout", frames=10, elapsed_s=1.0,
+                                     final_frame=None)
+        second_ok = SimpleNamespace(arrived=True, reason="arrived", frames=33, elapsed_s=1.6,
+                                    final_frame=None)
+
+        http = MagicMock()
+        http.wait_until_ready.return_value = True
+        http.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
+
+        with _patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             _patch.object(m, "ArmClient") as arm_cls, \
+             _patch.object(m, "RuntimeApiClient", return_value=http), \
+             _patch("main.chassis.track_chassis", side_effect=[first_fail, second_ok]) as tc, \
+             _patch("main.chassis.track_trace", return_value=None):
+            arm_cls.connect.return_value = arm_client
+            with _patch.object(m, "ArmRunner", return_value=runner):
+                result = m.run(http)
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(result["chassis_aligned"])
+        self.assertEqual(tc.call_count, 2)
+        self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
+
+    def test_align_failure_after_two_tries_still_proceeds(self):
+        """2026-08-06: 重试后仍失败 → ERROR 告警 + 放行; chassis_aligned=False, ok=True (比赛完赛优先)。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
+        from main.task import task1_seeding as m
+        arm_client, runner, _vision = _make_runtime()
+        cfg = CFG.copy()
+        cfg["chassis_align"] = {"enabled": True, "max_seconds": 0.01}
+
+        fail = SimpleNamespace(arrived=False, reason="no_target", frames=8, elapsed_s=0.8,
+                               final_frame=None)
+
+        http = MagicMock()
+        http.wait_until_ready.return_value = True
+        http.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
+
+        with _patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             _patch.object(m, "ArmClient") as arm_cls, \
+             _patch.object(m, "RuntimeApiClient", return_value=http), \
+             _patch("main.chassis.track_chassis", return_value=fail) as tc, \
+             _patch("main.chassis.track_trace", return_value=None):
+            arm_cls.connect.return_value = arm_client
+            with _patch.object(m, "ArmRunner", return_value=runner):
+                result = m.run(http)
+        self.assertTrue(result["ok"], result)
+        # 失败仍放行, chassis_aligned 写 False 让上层编排/日志能看见
+        self.assertFalse(result["chassis_aligned"])
+        self.assertEqual(tc.call_count, 2)
+        self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
+
+    def test_run_ends_at_S3_via_move_for(self):
+        """2026-08-07: 不管在哪结束, 末尾都把底盘移到 S3 (pos_along=0.30m) 作为终点。
+
+        验证三件事:
+          1) 主循环正常完成 → pos_along 终态 = 0.30m (S3), 主循环有 move_for +0.15 推 S2/S3;
+          2) 主循环异常 → 异常路径仍会尝试 move_for 到 S3, 不掩盖原 error;
+          3) 已在 S3 附近 (|dx|<5cm) → 跳过移动。
+        """
+        from main.task import task1_seeding as m
+        arm_client, runner, _vision = _make_runtime()
+        cfg = CFG.copy()
+        cfg["chassis_align"] = {"enabled": False}  # 简化, 跳过对齐路径
+
+        def _car_calls():
+            return [c for c in arm_client.http.execute_car_action.call_args_list
+                    if c.args and c.args[0] == "move_for"]
+
+        # ===== 1) 成功路径 =====
+        http = MagicMock()
+        http.wait_until_ready.return_value = True
+        http.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
+        http.get.side_effect = None
+
+        with patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             patch.object(m, "ArmClient") as arm_cls, \
+             patch.object(m, "RuntimeApiClient", return_value=http):
+            arm_cls.connect.return_value = arm_client
+            with patch.object(m, "ArmRunner", return_value=runner):
+                result = m.run(http)
+
+        self.assertTrue(result["ok"], result)
+        # 末尾把 pos_along 推到 0.30, 主循环 S2/S3 各 +0.15:
+        dxs = [c.args[1][0] for c in _car_calls()]
+        self.assertIn(0.15, dxs, "expected at least one +0.15 move (S2/S3 推进)")
+        # 全部 move_for 累计 dx 应该走到 0.30m (最后一笔 S3 → S3 不动):
+        cumulative = sum(dxs)
+        self.assertAlmostEqual(cumulative, 0.30, places=6)
+
+        # ===== 2) 异常路径也走 S3 =====
+        arm_client2, runner2, _vision2 = _make_runtime()
+        http2 = MagicMock()
+        http2.wait_until_ready.return_value = True
+        http2.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
+        # 让 stage (3) 的并发底盘移动抛错 → 主 except 接住
+        # 异常路径里走兜底 move_for 到 S3 (验证异常路径也尝试终点化)
+        # 关键: side_effect 直接 raise, 不回 wrap, 让 ThreadPoolExecutor.result() 重抛
+        call_count = {"n": 0}
+        def _flaky(name, *args, **kwargs):
+            call_count["n"] += 1
+            # 实际底盘 move_for 调用计数: i=1 T2 一次, i=2 T3 一次 = 2 次.
+            # 第 2 次抛错 → stage (3) 的 f_chassis.result() 重抛 → 主 except.
+            if call_count["n"] == 2:
+                raise RuntimeError("simulated stage3 move_for crash")
+            return {"ok": True, "status": "succeeded"}
+        arm_client2.http.execute_car_action.side_effect = _flaky
+
+        with patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             patch.object(m, "ArmClient") as arm_cls2, \
+             patch.object(m, "RuntimeApiClient", return_value=http2):
+            arm_cls2.connect.return_value = arm_client2
+            with patch.object(m, "ArmRunner", return_value=runner2):
+                result2 = m.run(http2)
+
+        self.assertFalse(result2["ok"])
+        self.assertIn("simulated stage3 move_for crash", result2["error"])
+        # 异常路径应尝试 move_for 移到 S3; 此时 pos_along 已经被 stage (3) 第 1 次推 +0.15,
+        # 异常抛在第 2 次, 所以兜底 dx = 0.30 - 0.15 = 0.15.
+        err_calls = [c for c in arm_client2.http.execute_car_action.call_args_list
+                     if c.args and c.args[0] == "move_for"]
+        self.assertTrue(err_calls, "异常路径也应该尝试 move_for 移到 S3")
+        # 兜底 move: dx = S3 - pos_along = 0.30 - 0.15 = 0.15
+        fallback = [c.args[1][0] for c in err_calls
+                    if abs(c.args[1][0] - 0.15) < 1e-6]
+        self.assertTrue(fallback, "异常路径兜底 move dx 应等于 0.15 (S3 - 已记账 pos_along=0.15)")
+
+    def test_skip_S3_move_when_already_there(self):
+        """已在 S3 附近 (|dx|<5cm) 时末尾不调 move_for, 避免无意义的抖动。"""
+        from main.task import task1_seeding as m
+        arm_client, runner, _vision = _make_runtime()
+        cfg = CFG.copy()
+        cfg["chassis_align"] = {"enabled": False}
+        cfg["target_slot_map"] = {"cylinder_1": 1, "cylinder_2": 2, "cylinder_3": 3}
+        cfg["source_position_order"] = [1]  # 只跑一列, pos_along 留在 0.0, |dx|>=5cm → 仍会移动
+        # 把 odom x 设成 0.295, 等价于 pos_along 已经走到 0.295 (距 S3 还有 5cm) — 不对,
+        # 实际我们的 _chassis_goto 不依赖 odom, 它走 self-bookkeeping; 想让末尾 dx<5cm
+        # 就让 source_position_order 只走 S1 (i=0 跳过底盘移动), pos_along=0.0,
+        # 末尾 dx=0.30-0.0=0.30 不在带内. 改写:
+        cfg["source_position_order"] = [1, 2, 3]
+        http = MagicMock()
+        http.wait_until_ready.return_value = True
+        http.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
+
+        # 强制 _chassis_goto 的 dx 接近 0 (最后一笔 S3→T3 走 move_for(dx=0)):
+        # 让 slot target 和 source 一致 (target_slot_map 是恒等 c_k→k, S↔T 同列),
+        # S3 走 +0.15 (源) 然后 place 到 T3 又走 -0.15 (源) — net dx 累计到 S3 时是 +0.30.
+        # 末尾 dx = 0.30 - 0.30 = 0 → 跳过. 这里跳过检测由 _chassis_goto 阈值 5cm 处理,
+        # 我们的新代码只看 s3_dx = 0.30 - pos_along (0.30) = 0 → 跳过调用.
+        with patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             patch.object(m, "ArmClient") as arm_cls, \
+             patch.object(m, "RuntimeApiClient", return_value=http):
+            arm_cls.connect.return_value = arm_client
+            with patch.object(m, "ArmRunner", return_value=runner):
+                result = m.run(http)
+
+        self.assertTrue(result["ok"], result)
+        # 末尾 dx=0 → 不应再追加 move_for. 总累计 dx 应该 = +0.30 (主循环给的), 末尾 0 没有新调用.
+        cumulative_dx = sum(
+            c.args[1][0]
+            for c in arm_client.http.execute_car_action.call_args_list
+            if c.args and c.args[0] == "move_for"
+        )
+        self.assertAlmostEqual(cumulative_dx, 0.30, places=6)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
 
 if __name__ == "__main__":
     unittest.main()

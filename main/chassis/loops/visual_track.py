@@ -189,6 +189,20 @@ def _sense_frame(
         cand = payload.get("task_state")
         inner_ts = cand if isinstance(cand, dict) else None
 
+    # 新鲜度: runtime 的 _StateCache 在每次刷新时写入 task_state.updated_at; 用它
+    # 算 age_ms, watchdog (2s 没刷就停) 才有意义。旧实现 age_ms 硬编码 None, watchdog
+    # 永远不触发 → 缓存卡死/推理端卸载 (LRU) 时车还按陈旧的 cx/cy 误差继续开。
+    # payload 没 updated_at (单测 / 老 runtime) 时 age_ms=None, watchdog 不参与, 行为兼容。
+    age_ms = None
+    if isinstance(inner_ts, dict):
+        ts = inner_ts.get("updated_at")
+        try:
+            ts = float(ts)
+            if ts > 0:
+                age_ms = max(0.0, (now_s - ts) * 1000.0)
+        except (TypeError, ValueError):
+            age_ms = None
+
     dets: List[Dict[str, Any]] = []
     if isinstance(inner_ts, dict):
         dets = inner_ts.get("detections") or []
@@ -221,7 +235,7 @@ def _sense_frame(
         score=score,
         cx_err=sx - cx,
         cy_err=sy - cy,
-        age_ms=None,
+        age_ms=age_ms,
     )
 
 
@@ -257,7 +271,7 @@ def track_chassis(
     # 控制律（2026-08-02 真机 cylinder_2/h_tu_dou 稳档：纯 P 振荡，所以 kp 保守 + slew 限幅）
     kp: float = 0.20,          # 比例增益（降 55% 防振荡）
     v_max: float = 0.12,        # 单向速度上限（绝对值，比前次 0.20 降 40%）
-    deadband: float = 0.08,     # cx/cy 误差都 < 死区 → 判到带内
+    deadband: float = 0.05,     # cx/cy 误差都 < 死区 → 判到带内
     hold_frames: int = 5,       # 连续 5 帧带内 → arrival（3 帧擦过不算）
     # 限速/平滑
     v_slew: Optional[float] = 0.02,     # 每帧 vx/vy 最多变 ±0.02 m/s（20Hz=0.4m/s²，不会爆冲）

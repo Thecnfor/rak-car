@@ -21,7 +21,43 @@ class RuntimeApiClient:
         # 2026-08-03：持久 Session = HTTP keep-alive。旧实现每请求 requests.request()
         # 新建 TCP 连接,50Hz 外环每次多付一个 RTT 的握手成本（~20-40ms LAN）。
         # Session 内部连接池线程安全（每次调用从池取连接）。
-        self._session = requests.Session()
+        self._session = self._build_session()
+
+    def _build_session(self):
+        """装配：连接池 + Retry。
+
+        改造点（不暴露给调用方）：
+          1) 给默认 adapter 挂 Retry：幂等 GET 自动重试 1 次，幂等 method
+             pool（HEAD/GET/OPTIONS）也覆盖。POST 等非幂等默认不重试，避免
+             重复下指令伤硬件。
+          2) pool_maxsize 调到 16，单 host 不会出现"pool full, use non-pooled
+             connection"那条 warning 偷跑（50Hz × 3 端点 = 150 req/s，外加
+             orchestrator/health 等并发，10 个连接偏紧）。
+          3) Retry 不抬高 connect timeout — 留给调用方的 _request(timeout=...)。
+        """
+        from requests.adapters import HTTPAdapter
+        from urllib3.util.retry import Retry
+
+        session = requests.Session()
+        retry = Retry(
+            total=1,
+            connect=1,
+            read=0,
+            redirect=0,
+            status=1,
+            allowed_methods=frozenset(["HEAD", "GET", "OPTIONS"]),
+            status_forcelist=(502, 503, 504),
+            backoff_factor=0.05,
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(
+            pool_connections=4,
+            pool_maxsize=16,
+            max_retries=retry,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
 
     @property
     def api_base(self):

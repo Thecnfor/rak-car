@@ -45,25 +45,90 @@ class RuntimeWsClient:
     def welcome(self):
         return self._welcome
 
+    # 2026-08-06：无创优化。
+    #   1) 预创建 socket + 启用 TCP keepalive（TCP_KEEPIDLE 5s, KEEPINTVL 1s,
+    #      KEEPCNT 3）—— Wi-Fi 抖动 / 对端进程崩溃导致半开连接时，OS 比应用层
+    #      早 ~9s 主动 RST。配合下面的 ping 线程，5s 内必能识别死链。
+    #   2) connect() 不再走 create_connection 直接连，先建 socket 再注入
+    #      websocket.connect 的 socket= 参数。
+    #   3) 一个 daemon 线程每 KEEPALIVE_INTERVAL_S 秒发 ping frame。starlette
+    #      / wsproto / h11 默认会自动回 pong（不需要服务端改动），但 pong
+    #      frame 不会进 _recv_json()（只 recv 一次文本帧），所以对正常请求
+    #      响应无干扰。
+    # 接口零变化：connect / close / _recv_json 签名不变。
+    _KEEPALIVE_INTERVAL_S = 5.0
+
+    def _build_keepalive_socket(self, host, port, timeout):
+        import socket as _socket
+        sock = _socket.create_connection((host, port), timeout=timeout)
+        sock.setsockopt(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)
+        if hasattr(_socket, "TCP_KEEPIDLE"):
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPIDLE, 5)
+        if hasattr(_socket, "TCP_KEEPINTVL"):
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPINTVL, 1)
+        if hasattr(_socket, "TCP_KEEPCNT"):
+            sock.setsockopt(_socket.IPPROTO_TCP, _socket.TCP_KEEPCNT, 3)
+        return sock
+
+    def _start_ping_thread(self):
+        import threading as _threading
+        if getattr(self, "_ping_thread", None) is not None and self._ping_thread.is_alive():
+            return
+        stop = _threading.Event()
+        self._ping_stop_event = stop
+        conn_ref = self._conn
+        interval = self._KEEPALIVE_INTERVAL_S
+
+        def _loop():
+            while not stop.wait(interval):
+                c = conn_ref
+                if c is None:
+                    return
+                try:
+                    c.ping(b"")
+                except Exception:
+                    return
+
+        self._ping_thread = _threading.Thread(
+            target=_loop, name="rak-car-ws-ping", daemon=True
+        )
+        self._ping_thread.start()
+
     def connect(self, timeout=None, force=False):
         if self._conn is not None and not force:
             return self._welcome
         self.close()
         timeout = self.settings.request_timeout if timeout is None else float(timeout)
-        self._conn = create_connection(self.ws_url, timeout=timeout)
+        from urllib.parse import urlparse
+        parsed = urlparse(self.ws_url)
+        if parsed.scheme not in ("ws", "wss"):
+            raise RuntimeError(f"ws_url 协议非法: {self.ws_url}")
+        host = parsed.hostname or "127.0.0.1"
+        port = parsed.port or (443 if parsed.scheme == "wss" else 80)
+        sock = self._build_keepalive_socket(host, port, timeout)
+        self._conn = create_connection(
+            self.ws_url, timeout=timeout, socket=sock
+        )
         self._conn.settimeout(timeout)
         welcome = self._recv_json()
         self._welcome = welcome
+        self._start_ping_thread()
         return welcome
 
     def close(self):
+        # 先停 ping 线程，避免它在 self._conn 已被置 None 后再调 ping()
+        stop = getattr(self, "_ping_stop_event", None)
+        if stop is not None:
+            stop.set()
         if self._conn is None:
+            self._ping_thread = None
             return
         try:
             self._conn.close()
         except Exception:
             pass
         self._conn = None
+        self._ping_thread = None
 
     def _recv_json(self):
         if self._conn is None:

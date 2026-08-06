@@ -228,6 +228,43 @@ class TestTrackChassis(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertIsNotNone(result.frames)
 
+    def test_watchdog_uses_updated_at_for_age(self):
+        """payload 带 updated_at 且超过 watchdog_ms → reason='watchdog' 且不再 arrived。
+
+        2026-08-06: 旧实现 age_ms 硬编码 None, watchdog 永远不触发; 现从
+        task_state.updated_at 计算 age_ms, 缓存陈旧时及时停。
+        """
+        import time
+        now = time.time()
+        stale_payload = {
+            "task_state": {
+                "active": True,
+                "detections": [_d(label="cylinder_set", cx=0.4, cy=0.0)],
+                # 5 秒前的快照, 远超 watchdog_ms=2000ms
+                "updated_at": now - 5.0,
+            }
+        }
+        api = _make_mock_api([stale_payload] * 5)
+        result = track_chassis(
+            "cylinder_set", api=api, hz=50, max_seconds=2.0,
+            kp=0.20, v_max=0.12, deadband=0.05, hold_frames=5,
+            max_lost_frames=200, dry_run=True,
+        )
+        self.assertFalse(result.arrived)
+        self.assertEqual(result.reason, "watchdog")
+        self.assertEqual(result.frames, 1)  # 第 1 帧就 watchdog 退出
+
+    def test_watchdog_skips_when_updated_at_missing(self):
+        """payload 没 updated_at → age_ms=None, watchdog 不参与 (向后兼容单测 / 老 runtime)。"""
+        seq = [(0.0, 0.0)] * 30
+        api = _make_mock_api(_step_payloads(seq, label="cylinder_set"))
+        result = track_chassis(
+            "cylinder_set", api=api, hz=200, max_seconds=2.0,
+            kp=0.20, v_max=0.12, deadband=0.05, hold_frames=3,
+            max_lost_frames=50, dry_run=True,
+        )
+        self.assertTrue(result.arrived, result)
+
 
 if __name__ == "__main__":
     unittest.main()

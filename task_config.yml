@@ -70,14 +70,13 @@ task_cfg:
     # 2026-08-03 00:07: 统一 place x=-265, 不再按 label 覆盖
     # place_x_overrides: {}
 
-    # 2026-08-02: pick 前视觉对齐底盘 (用户自己写 _chassis_align_by_area,
-    # 用 set_chassis_velocity 经 IK, 不像 VisualAlignRunner 那样旋转).
+    # 2026-08-02 起的 PLACE 对齐: track_chassis("cylinder_set") 把 set 拉到画面中心
+    # (setpoint (0,0) = 画面中心)。控制律参数走 track_chassis 模块默认 (现场 2026-08-02 验证)。
+    # 2026-08-06: 失败自动重试 1 次 (用户决策), 仍超时则 ERROR 告警但放行。代码只读 enabled + max_seconds,
+    # 其他字段 (ref_area/v_max/label) 此前是 _chassis_align_by_area 残留, 删除防止"配置撒谎"。
     chassis_align:
       enabled: true         # 启用 — 经 IK 的 set_chassis_velocity 路径
-      ref_area: 1.10        # 2026-08-02 实测 PLACE 姿态 / x=-270 / 距离 T 列约 30cm: cylinder_set bbox area ≈ 1.12
-      label: null           # auto
-      v_max: 0.20
-      max_seconds: 12.0
+      max_seconds: 12.0     # 单次预算; task1_seeding.py 失败重试 1 次, 总上限 ~24s
 
   water_tower_task:
     _doc: |
