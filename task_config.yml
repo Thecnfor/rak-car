@@ -89,12 +89,12 @@ task_cfg:
 
     source_position_order: [1, 2]
 
-    tower_spacing_m: 0.68        # 2026-08-06: 0.66 → 0.68 (实测两塔间距)
-    group_forward_m: 0.35        # 2026-08-06: 0.33 → 0.35 (tower 1 前向组间距)
+    tower_spacing_m: 0.43       # 2026-08-06: 0.66 → 0.68 (实测两塔间距); 2026-08-06: 0.68 → 0.70 → 0.58 → 0.50 → 0.43
+    group_forward_m: 0.35        # 2026-08-06: 0.33 → 0.35 (tower 1 前向组间距); 2026-08-06: 0.35 → 0.37
     group_backward_m: 0.33       # 2026-08-06: tower 2 后向用 0.33 (3 块回退距离, 不走 0.35)
 
-    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 后退 0.2m 再 cam2 检测)
-    detect_retry_step_m: -0.20
+    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前进 0.1m 再 cam2 检测)
+    detect_retry_step_m: 0.10
     detect_retry_max: 2
 
     init_pose:
@@ -105,9 +105,9 @@ task_cfg:
 
     detection_pose:
       x_mm: -200                # 2026-08-04: -240 → -200 (init X 起始位置)
-      arm_angle_deg: -95
+      arm_angle_deg: -92        # 2026-08-06: -95 → -92 (检测 + 投放大臂同角)
       hand_angle_deg: -60
-      y_mm: -20
+      y_mm: -10                 # 2026-08-06: -20 → -10 (抬高 10mm, 看清等级标)
 
     first_cube_x_mm: -165
     # 2026-08-04: 第二块 X 从 -265 改 -210 (用户实测摆放位置).
@@ -120,7 +120,7 @@ task_cfg:
       # 2026-08-04 实测: 底盘真对齐时 cam2 看到的 water 等级标在 (0.345, 0.243),
       # 不是画面中心. 这是 cam2 相对车体中线的安装偏移. 闭环要让 chassis 把
       # 等级标拉到这一点, 而不是 (0,0). 5 帧 x 锁死 0.3453, y 在 0.242~0.244 抖动.
-      setpoint_cxcy: [0.136, 0.308]  # 2026-08-06: 重测 (cx=0.345→0.136, cy=0.243→0.308)
+      setpoint_cxcy: [0.148, 0.234]  # 2026-08-06: 重测 (cx=0.345→0.136→0.123→0.148, cy=0.243→0.308→0.259→0.234, 大臂 -92° 重测)
       # 2026-08-06 试开 vy 横移闭环 (车不在道中央时让 track_chassis 自纠横向)
       vx_only: true                # 2026-08-06: 关闭 vy, 只让底盘前后调
       # 轴符号: -1/+1 是 2026-08-02 cylinder 标定值。水塔实测方向反了 →
@@ -140,11 +140,10 @@ task_cfg:
       max_seconds: 6.0
 
     # 同一水塔内第 1/2/3 块的投放 Y 深度梯度 (避免堆叠碰撞)
-    # 2026-08-06: -40/-60/-80 → -10/-55/-75 (用户新规定)
-    deliver_y_by_index: [-10, -55, -75]
-    # 同一水塔内第 1/2/3 块的投放手爪角度梯度 (2026-08-06 用户新规定)
-    # 第 1 块 -60°, 第 2 块 -70°, 第 3 块 -80° (越深越前倾, 适配堆叠)
-    deliver_hand_by_index: [-60, -70, -80]
+    # 2026-08-06: -40/-60/-80 → -10/-55/-75 → 0/-50/-75 → 0/-45/-70 (用户新规定)
+    deliver_y_by_index: [0, -45, -70]
+    # 同一水塔内第 1/2/3 块的投放手爪角度 (2026-08-06 统一改为 -80°, 不再梯度)
+    deliver_hand_by_index: [-80, -80, -80]
 
     pick_pose:
       # 2026-08-04: 抓取 init 姿态 (S 形态, 视觉伺服起点).
@@ -173,7 +172,8 @@ task_cfg:
       # 下, 水方块 bbox 中心在 cam2 画面 (0.0875, -0.236), 5 帧锁死. 换 cam2 安装位
       # 或换车体必须重测 (放水方块在 x=-150 正下方, 跑
       # `curl -X POST -H "Content-Type: application/json" -d '{}' http://<JETSON_IP>:5050/v1/vision/task`).
-      setpoint_cxcy: [0.0875, -0.236]  # cam2 安装偏移 (label=water 标定, [-1, +1] 中心化)
+      # 2026-08-06: 20 帧锁死实测均值 (cx=0.063, cy=-0.202), 抖动 < 2px
+      setpoint_cxcy: [0.063, -0.202]  # cam2 安装偏移 (label=water 标定, [-1, +1] 中心化); 2026-08-06 重测 20 帧均值 → (cx=0.063, cy=-0.202)
       servo_y_mm: -150          # 视觉伺服起始 Y (与 pick_pose.y_transition_mm 对齐)
       grasp_y_mm: -50           # 吸附高度 (2026-08-04: -75 → -50, 抓时更贴方块)
       descend_hand_deg: 0       # 2026-08-04: 下降到位后手爪转 0° (吸嘴朝下贴方块顶面)
@@ -193,16 +193,16 @@ task_cfg:
       arm_min: 60               # 大臂 +95° ±35° clamp; 给 PID 足够余量
       arm_max: 130              # 大臂 +95° ±35° clamp
       settle_hits: 4            # 2026-08-06: 3 → 2 → 4 (连续 4 帧死区即锁, 放宽+严帧数)
-      hold_s: 0.02              # 2026-08-06: 0.05 → 0.02 (吸附保持时间压缩)
+      hold_s: 0.0               # 2026-08-06: 0.05 → 0.02 → 0.0 (grasp 后立即抬, 不 sleep)
 
     carry_pose:
-      x_mm: -110                # 2026-08-06: -105 → -100 → -110
-      arm_angle_deg: -95
+      x_mm: -115                # 2026-08-06: -105 → -100 → -110 → -115 (投放位伸出更远)
+      arm_angle_deg: -92        # 2026-08-06: -95 → -92 (对标 detection 大臂角度)
       hand_angle_deg: -90
 
     v_max_arm_x_mms: 80
 
-    vacuum_settle_s: 0.2            # 2026-08-06: 0.5 → 0.2 (吸气等待压缩, 实测够用)
+    vacuum_settle_s: 0.0            # 2026-08-06: 0.5 → 0.2 → 0.0 (删除 sleep, grasp 后立即下一步)
     chassis_move_timeout_s: 30
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
@@ -245,7 +245,24 @@ waypoints:
     ir_threshold_right_m: 0.60    # 右 IR: 0.6m 内触发
     dis_at_least_m: null           # 2026-08-06: 不在基地开始测, dis 不参与触发
     trigger_op: AND              # ir_ok AND True = 只看 IR
-    settle_before_pause_s: 1.5   # 2026-08-06: 出弯后让外环多跑 1.5s 把车拉直
+    # 2026-08-06: 出弯后沿中心车道线直行 1.5s (走 move_along_lane, vy=0 + ω 锁对齐),
+    # 然后停 1s, 再沿车道后退 0.2m (弯道出口往回拉, 让 IR 重触发位置对齐工作位姿).
+    settle_forward_s: 1.5        # 沿车道直行 1.5s (替代旧 settle_before_pause_s 的 time.sleep)
+    settle_forward_speed_mps: 0.15
+    back_off_delay_s: 1.0       # 停 1s (避免前后冲击, 底盘减速 + 车物理稳定)
+    back_off_m: 0.1              # 2026-08-06: 沿车道后退 0.1m (走 move_along_lane, 不偏, 用户改 0.2→0.1)
+    back_off_speed_mps: 0.10    # 后退速度
+
+  # ----- task3_shoot (2026-08-06 拆分, 跟在 task2 后面, 读识别 json + 射击) -----
+  - name: task3_shoot
+    task_id: 8
+    task_module: main.task.task3_shoot
+    # 触发靠 dis_at_least_m, IR 不参与 (跟 task1_ir 类似, 远距离触发靠 dis)
+    # dis 数值需实测: 应该是从基地沿巡线路径到射击区位的累计距离.
+    ir_threshold_m: null
+    ir_side: any
+    dis_at_least_m: 14.0         # TODO: 实车标定, 沿巡线从基地到射击区位的距离
+    trigger_op: AND
 
   # ----- task4 -----
   - name: task4_harvest

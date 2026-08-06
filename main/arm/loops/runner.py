@@ -624,40 +624,36 @@ class ArmRunner:
 
         # 对齐完成 → y 降 0 → mode=pick 吸气 / mode=drop 释放
         # 用户 00:45: 缩短 timeout, 吸住后立即抬离, 低延迟!
-        # 2026-08-03 优化: 三个动作 (move_y+grasp+move_y) 改成 sync=False 并发提交,
-        # 然后 wait_job 各自等。三次串行 sync HTTP (>=0.5s×3 = 1.5s) -> 并发只需等
-        # 最长的那一个 (~max(move_y 物理 ~0.3s, grasp <0.1s) + poll ~0.1s)。
+        # 2026-08-06: hand 转 0° + y 下降并发 (1 次 composite_run 4 轴), 不等手爪到位
+        # 串行 set_hand_angle(~0.3-0.5s) + move_y(~0.3s) → 并发只等 move_y ~0.3s.
+        # 用户 (2026-08-06) 实测: 手爪 -10°→0° 时 Y 同时降, 吸嘴在最低点前已经 0°
+        # (因为 Y 物理 ~0.3s << 手爪 ~0.5s), 安全.
+        # 删除所有 sleep: hold_s 直接 0, vacuum_settle_s 走 cfg 0.
         try:
-            # 2026-08-04: 视觉对齐后, 先转手爪到 descend_hand_deg, 再下降 y.
-            # 顺序原因: 下降时吸嘴必须已经朝下 (0°), 否则 -10° 的倾斜吸嘴触到
-            # 方块顶面会推开它 (侧向力). 转手爪是同步等物理到位 (~0.3-0.5s).
-            # 设为 None 时跳过, 维持 hand_start (旧行为).
-            if descend_hand_deg is not None:
-                logger.info("track_velocity_pick: 手爪转 %.0f° (descend_hand, 在 move_y 之前)",
-                            descend_hand_deg)
-                self.client.set_hand_angle(
-                    float(descend_hand_deg), speed=80, timeout=5.0)
-
-            # 1) 提交 move_y(0) (同步落地)
+            # 1) hand + y 并发 (1 次 composite_run 4 轴: hand + y)
             target_m = float(grasp_y_mm) / 1000.0
-            logger.info("track_velocity_pick: 开始 grasp 段, mode=%s move_y(%.0fmm=%.4fm)",
+            logger.info("track_velocity_pick: 开始 grasp 段, mode=%s hand+y 并发 (move_y=%.0fmm=%.4fm)",
                         mode, grasp_y_mm, target_m)
+            hand_param = float(descend_hand_deg) if descend_hand_deg is not None else None
             job_y_down = self.client.http.execute(
-                "arm", "move_y_position",
-                kwargs=dict(target=target_m, timeout=5.0),
+                "arm", "composite_run",
+                kwargs=dict(
+                    arm=None, x=None,
+                    y=target_m,
+                    hand=hand_param,
+                    speed=100, timeout=5.0,
+                ),
                 sync=False,
             )
             jid_y_down = job_y_down.get("id") if isinstance(job_y_down, dict) else None
-            logger.info("  move_y(%.4fm) job_id=%s", target_m, jid_y_down)
+            logger.info("  hand+y 并发 job_id=%s", jid_y_down)
 
-            # 2) 等 y 到位后才发 grasp/drop (否则可能早开阀门)
-            # 2026-08-03 修复: 3s 不够, 物理从 -100 走到 0 要 2-3s, 之前 timeout 触发 raise 时
-            # 吸嘴已经触底但 grasp 没发, 物体没吸住 -> 主循环走兜底底盘移动就把物体拖走。
+            # 等 y 到位 (grasp 必须等 y 到位才能开阀门, 否则吸嘴没到方块就开阀门)
             if jid_y_down:
                 self.client.http.wait_job(jid_y_down, timeout=5.0)
             steps["lower"] = True
 
-            # 3) grasp/drop 是电平动作, ~100ms 即完成
+            # 2) grasp/drop 是电平动作, ~100ms 即完成
             if mode == "drop":
                 logger.info("  drop_object()")
                 self.client.drop_object()
@@ -667,22 +663,22 @@ class ArmRunner:
                 self.client.grasp(True, timeout=5.0)
                 steps["suck"] = True
 
-            if hold_s > 0:
-                time.sleep(hold_s)
+            # 删除 hold_s sleep (用户 2026-08-06: grasp 后立即下一步, 不要停顿)
 
-            # 4) 抬回 y_start 异步提交, 不阻塞返回 (lift_back 是 fire-and-forget)
+            # 3) 抬回 y_start (lift_back) — 用户 2026-08-06: 不要停顿, fire-and-forget
+            # wait_job 不阻塞返回, 下游立刻可继续 X 移动.
             if lift_back:
                 try:
                     target_m_up = float(y_start) / 1000.0
-                    logger.info("  move_y(%.4fm) 抬回", target_m_up)
+                    logger.info("  move_y(%.4fm) 抬回 fire-and-forget", target_m_up)
                     job_lift = self.client.http.execute(
-                        "arm", "move_y_position",
-                        kwargs=dict(target=target_m_up, timeout=5.0),
+                        "arm", "composite_run",
+                        kwargs=dict(arm=None, x=None, y=target_m_up,
+                                    hand=None, speed=100, timeout=5.0),
                         sync=False,
                     )
                     jid_lift = job_lift.get("id") if isinstance(job_lift, dict) else None
-                    if jid_lift:
-                        self.client.http.wait_job(jid_lift, timeout=5.0)
+                    # fire-and-forget: 不 wait_job, 立即返回. 下游 X 移动并发.
                     steps["lift"] = True
                 except Exception:
                     steps["lift"] = False

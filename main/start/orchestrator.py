@@ -54,9 +54,22 @@ class Waypoint:
         trigger_op:     "AND" (默认,严格防误触) / "OR".
         pause_before_s: 触发后、调 task 前的停顿.
         pause_after_s:  任务跑完、恢复巡线前的停顿.
-        settle_before_pause_s: trigger 满足后、pause 外环前的等待.
+        settle_before_pause_s: trigger 满足后、pause 外环前的等待 (旧版, 仅 sleep).
             这段时间 lane 外环继续跑,把车从弯道偏航 / 偏横向状态拉直.
-            用于 trigger 紧接弯道出口的任务 (如 task2 出弯后车身偏左+车头偏航).
+            新代码优先用 settle_forward_s (走 move_along_lane 沿车道直行).
+        settle_forward_s: trigger 满足后, 沿中心车道线直行 N 秒 (走 move_along_lane,
+            vy=0 + ω 锁对齐, 不偏航). 替代 settle_before_pause_s 的功能, 但走
+            chassis 控制器而不是 time.sleep 让外环自由跑.
+            默认 0.0 = 不直行 (旧行为).
+        settle_forward_speed_mps: 直行速度 (m/s), 正值. 默认 0.15.
+        back_off_m:     settle 完成后沿车道线向后移动的距离 (m).
+            >0 时, 走 move_along_lane(vx=-back_off_speed_mps, distance_m=back_off_m)
+            沿车道后退 (不偏). 替代原 move_for(物理后退, 弯道会偏).
+            默认 0.0 = 不后退.
+        back_off_speed_mps: 后退速度 (m/s, 正值). 默认 0.10.
+        back_off_delay_s: settle 跑完和 back_off 后退之间的停顿 (s).
+            给底盘减速 + 车物理稳定的时间, 避免前进→后退直接切换冲击底盘.
+            默认 0.0 = 不停顿.
         is_finish:      True = 这是终点 (里程计达到即整个流程结束).
     """
     name: str
@@ -71,6 +84,11 @@ class Waypoint:
     pause_before_s: float = 0.0
     pause_after_s: float = 0.0
     settle_before_pause_s: float = 0.0
+    settle_forward_s: float = 0.0
+    settle_forward_speed_mps: float = 0.15
+    back_off_m: float = 0.0
+    back_off_speed_mps: float = 0.10
+    back_off_delay_s: float = 0.0
     is_finish: bool = False
 
 
@@ -98,6 +116,10 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
     Waypoint("task7_deliver",     task_id=7,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=14.5, trigger_op="AND"),
+    Waypoint("task3_shoot",       task_id=8,
+             # 2026-08-06 拆分: task3 识别 + task3_shoot 射击, 中间放 task2.
+             # 实际位置由用户在 task_config.yml 里调 (跟在 task2 之后).
+             ir_threshold_m=None, dis_at_least_m=15.5, trigger_op="AND"),
     # 终点: 里程计达到 16.5m → 整个流程结束
     Waypoint("cruise_done",       ir_threshold_m=None,
              dis_at_least_m=16.5, is_finish=True),
@@ -146,6 +168,11 @@ class Orchestrator:
                 dis_at_least_m=w.get("dis_at_least_m"),
                 trigger_op=w.get("trigger_op", "AND"),
                 settle_before_pause_s=w.get("settle_before_pause_s", 0.0),
+                settle_forward_s=w.get("settle_forward_s", 0.0),
+                settle_forward_speed_mps=w.get("settle_forward_speed_mps", 0.15),
+                back_off_m=w.get("back_off_m", 0.0),
+                back_off_speed_mps=w.get("back_off_speed_mps", 0.10),
+                back_off_delay_s=w.get("back_off_delay_s", 0.0),
                 is_finish=w.get("is_finish", False),
             ))
         wp_summary = ", ".join(
@@ -246,13 +273,56 @@ class Orchestrator:
                 logger.info("=== navigating to %s ===", wp.name)
                 self._wait_until_triggered(wp, api, dis_buf, tui_buf,
                                            interval_s=self.ir_interval_s)
-                # settle_before_pause_s: trigger 满足后不立刻 pause 外环,
-                # 让 lane-following 多跑一会把车身 + 车头拉直.
-                # 出弯后触发任务用 (e.g. task2 出弯车身偏左+车头偏航).
-                if wp.settle_before_pause_s > 0:
+                # 触发后立即 pause 后台 lane 巡线 runner (settle_forward/back_off
+                # 要新建自己的 DoubleLoopRunner, 跟后台 A 的 runner 共享 lane_feed
+                # 但各自独立发轮速, 必须先 pause 否则两个 runner 互相打架 "原地抽搐".
+                self._pause_lane(runner, api)
+                # settle_forward_s: 沿中心车道线直行 N 秒 (走 move_along_lane,
+                # vy=0 + ω 锁对齐, 不偏航). 用户 2026-08-06 规定: task2 出弯后
+                # 沿车道直行 1.5s 拉直车身/车头, 不再让外环自由跑 (会偏).
+                # 默认 0 = 不直行.
+                if wp.settle_forward_s > 0:
+                    logger.info("[settle_forward] %s 沿车道直行 %.2fs @ %.2fm/s",
+                                wp.name, wp.settle_forward_s,
+                                wp.settle_forward_speed_mps)
+                    try:
+                        from main.chassis import move_along_lane
+                        move_along_lane(
+                            vx=float(wp.settle_forward_speed_mps),
+                            max_seconds=float(wp.settle_forward_s),
+                        )
+                    except Exception as exc:
+                        logger.warning("[settle_forward] %s 失败 (%s), 继续",
+                                       wp.name, exc)
+                elif wp.settle_before_pause_s > 0:
+                    # 旧版: time.sleep 让外环继续跑 (可能偏航, 向后兼容).
                     logger.info("[settle] %s 外环多跑 %.2fs 拉直车身/车头",
                                 wp.name, wp.settle_before_pause_s)
                     time.sleep(wp.settle_before_pause_s)
+                # back_off_m: settle 完成后底盘后退 (m).
+                # 用户 2026-08-06 实测决定: 跟 detect_retry_step_m 一样走 move_for
+                # (SDK 字节流 4 轮等速倒), 不是 move_along_lane. 因为后退距离短 (0.2m),
+                # 出弯后位置已知, 不需要走视觉对齐的 move_along_lane.
+                if wp.back_off_m > 0:
+                    # back_off_delay_s: settle 跑完和后退之间的停顿.
+                    if wp.back_off_delay_s > 0:
+                        logger.info("[back_off] %s settle→后退停顿 %.2fs",
+                                    wp.name, wp.back_off_delay_s)
+                        time.sleep(wp.back_off_delay_s)
+                    logger.info("[back_off] %s 底盘后退 %.2f m", wp.name, wp.back_off_m)
+                    try:
+                        # 仿 detect_retry 走 move_for (跟 _chassis_move_for 一致):
+                        # sync=False + wait_job, 走 car_queue, SDK SerialEngine 调度.
+                        job = client.execute_car_action(
+                            "move_for", [-wp.back_off_m, 0.0, 0.0],
+                            timeout=10.0, sync=False,
+                        )
+                        jid = job.get("id") if isinstance(job, dict) else None
+                        if jid:
+                            client.wait_job(jid, timeout=10.0)
+                    except Exception as exc:
+                        logger.warning("[back_off] %s 失败 (%s), 继续",
+                                       wp.name, exc)
                 if wp.is_finish:
                     logger.info("finish waypoint reached (dis=%.2fm), mission done",
                                 dis_buf[0])
@@ -261,7 +331,8 @@ class Orchestrator:
                                   "state": "done"}
                     completed.append(wp.name)
                     break
-                self._pause_lane(runner, api)
+                # 注意: _pause_lane 已经在 trigger 满足后立即调过 (settle_forward/
+                # back_off 之前), 这里不再重复 pause (幂等但冗余).
                 time.sleep(wp.pause_before_s)
                 if wp.task_module:
                     tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
@@ -316,7 +387,7 @@ class Orchestrator:
         """单任务独立测试模式：只巡线到一个任务点位，触发后执行该任务，然后停止。
 
         Args:
-            task_id: 任务编号 1-7。
+            task_id: 任务编号 1-8 (8=task3_shoot, 2026-08-06 拆分).
         """
         wp = next((w for w in self.waypoints if w.task_id == task_id), None)
         if wp is None:
