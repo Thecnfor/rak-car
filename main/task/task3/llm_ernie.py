@@ -154,6 +154,14 @@ def _parse_verdict(content: str) -> dict:
     return {"name": "unknown", "result": None, "analysis": f"unparseable: {content[:200]}"}
 
 
+def _is_rate_limited(text):
+    """aistudio 限流时返回 403 + errorCode 500 / “访问过于频繁” 等提示。"""
+    return any(
+        k in (text or "")
+        for k in ("过于频繁", "频繁", "稍候再试", "rate limit", "too many", "限流")
+    )
+
+
 def call_vision(
     token: str,
     image_url: str,
@@ -185,28 +193,36 @@ def call_vision(
     headers = _auth_header(token)
 
     last_err = ""
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             resp = requests.post(ERNIE_CHAT_URL, headers=headers, json=body, timeout=timeout)
         except requests.Timeout:
             last_err = "timeout"
-            time.sleep(1.5)
+            time.sleep(1.5 * (attempt + 1))
             continue
         except requests.RequestException as exc:
             last_err = str(exc)
-            time.sleep(1.5)
+            time.sleep(1.5 * (attempt + 1))
             continue
 
-        if resp.status_code in (401, 403):
+        if resp.status_code == 401:
+            # 401 = 鉴权真失败（token 无效/过期），重试无意义
             print(
-                f"[fatal] ERNIE {resp.status_code} - token invalid or expired\n"
+                f"[fatal] ERNIE 401 - token invalid or expired\n"
                 f"  endpoint: {ERNIE_CHAT_URL}\n  body: {resp.text[:200]}",
                 file=sys.stderr,
             )
             sys.exit(2)
+        if resp.status_code == 403:
+            # aistudio 限流也返回 403；启动期 health 已验过 token，
+            # 中途 403 基本是限流 → 退避重试，重试耗尽返回 unknown 继续流程
+            reason = "rate-limited" if _is_rate_limited(resp.text) else "forbidden"
+            last_err = f"HTTP 403 {reason} ({resp.text[:100]})"
+            time.sleep(2.0 * (attempt + 1))
+            continue
         if resp.status_code == 429 or resp.status_code >= 500:
             last_err = f"HTTP {resp.status_code}"
-            time.sleep(1.5)
+            time.sleep(1.5 * (attempt + 1))
             continue
         if not resp.ok:
             return {

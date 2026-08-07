@@ -7,7 +7,7 @@ r"""main/task/task3/shoot_target.py - 智能车射击任务 (2026-08-03 完全�
 - 起点 cam 视野可能只看到 2~3 只目标,从能看到的开始 L→R 依次为 #1 #2 #3 #4
 - 用户指定要射的目标编号 (--targets "1 3 4"),可对 yaw 微调对准
 - 若没击倒 → 前后调整位置 或 调整 yaw → 继续射,直至击倒 或 射击次数超过 5 次
-- 若成功击倒 → 向前移动 8cm 到下一个目标的射击点
+- 若成功击倒 → 沿车道前进 16cm 到下一个目标的射击点
 - 击倒完最后一个目标后停止移动
 - 记录击倒的是第几个目标,不要将其他目标重新记为这个目标
 
@@ -154,9 +154,7 @@ class TargetIdentityMatcher:
 
 # 几何
 N_TOTAL_BOARDS = 4                 # 板上总数 (用户硬约束)
-BOARD_SPACING_M = 0.08             # adjacent target boards are 8cm apart
-                                   # 实测: 板宽 8cm + 间距 8cm → 中心距 16cm
-                                   # 从 #1 前进到 #3 需 2 × 16 = 32cm (用户实测)
+BOARD_SPACING_M = 0.16             # 板宽 8cm + 间距 8cm → 中心距 16cm
 TARGET_BOARD_WIDTH_M = 0.08        # 板宽度 8cm (用户硬约束)
 
 # 算法阈值
@@ -181,14 +179,18 @@ YAW_K = 0.6                        # yaw 增益 (实测需要保守一点)
 POSITION_ADJUST_M = 0.04           # 位置微调 4cm
 HIT_GRACE_S = 0.3                  # 射击后等多久再检测命中 (实测电磁阀响应 < 200ms)
 POST_YAW_RELOCK_TOL = 0.12         # yaw 后重新锁定同一目标的观察容差
+PRE_SHOT_AIM_TOL = 0.05             # 开火前允许的残余水平误差
+PRE_SHOT_REFINE_STEPS = 5           # 首次 yaw 后最多再精修五次
 CONFIRM_IDENTITY_MIN_TOL = 0.07    # 命中确认时避免吸附到相邻目标
 CONFIRM_IDENTITY_MAX_TOL = 0.14
 
 # 重试
-DETECT_RETRIES = 3
-DETECT_DELAY_S = 0.1
-DETECT_LOST_RETRIES = 4
-DETECT_LOST_DELAY_S = 0.2
+DETECT_RETRIES = 2
+DETECT_DELAY_S = 0.05
+DETECT_LOST_RETRIES = 2
+DETECT_LOST_DELAY_S = 0.08
+POST_YAW_RETRIES = 1
+POST_YAW_DELAY_S = 0.03
 
 # 推进
 DRIVE_STEP_TIMEOUT_PER_M = 20
@@ -218,17 +220,61 @@ def car_call(client, name, *args, timeout=10.0, **kwargs):
 
 
 def drive_forward(client, distance_m, label=""):
-    """沿车头方向直行 distance_m 米 (正=前, 负=后)。"""
+    """射击区沿车道前后移动；lane 不可用时回退到 move_for。"""
     if abs(distance_m) < 0.005:
         return
     direction = "前" if distance_m > 0 else "后"
     print(f"  [drive] {direction} {abs(distance_m) * 100:.1f}cm ({label})",
           flush=True)
+    before = None
+    progress_m = 0.0
     try:
-        car_call(client, "move_for", [distance_m, 0.0, 0.0],
-                 timeout=max(5, abs(distance_m) * DRIVE_STEP_TIMEOUT_PER_M))
+        from main.chassis.config import LANE_FOLLOW
+        from main.chassis.controllers import move_along_lane
+        try:
+            before = (client.get_odom_state() or {}).get("odom_state", {}).get("distance")
+            lane_state = client.get("/v1/vision/lane/state") or {}
+        except Exception:
+            lane_state = {"last_error": "lane state unavailable"}
+        lane_error = lane_state.get("last_error")
+        if lane_error:
+            print(f"  [drive] lane unavailable ({lane_error}); move_for fallback",
+                  file=sys.stderr, flush=True)
+            raise RuntimeError("lane unavailable")
+        move_along_lane(
+            vx=0.12 if distance_m > 0 else -0.12,
+            distance_m=abs(distance_m),
+            profile=LANE_FOLLOW.tuned(watchdog_ms=None),
+            max_seconds=max(5.0, abs(distance_m) / 0.12 * 3.0 + 2.0),
+        )
+        after = (client.get_odom_state() or {}).get("odom_state", {}).get("distance")
+        if before is not None and after is not None:
+            progress_m = max(0.0, float(after) - float(before))
+        if (before is not None and after is not None
+                and float(after) < float(before) + abs(distance_m) * 0.25):
+            raise RuntimeError("move_along_lane made insufficient progress")
     except Exception as e:
-        print(f"  [drive err] {e}", file=sys.stderr)
+        if before is not None:
+            try:
+                after = (client.get_odom_state() or {}).get("odom_state", {}).get("distance")
+                if after is not None:
+                    progress_m = max(progress_m, max(0.0, float(after) - float(before)))
+            except Exception:
+                pass
+        remaining_m = max(0.0, abs(distance_m) - progress_m)
+        print(
+            f"  [drive] fallback move_for: {e}; "
+            f"remaining={remaining_m * 100:.1f}cm",
+            file=sys.stderr,
+            flush=True,
+        )
+        if remaining_m >= 0.005:
+            car_call(
+                client,
+                "move_for",
+                [math.copysign(remaining_m, distance_m), 0.0, 0.0],
+                timeout=max(5, remaining_m * DRIVE_STEP_TIMEOUT_PER_M),
+            )
 
 
 def adjust_yaw(client, deg, label=""):
@@ -380,7 +426,8 @@ def shoot_one_attempt(client, first_xc, shot_i):
         shot_i: 第几发 (1-based)
 
     Returns:
-        (hit: bool, yaw_used_deg: float, lost_identity: bool)
+        (hit: bool, yaw_used_deg: float, lost_identity: bool,
+         latest_xc: float | None)
     """
     # re-detect with retry (给 yolo 多帧机会避免漏检)
     animals_before = get_animals_retry(client, MIN_YOLO_SCORE,
@@ -389,7 +436,7 @@ def shoot_one_attempt(client, first_xc, shot_i):
                                        delay=DETECT_DELAY_S)
     if not animals_before:
         print(f"    [s{shot_i}] cam 视野空, 放弃这只", flush=True)
-        return False, 0.0, True
+        return False, 0.0, True, None
 
     n_before = len(animals_before)
     sorted_animals = sorted(animals_before, key=bbox_xc)
@@ -434,12 +481,12 @@ def shoot_one_attempt(client, first_xc, shot_i):
                       flush=True)
             elif n_before == 0:
                 print(f"    [s{shot_i}] ✗ cam 视野完全空, 放弃这只", flush=True)
-                return False, 0.0, True
+                return False, 0.0, True, None
             else:
                 print(f"    [s{shot_i}] ✗ LOCK 失败 (±{LOCK_XC_TOL}) 且松搜索 "
                       f"(±{CONFIRM_XC_TOL}) 也无 detection, 放弃本发",
                       flush=True)
-                return False, 0.0, True   # lost_id (不再当 HIT)
+                return False, 0.0, True, None   # lost_id (不再当 HIT)
 
     shot_anchor_xc = cur_xc            # 冻结本发 anchor
     shot_anchor_score = target.get("score", 0.0)
@@ -457,10 +504,12 @@ def shoot_one_attempt(client, first_xc, shot_i):
 
     # yaw 后重新读取一次画面, 让命中确认使用开火瞬间的目标位置。
     # 这里只更新识别锚点, 不改变已有 yaw/移动/射击参数。
-    post_yaw_animals = get_animals_retry(
-        client, MIN_YOLO_SCORE, label=f"shot{shot_i} post-yaw",
-        retries=2, delay=0.05,
-    )
+    post_yaw_animals = []
+    if abs(yaw_used) >= 0.3:
+        post_yaw_animals = get_animals_retry(
+            client, MIN_YOLO_SCORE, label=f"shot{shot_i} post-yaw",
+            retries=POST_YAW_RETRIES, delay=POST_YAW_DELAY_S,
+        )
     if post_yaw_animals:
         expected_xc = (
             shot_anchor_xc
@@ -483,12 +532,65 @@ def shoot_one_attempt(client, first_xc, shot_i):
             shot_anchor_xc = bbox_xc(post_target)
             shot_anchor_score = post_target.get("score", 0.0)
             shot_anchor_yc = bbox_yc(post_target)
+            cur_xc = shot_anchor_xc
             print(
                 f"    [s{shot_i}] yaw 后重新锁定目标 "
                 f"xc={shot_anchor_xc:+.3f}, "
                 f"view={[f'{x:+.2f}' for x in reference_xcs]}",
                 flush=True,
             )
+
+    # 第一次 yaw 受单步角度上限约束；残余误差较大时再做一次精修，
+    # 避免使用 yaw 前的旧 xc 开火。
+    for refine_i in range(PRE_SHOT_REFINE_STEPS):
+        residual = shot_anchor_xc - AIM_TARGET_XC
+        if abs(residual) <= PRE_SHOT_AIM_TOL:
+            break
+        refine_needed = -residual * YAW_HFOV_DEG * YAW_K * YAW_SIGN
+        refine_used = adjust_yaw(
+            client, refine_needed, label=f"s{shot_i} aim-refine{refine_i + 1}",
+        )
+        yaw_used += refine_used
+        if abs(refine_used) < 0.1:
+            break
+        refined_animals = get_animals_retry(
+            client, MIN_YOLO_SCORE, label=f"shot{shot_i} refine",
+            retries=POST_YAW_RETRIES, delay=POST_YAW_DELAY_S,
+        )
+        if not refined_animals:
+            break
+        expected_xc = shot_anchor_xc + refine_used * YAW_SIGN / (
+            YAW_HFOV_DEG * max(abs(YAW_K), 0.1)
+        )
+        refined_target = min(
+            refined_animals, key=lambda a: abs(bbox_xc(a) - expected_xc)
+        )
+        if abs(bbox_xc(refined_target) - expected_xc) > POST_YAW_RELOCK_TOL:
+            break
+        post_sorted = sorted(refined_animals, key=bbox_xc)
+        reference_xcs = [bbox_xc(a) for a in post_sorted]
+        target_index = min(
+            range(len(post_sorted)),
+            key=lambda i: abs(bbox_xc(post_sorted[i]) - bbox_xc(refined_target)),
+        )
+        shot_anchor_xc = bbox_xc(refined_target)
+        cur_xc = shot_anchor_xc
+        shot_anchor_score = refined_target.get("score", 0.0)
+        shot_anchor_yc = bbox_yc(refined_target)
+        print(f"    [s{shot_i}] 精修后锁定目标 xc={shot_anchor_xc:+.3f}",
+              flush=True)
+
+    err = cur_xc - AIM_TARGET_XC
+
+    # 未达到开火精度时不发射。当前 xc 会返回给下一发，避免位置微调后
+    # 继续使用本发之前的旧坐标。
+    if abs(err) > PRE_SHOT_AIM_TOL:
+        print(
+            f"    [s{shot_i}] aim 未收敛: err={err:+.3f} "
+            f">{PRE_SHOT_AIM_TOL:.2f}, 暂不开火",
+            flush=True,
+        )
+        return False, yaw_used, False, shot_anchor_xc
 
     # shoot
     print(f"    [s{shot_i}] cur_xc={cur_xc:+.3f} err={err:+.3f} "
@@ -512,10 +614,10 @@ def shoot_one_attempt(client, first_xc, shot_i):
     )
     if hit_confirmed:
         print(f"    ✓ 命中! ({reason})", flush=True)
-        return True, yaw_used, False
+        return True, yaw_used, False, shot_anchor_xc
 
     print(f"    [s{shot_i} miss] ({reason})", flush=True)
-    return False, yaw_used, False
+    return False, yaw_used, False, shot_anchor_xc
 
 
 def confirm_hit_multi_frame(client, shot_anchor_xc, shot_anchor_score,
@@ -626,11 +728,16 @@ def shoot_one_board(client, first_xc, board_num):
     position_offset = 0.0
     yaw_used_total = 0.0  # **2026-08-03**: 累积 yaw, 板上结束后反向
 
+    anchor_xc = first_xc
     for shot_i in range(1, MAX_SHOTS_PER_BOARD + 1):
         attempts = shot_i
-        this_hit, yaw_used, lost_id = shoot_one_attempt(
-            client, first_xc, shot_i)
+        this_hit, yaw_used, lost_id, latest_xc = shoot_one_attempt(
+            client, anchor_xc, shot_i)
         yaw_used_total += yaw_used   # **2026-08-03**: 累积
+        if latest_xc is not None:
+            anchor_xc = latest_xc
+            print(f"    [anchor] 更新当前目标 xc={anchor_xc:+.3f}",
+                  flush=True)
         if lost_id:
             print(f"  [retry] 板上 #{board_num} 本次未锁定, 继续当前目标的调整尝试",
                   flush=True)
@@ -688,10 +795,7 @@ class BoardTracker:
     4. mark_hit(board_num) / is_hit(board_num) — 手动标记 / 查询
     """
 
-    MATCH_TOL = 0.45     # **2026-08-03 第七次调整**: 0.30 → 0.45
-                            # 实测 16cm 直行 + yaw drift 后板上 xc 漂移可达 ~0.40
-                            # (板上 #4 last_xc=+0.94, 实际已到 +0.54, 距离 0.40)
-                            # 0.45 容差兼容这种漂移, 由 Hungarian (而非 greedy) 缓解误匹配
+    MATCH_TOL = 0.30     # 目标间距约 0.25，禁止跨板吸附；允许单步位移漂移
     MAX_MISSING = 3      # 连续 N 帧缺失 → 自动 mark hit
 
     def __init__(self, n_total=N_TOTAL_BOARDS):
@@ -727,26 +831,38 @@ class BoardTracker:
             (bn, info) for bn, info in self.boards.items()
             if info is not None and info['status'] == 'standing'
         ]
+        identity_numbers = identity_numbers or {}
+        unassigned = sorted(
+            bn for bn, info in self.boards.items() if info is None
+        )
+        new_rightmost_board = (
+            not identity_numbers
+            and len(unassigned) == 1
+            and bool(standing_boards)
+            and unassigned[0] > max(bn for bn, _ in standing_boards)
+            and len(animals) > len(standing_boards)
+        )
+        matching_animals = animals[:-1] if new_rightmost_board else animals
 
         # Estimate the common camera shift first. This prevents a later board
         # from being assigned to an earlier board after the earlier one falls.
         estimated_shift = estimate_common_xc_shift(
             [info['last_xc'] for _, info in standing_boards],
-            [bbox_xc(a) for a in animals],
+            [bbox_xc(a) for a in matching_animals],
         )
-        if len(animals) >= 2:
+        if len(matching_animals) >= 2:
             self.last_common_shift = estimated_shift
-        common_shift = estimated_shift if len(animals) >= 2 else 0.0
+        common_shift = estimated_shift if len(matching_animals) >= 2 else 0.0
         residual_tol = min(
             self.MATCH_TOL,
-            max(0.18, 0.20 + abs(common_shift) * 0.25),
+            max(0.16, 0.18 + abs(common_shift) * 0.25),
         )
 
         n_b = len(standing_boards)
-        n_a = len(animals)
+        n_a = len(matching_animals)
         predicted = []
         for _, info in standing_boards:
-            if len(animals) < 2 and info['frames_missing'] > 0:
+            if len(matching_animals) < 2 and info['frames_missing'] > 0:
                 predicted.append(info['last_xc'] + self.last_common_shift)
             else:
                 predicted.append(info['last_xc'] + common_shift)
@@ -782,7 +898,7 @@ class BoardTracker:
                         (matched, cost, assignment),
                     )
                 if i < n_b and j < n_a:
-                    distance = abs(bbox_xc(animals[j]) - predicted[i])
+                    distance = abs(bbox_xc(matching_animals[j]) - predicted[i])
                     if distance <= residual_tol:
                         dp[i + 1][j + 1] = better(
                             dp[i + 1][j + 1],
@@ -799,7 +915,7 @@ class BoardTracker:
             if animal_index is None:
                 matches[bn] = None
                 continue
-            animal = animals[animal_index]
+            animal = matching_animals[animal_index]
             info['last_xc'] = bbox_xc(animal)
             info['last_yc'] = bbox_yc(animal)
             info['last_score'] = animal.get("score", 0.0)
@@ -821,10 +937,6 @@ class BoardTracker:
             animal for i, animal in enumerate(animals)
             if i not in matched_animals
         ]
-        unassigned = sorted(
-            bn for bn, info in self.boards.items() if info is None
-        )
-        identity_numbers = identity_numbers or {}
         for animal_index, board_num in sorted(identity_numbers.items()):
             if animal_index in matched_animals or board_num not in unassigned:
                 continue
@@ -845,9 +957,19 @@ class BoardTracker:
             animal for i, animal in enumerate(animals)
             if i not in matched_animals
         ]
-        # Remaining never-seen boards use left-to-right order as fallback.
-        for board_num, animal in zip(
-                unassigned, sorted(unmatched_animals, key=bbox_xc)):
+        # 首次同时出现多块未见板时按编号顺序绑定；只有一块新板进入时，
+        # 才优先取画面右侧目标，避免已有板漏检造成新板串号。
+        if len(unassigned) == 1:
+            pending_pairs = zip(
+                unassigned,
+                sorted(unmatched_animals, key=bbox_xc, reverse=True),
+            )
+        else:
+            pending_pairs = zip(
+                unassigned,
+                sorted(unmatched_animals, key=bbox_xc),
+            )
+        for board_num, animal in pending_pairs:
             self.boards[board_num] = {
                 'last_xc': bbox_xc(animal),
                 'last_yc': bbox_yc(animal),

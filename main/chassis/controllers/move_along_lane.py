@@ -94,6 +94,7 @@ def move_along_lane(
     dry_run: bool = False,
     with_trace: bool = False,
     on_tick: Optional[Callable[[LaneState, list[float]], None]] = None,
+    stop_when: Optional[Callable[[LaneState, list[float]], bool]] = None,
     calibrator: Optional["ErrorCalibrator"] = None,
     straight: Optional[dict] = None,
 ) -> None:
@@ -152,7 +153,28 @@ def move_along_lane(
     if on_tick is None and with_trace:
         on_tick = lane_trace(outer)
     holder: dict = {"runner": None}
-    combined_on_tick = _make_distance_stop(distance_m, on_tick, holder)
+
+    def combined_on_tick(state: LaneState, wheels: list[float]) -> None:
+        if on_tick is not None:
+            try:
+                on_tick(state, wheels)
+            except Exception:
+                pass
+        if stop_when is not None:
+            try:
+                if stop_when(state, wheels):
+                    runner = holder.get("runner")
+                    if runner is not None:
+                        runner.stop()
+            except Exception:
+                pass
+
+    distance_stop = _make_distance_stop(distance_m, None, holder)
+
+    def distance_and_target_stop(state: LaneState, wheels: list[float]) -> None:
+        distance_stop(state, wheels)
+        combined_on_tick(state, wheels)
+
     runner = DoubleLoopRunner(
         api=api,
         outer=outer,
@@ -161,7 +183,7 @@ def move_along_lane(
         lost_line_ms=profile.lost_line_ms,
         dry_run=dry_run,
         smoother=profile.build_smoother(),
-        on_tick=combined_on_tick,
+        on_tick=distance_and_target_stop,
         calibrator=calibrator,
     )
     holder["runner"] = runner
