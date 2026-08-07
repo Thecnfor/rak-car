@@ -273,11 +273,16 @@ def _loop_run(client: ArmClient, runner: ArmRunner,
 
 
 def _retreat_166mm(client: ArmClient) -> dict:
-    """底盘后退 166mm (复用 dipan.py 的常量, 不调其私有 _run)。
+    """底盘后退 166mm (硬编码 -166mm, 不依赖 dipan.DEFAULT_DIST_MM)。
 
     走 ``client.http.execute_car_action("move_for", [-0.166, 0, 0], sync=True)``,
-    默认限速 0.10 m/s, timeout 自适应 (dipan.py 文档:
-    max(5.0, abs(dist_m)/max_vel + 2) = max(5.0, 0.166/0.10 + 2) = max(5.0, 3.66) = 5.0s)。
+    默认限速 0.10 m/s, timeout 自适应 (max(5.0, 0.166/0.10 + 2) = 5.0s)。
+
+    ⚠️ **dist_mm / max_vel / timeout 全部硬编码**, 不读 dipan.DEFAULT_*:
+      - task5 分拣流水线对后退距离有强约定 (166mm = 从高塔位到低塔位的标定值),
+        不允许跟随 dipan.DEFAULT_DIST_MM 漂移 (曾经被外部动作改成 +325,
+        导致车向前窜 325mm 而不是向后 166mm)
+      - max_vel / timeout 用同样策略, 与 dipan.py 默认值一致但本地硬编码
 
     Args:
         client: ArmClient (取 .http 走车端 action)
@@ -288,18 +293,21 @@ def _retreat_166mm(client: ArmClient) -> dict:
     Raises:
         RuntimeError: move_for 失败 (status != succeeded)。
     """
-    dist_mm = dipan.DEFAULT_DIST_MM  # -166.0
-    max_vel = dipan.DEFAULT_MAX_VELOCITY_MS  # 0.10
-    timeout = dipan.DEFAULT_TIMEOUT_S  # 20.0 (用户未传 --timeout, 用 dipan 默认)
-    # 自适应 timeout (与 dipan.py main() 同款)
-    adaptive_timeout = max(5.0, abs(dist_mm) / 1000.0 / max(max_vel, 0.01) + 2.0)
-    # 优先用 adaptive_timeout, 但若 dipan DEFAULT_TIMEOUT_S 与原值相等说明未传 --timeout,
-    # 用 adaptive; 否则用显式传入值。本文件不暴露 --timeout, 故全部用 adaptive。
-    actual_timeout = adaptive_timeout
+    # ⚠️ 硬编码: 166mm 后退 = -0.166m, 不读 dipan.DEFAULT_DIST_MM
+    dist_mm: float = -166.0
+    max_vel: float = 0.10
+    timeout_default: float = 20.0  # 与 dipan.DEFAULT_TIMEOUT_S 一致, 仅用于自适应计算参考
+    # 自适应 timeout (与 dipan.py main() 同款, 但 floor 提高到 15s)
+    # ⚠️ **floor=15s 而非 5s**: dipan.py 默认 floor=5s, 现场实测 166mm 在网络/
+    # 队列抖动时常跑到第 5s 还没完成 (job_queue 排队 + 加减速 + 网络),
+    # 触发 TimeoutError。the_final 是流水线编排, 不允许在中间超时, 故放宽到 15s
+    adaptive_timeout = max(15.0, abs(dist_mm) / 1000.0 / max(max_vel, 0.01) + 10.0)
+    actual_timeout = adaptive_timeout  # 本文件不暴露 --timeout, 全部用 adaptive
 
     dist_m = dist_mm / 1000.0
-    direction = "向后"
-    print(f"\n--- Phase 3c: 底盘后退 {abs(dist_mm):.0f}mm "
+    # 由 dist_m 实际符号决定方向 (而不是硬编码字面量, 与实际行为一致)
+    direction = "向后" if dist_m < 0 else ("向前" if dist_m > 0 else "原地")
+    print(f"\n--- Phase 3c: 底盘{direction} {abs(dist_mm):.0f}mm "
           f"(x_offset={dist_m:+.3f}m, max_v={max_vel:.2f}m/s, "
           f"timeout={actual_timeout:.1f}s) ---")
     t0 = time.perf_counter()
@@ -316,7 +324,7 @@ def _retreat_166mm(client: ArmClient) -> dict:
     status = job.get("status") if isinstance(job, dict) else None
     error = job.get("error") if isinstance(job, dict) else None
 
-    print(f"  ✅ 底盘 {direction} {abs(dist_mm):.0f}mm 完成 (status={status!r}, 耗时={dt:.2f}s)")
+    print(f"  ✅ 底盘{direction} {abs(dist_mm):.0f}mm 完成 (status={status!r}, 耗时={dt:.2f}s)")
 
     if not ok:
         raise RuntimeError(
