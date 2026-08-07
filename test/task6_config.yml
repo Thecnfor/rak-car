@@ -9,19 +9,25 @@ get_order:
     扫动: X -200→-120 (100mm/s) 推杆, Y=0
     复位: X=-150, arm=-85°, hand=-45°, Y=-120
 
+  # 摆姿势同时底盘直行到任务点 (move_along_lane, 与 4 轴复合并发)
+  approach_straight_m: 0.2     # 直行距离 (m) 2026-08-08: 0.5→0.3→0.2→0.15→0.2
+  approach_straight_vx: 0.20   # 直行速度 (m/s)
+
   push_bar_pose:
-    x_mm: -200
-    arm_angle_deg: -95
-    hand_angle_deg: -90
+    x_mm: -220             # 2026-08-07: -200 → -220 (推牌从 -220 起)
+    arm_angle_deg: -92     # 2026-08-08: -95→-90→-92
+    hand_angle_deg: -55    # 2026-08-07: 进入姿势直接到推杆姿态 (4轴并行, 不再 -90)
     y_mm: 0
 
   sweep_x_end_mm: -120
-  sweep_speed_mms: 100
+  sweep_speed_mms: 150     # 2026-08-07: 120 → 150
+  push_retract_x_mm: -200  # 2026-08-07: 回退并入抬升, X→-200 (原 -180)
 
   reposition_pose:
     x_mm: -150
-    arm_angle_deg: -85
-    hand_angle_deg: -45
-    y_mm: -120
+    arm_angle_deg: -80      # 2026-08-08: -87 → -80 (订单机大臂)
+    hand_angle_deg: -60     # 2026-08-08: -45 → -60
+    y_mm: -150              # 读单 Y (2026-08-08: -180 → -150)
+    final_x_mm: -150        # 读单最终 X (2026-08-08: -200 → -150)
 
   v_max_arm_x_mms: 80

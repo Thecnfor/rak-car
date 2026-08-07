@@ -297,9 +297,9 @@ waypoints:
     task_id: 6
     task_module: main.task.task6_get_order
     ir_threshold_m: 0.50
-    ir_side: left
-    dis_at_least_m: 0
-    trigger_op: AND
+    ir_side: right
+    dis_at_least_m: 13.0
+    trigger_op: OR
 
   # ----- task7 (TODO) -----
   - name: task7_deliver
