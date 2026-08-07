@@ -176,4 +176,18 @@ def generate_launch_description() -> LaunchDescription:
                 "deadman_ms": 500,
             }],
         ),
+
+        # Inference bridge — subscribes camera images, publishes perception topics.
+        # ENABLE_INFERENCE=1 runs real model forward pass (Phase 6-7).
+        # ENABLE_INFERENCE=0 (default) publishes mock results for downstream testing.
+        Node(
+            package="vehicle_wbt_platform",
+            executable="inference-bridge",
+            name="inference_bridge",
+            output="screen",
+            parameters=[{
+                "camera_topic": "/vehicle_wbt/v1/sensors/camera/front/image_raw",
+                "mock_rate_hz": 10.0,
+            }],
+        ),
     ])

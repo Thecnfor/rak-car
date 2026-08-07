@@ -70,4 +70,14 @@ def generate_launch_description() -> LaunchDescription:
                 "deadman_ms": 1000,  # relaxed for dev iteration
             }],
         ),
+
+        # Inference bridge — pure ROS2, mock mode for dev/hardware-free testing.
+        # ENABLE_INFERENCE=1 switches to live mode (real model, Phase 6-7).
+        Node(
+            package="vehicle_wbt_platform",
+            executable="inference-bridge",
+            name="inference_bridge",
+            output="screen",
+            parameters=[{"mock_rate_hz": 10.0}],
+        ),
     ])

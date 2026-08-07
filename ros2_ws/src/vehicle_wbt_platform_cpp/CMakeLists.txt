@@ -39,14 +39,19 @@ find_package(tf2_ros REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
-find_package(camera_info_manager REQUIRED)   # camera_node loads YAML calibration
+find_package(camera_info_manager QUIET)   # camera_node loads YAML calibration (Humble-only)
 find_package(hardware_interface QUIET)
 find_package(pluginlib QUIET)
 find_package(rcpputils REQUIRED)
 
-# Re-enabled: Humble's rosidl_default_generators is fixed (was disabled
-# in commit 9e11fd7 due to a Lyrical 2.8.7 bug that no longer applies).
-find_package(rosidl_default_generators REQUIRED)
+# Track whether camera_info_manager is available.
+set(CAMERA_INFO_MANAGER_FOUND ${camera_info_manager_FOUND})
+
+# rosidl_default_generators is REQUIRED on Humble, but fails on Lyrical 2.8.7
+# (Python3::Interpreter target missing). Make it QUIET; custom .msg generation
+# is skipped when unavailable — the C++ nodes use standard ROS2 messages.
+find_package(rosidl_default_generators QUIET)
+set(ROSIDL_GENERATORS_FOUND ${rosidl_default_generators_FOUND})
 
 # -----------------------------------------------------------------------------
 # rclcpp nodes — each includes its needed core sources directly.
@@ -56,6 +61,8 @@ find_package(rosidl_default_generators REQUIRED)
 # camera_info, camera_status, camera_meta. Live V4L2 capture via OpenCV
 # (no synthetic fallback). camera_info loaded from YAML via
 # camera_info_manager. Publishes /tf_static for camera optical frame.
+# OPTIONAL: skipped on distros without camera_info_manager (Lyrical).
+if(CAMERA_INFO_MANAGER_FOUND)
 add_executable(camera_node src/camera_node.cpp)
 target_include_directories(camera_node PUBLIC include)
 target_link_libraries(camera_node PUBLIC
@@ -73,9 +80,14 @@ target_link_libraries(camera_node PUBLIC
   opencv_imgproc
   opencv_videoio
 )
+endif()
 
-# infrared_node
-add_executable(infrared_node src/infrared_node.cpp)
+# infrared_node — uses MC602Adapter::read_infrared for real IR sensor reads
+add_executable(infrared_node
+  src/infrared_node.cpp
+  src/mc602_adapter.cpp
+  src/serial_port.cpp
+)
 target_include_directories(infrared_node PUBLIC include)
 target_link_libraries(infrared_node PUBLIC
   rclcpp::rclcpp
@@ -83,23 +95,30 @@ target_link_libraries(infrared_node PUBLIC
   std_msgs::std_msgs
 )
 
-# mecanum_chassis_node — also pulls in mecanum_chassis.cpp
+# mecanum_chassis_node — also pulls in mecanum_chassis.cpp + mc602_adapter.cpp
 add_executable(mecanum_chassis_node
   src/mecanum_chassis_node.cpp
   src/mecanum_chassis.cpp
+  src/mc602_adapter.cpp
+  src/serial_port.cpp
 )
 target_include_directories(mecanum_chassis_node PUBLIC include)
 target_link_libraries(mecanum_chassis_node PUBLIC
   rclcpp::rclcpp
   geometry_msgs::geometry_msgs
   nav_msgs::nav_msgs
+  sensor_msgs::sensor_msgs
   tf2_ros::tf2_ros
   tf2::tf2
   std_msgs::std_msgs
 )
 
-# arm_node — uses sensor_msgs/JointState (standard) instead of custom ActuatorState.msg
-add_executable(arm_node src/arm_node.cpp)
+# arm_node — uses MC602Adapter for joint command dispatch
+add_executable(arm_node
+  src/arm_node.cpp
+  src/mc602_adapter.cpp
+  src/serial_port.cpp
+)
 target_include_directories(arm_node PUBLIC include)
 target_link_libraries(arm_node PUBLIC
   rclcpp::rclcpp
@@ -141,11 +160,19 @@ if(hardware_interface_FOUND AND pluginlib_FOUND)
   )
 endif()
 
-install(TARGETS
-  camera_node infrared_node mecanum_chassis_node arm_node safety_gate_node
-  mission_runner_node
-  RUNTIME DESTINATION lib/${PROJECT_NAME}
-)
+if(CAMERA_INFO_MANAGER_FOUND)
+  install(TARGETS
+    camera_node infrared_node mecanum_chassis_node arm_node safety_gate_node
+    mission_runner_node
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+else()
+  install(TARGETS
+    infrared_node mecanum_chassis_node arm_node safety_gate_node
+    mission_runner_node
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
 
 # SeedingTask is a library linked into the mission_runner_node — it has
 # a REGISTER_TASK static initializer that registers itself at startup.
@@ -188,12 +215,16 @@ install(
 # Note: .msg files are installed as documentation (not generated)
 install(DIRECTORY msg/ DESTINATION share/${PROJECT_NAME}/msg)
 
-# ---- Generate C++/Python interfaces from .msg files (Humble — re-enabled
-#      after the Lyrical 2.8.7 workaround in commit 9e11fd7 is no longer needed) ----
+# Generate C++/Python interfaces from .msg files (only on Humble+ where
+# rosidl_default_generators works — skipped on Lyrical).
+if(ROSIDL_GENERATORS_FOUND)
 rosidl_generate_interfaces(${PROJECT_NAME}
   "msg/CameraMeta.msg"
+  "msg/LaneResult.msg"
+  "msg/DetectionArray.msg"
   DEPENDENCIES builtin_interfaces std_msgs
 )
+endif()
 
 # -----------------------------------------------------------------------------
 # Testing
@@ -204,11 +235,30 @@ if(BUILD_TESTING)
   ament_add_gmock(test_mc602_adapter
     test/test_mc602_adapter.cpp
     src/mc602_adapter.cpp
+    src/serial_port.cpp
   )
   target_include_directories(test_mc602_adapter PUBLIC include)
+
+  # Protocol-layer tests — frame structure, parameter encoding, port validation
+  ament_add_gmock(test_mc602_protocol
+    test/test_mc602_protocol.cpp
+    src/mc602_adapter.cpp
+    src/serial_port.cpp
+  )
+  target_include_directories(test_mc602_protocol PUBLIC include)
+  target_link_libraries(test_mc602_protocol rclcpp::rclcpp pluginlib::pluginlib)
+
   # ament_add_gmock uses plain target_link_libraries internally, so we
   # must use the plain (un-keyworded) signature here for consistency.
   target_link_libraries(test_mc602_adapter rclcpp::rclcpp pluginlib::pluginlib)
+
+  # SerialPort unit tests — frame building, exchange handshake, timeout handling
+  ament_add_gmock(test_serial_port
+    test/test_serial_port.cpp
+    src/serial_port.cpp
+    src/mc602_adapter.cpp
+  )
+  target_include_directories(test_serial_port PUBLIC include)
 
   ament_add_gmock(test_mecanum_chassis
     test/test_mecanum_chassis.cpp

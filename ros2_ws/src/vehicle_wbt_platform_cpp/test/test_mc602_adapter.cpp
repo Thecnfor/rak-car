@@ -63,9 +63,18 @@ TEST(MC602AdapterTest, ConstructorRejectsUnsupportedBaud)
   EXPECT_NO_THROW(MC602Adapter("/dev/ttyUSB0", 115200));
 }
 
+// Helper: set up injection so open() succeeds without real hardware.
+static void enable_injection(MC602Adapter & a)
+{
+  a.set_injection([](const std::vector<uint8_t> &) {
+    return std::vector<uint8_t>{0x0A};
+  });
+}
+
 TEST(MC602AdapterTest, OpenCloseIdempotent)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   EXPECT_FALSE(a.is_open());
   a.open();
   EXPECT_TRUE(a.is_open());
@@ -86,10 +95,10 @@ TEST(MC602AdapterTest, EnumeratePortsMatchesHardwareSpec)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
   auto ports = a.enumerate_ports();
-  EXPECT_EQ(ports.at("motor"), 6u);
-  EXPECT_EQ(ports.at("servo"), 7u);
-  EXPECT_EQ(ports.at("stepper"), 3u);
-  EXPECT_EQ(ports.at("io"), 8u);
+  EXPECT_EQ(ports.at("motor"), 4u);    // MC602: ports 1-4
+  EXPECT_EQ(ports.at("servo"), 7u);    // MC602: ports 1-7
+  EXPECT_EQ(ports.at("stepper"), 4u);  // MC602: ports 1-4
+  EXPECT_EQ(ports.at("io"), 16u);      // MC602: ports 1-16
 }
 
 TEST(MC602AdapterTest, ReadRequiresOpen)
@@ -107,6 +116,7 @@ TEST(MC602AdapterTest, WriteRequiresOpen)
 TEST(MC602AdapterTest, RejectsUnknownSensorType)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.read_sensor(7, "tachyon_beam"), std::runtime_error);
 }
@@ -114,6 +124,7 @@ TEST(MC602AdapterTest, RejectsUnknownSensorType)
 TEST(MC602AdapterTest, RejectsUnknownActuatorType)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.write_actuator(5, "warp_drive", 0.0), std::runtime_error);
 }
@@ -121,6 +132,7 @@ TEST(MC602AdapterTest, RejectsUnknownActuatorType)
 TEST(MC602AdapterTest, RejectsPortIdZeroForSensor)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.read_sensor(0, "ir"), std::runtime_error);
 }
@@ -128,6 +140,7 @@ TEST(MC602AdapterTest, RejectsPortIdZeroForSensor)
 TEST(MC602AdapterTest, RejectsPortIdAboveIOMaxForSensor)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.read_sensor(9, "ir"), std::runtime_error);
 }
@@ -135,6 +148,7 @@ TEST(MC602AdapterTest, RejectsPortIdAboveIOMaxForSensor)
 TEST(MC602AdapterTest, RejectsPortIdAboveMotorMaxForMotor)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.write_actuator(7, "motor", 0.5), std::runtime_error);
 }
@@ -142,6 +156,7 @@ TEST(MC602AdapterTest, RejectsPortIdAboveMotorMaxForMotor)
 TEST(MC602AdapterTest, RejectsNaNValue)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.write_actuator(5, "motor", std::nan("")), std::runtime_error);
 }
@@ -149,7 +164,10 @@ TEST(MC602AdapterTest, RejectsNaNValue)
 TEST(MC602AdapterTest, RejectsInfValue)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
+  enable_injection(a);
   a.open();
   EXPECT_THROW(a.write_actuator(5, "motor", std::numeric_limits<double>::infinity()),
+               std::runtime_error);
+  EXPECT_THROW(a.write_actuator(5, "motor", -std::numeric_limits<double>::infinity()),
                std::runtime_error);
 }

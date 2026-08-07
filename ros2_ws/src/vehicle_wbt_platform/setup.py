@@ -24,6 +24,7 @@ setup(
     entry_points={
         "console_scripts": [
             "sidecar = vehicle_wbt_platform.__main__:main",
+            "inference-bridge = vehicle_wbt_platform.inference.bridge:main",
         ],
     },
 )

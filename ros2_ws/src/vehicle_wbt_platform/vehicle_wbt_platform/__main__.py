@@ -77,13 +77,32 @@ def main() -> int:
         serial_port=serial_port,
         ros_domain_id=ros_domain_id,
     )
+    rclpy.init()
     try:
         orch.open_hardware()
+
+        # Spawn feed components from config_sensors.yml
+        components = orch.spawn_components()
+
+        # Create the ROS2 node that components will use
+        node = rclpy.create_node("sidecar_health")
+        node.declare_parameter("component", "vehicle_wbt_platform")
+        node.declare_parameter("version", "phase2")
+
+        # Wire components into the node (init + start)
+        orch.init_components(node)
+        orch.start_components()
+
         print(f"[vehicle_wbt_platform] sidecar ready: {orch.summary()}")
-        # Phase 1: just print status and exit. Phase 2 adds rclpy.spin().
+        print(f"[vehicle_wbt_platform] {len(components)} feed components active")
+
+        # Spin until signal / shutdown
+        orch.spin(node)
         return 0
     finally:
         orch.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":
