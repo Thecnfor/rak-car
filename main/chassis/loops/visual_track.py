@@ -283,6 +283,7 @@ def track_chassis(
     max_seconds: float = 10.0,
     dry_run: bool = False,
     on_tick: Optional[Callable[[TrackFrame, Tuple[float, float]], None]] = None,
+    sense_fn: Optional[Callable[[], TrackFrame]] = None,
 ) -> TrackChassisResult:
     """通用底盘视觉追踪: 把 target bbox 中心拉到 setpoint_cxcy。
 
@@ -303,6 +304,9 @@ def track_chassis(
       - ``vx_only=True`` → 只控 vx(前后), vy 恒 0, 到达判定只看 cx（task2 水塔对齐, 横向不做闭环）
 
     返回 ``TrackChassisResult``: arrived=True / 到达帧信息 / 跑了多少帧。
+
+    sense_fn (可选, 2026-08-07): 注入自定义检测源 (如 LLM 看帧报坐标), 返回
+    TrackFrame 形状, 复用整套控制律; None 时走原 YOLO task_feed 检测。
     """
     if api is None:
         api = ChassisClient.connect()
@@ -354,7 +358,9 @@ def track_chassis(
             if next_tick < now:
                 next_tick = now + period
 
-            frm = _sense_frame(api, labels, setpoint_cxcy, select_mode)
+            frm = sense_fn() if sense_fn is not None else _sense_frame(
+                api, labels, setpoint_cxcy, select_mode
+            )
             frames += 1
             final_frame = frm
 
