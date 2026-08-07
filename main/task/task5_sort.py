@@ -100,7 +100,7 @@ HIGH_COMPOSITE_Y_MM: float = -185.0     # 步骤 2
 HIGH_COMPOSITE_X_MM: float = -70.0
 HIGH_COMPOSITE_ARM_DEG: float = 90.0
 HIGH_COMPOSITE_HAND_DEG: float = -82.0
-HIGH_GRASP_X_MM: float = -135.0         # 步骤 3: 伸进塔
+HIGH_GRASP_X_MM: float = -160         # 步骤 3: 伸进塔
 HIGH_RETRACT_X_MM: float = -70.0        # 步骤 5: 退回
 
 # ---------- Phase 3d (取球 + 投低塔) ----------
