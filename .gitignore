@@ -69,3 +69,13 @@ coverage.xml
 # Calibration session artifacts (operator-only, regenerated each run)
 calibration_session/
 
+
+# Code intelligence index (per-machine)
+.codegraph/
+
+# Serena editor state (per-machine)
+**/.serena/
+
+# ROS2 Lyrical colcon artifacts inside package src
+ros2_ws/src/*/AMENT_IGNORE
+ros2_ws/src/*/CMakeFiles/

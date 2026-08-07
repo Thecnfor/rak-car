@@ -25,9 +25,13 @@ ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
 ## Verify
 
 ```bash
-ros2 topic list                                  # ~15 topics under /vehicle_wbt/v1/
-ros2 node list                                   # 7 nodes alive
-ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_raw   # ~30 Hz
+ssh xrak@192.168.3.69
+sudo apt install -y python3-colcon-common-extensions  # one-time
+cd ~/ros2_ws/src  # rsync or git clone from dev
+cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp
+source install/setup.bash
+export ROS_DOMAIN_ID=42
+ros2 launch vehicle_wbt_platform_cpp full_system.launch.py
 ```
 
 ## Re-calibrate after lens/sensor swap

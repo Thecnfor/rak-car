@@ -14,15 +14,54 @@ happens; **never commit dev experiments directly here** — push to
 `develop/ros2-sidecar` first, then merge back to `robot-stable` after
 testing on real hardware.
 
-The platform:
-- **Hardware**: NVIDIA Jetson Orin Nano 4GB, 4 mecanum wheels, 4-joint
-  arm with vacuum gripper, 2 Aveo SP2812 cameras, 2 IR sensors.
-- **Software**: 7 rclcpp nodes + `ros2_control` hardware interface, all
-  under `ROS_DOMAIN_ID=42`.
-- **Network**: this Jetson is `192.168.3.69` (Wi-Fi `wlP1p1s0`); dev
-  boxes connect from `192.168.3.50 ~ 200`.
+Two active branches:
+- `main` — frozen for 2026-08-10 → 08-12 competition. Legacy Python+ZMQ stack.
+- `develop/ros2-sidecar` — the ROS2 future. Pure rclcpp/rclpy implementation. **Most development happens here.** After 2026-08-12 this branch merges to main per `docs/contributing/branch-strategy.md`.
+- `robot-stable` — slim runtime that lives **on the Jetson itself** (IP `192.168.3.69`). Stripped of all dev-only stuff at commit `30f9620`. Keeps only `ros2_ws/`, `config_sensors.yml`, `urdf/`, and `scripts/calibrate_camera.py`. Drivers + minimal app that publishes the `/vehicle_wbt/v1/...` contract to dev desktops over DDS. **New contributors: never commit here directly — push to `develop/ros2-sidecar` first**, then Thecnfor cherry-picks to robot-stable after a real-hardware smoke test. Full split rationale and merge rules: [`docs/driver-app-interface.md`](docs/driver-app-interface.md) and [`docs/contributing/branch-strategy.md`](docs/contributing/branch-strategy.md).
 
-## Architecture (7 nodes live here)
+The full platform rationale (why move from ZMQ to DDS) is in the root `README.md`. The 1885-line architecture spec is in `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md`.
+
+## 团队开发约定 (any Claude must internalize)
+
+> **这 3 条是整个团队的开发模式。** 任何 dev 机和 Jetson 都在同一个局域网下；任何 team member 都在自己 dev 机上开发。
+
+1. **LAN 共享 + Jetson IP 永远是 `192.168.3.69`**
+   - 全队硬约定，dev 机 / Jetson / 文档 / 脚本同步维护（改它 = 改全队）
+   - dev 机连上团队 Wi-Fi/路由器，DHCP 自动落在 `192.168.3.50 ~ 192.168.3.200`
+   - 验证：`ping -c 3 192.168.3.69` 通即可
+   - 详 [`docs/team-constants.md`](docs/team-constants.md)
+
+2. **Jetson 端实际在发什么话题 → team member 自己用 RViz 看（不假设）**
+   - **不要凭 spec / 代码推断**话题名、类型、频率、QoS
+   - 标准做法（让 team member 跑）：
+     ```bash
+     bash scripts/start_team_rviz.sh    # 一键 RViz2 看相机 + 列所有 /vehicle_wbt/v1/... 话题
+     # 或纯 CLI：
+     ros2 topic list
+     ros2 topic info /vehicle_wbt/v1/sensors/camera/front/image_compressed --verbose
+     ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_compressed
+     ```
+   - `config_sensors.yml` 是话题的"权威清单"，但**实时状态**（是否在发、实际频率、QoS 兼容性）必须现场查
+   - 帮 team member 加新功能前，先确认 Jetson 端对应话题已发 + QoS 兼容
+
+3. **开发 + 测试永远在自己 dev 机上做（不直接动 Jetson）**
+   - 代码改完 → dev 端 `colcon build`（Jetson 端 ABI 不兼容，**不要 push install/**）
+   - 无硬件 smoke test → dev 端 `ros2 launch ... mock_system.launch.py`
+   - 真机联调 → dev 端订阅 Jetson 的话题（同 `ROS_DOMAIN_ID=42` 自动发现），dev 端发指令、Jetson 端节点执行
+   - 真机部署 → `git push` + ssh Jetson `colcon build` + ssh Jetson launch
+   - 详下文 "Daily dev workflow"
+
+## Architecture: dev/target dual-machine
+
+| Dev desktop (Ubuntu 22.04+ + ROS2 Humble) | Target (Jetson Orin Nano 4GB) |
+|---|---|
+| Edit, simulation (RViz2, Gazebo), CI, linters | Real hardware I/O — no GUI |
+| `ROS_DOMAIN_ID=42` | `ROS_DOMAIN_ID=42` |
+| Discovers Jetson topics via DDS over LAN | Publishes sensors on real hardware |
+
+Both machines MUST share `ROS_DOMAIN_ID=42`. The `full_system.launch.py` enforces this via `SetEnvironmentVariable`; you don't need to export it manually.
+
+The 7 rclcpp nodes (live today):
 
 | Node | Subscribes | Publishes | Rate |
 |------|------------|-----------|------|
