@@ -1,30 +1,50 @@
-"""task5 / the_final —— **task5 收官脚本** (2026-07-30 重写, 4 步严格按用户指定)。
+"""task5 / the_final —— 端到端分拣入库流水线 (4 阶段)。
 
-业务流程:
-  1. 调用 ``target.py`` 识别高仓颜色 → 记为 color A
-     (A ∈ {blue, yellow, unknown};  unknown → 退出 3)
-  2. **同色球进高仓**:
-     - A = blue   → ``last_blue_to_high.main()``
-     - A = yellow → ``last_yellow_to_high.main()``
-  3. **底盘到 LOW 仓取位** (2026-08-03 起两档):
-     - ``--align-area`` 传了 → 视觉闭环对仓 (main.chassis.make_align_runner,
-       按 bbox 面积前后微调; 需现场标定 ref_area), 失败回退开环
-     - 默认 → 开环后撤 165mm: ``dipan._run(client, dist_mm=-165.0)``
-  4. **反色球进 LOW 仓**:
-     - A = blue   → ``last_yellow_to_low.main()``   (高仓是蓝 → LOW 仓放黄)
-     - A = yellow → ``last_blue_to_low.main()``     (高仓是黄 → LOW 仓放蓝)
+业务流程 (2026-08-08 用户指定):
 
-⚠️ **color A 是唯一的真相源**: 阶段 1 识别一次, 阶段 2 / 4 都用它分流。
-   不在阶段 4 重新识别 — 中间已经移车 (high + 后撤), 视野完全变了,
-   重新识别会拿到 LOW 仓自己的标签, 跟高仓无关。
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ [1/4] new_target.run()        摆位 + 模型识别高仓颜色 → blue/yellow  │
+  │ [2/4] target_all.run()        摆位 + 全色识别 + 黄蓝分桶计数          │
+  │ [3a/3b] **底盘 + 高塔循环**    matching 色 → 高塔 (调用次数 = 同色球数)│
+  │ [3c] 后退 166mm               move_for([-0.166, 0, 0]) (调 dipan 默认)│
+  │ [3d] **底盘 + 低塔循环**      opposite 色 → 低塔 (调用次数 = 反色球数)│
+  └──────────────────────────────────────────────────────────────────────┘
 
-⚠️ **本文件自包含** (task5/__init__.py 提到的"曾被外部清空"防御):
-  - 只 import 6 个 task5 兄弟模块, 不重复实现 move_for / HSV / _last_loop 骨架。
+  - 高仓 = blue  → 蓝球进高塔 (N=count_blue 次) → 后退 → 黄球进低塔 (M=count_yellow 次)
+  - 高仓 = yellow → 黄球进高塔 (N=count_yellow 次) → 后退 → 蓝球进低塔 (M=count_blue 次)
+
+⚠️ **设计原则 (用户要求: 不重写内部逻辑)**:
+  - **不直接调用** new_target / target_all / from_*_to_*.py / dipan 内部的动作
+  - **调用它们的 run() / _run() 函数**: 端到端流程已封装好, 业务硬限 / composite_run
+    4 轴全传 / grasp 走 runner.* / move_y 保护区绕过 全部在内部处理
+  - 本文件只负责**顶层编排 + 错误透传**, 不重写任何具体步骤
+
+⚠️ **底盘后退 166mm 复用 dipan.py**:
+  - dipan.py 已有 ``client.http.execute_car_action("move_for", [-0.166, 0, 0], sync=True)``
+    完整逻辑 (默认参数 / 限速 / timeout 自适应)
+  - 本文件直接 import DEFAULT_DIST_MM / DEFAULT_MAX_VELOCITY_MS / DEFAULT_TIMEOUT_S 常量,
+    用 client.http.execute_car_action 调一次, **不走 dipan._run()** (私有接口)
+  - 这是 2026-07-30 用户拍板的"向后 166mm", 与 __init__.py 提到的"默认 dipan 后撤 165mm"
+    差 1mm (165 vs 166), 按用户本次明示用 166。
+
+⚠️ **循环调用 from_*_to_*.run()**:
+  - 每个 run() 内部是**单球端到端**: 4 机联动 → 吸气 → 下探 (取) → 抬升 → 4 机联动 → 投
+  - 循环 N 次 = 处理 N 个同色球 (假设球都在同一 bin 位置, 每次从 bin 拿同一颗; 这是
+    task5 业务层的现有约定 — task4 蓝 x=0 / 黄 x=-65, 不区分多颗)
+  - 一次循环耗时 ~8-12s (3+5 步 for 蓝→高, 3+3 步 for 黄→低)
+  - 任一循环失败 → RuntimeError 透传, 终止整个流水线 (不继续后面的球)
+
+⚠️ **业务硬限**: 全部来自 5 个底层 run() 内部 (new_target / target_all / from_*_to_*),
+   本文件不重写, 故不重复列硬限。详见各 run() 文档。
+
+⚠️ **本文件自包含 (task5 约定)**: 只依赖 ``main.arm`` (ArmClient/ArmRunner)
+   + import task5 兄弟模块的 run() 函数 / 常量, 不重写任何内部步骤。
+   沿用 task5 业务层自包含约定 — task5 辅助文件曾被外部动作清空过,
+   本文件 import 5 个稳定的兄弟 run() 而非重写, 保证直接跑不受影响。
 
 跑法:
-    python main/arm/each_task/task5/the_final.py                # 端到端
-    python main/arm/each_task/task5/the_final.py --color blue   # 手动指定色
-    python main/arm/each_task/task5/the_final.py --balls 2      # 强制 2 轮
+    python main/arm/each_task/task5/the_final.py
+    python -m main.arm.each_task.task5.the_final
 """
 from __future__ import annotations
 
@@ -33,280 +53,307 @@ import os
 import sys
 import time
 
+# 1) 把 repo 根加进 sys.path, 让 "main.arm" / "main.arm.each_task.task5.*" 可解析
 _ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", ".."))
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
+# 2) 业务硬限: 只 import task5 兄弟模块的 run() 函数 / 常量
 from main.arm import ArmClient, ArmRunner  # noqa: E402
+from main.arm.each_task.task5 import (  # noqa: E402
+    new_target,        # Phase 1: 识别高仓颜色
+    target_all,        # Phase 2: 识别球数 (黄/蓝 分桶)
+    from_blue_to_high, # 高仓=蓝 → 蓝球进高塔 (Phase 3a)
+    from_yellow_to_high, # 高仓=黄 → 黄球进高塔 (Phase 3a 反)
+    from_blue_to_low,  # 高仓=黄 → 蓝球进低塔 (Phase 3d)
+    from_yellow_to_low, # 高仓=蓝 → 黄球进低塔 (Phase 3d 反)
+    dipan,             # Phase 3c: 底盘后退 166mm (用其常量, 不调 _run 私有)
+)
 
-import main.arm.each_task.task5.target as target_module                       # noqa: E402
-import main.arm.each_task.task5.dipan as dipan_module                         # noqa: E402
-import main.arm.each_task.task5.last_blue_to_high as last_blue_high_module    # noqa: E402
-import main.arm.each_task.task5.last_yellow_to_high as last_yellow_high_module  # noqa: E402
-import main.arm.each_task.task5.last_blue_to_low as last_blue_low_module      # noqa: E402
-import main.arm.each_task.task5.last_yellow_to_low as last_yellow_low_module  # noqa: E402
 
-
-# ---------- 常量 ----------
+# ---------- 流程常量 ----------
 
 LOG_PREFIX: str = "[task5/the_final]"
 
-BACK_DIST_MM: float = -165.0
-"""底盘后撤距离 (mm), 用户 2026-07-30 指定。"""
 
-EXIT_OK = 0
-EXIT_BAD_COLOR = 3           # 阶段 1 识别失败
-EXIT_DISPATCH_FAIL = 5       # 阶段 2 / 4 调 last_* 失败
+# ---------- 主入口 ----------
 
+def run(client: ArmClient, runner: ArmRunner) -> dict:
+    """端到端分拣入库流水线 (4 阶段)。
 
-# ---------- 4 阶段 ----------
+    业务流程:
+      Phase 1: ``new_target.run(client, runner)``
+                → 4 机联动 + 模型识别 → label = "blue" / "yellow" / "unknown"
+      Phase 2: ``target_all.run(client, runner)``
+                → 4 机联动 + 全色识别 + Python 层黄蓝分桶计数
+                → counts = {count_yellow, count_blue, ...}
+      Phase 3: 根据 high_color 分支:
+        ─── 高仓 = "blue" ───
+          Phase 3a: 循环 from_blue_to_high.run() N 次 (N = count_blue)
+          Phase 3c: 底盘 move_for([-0.166, 0, 0]) 后退 166mm
+          Phase 3d: 循环 from_yellow_to_low.run() M 次 (M = count_yellow)
+        ─── 高仓 = "yellow" ───
+          Phase 3a: 循环 from_yellow_to_high.run() N 次 (N = count_yellow)
+          Phase 3c: 底盘 move_for([-0.166, 0, 0]) 后退 166mm
+          Phase 3d: 循环 from_blue_to_low.run() M 次 (M = count_blue)
+        ─── 高仓 = "unknown" / 其它 ───
+          RuntimeError: 高仓颜色无法识别, 终止流水线
 
-def step1_detect(client: ArmClient, runner: ArmRunner, args) -> str:
-    """阶段 1: 调 target.run() 识别高仓颜色, 返回 color A。"""
-    print(f"\n========== {LOG_PREFIX} [1/4] 识别高仓色标 (target.run) ==========")
-    print(f"  cam={args.cam}  roi={args.roi}  timeout={args.color_timeout}s")
-    result = target_module.run(
-        client, runner,
-        detect_color=True,
-        cam=args.cam,
-        roi=args.roi,
-        color_timeout=args.color_timeout,
-    )
-    color_info = result.get("color_info") if isinstance(result, dict) else None
-    if not isinstance(color_info, dict):
-        print(f"  {LOG_PREFIX} [FAIL] target.run() 没返回 color_info")
-        return "unknown"
-    color = str(color_info.get("color", "unknown")).lower()
-    print(f"  → color A = {color!r}  "
-          f"(blue_ratio={color_info.get('blue_ratio', 0.0):.3f}, "
-          f"yellow_ratio={color_info.get('yellow_ratio', 0.0):.3f})")
-    return color
+    Args:
+        client: ArmClient (composite_run + http + move_for 都在这里)
+        runner: ArmRunner (move_y + move_x + grasp 在这里)
 
+    Returns:
+        {
+            "ok": bool,                              # 全部阶段成功
+            "phase1_high_tower_label": dict,         # new_target.run 完整返回值
+            "high_color": str,                       # "blue" / "yellow" (Phase 1 简化)
+            "phase2_ball_counts": dict,              # target_all.run 完整返回值
+            "counts": {                              # Phase 2 简化 (球数)
+                "count_total": int,
+                "count_yellow": int,
+                "count_blue": int,
+                "count_unknown": int,
+            },
+            "phase3a_runs": list[dict],              # 高塔循环每次 run() 完整返回值
+            "phase3c_retreat": dict,                 # move_for job dict
+            "phase3d_runs": list[dict],              # 低塔循环每次 run() 完整返回值
+            "final_pose": {                          # 终态 (来自最后一次 Phase 3d run)
+                "x_mm": float,
+                "y_mm": float,
+                "arm_deg": float,
+                "hand_deg": float,
+            },
+        }
 
-def step2_high(client: ArmClient, runner: ArmRunner, color_a: str, args) -> int:
-    """阶段 2: 同色球进高仓。blue → last_blue_to_high; yellow → last_yellow_to_high."""
-    print(f"\n========== {LOG_PREFIX} [2/4] 同色球进高仓 ==========")
-    last_argv = _build_last_argv(args)
-    if color_a == "blue":
-        print(f"  A=blue → last_blue_to_high (argv={last_argv})")
-        return _invoke(last_blue_high_module, last_argv, "last_blue_to_high")
-    if color_a == "yellow":
-        print(f"  A=yellow → last_yellow_to_high (argv={last_argv})")
-        return _invoke(last_yellow_high_module, last_argv, "last_yellow_to_high")
-    print(f"  [SKIP] A={color_a!r} 不是 blue/yellow, 跳过 high")
-    return EXIT_BAD_COLOR
-
-
-def step3_back(client: ArmClient, dist_mm: float = BACK_DIST_MM,
-               align_area: float = None, align_label: str = None,
-               align_max_s: float = 15.0) -> dict:
-    """阶段 3: 底盘到 LOW 仓取位。
-
-    两种模式 (2026-08-03):
-      1. align_area 传了 → **视觉闭环对仓**: make_align_runner(ref_area=align_area)
-         按目标 bbox 面积前后微调 (main.chassis 新方法, 只动 vx 不横移不旋转)。
-         到位 → 完成; 失败 (no_target / watchdog / 超时) → 回退开环后撤。
-      2. align_area=None (默认) → 开环后撤 dist_mm mm (dipan._run, 旧行为)。
-
-    ⚠️ align_area 需**现场标定**: 手动把车摆到理想放料位, 读一帧
-       GET /v1/realtime/vision/task 里目标 bbox 的 width*height 填进来。
-       align_label=None 时取画面面积最大目标。
+    Raises:
+        RuntimeError: 任一阶段失败 (Phase 1/2/3a/3c/3d), 错误透传, 终止流水线。
+            - Phase 1: new_target.run 失败 (composite_run / 模型推理)
+            - Phase 2: target_all.run 失败 (composite_run)
+            - Phase 3a/d: from_*_to_*.run 单次循环失败
+            - Phase 3c: move_for 失败 (HTTP / 底盘故障)
+            - Phase 1 高仓颜色为 "unknown" → 主动 raise
     """
-    if align_area is not None:
-        print(f"\n========== {LOG_PREFIX} [3/4] 视觉闭环对仓 "
-              f"(ref_area={align_area}, label={align_label}, ≤{align_max_s}s) ==========")
-        try:
-            from main.chassis import make_align_runner  # 局部 import, 不开环时零依赖
-            runner = make_align_runner(ref_area=align_area, label=align_label)
-            result = runner.run(max_seconds=align_max_s)
-            print(f"  {LOG_PREFIX} 视觉对仓结果: arrived={result.arrived} "
-                  f"reason={result.reason} frames={result.frames} "
-                  f"elapsed={result.elapsed_s:.1f}s")
-            if result.arrived:
-                return {"mode": "vision_align", "arrived": True,
-                        "reason": result.reason}
-            print(f"  [WARN] 视觉对仓未到位 (reason={result.reason}), 回退开环后撤")
-        except Exception as e:
-            print(f"  [WARN] 视觉对仓异常: {type(e).__name__}: {e}, 回退开环后撤")
+    t_total_start = time.perf_counter()
 
-    print(f"\n========== {LOG_PREFIX} [3/4] 底盘开环后撤 {abs(dist_mm):.0f}mm ==========")
-    print(f"  走 dipan._run(client, dist_mm={dist_mm}) "
-          f"(max_velocity=0.10 m/s, timeout=20.0s)")
-    job = dipan_module._run(
-        client, dist_mm=dist_mm, max_velocity_ms=0.10, timeout=20.0,
-    )
-    print(f"  {LOG_PREFIX} 后撤完成")
-    return {"mode": "open_loop", "job": job}
+    print(f"\n========== {LOG_PREFIX} run (端到端分拣入库流水线, 4 阶段) ==========")
+    print(f"  Phase 1: new_target.run  (识别高仓颜色)")
+    print(f"  Phase 2: target_all.run  (识别球数: 黄/蓝 分桶)")
+    print(f"  Phase 3: 底盘 + 高/低塔循环 (matching → 高, opposite → 低)")
+
+    # ========== Phase 1: 识别高仓颜色 ==========
+    print(f"\n--- Phase 1: new_target.run ---")
+    phase1 = new_target.run(client, runner)
+    if not isinstance(phase1, dict) or not phase1.get("ok", False):
+        print(f"  ❌ Phase 1 失败: {phase1}")
+        raise RuntimeError(
+            f"{LOG_PREFIX} Phase 1 new_target.run 失败, 终止流水线 (Phase 2/3 未执行)"
+        )
+    high_color = phase1.get("label", "unknown")
+    print(f"  ✅ Phase 1 完成  高仓颜色 = {high_color!r}")
+    if high_color not in ("blue", "yellow"):
+        raise RuntimeError(
+            f"{LOG_PREFIX} Phase 1 高仓颜色无法识别 ({high_color!r}), "
+            f"仅支持 'blue' / 'yellow', 终止流水线"
+        )
+
+    # ========== Phase 2: 识别球数 (黄/蓝 分桶) ==========
+    print(f"\n--- Phase 2: target_all.run ---")
+    phase2 = target_all.run(client, runner)
+    if not isinstance(phase2, dict) or not phase2.get("ok", False):
+        print(f"  ❌ Phase 2 失败: {phase2}")
+        raise RuntimeError(
+            f"{LOG_PREFIX} Phase 2 target_all.run 失败, 终止流水线 (Phase 3 未执行)"
+        )
+    counts = phase2.get("counts", {})
+    n_blue = int(counts.get("count_blue", 0))
+    n_yellow = int(counts.get("count_yellow", 0))
+    n_total = int(counts.get("count_total", 0))
+    print(f"  ✅ Phase 2 完成  球数: 总 {n_total} 个, 黄 {n_yellow}, 蓝 {n_blue}, "
+          f"unknown {counts.get('count_unknown', 0)}")
+
+    # ========== Phase 3: 根据 high_color 分支 ==========
+    if high_color == "blue":
+        phase3a_runs = _loop_run(client, runner,
+                                  runner_module=from_blue_to_high,
+                                  count=n_blue,
+                                  phase_label="3a",
+                                  color_label="蓝",
+                                  tower_label="高")
+        phase3c_retreat = _retreat_166mm(client)
+        phase3d_runs = _loop_run(client, runner,
+                                  runner_module=from_yellow_to_low,
+                                  count=n_yellow,
+                                  phase_label="3d",
+                                  color_label="黄",
+                                  tower_label="低")
+    else:  # high_color == "yellow"
+        phase3a_runs = _loop_run(client, runner,
+                                  runner_module=from_yellow_to_high,
+                                  count=n_yellow,
+                                  phase_label="3a",
+                                  color_label="黄",
+                                  tower_label="高")
+        phase3c_retreat = _retreat_166mm(client)
+        phase3d_runs = _loop_run(client, runner,
+                                  runner_module=from_blue_to_low,
+                                  count=n_blue,
+                                  phase_label="3d",
+                                  color_label="蓝",
+                                  tower_label="低")
+
+    # 终态 = Phase 3d 最后一次 run 的 final_pose (失败时 final_pose 来自最后一次成功)
+    final_pose = (phase3d_runs[-1].get("final_pose", {}) if phase3d_runs
+                  else (phase3a_runs[-1].get("final_pose", {}) if phase3a_runs
+                        else phase2.get("final_pose", {})))
+
+    elapsed = time.perf_counter() - t_total_start
+    print(f"\n========== {LOG_PREFIX} 完成 "
+          f"(高仓={high_color}, 球数 黄={n_yellow} 蓝={n_blue}, "
+          f"高塔={len(phase3a_runs)} 次, 低塔={len(phase3d_runs)} 次, "
+          f"总耗时 {elapsed:.3f}s) ==========\n")
+
+    return {
+        "ok": True,
+        "phase1_high_tower_label": phase1,
+        "high_color": high_color,
+        "phase2_ball_counts": phase2,
+        "counts": counts,
+        "phase3a_runs": phase3a_runs,
+        "phase3c_retreat": phase3c_retreat,
+        "phase3d_runs": phase3d_runs,
+        "final_pose": final_pose,
+    }
 
 
-def step4_low(client: ArmClient, runner: ArmRunner, color_a: str, args) -> int:
-    """阶段 4: 反色球进 LOW 仓。blue → last_yellow_to_low; yellow → last_blue_to_low."""
-    print(f"\n========== {LOG_PREFIX} [4/4] 反色球进 LOW 仓 ==========")
-    last_argv = _build_last_argv(args)
-    if color_a == "blue":
-        print(f"  A=blue → LOW 仓放黄球: last_yellow_to_low (argv={last_argv})")
-        return _invoke(last_yellow_low_module, last_argv, "last_yellow_to_low")
-    if color_a == "yellow":
-        print(f"  A=yellow → LOW 仓放蓝球: last_blue_to_low (argv={last_argv})")
-        return _invoke(last_blue_low_module, last_argv, "last_blue_to_low")
-    print(f"  [SKIP] A={color_a!r} 不是 blue/yellow, 跳过 LOW")
-    return EXIT_BAD_COLOR
+# ---------- 辅助函数 (本文件私有) ----------
 
+def _loop_run(client: ArmClient, runner: ArmRunner,
+              runner_module, count: int,
+              phase_label: str, color_label: str, tower_label: str) -> list:
+    """循环调用 ``runner_module.run(client, runner)`` 共 ``count`` 次。
 
-# ---------- helpers ----------
+    Args:
+        client: ArmClient
+        runner: ArmRunner
+        runner_module: 任一 from_*_to_*.py 模块 (from_blue_to_high 等)
+        count: 循环次数 (= 对应颜色的球数)
+        phase_label: "3a" / "3d" (用于日志)
+        color_label: "黄" / "蓝" (中文, 用于日志)
+        tower_label: "高" / "低" (中文, 用于日志)
 
-def _invoke(module, argv: list, label: str) -> int:
-    """调 last_*_to_{high,low}.main(argv); 异常 → EXIT_DISPATCH_FAIL。"""
-    try:
-        rc = module.main(argv)
-    except Exception as e:
-        print(f"  {LOG_PREFIX} [FAIL] {label} 抛异常: {type(e).__name__}: {e}")
-        return EXIT_DISPATCH_FAIL
-    return int(rc) if rc is not None else EXIT_OK
+    Returns:
+        list[dict]: 每次 run() 的完整返回值, 按顺序。
 
-
-def _build_last_argv(args) -> list:
-    """the_final Namespace → last_*_to_{high,low} 接受的 argv。
-
-    ⚠️ --no-detect 语义冲突: the_final 是「跳过 target 识别」, last_* 是「跳过球
-    识别」。**不**透传 --no-detect 给 last_*, 让它照常做球识别 (更稳)。
+    Raises:
+        RuntimeError: 任一次循环失败, 透传原始错误, 终止流水线 (不继续后面的球)。
+            若 count=0 直接返回 [] 不报错。
     """
-    argv = []
-    if args.balls is not None and args.balls >= 0:
-        argv += ["--balls", str(args.balls)]
-    if args.hold is not None:
-        argv += ["--hold", str(args.hold)]
-    if args.no_prep:
-        argv += ["--no-prep"]
-    if args.detect_timeout is not None:
-        argv += ["--detect-timeout", str(args.detect_timeout)]
-    if args.score_min is not None:
-        argv += ["--score-min", str(args.score_min)]
-    if args.area_min is not None:
-        argv += ["--area-min", str(args.area_min)]
-    if args.area_max is not None:
-        argv += ["--area-max", str(args.area_max)]
-    if args.aspect_tol is not None:
-        argv += ["--aspect-tol", str(args.aspect_tol)]
-    # 2026-08-03: 视觉闭环取球参数透传给 last_* (再透传 test_run_fn / pick_and_place)
-    if getattr(args, "vision", False):
-        argv += ["--vision"]
-        if getattr(args, "grasp_y", None) is not None:
-            argv += ["--grasp-y", str(args.grasp_y)]
-        if not getattr(args, "vision_fallback", True):
-            argv += ["--no-vision-fallback"]
-        if getattr(args, "sign_arm", 1.0) != 1.0:
-            argv += ["--sign-arm", str(args.sign_arm)]
-        if getattr(args, "sign_x", -1.0) != -1.0:
-            argv += ["--sign-x", str(args.sign_x)]
-        if getattr(args, "vision_timeout", 20.0) != 20.0:
-            argv += ["--vision-timeout", str(args.vision_timeout)]
-    return argv
+    print(f"\n--- Phase {phase_label}: {runner_module.__name__.split('.')[-1]}.run × {count} "
+          f"({color_label}球进{tower_label}塔) ---")
+    if count <= 0:
+        print(f"  ⏭️  count={count}, 跳过循环")
+        return []
+    results: list = []
+    for i in range(1, count + 1):
+        print(f"\n  [{phase_label}.{i}/{count}] {runner_module.__name__.split('.')[-1]}.run(client, runner)")
+        result = runner_module.run(client, runner)
+        if not isinstance(result, dict) or not result.get("ok", False):
+            print(f"  [{phase_label}.{i}/{count}] ❌ 失败: {result}")
+            raise RuntimeError(
+                f"{LOG_PREFIX} Phase {phase_label} 第 {i}/{count} 次 "
+                f"{runner_module.__name__.split('.')[-1]}.run 失败, 终止流水线"
+            )
+        results.append(result)
+        pose = result.get("final_pose", {})
+        print(f"  [{phase_label}.{i}/{count}] ✅ 完成  终态: "
+              f"x={pose.get('x_mm')} y={pose.get('y_mm')} "
+              f"arm={pose.get('arm_deg')}° hand={pose.get('hand_deg')}°")
+    return results
+
+
+def _retreat_166mm(client: ArmClient) -> dict:
+    """底盘后退 166mm (复用 dipan.py 的常量, 不调其私有 _run)。
+
+    走 ``client.http.execute_car_action("move_for", [-0.166, 0, 0], sync=True)``,
+    默认限速 0.10 m/s, timeout 自适应 (dipan.py 文档:
+    max(5.0, abs(dist_m)/max_vel + 2) = max(5.0, 0.166/0.10 + 2) = max(5.0, 3.66) = 5.0s)。
+
+    Args:
+        client: ArmClient (取 .http 走车端 action)
+
+    Returns:
+        ``/v1/execute`` 同步返回的 job dict (含 status/result/error)。
+
+    Raises:
+        RuntimeError: move_for 失败 (status != succeeded)。
+    """
+    dist_mm = dipan.DEFAULT_DIST_MM  # -166.0
+    max_vel = dipan.DEFAULT_MAX_VELOCITY_MS  # 0.10
+    timeout = dipan.DEFAULT_TIMEOUT_S  # 20.0 (用户未传 --timeout, 用 dipan 默认)
+    # 自适应 timeout (与 dipan.py main() 同款)
+    adaptive_timeout = max(5.0, abs(dist_mm) / 1000.0 / max(max_vel, 0.01) + 2.0)
+    # 优先用 adaptive_timeout, 但若 dipan DEFAULT_TIMEOUT_S 与原值相等说明未传 --timeout,
+    # 用 adaptive; 否则用显式传入值。本文件不暴露 --timeout, 故全部用 adaptive。
+    actual_timeout = adaptive_timeout
+
+    dist_m = dist_mm / 1000.0
+    direction = "向后"
+    print(f"\n--- Phase 3c: 底盘后退 {abs(dist_mm):.0f}mm "
+          f"(x_offset={dist_m:+.3f}m, max_v={max_vel:.2f}m/s, "
+          f"timeout={actual_timeout:.1f}s) ---")
+    t0 = time.perf_counter()
+    job = client.http.execute_car_action(
+        "move_for",
+        [dist_m, 0.0, 0.0],          # [x, y, theta] —— 纯 x 直线, 不横移 / 不转向
+        max_velocities=[max_vel, max_vel, 0.0],
+        sync=True,
+        timeout=actual_timeout,
+    )
+    dt = time.perf_counter() - t0
+
+    ok = isinstance(job, dict) and job.get("status") == "succeeded"
+    status = job.get("status") if isinstance(job, dict) else None
+    error = job.get("error") if isinstance(job, dict) else None
+
+    print(f"  ✅ 底盘 {direction} {abs(dist_mm):.0f}mm 完成 (status={status!r}, 耗时={dt:.2f}s)")
+
+    if not ok:
+        raise RuntimeError(
+            f"{LOG_PREFIX} Phase 3c 底盘后退失败 (status={status!r}, error={error!r})"
+        )
+    return job
 
 
 # ---------- CLI ----------
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="task5 the_final: target识别 → 同色high → 后撤165mm → 反色low",
+    """CLI 参数: 顶层编排层**不暴露** 5 个底层 run() 内部参数。
+
+    原因: 用户明确要求"调用它们的 run()", 即让 5 个底层 run() 自己用默认值,
+    不在顶层编排层覆写。如果未来需要调参, 直接调 new_target.run / target_all.run /
+    from_*_to_*.run / dipan._run 的关键字参数 (这些 run 都已经把每个步骤的参数做成可调关键字)。
+    """
+    return argparse.ArgumentParser(
+        description=(
+            "task5/the_final v1: 端到端分拣入库流水线 (4 阶段)\n"
+            "  Phase 1: new_target.run (识别高仓颜色)\n"
+            "  Phase 2: target_all.run (识别球数: 黄/蓝 分桶)\n"
+            "  Phase 3: 底盘 + 高/低塔循环 (matching → 高塔, opposite → 低塔)\n"
+            "  默认耗时 ~30-60s (含底盘后退)"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # ---- 阶段 1 色标识别 ----
-    p.add_argument("--color", choices=("blue", "yellow"), default=None,
-                   help="手动指定高仓色 (跳过阶段 1 target 识别)")
-    p.add_argument("--cam", default=target_module.DEFAULT_CAM,
-                   help=f"色标识别相机 (默认 {target_module.DEFAULT_CAM}=side)")
-    p.add_argument("--roi", type=int, nargs=4, default=None,
-                   metavar=("X", "Y", "W", "H"),
-                   help=f"色标 ROI, 默认 target.DEFAULT_ROI ({target_module.DEFAULT_ROI})")
-    p.add_argument("--color-timeout", type=float,
-                   default=target_module.JPEG_FETCH_TIMEOUT_S,
-                   dest="color_timeout",
-                   help="抓 JPEG HTTP 超时 (秒)")
-    # ---- 透传给 last_* ----
-    p.add_argument("--balls", type=int, default=-1,
-                   help="强制执行轮数 (透传给 last_*), -1=用检测球数")
-    p.add_argument("--hold", type=float, default=None,
-                   help="每轮吸气保持秒数 (透传给 last_*)")
-    p.add_argument("--no-prep", action="store_true", dest="no_prep",
-                   help="跳过 last_* 检测前的摆臂 (透传)")
-    p.add_argument("--detect-timeout", type=float, default=None,
-                   dest="detect_timeout",
-                   help="last_* 球识别轮询总时长 (秒)")
-    p.add_argument("--score-min", type=float, default=None,
-                   dest="score_min", help="last_* 识别最低置信度")
-    p.add_argument("--area-min", type=float, default=None,
-                   dest="area_min", help="last_* 识别最小归一化面积")
-    p.add_argument("--area-max", type=float, default=None,
-                   dest="area_max", help="last_* 识别最大归一化面积")
-    p.add_argument("--aspect-tol", type=float, default=None,
-                   dest="aspect_tol",
-                   help="last_* 识别宽高比容差 |aspect-1|≤tol")
-    # ---- 2026-08-03 新增: 视觉闭环取球 (透传 last_* → test_run_fn) ----
-    p.add_argument("--vision", action="store_true",
-                   help="启用视觉闭环取球 (track_velocity_pick); "
-                        "⚠️ sign 是 task1 姿态标定值, task5 位姿首跑先确认方向")
-    p.add_argument("--grasp-y", type=float, default=None, dest="grasp_y",
-                   help="视觉模式吸气 y (mm); 不传用 pick_and_place 默认 (-70)")
-    p.add_argument("--no-vision-fallback", dest="vision_fallback", action="store_false",
-                   help="视觉失败不回退开环盲吸 (默认回退)")
-    p.add_argument("--sign-arm", type=float, default=1.0, dest="sign_arm",
-                   help="视觉伺服大臂轴符号 (±1, 现场标定)")
-    p.add_argument("--sign-x", type=float, default=-1.0, dest="sign_x",
-                   help="视觉伺服 x 轴符号 (±1, 现场标定)")
-    p.add_argument("--vision-timeout", type=float, default=20.0,
-                   dest="vision_timeout", help="视觉伺服总超时 (秒)")
-    # ---- 2026-08-03 新增: 阶段 3 视觉闭环对仓 (make_align_runner) ----
-    p.add_argument("--align-area", type=float, default=None, dest="align_area",
-                   help="阶段 3 视觉对仓参考面积 (现场标定); 传了则优先视觉闭环, "
-                        "失败回退开环后撤; 不传走开环后撤 (旧行为)")
-    p.add_argument("--align-label", default=None, dest="align_label",
-                   help="视觉对仓目标 label; 不传取画面面积最大目标")
-    p.add_argument("--align-max-s", type=float, default=15.0, dest="align_max_s",
-                   help="视觉对仓最长时长 (秒)")
-    p.set_defaults(vision_fallback=True)
-    return p
 
 
 def main(argv=None) -> int:
-    t_total = time.perf_counter()
     args = build_parser().parse_args(argv)
-    print(f"========== {LOG_PREFIX} run ==========")
-    print(f"  --color={args.color}  --balls={args.balls}")
-
     client = ArmClient.connect()
+    if not client.ping():
+        raise RuntimeError("机械臂 runtime 未在线, 请检查 arm_feed 守护进程")
     runner = ArmRunner(client)
-
-    # 阶段 1: 识别高仓色 → color A
-    if args.color is not None:
-        color_a = args.color
-        print(f"\n  {LOG_PREFIX} [1/4] 跳过 target 识别, 手动 --color={color_a}")
-    else:
-        color_a = step1_detect(client, runner, args)
-
-    if color_a not in ("blue", "yellow"):
-        print(f"  {LOG_PREFIX} [FAIL] color A={color_a!r} 不是 blue/yellow, 终止")
-        return EXIT_BAD_COLOR
-
-    # 阶段 2: 同色球进高仓
-    rc2 = step2_high(client, runner, color_a, args)
-    if rc2 not in (EXIT_OK, EXIT_BAD_COLOR):
-        print(f"  {LOG_PREFIX} 阶段 2 失败 (rc={rc2}), 流水线终止")
-        return rc2
-
-    # 阶段 3: 底盘后撤 165mm
-    step3_back(client, BACK_DIST_MM)
-
-    # 阶段 4: 反色球进 LOW 仓
-    rc4 = step4_low(client, runner, color_a, args)
-    if rc4 not in (EXIT_OK, EXIT_BAD_COLOR):
-        print(f"  {LOG_PREFIX} 阶段 4 失败 (rc={rc4})")
-        return rc4
-
-    elapsed = time.perf_counter() - t_total
-    print(f"\n========== {LOG_PREFIX} 完成 (A={color_a}, "
-          f"{elapsed:.3f}s) ==========\n")
-    return EXIT_OK
+    result = run(client, runner)
+    return 0 if result.get("ok") else 1
 
 
 if __name__ == "__main__":

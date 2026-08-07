@@ -287,9 +287,9 @@ waypoints:
   - name: task5_sort
     task_id: 5
     task_module: main.task.task5_sort
-    ir_threshold_m: 0.50
-    ir_side: right
-    dis_at_least_m: 11.0
+    ir_threshold_m: 0.15
+    ir_side: left
+    dis_at_least_m: 0
     trigger_op: AND
 
   # ----- task6 -----
@@ -298,7 +298,7 @@ waypoints:
     task_module: main.task.task6_get_order
     ir_threshold_m: 0.50
     ir_side: left
-    dis_at_least_m: 13.0
+    dis_at_least_m: 0
     trigger_op: AND
 
   # ----- task7 (TODO) -----

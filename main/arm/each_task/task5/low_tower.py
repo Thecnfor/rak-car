@@ -1,33 +1,44 @@
-"""task5 / low_tower —— 把机械臂摆到 '低塔/低位仓' 目标位姿。
+"""task5 / low_tower —— 低塔投球 3 步流程 (单文件, 非包)。
 
-目标位姿 (用户指定 2026-07-22, y/x 后续调整, 2026-07-27 arm 0°→90°):
-  - y 轴  → -200 mm   (high_tower 是 -180, low_tower 更深)
-  - x 轴  → -169 mm   (high_tower 是 -150, low_tower 更远)
-  - 大臂角度 → +90°   (MID / 复位位, 跟 high_tower 一样)
-  - 手爪角度 →   0°   (DOWN, **跟 high_tower 的 -90 UP 不同!**)
+业务流程 (2026-08-08 用户指定):
+  1. move_y(-176mm)               y 先抬到 -176mm (出保护区, 给复合摆位让出空间)
+  2. composite_run (4 机联动)     y=-176, x=-150, arm=90°, hand=0° (~2-3s)
+  3. grasp(False)                 **结束吸气** = 释放真空 (球掉进低塔)
 
-动作顺序 (跟 high_tower 一致, 用户 2026-07-22 指定):
-  1. move_y(-200)         抬出保护区 [0,-30]
-  2. set_arm_angle(+90°)   MID / 复位位, 保护区允许 (跟 high_tower 同款)
-  3. set_hand_angle(0°)   **DOWN, 不走 wrapper 走 _call_arm 直调** (关键差异!)
-  4. move_x(-169)         belt-slip 分段 + realtime 校验 (跨 180mm, 触发分段)
+终态: x=-150mm, y=-176mm, arm=90°, hand=0°, 真空阀 OFF (球已入低塔)。
 
-⚠️ **跟 high_tower 的差异 (2026-07-22 用户多次调整)**:
-  - y:     -180 → -200  (low_tower 更深 20mm)
-  - x:     -150 → -180 → -172 → -169  (low_tower 更远 19mm; 2026-07-30 现场连调 2 次)
-  - 手爪:  -90° (UP) → 0° (DOWN)   **关键差异: 0° 走 wrapper 会被拒**
-  - 大臂:  一样 (+90° MID / 复位位)
+⚠️ **业务流程 vs high_tower.py 的差异** (2026-08-08 用户指定):
+  - low_tower 没有 x 推进 / 回退 (high_tower 的步骤 3/5)
+    → 低塔位置比高塔矮, 不需要伸进去就能投球
+  - hand=0° (DOWN) vs high_tower hand=-82° (接近 UP)
+    → 低塔投球姿势: 手爪朝下, 业务硬限中点 (-90, +10)
+  - y=-176 vs high_tower y=-185 (高塔更高)
+    → y=-176 比 -185 离 0 (触底) 近 9mm, 符合"低塔"语义
+  - 总耗时更短 (3 步 vs 5 步)
 
-⚠️ **手爪 0° 必须 _call_arm 底层直调 (跟 high_tower 第 3 步不同)**:
-  - api.py:591-599 的 Python 层安全门: 大臂 ∈ [-30, 0] 展开区时手爪只允许
-    -90 (UP), 0° 会 raise。
-  - 走 `_call_arm("set_hand_angle", ...)` 直调 + `sync=True`, 绕开 Python 层
-    校验。真正下发的合法性由车端决定: 硬件若真不允许 → 车端 error; Python
-    层不先 raise。
-  - 跟 get_yellow.py 的 set_hand_angle(0°) 同款 (那里大臂 2026-07-29 已改 85°)。
+⚠️ **业务硬限校验 (ARM_API.md §1.1 / setters.py:45)**:
+  - y=-176 ∈ [-200, 0] mm ✓ (出保护区 [0, -80] 96mm)
+  - x=-150 ∈ [-320, +220] mm ✓ (距物理墙 ~-300mm, 安全)
+  - arm=90 ∈ [-150, +150]° ✓ (复位位, 业务硬限上界)
+  - hand=0 ∈ [-90, +10]° ✓ (DOWN 位, 业务硬限中点)
 
-⚠️ 本文件**自包含**: 只依赖 `main.arm` (ArmClient/ArmRunner), 不 import task5
-   包内其它模块。原因: task5 辅助文件曾被外部动作清空过, 自包含可保证跑得起来。
+⚠️ **composite_run 业务硬限 (ARM_API.md §1.1 / setters.py:45)**:
+  - 4 轴必须全传有效值 (2026-08-06 实测踩坑): 不接受 None 轴, SDK 会把 None 判 False
+    整个 job `result.ok=False`。详见 [[composite-run-no-partial-2026-08-06]]
+  - 步骤 2 y=-176 与步骤 1 末态 y=-176 相同: composite 内部走 no-op (SDK 同值 = 不动)
+  - composite_run 不调 _check_y_protected (composite.py:60 拍板): hand=0°
+    在 y=-176 时不会被 wrapper 拦截 (虽然本身在业务硬限内)
+
+⚠️ **grasp 真空阀走 runner.grasp()** (loops/runner.py:182):
+  - **严禁** ``client.http.execute_arm_action('grasp', ...)``
+  - 现场实测 2026-08-03 SDK 内部 struct.pack 报 "required argument is not an integer"
+  - **关键**: 投球动作 = ``runner.grasp(False)`` (释放真空), 不要写成 grasp(True)
+  - 详见 [[arm-grasp-call-arm-base]]
+
+⚠️ **本文件自包含**: 只依赖 ``main.arm`` (ArmClient/ArmRunner),
+   **不 import task5 包内其它模块** (constants.py / grasp_5 / *_tower)。
+   沿用 high_tower.py / new_get_*.py / target_blue.py 自包含约定
+   — task5 辅助文件曾被外部动作清空过, 自包含保证直接跑不受影响。
 
 跑法:
     python main/arm/each_task/task5/low_tower.py
@@ -45,113 +56,177 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
-from main.arm.each_task.common import move_x_with_split  # noqa: E402
 
 
-# ---------- 目标位姿常量 (内联, 不依赖 constants.py) ----------
+# ---------- 流程常量 (内联, 不依赖 constants.py) ----------
 
 LOG_PREFIX: str = "[task5/low_tower]"
 
-LOW_TOWER_Y_MM: float = -200.0
-"""低位仓 y。2026-07-22 用户从 -180 调为 -200 (比 high_tower 深 20mm)。出 y 保护区 [0,-30]。"""
+APPROACH_Y_MM: float = -176.0
+"""步骤 1 y 目标 (mm)。
 
-LOW_TOWER_X_MM: float = -169
-"""低位仓 x。历史: 2026-07-22 用户从 -210 调为 -180 (比 high_tower 远 30mm);
-2026-07-30 现场再调 -180 → -172 (根据 overshoot 实测反推, 8mm 留 PID 余量);
-2026-07-30 当场又调 -172 → -169 (再缩 3mm, PID 闭环实测更稳)。
-跨 180mm 仍触发 belt-slip 分段 (overshoot_wall_hit 场景, 见 common.move_x_with_split)。"""
+y=-176: 出保护区 [0, -80] 96mm, 给步骤 2 composite_run 让出空间。
+也是 low_tower 投球的高度 (比 high_tower 的 -185 高 9mm, 离触底近 9mm)。"""
 
-LOW_TOWER_ARM_DEG: float = 90.0
-"""大臂 MID / 复位位 (+90°, 2026-07-27 后)。保护区允许 (跟 high_tower 一样)。"""
+PICK_COMPOSITE_Y_MM: float = -176.0
+"""步骤 2 composite_run 目标 y (mm)。
 
-LOW_TOWER_HAND_DEG: float = 0.0
-"""手爪 DOWN。**走 _call_arm 直调, 绕开 api.py:591-599 展开区手爪限 -90 的校验**。
-跟 high_tower 的 -90 UP 不同 (high_tower 走 wrapper OK, low_tower 必须直调)。"""
+y=-176: 与步骤 1 相同, composite 内部走 no-op (SDK 同值 = 不动)。
+低塔投球位姿 (比高塔 -185 高 9mm)。"""
 
+PICK_COMPOSITE_X_MM: float = -150.0
+"""步骤 2 composite_run 目标 x (mm)。
 
-# ---------- belt-slip 安全 move_x (抽离到 main.arm.each_task.common) ----------
+x=-150: 低塔投球位姿 (吸盘正对低塔开口)。
+距物理墙 ~-300mm 还有 150mm, 安全。"""
 
-# 2026-07-30: 之前 3 个 task5 文件 (high_tower / low_tower / target) 各拷贝一份
-# _move_x_with_split, 改一处要同步 3 处容易漏。现抽到 main.arm.each_task.common,
-# 3 个文件 import 即可。low_tower 是 2026-07-30 增强版 (wall_hit + overshoot 检测)
-# 的源头, 抽离后另外两个自动获得这些能力。
-# 本地保留 _move_x_with_split 别名 → 兼容 run() 内部调用 + 历史 log 习惯
-def _move_x_with_split(client: ArmClient, runner: ArmRunner,
-                       target_x_mm: float) -> dict:
-    """薄 wrapper: 透传 common.move_x_with_split, 注入 LOG_PREFIX。
+PICK_COMPOSITE_ARM_DEG: float = 90.0
+"""步骤 2 composite_run 目标大臂角度 (°)。
 
-    见 main/arm/each_task/common.py:move_x_with_split 完整 docstring。
-    """
-    return move_x_with_split(
-        client, runner, target_x_mm,
-        log_prefix=LOG_PREFIX,
-    )
+arm=90: 业务硬限上界 + 复位位 (init 例外位, 保护区允许)。
+低塔投球大臂姿势 (与 high_tower 一致)。"""
+
+PICK_COMPOSITE_HAND_DEG: float = 0.0
+"""步骤 2 composite_run 目标手爪角度 (°)。
+
+hand=0: DOWN 位 (手爪朝下), 业务硬限中点 (-90, +10) 范围内。
+与 high_tower hand=-82° (接近 UP) 不同, low_tower 用 DOWN 投球姿势。"""
+
+# composite_run 4 机联动参数 (沿用 high_tower.py / new_get_blue.py 同款)
+COMPOSITE_TIMEOUT_S: float = 30.0
+"""4 机联动 composite_run 同步超时 (秒)。4 轴并发到位一般 ~2-3s, 给 30s 兜底
+(含网络 + job_queue + SDK 内部 4 路 as_completed)。"""
+
+ANGLE_SPEED: int = 80
+"""大臂 / 手爪舵机速度 + xy PID speed, 默认 80。与 task5 v4 / high_tower 一致。"""
+
+# 步骤 1 的 move_y 超时 + 步骤 3 的 grasp 超时
+MOVE_TIMEOUT_S: float = 30.0
+"""步骤 1 单轴 move_y 超时 (秒)。"""
+
+GRASP_TIMEOUT_S: float = 10.0
+"""步骤 3 释放真空超时 (秒)。真空阀 OFF 响应时间 ~1s, 给 10s 兜底。"""
 
 
 # ---------- 主入口 ----------
 
 def run(client: ArmClient, runner: ArmRunner,
-        y_mm: float = LOW_TOWER_Y_MM,
-        x_mm: float = LOW_TOWER_X_MM,
-        arm_deg: float = LOW_TOWER_ARM_DEG,
-        hand_deg: float = LOW_TOWER_HAND_DEG) -> dict:
-    """把臂摆到低位仓目标位姿 (顺序跟 high_tower 一致)。
+        approach_y_mm: float = APPROACH_Y_MM,
+        pick_y_mm: float = PICK_COMPOSITE_Y_MM,
+        pick_x_mm: float = PICK_COMPOSITE_X_MM,
+        pick_arm_deg: float = PICK_COMPOSITE_ARM_DEG,
+        pick_hand_deg: float = PICK_COMPOSITE_HAND_DEG,
+        *,
+        move_timeout: float = MOVE_TIMEOUT_S,
+        grasp_timeout: float = GRASP_TIMEOUT_S) -> dict:
+    """低塔投球 3 步流程。
+
+    业务流程:
+      1. ``runner.move_y(approach_y_mm)``  y 抬到 -176mm (出保护区)
+      2. ``client.composite_run(...)``      4 机联动到投球位姿 (~2-3s)
+      3. ``runner.grasp(False)``            **结束吸气** = 释放真空 (球入低塔)
+
+    Args:
+        client: ArmClient (composite_run + http 在这里)
+        runner: ArmRunner (move_y + grasp 在这里)
+        approach_y_mm: 步骤 1 y 目标 (mm), 默认 -176
+        pick_y_mm: 步骤 2 composite_run 目标 y (mm), 默认 -176
+        pick_x_mm: 步骤 2 composite_run 目标 x (mm), 默认 -150
+        pick_arm_deg: 步骤 2 composite_run 目标大臂角度 (°), 默认 90
+        pick_hand_deg: 步骤 2 composite_run 目标手爪角度 (°), 默认 0
+        move_timeout: 步骤 1 move_y 超时 (秒), 默认 30
+        grasp_timeout: 步骤 3 释放真空超时 (秒), 默认 10
 
     Returns:
         {
-            "ok": bool,            # **2026-07-30 改**: 反映 x 实际成功 (不是永远 True)
-            "y_mm": float,
-            "x_info": dict,        # 见 _move_x_with_split 注释
-            "arm_deg": float,
-            "hand_deg": float,
+            "ok": True,                          # 3 步全成功
+            "step1_move_y": dict,                # 步骤 1 move_y job dict
+            "step2_composite": dict,             # 步骤 2 composite_run job dict
+            "step3_release": dict,               # 步骤 3 grasp(False) job dict
+            "final_pose": {                      # 终态 (预期值, 不重读 state)
+                "x_mm": float,                    # = pick_x_mm
+                "y_mm": float,                    # = pick_y_mm
+                "arm_deg": float,                 # = pick_arm_deg
+                "hand_deg": float,                # = pick_hand_deg
+            },
         }
+
+    Raises:
+        RuntimeError: 步骤 2 composite_run 失败 (status != "succeeded" 或 result.ok=False)。
+            步骤 1 move 失败走 runner.move_y 抛错逻辑。
+            步骤 3 release 失败走 runner.grasp 抛错逻辑。
     """
-    print(f"\n========== {LOG_PREFIX} run ==========")
-    print(f"  目标: y={y_mm}mm arm={arm_deg}° hand={hand_deg}° x={x_mm}mm (最后动)")
+    print(f"\n========== {LOG_PREFIX} run (低塔投球 3 步) ==========")
+    print(f"  步骤 1: y → {approach_y_mm}mm (出保护区)")
+    print(f"  步骤 2: composite_run (y={pick_y_mm} x={pick_x_mm} "
+          f"arm={pick_arm_deg}° hand={pick_hand_deg}°)")
+    print(f"  步骤 3: grasp(False) (结束吸气 = 释放真空, 球入低塔)")
 
-    # 1. y 出保护区
-    print(f"  [1/4] move_y({y_mm}mm)  出 y 保护区 [0,-30]")
-    runner.move_y(y_mm, timeout=30.0)
+    # ========== 步骤 1: y → -176mm (出保护区) ==========
+    # move_y 走步进电机, 允许保护区 [0, -30] 内调, 用于出保护区
+    print(f"\n  [1/3] runner.move_y({approach_y_mm}mm)  y 抬到 -176mm")
+    step1 = runner.move_y(approach_y_mm, timeout=move_timeout)
 
-    # 2. 大臂 MID (跟 high_tower 同款)
-    print(f"  [2/4] set_arm_angle({arm_deg}°)  MID (init 例外位, 保护区允许)")
-    client.set_arm_angle(arm_deg, speed=80, timeout=10.0)
-
-    # 3. 手爪 DOWN —— 跟 high_tower 不同! wrapper 会拒, 走底层直调
-    print(f"  [3/4] set_hand_angle({hand_deg}°)  DOWN (底层直调, 绕开 api.py:591-599)")
-    client._call_arm(
-        "set_hand_angle", timeout=10.0, sync=True,
-        angle=hand_deg, speed=80,
+    # ========== 步骤 2: composite_run 4 机联动到投球位姿 ==========
+    # 仿 high_tower.py / new_get_blue.py / new_target.py / target_blue.py 模式
+    # ⚠️ composite_run 不接受 None 轴 (2026-08-06 实测): 4 轴全传有效值
+    #    步骤 2 y=-176 与步骤 1 末态相同, 内部走 no-op (SDK 同值 = 不动)
+    # ⚠️ composite_run 不调 _check_y_protected (composite.py:60 拍板): hand=0°
+    #    在 y=-176 时不会被 wrapper 拦截 (虽然本身在业务硬限内)
+    print(f"\n  [2/3] composite_run (4 机联动): arm={pick_arm_deg:+.0f}° x={pick_x_mm:.0f}mm "
+          f"y={pick_y_mm:.0f}mm hand={pick_hand_deg:+.0f}°  speed={ANGLE_SPEED} "
+          f"timeout={COMPOSITE_TIMEOUT_S:.0f}s")
+    step2 = client.composite_run(
+        arm=pick_arm_deg,
+        x_mm=pick_x_mm,
+        y_mm=pick_y_mm,
+        hand=pick_hand_deg,
+        speed=ANGLE_SPEED,
+        timeout=COMPOSITE_TIMEOUT_S,
     )
+    ok2 = (
+        isinstance(step2, dict)
+        and step2.get("status") == "succeeded"
+        and isinstance(step2.get("result"), dict)
+        and step2["result"].get("ok", False)
+    )
+    if not ok2:
+        # ⚠️ 通用踩坑: job["result"]["ok"] 不是 job["ok"] — job dict 和
+        # composite_run SDK 返回的 result dict 是嵌套结构, 详见
+        # [[composite-run-no-partial-2026-08-06]]
+        print(f"  [2/3] ❌ composite_run 失败: {step2}")
+        raise RuntimeError(
+            f"{LOG_PREFIX} Step 2 composite_run 4 机联动失败: {step2}"
+        )
+    steps2 = step2["result"].get("steps", {}) if isinstance(step2.get("result"), dict) else {}
+    print(f"  [2/3] ✅ 4 轴并发到位 (~2-3s)  steps={steps2}")
 
-    # 4. x (belt-slip 分段 + realtime 校验; 放在最后, 摆好姿态再横移)
-    print(f"  [4/4] move_x({x_mm}mm)  belt-slip 分段 (最后动)")
-    x_info = _move_x_with_split(client, runner, x_mm)
+    # ========== 步骤 3: grasp(False) 结束吸气 (释放真空, 球入低塔) ==========
+    # ⚠️ 关键: 不是 grasp(True) (吸气 = 取球), 而是 grasp(False) (结束吸气 = 投球)
+    # low_tower 投球场景: 步骤 2 摆位到低塔 → 步骤 3 释放真空 → 球掉进低塔
+    # ⚠️ 通用踩坑: grasp 真空阀走 runner.grasp() / runner.suck() / runner.drop_object()
+    # (loops/runner.py:182/185/194), **严禁 client.http.execute_arm_action('grasp', ...)**
+    # — 现场实测 2026-08-03 SDK 内部 struct.pack 报 "required argument is not an integer"
+    # (runtime ARM_ACTIONS lambda kwargs 透传 + list 整个传给 valve.set → struct.pack 格式
+    # 不匹配)。详见 [[arm-grasp-call-arm-base]]。
+    print(f"\n  [3/3] runner.grasp(False)  结束吸气 (释放真空, 球入低塔, "
+          f"timeout={grasp_timeout:.0f}s)")
+    step3 = runner.grasp(False, timeout=grasp_timeout)
 
-    # 2026-07-30 改: 打印 result 而不是裸 x_info, 让 caller / log 一眼看清结果
-    result = x_info.get("result", "unknown")
-    final_x = x_info.get("final_x", x_info.get("actual_x"))
-    residual = x_info.get("residual_mm", 0.0)
-    wall_hit = x_info.get("wall_hit", False)
-    overshoot_mm = x_info.get("overshoot_mm", 0.0)
-    print(f"        result       = {result}")
-    print(f"        final_x      = {final_x:+.1f}mm  (target={x_info.get('target_x', x_mm):+.0f}mm, "
-          f"residual={residual:+.1f}mm)")
-    print(f"        wall_hit     = {wall_hit}")
-    print(f"        overshoot_mm = {overshoot_mm:+.1f}mm")
-    if result != "success":
-        print(f"        [WARN]  x 未到位 ({result}), 后续 placement 可能撞车, 请人工介入")
-
-    # 2026-07-30 改: ok 反映 x 实际结果 (不是永远 True)
-    ok = (result == "success")
-
-    print(f"========== {LOG_PREFIX} 完成 ==========\n")
+    print(f"\n========== {LOG_PREFIX} 完成 "
+          f"(arm={pick_arm_deg}° x={pick_x_mm}mm y={pick_y_mm}mm "
+          f"hand={pick_hand_deg}°, 真空阀 OFF 球已入低塔) ==========\n")
     return {
-        "ok": ok,
-        "y_mm": y_mm,
-        "x_info": x_info,
-        "arm_deg": arm_deg,
-        "hand_deg": hand_deg,
+        "ok": True,
+        "step1_move_y": step1,
+        "step2_composite": step2,
+        "step3_release": step3,
+        "final_pose": {
+            "x_mm": pick_x_mm,
+            "y_mm": pick_y_mm,
+            "arm_deg": pick_arm_deg,
+            "hand_deg": pick_hand_deg,
+        },
     }
 
 
@@ -159,13 +234,29 @@ def run(client: ArmClient, runner: ArmRunner,
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="task5 low_tower: 臂摆到低位仓位姿 (y=-200→arm=0→hand=0→x=-169)",
+        description=(
+            "task5/low_tower v1: 低塔投球 3 步流程 (place, 不是 pick)\n"
+            "  1. y=-176 (出保护区)\n"
+            "  2. composite_run → y=-176, x=-150, arm=90°, hand=0°\n"
+            "  3. grasp(False) (结束吸气 = 释放真空, 球入低塔)\n"
+            "  默认耗时 ~3-5s"
+        ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--y", type=float, default=LOW_TOWER_Y_MM, help="y (mm)")
-    p.add_argument("--x", type=float, default=LOW_TOWER_X_MM, help="x (mm)")
-    p.add_argument("--arm", type=float, default=LOW_TOWER_ARM_DEG, help="大臂角度 (°)")
-    p.add_argument("--hand", type=float, default=LOW_TOWER_HAND_DEG, help="手爪角度 (°)")
+    p.add_argument("--approach-y", type=float, default=APPROACH_Y_MM,
+                   dest="approach_y", help="步骤 1 y 目标 (mm)")
+    p.add_argument("--pick-y", type=float, default=PICK_COMPOSITE_Y_MM,
+                   dest="pick_y", help="步骤 2 composite_run 目标 y (mm)")
+    p.add_argument("--pick-x", type=float, default=PICK_COMPOSITE_X_MM,
+                   dest="pick_x", help="步骤 2 composite_run 目标 x (mm)")
+    p.add_argument("--pick-arm", type=float, default=PICK_COMPOSITE_ARM_DEG,
+                   dest="pick_arm", help="步骤 2 composite_run 目标大臂角度 (°)")
+    p.add_argument("--pick-hand", type=float, default=PICK_COMPOSITE_HAND_DEG,
+                   dest="pick_hand", help="步骤 2 composite_run 目标手爪角度 (°)")
+    p.add_argument("--move-timeout", type=float, default=MOVE_TIMEOUT_S,
+                   dest="move_timeout", help="步骤 1 move_y 超时 (秒)")
+    p.add_argument("--grasp-timeout", type=float, default=GRASP_TIMEOUT_S,
+                   dest="grasp_timeout", help="步骤 3 释放真空超时 (秒)")
     return p
 
 
@@ -173,9 +264,17 @@ def main(argv=None) -> int:
     t_total_start = time.perf_counter()
     args = build_parser().parse_args(argv)
     client = ArmClient.connect()
+    if not client.ping():
+        raise RuntimeError("机械臂 runtime 未在线, 请检查 arm_feed 守护进程")
     runner = ArmRunner(client)
-    run(client, runner, y_mm=args.y, x_mm=args.x,
-        arm_deg=args.arm, hand_deg=args.hand)
+    result = run(client, runner,
+        approach_y_mm=args.approach_y,
+        pick_y_mm=args.pick_y,
+        pick_x_mm=args.pick_x,
+        pick_arm_deg=args.pick_arm,
+        pick_hand_deg=args.pick_hand,
+        move_timeout=args.move_timeout,
+        grasp_timeout=args.grasp_timeout)
     elapsed = time.perf_counter() - t_total_start
     print(f"========== {LOG_PREFIX} 总耗时: {elapsed:.3f} s ==========")
     return 0

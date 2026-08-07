@@ -3,14 +3,22 @@
 (2026-07-29 从 target_blue.py 复制而来, 改 x/x 常量 + 颜色过滤为 "yellow"。)
 
 目标位姿 (用户指定 2026-07-29):
-  1. y 轴  → -200 mm  (先抬出保护区 [0,-30], 后面 x/大臂 wrapper 才能过)
-  2. x 轴  → -68 mm   (belt-slip 安全 move_x, 不撞墙; 与 get_yellow 的
-                       终点 -68 对齐 (2026-07-29 get_yellow 同步), get_yellow → target_yellow 直接串)
-  3. 大臂  → 90°      (业务硬限上界 = 复位位, init 例外位)
-  4. 手爪  → 0°       (DOWN, 走底层直调, 大臂不动)
-  5. **黄球**识别      (摆位完成后读侧摄 task_feed, 输出黄球归一化坐标)
+  1. **4 机联动** composite_run (arm=90°, x=-68, y=-200, hand=0°) ≈ 2-3s
+  2. **黄球**识别      (摆位完成后读侧摄 task_feed, 输出黄球归一化坐标)
 
 最终位姿: x=-68, arm=90°, y=-200, hand=0°。
+
+⚠️ **v2 改: 4 步顺序摆位 → 1 步 composite_run (2026-08-07 用户拍板)**
+  - 旧版: move_y(-200) → move_x_with_split(-68) → set_arm_angle(90) → _call_arm(set_hand_angle, 0)
+    4 步顺序, 含 belt-slip 安全 move_x (wall_hit / overshoot / FUSE), 耗时 ~5-10s
+  - 新版: client.composite_run(arm=90, x_mm=-68, y_mm=-200, hand=0, speed=80, timeout=30)
+    4 轴并发, 沿用 new_get_blue.py / new_get_yellow.py / new_target.py / target_blue.py 模式, 耗时 ~2-3s
+  - **去掉 belt-slip 安全 move_x**: composite_run 内部走 SDK `move_x_position` (无 split),
+    与 new_get_*.py / target_blue.py 一致。前提是 belt-slip 已修复 (2026-07-31 现场验证)
+  - 业务硬限检查: arm=90 ∈ [-150, +150]° ✓ / hand=0 ∈ [-90, +10]° ✓ /
+    y=-200 ∈ [-200, 0] mm ✓ (软限位边界) / x=-68 ∈ [-320, +220] mm ✓
+  - composite_run 不接受 None 轴 (2026-08-06 实测踩坑): 4 轴全传有效值
+  - composite_run 不调 _check_y_protected (composite.py:60 拍板): 手爪 0° 在 y=-200 安全
 
 ⚠️ **第 5 步只检测黄球 (2026-07-29 用户要求)**:
   - `DETECT_COLOR_FILTER = "yellow"` 写死, **不提供 --color CLI 开关** —— 文件名
@@ -58,18 +66,10 @@
    若哪天 soft_y_max_m 被标定成 < 0.2, 这里会直接 raise ValueError —— 那是
    预期行为 (软限位在保护你), 不要靠改脚本绕过, 去改标定。
 
-⚠️ **x = -40mm 的 belt-slip 处理**: 40mm 接近 belt-slip 单次有效行程上界
-   (24-46mm, ARM_API §7.2.1), 单次 move_x 有可能到不了位。故走
-   `_move_x_with_split` (test_x_to_150.py 模式, 与 get_yellow.py 同款):
-   每轮 move_x(target, v_max_mms=30) + realtime 校验; 卡住 kick 让同步带重咬合;
-   连续 3 轮 stall 放弃。位置验证一律走 `_read_x_mm_realtime()` (20Hz arm_feed
-   真值), **不走 get_state()** —— calibrate 框架已坏, 见 ARM_API §11。
-
 ⚠️ **大臂 90°**: 业务硬限 [+90, -150] 的**上界**(api.py:502-503), 同时是
    `set_arm_angle` 的 init 例外位 (a == 90.0 → allow_init_position=True), 保护区
-   里也允许下发。90° ≥ +30 落在 "安全姿态" 带外 → 之后 set_hand_angle(0) 走
-   Python 层 wrapper **不会被拒**; 但这里仍保留底层 `_call_arm` 直调, 与
-   get_blue / get_yellow 保持一致 (行为交由车端裁决)。
+   里也允许下发。v2 改: composite_run 内部走 SDK set_arm_angle, 不走 Python 层 wrapper,
+   大臂与 xy/hand 4 轴并发到位 (~2-3s)。
 
 ⚠️ 本文件**自包含**: 只依赖 `main.arm` (ArmClient/ArmRunner) + `task4/target2.py`
    的 `fetch_balls` (球识别, 见第 5 步说明), 不 import task5 包内其它模块。
@@ -93,7 +93,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
-from main.arm.each_task.common import move_x_with_split  # noqa: E402
 
 
 # ---------- 目标位姿常量 (内联, 不依赖 constants.py) ----------
@@ -105,27 +104,31 @@ TARGET1_Y_MM: float = -200.0
 (闭区间, 通过)。远出保护区 [0,-30], 后续 x/大臂动作 wrapper 都能过。"""
 
 TARGET1_X_MM: float = -68.0
-"""x 轴目标 (mm)。68mm 跨 belt-slip 单次有效行程 (24-46mm, §7.2.1),
-走 _move_x_with_split (test_x_to_150.py 模式, 与 get_yellow.py 同款) 分段 +
-卡住 kick。**与 get_yellow 的终点对齐**, get_yellow → target_yellow 串接时
-不用再做 x 校正。"""
+"""x 轴目标 (mm)。v2 改: composite_run 内部走 SDK move_x_position (无 belt-slip split)。
+
+68mm 接近 belt-slip 单次有效行程上界 (24-46mm, §7.2.1), 旧版走 _move_x_with_split
+分段 + 卡住 kick; v2 沿用 new_get_yellow.py 同款 (-71mm 一次走通), 前提是
+belt-slip 已修复 (2026-07-31 现场验证)。**与 get_yellow 的终点对齐**,
+get_yellow → target_yellow 串接时不用再做 x 校正。"""
 
 TARGET1_ARM_DEG: float = 90.0
 """大臂角度。90° = 业务硬限上界 (api.py:503 _ARM_ANGLE_MAX) = 复位位,
 且是 set_arm_angle 的 init 例外位 (保护区内也允许下发)。"""
 
 TARGET1_HAND_DEG: float = 0.0
-"""手爪 DOWN。走底层 _call_arm 直调 (与 get_blue / get_yellow 同款)。
-大臂 90° 已在展开区 [-30, +30] 之外, api.py:604-612 的门不再命中,
-wrapper 其实也能过; 直调只为跟兄弟脚本保持一致的行为语义。"""
+"""手爪 DOWN (composite_run 内部走 SDK set_hand_angle, 与 arm_angle 同步下发)。
 
-# belt-slip 安全 move_x 参数 (test_x_to_150.py 模式, ARM_API §7.2.1+§11)
-MOVE_X_TOL_MM: float = 5.0          # 到位容差 (realtime 抖动 <1mm, 放宽给 PID 余量)
-MOVE_X_V_MAX_MMS: float = 30.0      # 业务限速 (2026-07-22 限速透传 bug 修复后定档 30)
-MOVE_X_MAX_ROUNDS: int = 12         # 最多尝试轮数
-MOVE_X_STALL_MM: float = 3.0        # 本轮位移 < 此值视为卡住 (疑似打滑)
-MOVE_X_MAX_STALL_ROUNDS: int = 3    # 连续卡住这么多轮 → 放弃
-MOVE_X_KICK_SLEEP_S: float = 0.2    # kick: 停一下让同步带齿重新咬合
+v2 改: 旧版走底层 _call_arm("set_hand_angle", ...) 直调; composite_run 不允许 None 轴,
+统一改走 client.composite_run() 4 轴并发, hand=0° 通过 speed 参数控制舵机速度。
+"""
+
+# v2 新增: composite_run 4 机联动参数 (沿用 new_get_blue.py / target_blue.py / new_target.py 同款)
+COMPOSITE_TIMEOUT_S: float = 30.0
+"""4 机联动 composite_run 同步超时 (秒)。4 轴并发到位一般 ~2-3s, 给 30s 兜底
+(含网络 + job_queue + SDK 内部 4 路 as_completed)。"""
+
+ANGLE_SPEED: int = 80
+"""大臂 / 手爪舵机速度 + xy PID speed, 默认 80。与 task5/target.py / new_get_* 一致。"""
 
 # ---------- 球类识别参数 (第 5 步, 2026-07-29) ----------
 
@@ -275,24 +278,6 @@ def detect_balls(client: ArmClient,
 
 
 
-# ---------- belt-slip 安全 move_x (薄 wrapper, 透传 common 版) ----------
-
-def _move_x_with_split(client: ArmClient, runner: ArmRunner,
-                       target_x_mm: float) -> dict:
-    """薄 wrapper: 透传 common.move_x_with_split, 注入 LOG_PREFIX。
-
-    见 main/arm/each_task/common.py:move_x_with_split 完整 docstring。
-
-    2026-08-01 切到 common 版 (替换原内联 reach+stall 模式): 自动获得
-    wall_hit / overshoot / FUSE-rescue 增强 (来自 low_tower 2026-07-30 现场 case
-    的加强)。行为对短距场景兼容,跟 high_tower.py / low_tower.py / target.py 对齐。
-    """
-    return move_x_with_split(
-        client, runner, target_x_mm,
-        log_prefix=LOG_PREFIX,
-    )
-
-
 # ---------- 主入口 ----------
 
 def run(client: ArmClient, runner: ArmRunner,
@@ -306,51 +291,72 @@ def run(client: ArmClient, runner: ArmRunner,
         score_min: float = DETECT_SCORE_MIN,
         area_min: float = DETECT_AREA_MIN,
         area_max: float = DETECT_AREA_MAX) -> dict:
-    """摆到 target1 目标位姿: y=-200 → x=-40 → 大臂 90° → 手爪 0° → 球类识别。
+    """摆到 target1 目标位姿 (composite_run 4 机联动) + 只检测黄球。
+
+    v2 改: 旧 4 步顺序 (y → x → 大臂 → 手爪) → 1 步 composite_run (~2-3s)。
 
     Returns:
         {"ok": True, "x_info": dict, "x_mm": float, "y_mm": float,
          "arm_deg": float, "hand_deg": float, "balls": list[dict]}
         `balls` 在 detect=False 或没识别到时为 []。
+        `x_info` 在 v2 中记录 composite_run 信息 ({method, steps, ok, step1_job})。
     """
     print(f"\n========== {LOG_PREFIX} run ==========")
-    print(f"  目标: y={y_mm}mm → x={x_mm}mm → 大臂{arm_deg}° → 手爪{hand_deg}°"
-          f"{' → 球类识别' if detect else ' (不识别)'}")
+    print(f"  目标: 4 机联动 composite_run (arm={arm_deg}° x={x_mm}mm y={y_mm}mm hand={hand_deg}°)"
+          f"{' → 黄球识别' if detect else ' (不识别)'}")
 
-    # 1. y → -200 (先抬出保护区 [0,-30]; move_y 走步进电机, 保护区里也能调)
-    print(f"  [1/5] move_y({y_mm}mm)  抬出保护区 [0,-30]")
-    runner.move_y(y_mm, timeout=30.0)
-
-    # 2. x → -40 (belt-slip 安全 move_x, 透传 v_max_mms=30; 卡住 kick + stall 放弃)
-    print(f"  [2/5] move_x({x_mm}mm)  belt-slip 安全 (common 版, 含 wall_hit/overshoot/FUSE)")
-    x_info = _move_x_with_split(client, runner, x_mm)
-    print(f"        x_info={x_info}")
-
-    # 3. 大臂 → 90° (业务硬限上界 / 复位位 / init 例外位; y=-200 远出保护区)
-    print(f"  [3/5] set_arm_angle({arm_deg}°)")
-    client.set_arm_angle(arm_deg, speed=80, timeout=10.0)
-
-    # 4. 手爪 → 0° (DOWN) —— 不动大臂, 直接设手爪
-    #    大臂 90° 已在展开区 [-30,+30] 之外, api.py:604-612 的门不再命中;
-    #    仍走底层 _call_arm 直调 (与 get_blue / get_yellow 一致) → 真正下发的
-    #    合法性由车端决定。硬件真不允许 → 拿到车端错误, 不会崩在 Python 层。
-    print(f"  [4/5] 手爪 → {hand_deg}° (DOWN), 大臂保持 {arm_deg}° 不动 (底层直调)")
-    client._call_arm(
-        "set_hand_angle", timeout=10.0, sync=True,
-        angle=hand_deg, speed=80,
+    # 1. 4 机联动 composite_run (仿 new_get_blue.py / new_get_yellow.py / new_target.py / target_blue.py)
+    #    一次性把 4 轴摆到目标 (arm=90°, x=-68, y=-200, hand=0°) ≈ 2-3s
+    #    ⚠️ composite_run 不接受 None 轴 (2026-08-06 实测踩坑): 4 轴全传有效值。
+    #    ⚠️ composite_run 不调 _check_y_protected (composite.py:60 拍板), 所以
+    #       hand=0° 在 y=-200 时不会被 wrapper 拦截。
+    print(f"  [1/2] composite_run (4 机联动): arm={arm_deg:+.0f}° x={x_mm:.0f}mm "
+          f"y={y_mm:.0f}mm hand={hand_deg:+.0f}°  speed={ANGLE_SPEED} "
+          f"timeout={COMPOSITE_TIMEOUT_S:.0f}s")
+    step1 = client.composite_run(
+        arm=arm_deg,
+        x_mm=x_mm,
+        y_mm=y_mm,
+        hand=hand_deg,
+        speed=ANGLE_SPEED,
+        timeout=COMPOSITE_TIMEOUT_S,
     )
+    ok1 = (
+        isinstance(step1, dict)
+        and step1.get("status") == "succeeded"
+        and isinstance(step1.get("result"), dict)
+        and step1["result"].get("ok", False)
+    )
+    if not ok1:
+        # ⚠️ 通用踩坑: job["result"]["ok"] 不是 job["ok"] — job dict 和
+        # composite_run SDK 返回的 result dict 是嵌套结构, 详见
+        # [[composite-run-no-partial-2026-08-06]]
+        print(f"  [1/2] ❌ composite_run 失败: {step1}")
+        raise RuntimeError(
+            f"{LOG_PREFIX} Step 1 composite_run 4 机联动失败: {step1}"
+        )
+    # 检查 4 轴全部 ok (现场实测 SDK 会把 None 轴判 False, 所以这里再核一次 steps)
+    steps = step1["result"].get("steps", {}) if isinstance(step1.get("result"), dict) else {}
+    print(f"  [1/2] ✅ 4 轴并发到位 (~2-3s)  steps={steps}")
+    # 保留 x_info 字段名 (旧版 move_x_with_split 返回 dict), 改成记录 composite_run 信息
+    x_info = {
+        "method": "composite_run",
+        "steps": steps,
+        "ok": ok1,
+        "step1_job": step1,
+    }
 
-    # 5. 球类识别 (只读, 不动机械臂; 失败只 warn 不抛)
+    # 2. 黄球识别 (只读, 不动机械臂; 失败只 warn 不抛)
     balls: list = []
     if detect:
-        print(f"  [5/5] 球类识别 (侧摄 task_feed, ≤{detect_timeout_s}s, "
+        print(f"  [2/2] 黄球识别 (侧摄 task_feed, ≤{detect_timeout_s}s, "
               f"score≥{score_min} area∈[{area_min},{area_max}])")
         balls = detect_balls(client, color_filter=color_filter,
                              timeout_s=detect_timeout_s,
                              score_min=score_min,
                              area_min=area_min, area_max=area_max)
     else:
-        print(f"  [5/5] 球类识别  已跳过 (--no-detect)")
+        print(f"  [2/2] 黄球识别  已跳过 (--no-detect)")
 
     print(f"========== {LOG_PREFIX} 完成 "
           f"(x={x_mm}mm arm={arm_deg}° y={y_mm}mm hand={hand_deg}° "
@@ -370,7 +376,7 @@ def run(client: ArmClient, runner: ArmRunner,
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="task5 target_yellow: 摆到取黄位姿 (y=-200→x=-68→arm=90→hand=0) + 只检测黄球",
+        description="task5 target_yellow v2: 4 机联动 composite_run (arm=90° x=-68 y=-200 hand=0°) + 只检测黄球",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--x", type=float, default=TARGET1_X_MM, help="x (mm), 默认 -68")
