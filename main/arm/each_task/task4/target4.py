@@ -198,15 +198,24 @@ class _CreepThread:
         self.balls = None
         self.found_ball = False
         self._t0 = 0.0
+        self._odo_start_x = None
+        self._odo_ir_trigger_x = None
+        self.ir_triggered = False
 
     def start(self) -> None:
         self._t0 = time.monotonic()
+        # 记录启动时里程计 x，后续闭环累加
+        try:
+            odo = self.http.get_odom_state() or {}
+            odo_data = odo.get("odom_state") or {}
+            self._odo_start_x = odo_data.get("x")
+        except Exception:
+            self._odo_start_x = None
         self._thread.start()
 
     def _loop(self) -> None:
         period = 1.0 / max(self.poll_hz, 1.0)
         t0 = time.monotonic()
-        dist = 0.0
         try:
             while not self._stop_event.is_set():
                 try:
@@ -218,11 +227,54 @@ class _CreepThread:
                 except Exception:
                     pass
                 time.sleep(period)
-                dist += self.speed_mps * period
-                self.distance_m = dist
+
+                # 里程计闭环累加（替换原开环 speed*time）
+                if self._odo_start_x is not None:
+                    try:
+                        odo = self.http.get_odom_state() or {}
+                        odo_data = odo.get("odom_state") or {}
+                        current_x = odo_data.get("x")
+                        if current_x is not None:
+                            self.distance_m = max(0.0, current_x - self._odo_start_x)
+                    except Exception:
+                        pass
+                else:
+                    # 里程计不可用时回退到开环
+                    self.distance_m += self.speed_mps * period
                 self.elapsed_s = time.monotonic() - t0
-                if dist >= self.max_distance_m:
+                if self.distance_m >= self.max_distance_m:
                     break
+
+                # 左侧红外 > 0.4 触发：记录触发点里程计，后续走 0.3m 结束
+                if not self.ir_triggered and self.speed_mps > 0:
+                    try:
+                        ir_payload = self.http.get_ir_state() or {}
+                        ir_data = ir_payload.get("ir_state") or {}
+                        left_ir = ir_data.get("left")
+                        if left_ir is not None and float(left_ir) > 0.6:
+                            self.ir_triggered = True
+                            odo_payload = self.http.get_odom_state() or {}
+                            odo_data = odo_payload.get("odom_state") or {}
+                            self._odo_ir_trigger_x = odo_data.get("x")
+                            print(f"  [{LOG_PREFIX}] 左侧红外触发 > 0.4 "
+                                  f"({float(left_ir):.2f}m), 里程计走 0.3m")
+                    except Exception:
+                        pass
+
+                if self.ir_triggered and self._odo_ir_trigger_x is not None:
+                    try:
+                        odo = self.http.get_odom_state() or {}
+                        odo_data = odo.get("odom_state") or {}
+                        current_x = odo_data.get("x", 0)
+                        if current_x is not None:
+                            extra = max(0.0, current_x - self._odo_ir_trigger_x)
+                            if extra >= 0.3:
+                                print(f"  [{LOG_PREFIX}] 里程计走完 0.3m "
+                                      f"({extra:.3f}m), 结束搜索")
+                                break
+                    except Exception:
+                        pass
+
                 try:
                     balls = target2.fetch_balls(
                         self.http, color_filter=None, debug=False,
@@ -975,15 +1027,7 @@ def step_target4(
                 creep_thread.stop_and_join()
                 break
 
-            # 2.0.b 啟動 creep (在 composite_run 完成後, 見球即停 → track)
-            creep_thread = _CreepThread(
-                http_client, speed_mps=creep_speed_mps,
-                max_distance_m=remaining_m,
-                poll_hz=CREEP_POLL_HZ,
-            )
-            creep_thread.start()
-
-            # 2.1 等后台见球 / 见 ball 见 fetch_balls 触发停 + 累计前移记账
+            # 2.0.b 等待 creep 后台见球 / 见球即停 + 累计前移记账
             creep_res = creep_thread.wait_for_ball(
                 timeout_s=max(1.0, max_seconds - elapsed))
             creep_thread.stop_and_join()
@@ -1190,7 +1234,7 @@ def step_target4(
                 pass
             # 最后一球的放仓线程收尾, 再关仓 (防臂还在动就关舵机)
             if release_thread is not None and release_thread.is_alive():
-                release_thread.join(timeout=15.0)
+                release_thread.join(timeout=2.0)
             # ---- 关闭存储仓 (task4 结束关仓) ----
             try:
                 print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")
@@ -1198,6 +1242,28 @@ def step_target4(
                     STORAGE_CLOSE_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
             except Exception as e:
                 print(f"  [{LOG_PREFIX}] ⚠️ 关仓失败 ({type(e).__name__}: {str(e)[:80]})")
+            # ---- 结束回到 bin/P 姿态 (后台线程, 不阻塞导航) ----
+            try:
+                import threading as _th
+                def _return_to_pose_p():
+                    try:
+                        print(f"  [{LOG_PREFIX}] 后台回到 P 姿态 "
+                              f"(x={pose_p_x_mm} y={pose_p_y_mm} "
+                              f"arm={pose_p_arm_deg} hand={pose_p_hand_deg})")
+                        arm_client.composite_run(
+                            arm=pose_p_arm_deg,
+                            x_mm=pose_p_x_mm,
+                            y_mm=pose_p_y_mm,
+                            hand=pose_p_hand_deg,
+                            speed=80,
+                            timeout=30.0,
+                        )
+                    except Exception as e:
+                        print(f"  [{LOG_PREFIX}] ⚠️ 回 P 姿态失败 "
+                              f"({type(e).__name__}: {str(e)[:80]})")
+                _th.Thread(target=_return_to_pose_p, daemon=True).start()
+            except Exception:
+                pass
             # ---- 恢复 arm_feed (2026-08-06 修) ----
             #    start_arm_feed 幂等, 任务前 stop 后 start 不丢状态.
             #    没在任务前 stop 的场景 (force=False 静默 noop, 或本来就没启)
