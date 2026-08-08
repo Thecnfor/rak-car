@@ -153,9 +153,11 @@ add_executable(arm_node
 target_include_directories(arm_node PUBLIC include)
 target_link_libraries(arm_node PUBLIC
   rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
   trajectory_msgs::trajectory_msgs
   sensor_msgs::sensor_msgs
   std_msgs::std_msgs
+  std_srvs::std_srvs
   msgs::msgs
 )
 

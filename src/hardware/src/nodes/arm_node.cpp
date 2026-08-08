@@ -17,6 +17,10 @@
 #include "hardware/mc602_adapter.hpp"
 #include "hardware/transport_factory.hpp"
 
+#include <msgs/action/arm_execute_trajectory.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <std_srvs/srv/set_bool.hpp>
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
@@ -126,12 +130,77 @@ public:
       });
 
     // --- Publications ---
-    const std::string state_topic = "/rak/state/actuators/" + arm_id_;
+    // 关节状态统一进 /rak/state/joint_states(与轮子共用,消费者按 joint_names 区分)。
+    const std::string state_topic = "/rak/state/joint_states";
     state_pub_ = this->create_publisher<sensor_msgs::msg::JointState>(state_topic, 10);
 
     // --- Main loop timer ---
     const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / rate));
     timer_ = this->create_wall_timer(period, [this]() { this->publish_state(); });
+
+    // --- ArmExecuteTrajectory action server ---
+    // 无关节反馈传感器:执行 = 把 trajectory 目标点写进一次 burst,成功即完成(诚实语义)。
+    act_server_ = rclcpp_action::create_server<ArmAction>(
+      this, "/rak/arm/" + arm_id_ + "/execute_trajectory",
+      [](const std::array<uint8_t, 16> & /*uuid*/,
+         const typename ArmAction::Goal::ConstSharedPtr) {
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+      },
+      [](const std::shared_ptr<rclcpp_action::ServerGoalHandle<ArmAction>>) {
+        return rclcpp_action::CancelResponse::ACCEPT;
+      },
+      [this](const std::shared_ptr<rclcpp_action::ServerGoalHandle<ArmAction>> gh) {
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          if (active_goal_ && active_goal_->is_active()) {
+            auto r = std::make_shared<ArmAction::Result>();
+            r->success = false;
+            r->error = "preempted";
+            active_goal_->abort(r);
+          }
+          active_goal_ = gh;
+        }
+        auto res = std::make_shared<ArmAction::Result>();
+        try {
+          execute_trajectory(gh->get_goal()->trajectory);   // 内部自己锁
+          gh->publish_feedback(std::make_shared<ArmAction::Feedback>());
+          res->success = true;
+          res->error = "none";
+          res->final_positions.assign(NUM_JOINTS, 0.0f);    // 无测量,诚实填 0
+          gh->succeed(res);
+        } catch (const std::exception & e) {
+          res->success = false;
+          res->error = e.what();
+          gh->abort(res);
+        }
+        active_goal_.reset();
+      });
+
+    // --- set_vacuum / set_valve services ---
+    vacuum_srv_ = this->create_service<std_srvs::srv::SetBool>(
+      "/rak/arm/" + arm_id_ + "/set_vacuum",
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+             std::shared_ptr<std_srvs::srv::SetBool::Response> resp) {
+        try {
+          adapter_->set_dout(2, req->data ? PUMP_ON : PUMP_OFF);
+          resp->success = true;
+        } catch (const std::exception & e) {
+          resp->success = false;
+          resp->message = e.what();
+        }
+      });
+    valve_srv_ = this->create_service<std_srvs::srv::SetBool>(
+      "/rak/arm/" + arm_id_ + "/set_valve",
+      [this](const std::shared_ptr<std_srvs::srv::SetBool::Request> req,
+             std::shared_ptr<std_srvs::srv::SetBool::Response> resp) {
+        try {
+          adapter_->set_dout(3, req->data ? VALVE_CLOSE : VALVE_OPEN);
+          resp->success = true;
+        } catch (const std::exception & e) {
+          resp->success = false;
+          resp->message = e.what();
+        }
+      });
 
     RCLCPP_INFO(this->get_logger(),
       "ArmNode[%s] joints=%s rate=%.1f Hz",
@@ -152,9 +221,17 @@ public:
 
 private:
   // -----------------------------------------------------------------------
-  // Trajectory callback: execute the last point immediately.
+  // Trajectory callback (escape-hatch topic): execute the last point.
   // -----------------------------------------------------------------------
   void on_trajectory(const trajectory_msgs::msg::JointTrajectory & traj)
+  {
+    execute_trajectory(traj);
+  }
+
+  // Execute a trajectory (its last point) against the MC602 hardware.
+  // Shared by the /rak/cmd/arm/<id>/trajectory topic AND the
+  // ArmExecuteTrajectory action server. Locks state_mutex_ internally.
+  void execute_trajectory(const trajectory_msgs::msg::JointTrajectory & traj)
   {
     std::lock_guard<std::mutex> lock(state_mutex_);
 
@@ -299,6 +376,12 @@ private:
   rclcpp::Subscription<trajectory_msgs::msg::JointTrajectory>::SharedPtr traj_sub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr state_pub_;
   rclcpp::TimerBase::SharedPtr timer_;
+
+  using ArmAction = msgs::action::ArmExecuteTrajectory;
+  rclcpp_action::Server<ArmAction>::SharedPtr act_server_;
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<ArmAction>> active_goal_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr vacuum_srv_;
+  rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr valve_srv_;
 };
 
 // ---------------------------------------------------------------------------
