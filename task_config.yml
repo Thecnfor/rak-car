@@ -163,6 +163,8 @@ task_cfg:
     #   enabled: false → 退回盲抓 (fixed 姿态 move_y + grasp, 无视觉).
     pick_vision:
       enabled: true
+      # 2026-08-09: true=闭环下沉 (runtime 进程内视觉伺服, main 只发目标参数, 无每帧网络)
+      local_servo: true
       label: "water"            # 水立方检测标签 (20 类里无 cube, 默认水容器; 实车识别为其他类改这里)
       # 2026-08-04 实测: 在 pick_pose init 姿态 (x=-150, y=-150, arm=90, hand=-10)
       # 下, 水方块 bbox 中心在 cam2 画面 (0.0875, -0.236), 5 帧锁死. 换 cam2 安装位
