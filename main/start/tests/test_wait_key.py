@@ -90,3 +90,29 @@ class TestPressDetector(unittest.TestCase):
         d = PressDetector(confirm_samples=1)
         d.feed(False)
         self.assertTrue(d.feed(True))    # 單樣本確認
+
+
+class TestWalkWaypointsEmptyCleanup(unittest.TestCase):
+    """_walk_waypoints 空 waypoints：unpack + finally 清理路徑無 NameError/回歸。
+
+    驗證 _init_mission/_walk_waypoints 拆分後，state unpack 與清理邏輯仍自洽。
+    """
+
+    def test_empty_waypoints_cleanup(self):
+        from unittest.mock import MagicMock
+        from main.start.orchestrator import Orchestrator
+        orch = Orchestrator(waypoints=[])
+        state = {
+            "client": MagicMock(),
+            "api": MagicMock(),
+            "runner": MagicMock(),
+            "runner_thread": MagicMock(),
+            "dis_buf": [0.0], "dis_epoch": [0],
+            "tui_buf": [{}], "tui_running": MagicMock(),
+            "display_ui": MagicMock(), "display_running": MagicMock(),
+            "post_task1": None, "post_task6": None,
+        }
+        completed = orch._walk_waypoints(state, [])
+        self.assertEqual(completed, [])
+        state["runner"].stop.assert_called_once()
+        state["api"].stop_wheel_speeds.assert_called_once()
