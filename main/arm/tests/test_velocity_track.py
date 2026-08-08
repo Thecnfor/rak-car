@@ -344,7 +344,7 @@ class TestKalmanVelocity(unittest.TestCase):
     def test_kalman_first_frame_unchanged(self):
         """首帧 kalman 直接初始化不过滤 → 单帧结果与关 kalman 完全一致."""
         frames = [_frame("ball_yellow", 0.5, 0.4)]
-        r_raw, p_raw = self._run(frames, gain=0.1)
+        r_raw, p_raw = self._run(frames, gain=0.1, kalman=False)
         r_kf, p_kf = self._run(frames, gain=0.1, kalman=True)
         self.assertAlmostEqual(p_kf[0]["x_vel"], p_raw[0]["x_vel"], places=6)
         self.assertAlmostEqual(p_kf[0]["y_vel"], p_raw[0]["y_vel"], places=6)
@@ -353,7 +353,7 @@ class TestKalmanVelocity(unittest.TestCase):
         """小抖动 (真值 0.5 ±0.03 交替) → kalman 后 x_vel 方差显著小于原始."""
         frames = [_frame("ball_yellow", 0.47 if i % 2 else 0.53, 0.0)
                   for i in range(12)]
-        _, p_raw = self._run(frames, gain=0.1)
+        _, p_raw = self._run(frames, gain=0.1, kalman=False)
         _, p_kf = self._run(frames, gain=0.1, kalman=True)
 
         def _xvels(posts):
@@ -381,7 +381,7 @@ class TestKalmanVelocity(unittest.TestCase):
     def test_kalman_import_fail_disables(self):
         """filterpy 未装 (ArmKalmanTracker 构造抛 ImportError) → 自动降级, 行为同原始."""
         frames = [_frame("ball_yellow", 0.5, 0.4)]
-        r_raw, p_raw = self._run(frames, gain=0.1)
+        r_raw, p_raw = self._run(frames, gain=0.1, kalman=False)
         with mock.patch(
             "main.arm.vision.kalman.ArmKalmanTracker.__init__",
             side_effect=ImportError("no filterpy"),

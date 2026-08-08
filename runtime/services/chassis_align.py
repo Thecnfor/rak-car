@@ -210,7 +210,7 @@ class ChassisAlignController:
                  v_slew=0.02, max_lost_frames=60, recover_after_lost=True,
                  watchdog_ms=2000.0,
                  hz=20.0, max_seconds=10.0, dry_run=False,
-                 kalman=False):
+                 kalman=True):
         self._service = service
         self._target = target
         self._setpoint_cxcy = tuple(float(x) for x in setpoint_cxcy)

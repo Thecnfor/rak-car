@@ -450,7 +450,7 @@ def track_chassis(
     hz: float = 20.0,
     max_seconds: float = 10.0,
     dry_run: bool = False,
-    kalman: bool = False,
+    kalman: bool = True,
     on_tick: Optional[Callable[[TrackFrame, Tuple[float, float]], None]] = None,
     sense_fn: Optional[Callable[[], TrackFrame]] = None,
 ) -> TrackChassisResult:

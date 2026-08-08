@@ -377,10 +377,16 @@ class TestKalmanTracker(unittest.TestCase):
 
 
 class TestKalmanController(unittest.TestCase):
-    def test_disabled_by_default(self):
-        """kalman=False（默认）→ 不建 tracker, 保持已验证行为。"""
+    def test_enabled_by_default(self):
+        """kalman 默认开 (2026-08-09 用户决定) → tracker 实例化。"""
         svc = _make_service_with_detections([_d(cx=0.3)] * 10)
         ctrl = _make_controller(svc)
+        self.assertIsNotNone(ctrl._kalman)
+
+    def test_disabled_when_false(self):
+        """显式 kalman=False → 不建 tracker, 降级原始检测。"""
+        svc = _make_service_with_detections([_d(cx=0.3)] * 10)
+        ctrl = _make_controller(svc, kalman=False)
         self.assertIsNone(ctrl._kalman)
 
     def test_enabled_instantiates_tracker(self):

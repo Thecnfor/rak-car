@@ -223,7 +223,7 @@ class VelocityLoop:
                              sign_x: float = -1.0, sign_y: float = 1.0,
                              setpoint_x_norm: float = 0.0,
                              setpoint_y_norm: float = 0.0,
-                             kalman: bool = False,
+                             kalman: bool = True,
                              post_fn: Optional[Callable] = None,
                              ws=None) -> VelocityResult:
         """velocity XY 追踪 (示例 07): 只动十字, 检测丢失即停.
@@ -271,7 +271,7 @@ class VelocityLoop:
                          setpoint_x_norm: float = 0.0,
                          setpoint_y_norm: float = 0.0,
                          hold_y: bool = True,
-                         kalman: bool = False,
+                         kalman: bool = True,
                          post_fn: Optional[Callable] = None,
                          ws=None) -> VelocityResult:
         """4-DOF 追踪 (示例 08, 方向修正后): x 十字 + 大臂 + 手抓 增量联调.
