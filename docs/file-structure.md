@@ -3,7 +3,7 @@
 ## 目录树
 
 ```
-vehicle_wbt/                             # 项目根目录
+rak/                             # 项目根目录
 ├── docs/                                # 📖 项目文档（本目录）
 ├── config_car.yml                       # 主配置文件
 ├── car_wrap.py                          # MyCar 中央调度器（1438行）

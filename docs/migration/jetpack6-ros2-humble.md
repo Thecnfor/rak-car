@@ -72,17 +72,17 @@ ssh jetson@<jetson-ip>
 sudo cp /etc/systemd/system/py_boot.service /tmp/backup/
 sudo cp /etc/systemd/system/multi-user.target.wants/py_boot.service /tmp/backup/ 2>/dev/null || true
 
-# 2. 备份 main/boot_py.sh 引用的整个 vehicle_wbt 工作目录
-tar czf /tmp/backup/vehicle_wbt_$(date +%Y%m%d).tar.gz \
-    -C /home/jetson/workspace vehicle_wbt/
+# 2. 备份 main/boot_py.sh 引用的整个 rak 工作目录
+tar czf /tmp/backup/rak_$(date +%Y%m%d).tar.gz \
+    -C /home/jetson/workspace rak/
 
 # 3. 备份所有 yml 配置（含硬件校准参数）
 tar czf /tmp/backup/configs_$(date +%Y%m%d).tar.gz \
-    /home/jetson/workspace/vehicle_wbt/config_car.yml \
-    /home/jetson/workspace/vehicle_wbt/vehicle/driver/cfg_vehicle.yaml \
-    /home/jetson/workspace/vehicle_wbt/vehicle/arm/arm_cfg.yaml \
-    /home/jetson/workspace/vehicle_wbt/infer_cs/base/infer.yaml \
-    /home/jetson/workspace/vehicle_wbt/vehicle/base/mc602_cfg.yaml
+    /home/jetson/workspace/rak/config_car.yml \
+    /home/jetson/workspace/rak/vehicle/driver/cfg_vehicle.yaml \
+    /home/jetson/workspace/rak/vehicle/arm/arm_cfg.yaml \
+    /home/jetson/workspace/rak/infer_cs/base/infer.yaml \
+    /home/jetson/workspace/rak/vehicle/base/mc602_cfg.yaml
 
 # 4. 备份 CH340 串口 udev 规则（若有）
 sudo cp /etc/udev/rules.d/*.rules /tmp/backup/ 2>/dev/null || true
@@ -165,7 +165,7 @@ scp -r jetson@<jetson-ip>:/tmp/backup ./jetson_pre_migration_backup_$(date +%Y%m
    ```
 
 8. **验证 ZMQ 推理后端能起**
-   - 把备份的 `infer_cs/` 恢复到 `/home/jetson/workspace/vehicle_wbt/`
+   - 把备份的 `infer_cs/` 恢复到 `/home/jetson/workspace/rak/`
    - 运行 `python infer_cs/base/infer_back_end.py`，确认 5001-5004 端口监听
 
 ---
@@ -184,7 +184,7 @@ scp -r jetson@<jetson-ip>:/tmp/backup ./jetson_pre_migration_backup_$(date +%Y%m
 **整体回滚方案**:
 
 - **首选**: 用备份的完整 eMMC/SD 镜像 `dd` 写回 → 5-10 分钟恢复 JetPack 5.1.2 + Noetic 环境
-- **次选**: 重烧 JetPack 5.1.2 SDK（同 SDK Manager 步骤，目标 OS 选 5.x），然后 `scp` 回备份的 vehicle_wbt 工作目录
+- **次选**: 重烧 JetPack 5.1.2 SDK（同 SDK Manager 步骤，目标 OS 选 5.x），然后 `scp` 回备份的 rak 工作目录
 - **应急**: 跑备用载板（旧 Jetson）顶上比赛，主载板在赛后慢慢排查
 
 ---
@@ -209,7 +209,7 @@ scp -r jetson@<jetson-ip>:/tmp/backup ./jetson_pre_migration_backup_$(date +%Y%m
 
 3. **原项目入口能跑（关键回归）**
    ```bash
-   cd /home/jetson/workspace/vehicle_wbt
+   cd /home/jetson/workspace/rak
    python main/qqq.py                       # 手动启动 5 分钟，确认 systemd path 仍正确
    ```
 
@@ -243,7 +243,7 @@ scp -r jetson@<jetson-ip>:/tmp/backup ./jetson_pre_migration_backup_$(date +%Y%m
 | 2026-08-13 | SDK Manager 烧 JetPack 6.1（约 45-60 分钟） | **已完成** (R36) |
 | 2026-08-13/14 | oem-config + apt update/upgrade | **已完成** |
 | 2026-08-14 | 装 ROS2 Humble + 项目 pip 依赖（约 2 小时） | **已完成 (base)**，colcon 待装 |
-| 2026-08-15 | 还原 systemd service + vehicle_wbt 源码 | — |
+| 2026-08-15 | 还原 systemd service + rak 源码 | — |
 | 2026-08-15/16 | 跑"迁移后第一周验证"7 项 | — |
 | 2026-08-17 | 排查任何冒烟失败项 | — |
 | 2026-08-20 | 缓冲窗口（处理意外问题） | — |
@@ -263,7 +263,7 @@ scp -r jetson@<jetson-ip>:/tmp/backup ./jetson_pre_migration_backup_$(date +%Y%m
 # /tmp/backup/verify.sh — 刷机前后各跑一次
 set -e
 echo "[$(date)] Verifying backup integrity..."
-md5sum /tmp/backup/vehicle_wbt_*.tar.gz \
+md5sum /tmp/backup/rak_*.tar.gz \
        /tmp/backup/configs_*.tar.gz \
        /tmp/backup/jetson_full_*.img.gz 2>/dev/null
 test -f /tmp/backup/py_boot.service && md5sum /tmp/backup/py_boot.service

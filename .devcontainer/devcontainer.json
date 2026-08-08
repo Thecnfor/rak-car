@@ -1,5 +1,5 @@
 {
-  "name": "vehicle_wbt dev (ROS2 Humble)",
+  "name": "rak dev (ROS2 Humble)",
   "image": "osrf/ros:humble-desktop",
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
@@ -11,11 +11,11 @@
     "vscode": {
       "settings": {
         "python.analysis.extraPaths": [
-          "/workspaces/rak-car/ros2_ws/src/vehicle_wbt_platform"
+          "/workspaces/rak-car/src/cognition"
         ],
         "python.testing.pytestEnabled": true,
         "python.testing.pytestArgs": [
-          "ros2_ws/src/vehicle_wbt_platform/test/"
+          "src/cognition/test/"
         ]
       },
       "extensions": [

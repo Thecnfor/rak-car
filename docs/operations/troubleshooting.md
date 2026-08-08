@@ -19,8 +19,8 @@
 ### 1. .rviz 字段名错
 ```bash
 grep "Image Topic\|Topic:" team_cameras.rviz
-# ❌ 错:  Image Topic: /vehicle_wbt/.../image_raw
-# ✅ 对:  Topic: /vehicle_wbt/.../image_raw
+# ❌ 错:  Image Topic: /rak/.../image_raw
+# ✅ 对:  Topic: /rak/.../image_raw
 ```
 
 `_RosTopicDisplay` 的 property 名字是 `Topic`（不是 `Image Topic`）。改完重启 RViz2。
@@ -32,7 +32,7 @@ grep "Image Topic\|Topic:" team_cameras.rviz
 
 ```bash
 sed -i 's|image_raw|image_compressed|g; s|Transport Hint: raw|Transport Hint: compressed|g' \
-  ros2_ws/src/vehicle_wbt_platform_cpp/config/team_cameras.rviz
+  src/bringup/config/team_cameras.rviz
 ```
 
 ### 3. QoS 不匹配
@@ -49,7 +49,7 @@ inline rclcpp::QoS image_qos() { return rclcpp::QoS(1).reliable(); }  // ✅
 ### 4. CycloneDDS config 没部署
 ```bash
 test -f ~/.ros/cyclonedds.xml || \
-  cp ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml ~/.ros/
+  cp src/bringup/config/cyclonedds.xml ~/.ros/
 ```
 
 ### 5. ROS_DOMAIN_ID 不一致

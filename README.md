@@ -1,4 +1,4 @@
-# vehicle_wbt — ROS2 Platform
+# rak — ROS2 Platform
 
 > **An autonomous vehicle robot built on ROS2 Humble** — runs on NVIDIA Jetson Orin Nano, controlled by 4 mecanum wheels + a 4-joint arm with vacuum gripper, observed through 2 cameras and 2 IR sensors.
 
@@ -26,14 +26,14 @@ ROS2 fixes all of these with topics, services, ros2_control, ros2 bag, RViz2, Ga
 # 2. Clone and build
 git clone https://github.com/Thecnfor/rak-car.git
 cd rak-car
-# Edit src/vehicle_wbt_platform_cpp/config/cyclonedds.xml if needed
-colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform
+# Edit src/bringup/config/cyclonedds.xml if needed
+colcon build --packages-up-to bringup
 
 # 3. Source + run mock system
 source install/setup.bash
 export ROS_DOMAIN_ID=42
-ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
-# → 5 nodes spin up; view in RViz2
+ros2 launch bringup mock_system.launch.py
+# → 6 nodes spin up; view in RViz2
 rviz2
 ```
 
@@ -42,11 +42,10 @@ rviz2
 ```bash
 ssh xrak@192.168.3.69
 sudo apt install -y python3-colcon-common-extensions  # one-time
-cd ~/ros2_ws/src  # rsync or git clone from dev
-cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp
+cd ~/rak && colcon build --packages-up-to bringup     # workspace = repo root
 source install/setup.bash
 export ROS_DOMAIN_ID=42
-ros2 launch vehicle_wbt_platform_cpp full_system.launch.py
+ros2 launch bringup full_system.launch.py
 ```
 
 ## Architecture
@@ -67,8 +66,8 @@ Components run as **rclcpp nodes** under `ros2_control`:
 
 | Node | Subscribes | Publishes |
 |------|------------|-----------|
-| `camera_node` (×2) | — | `/vehicle_wbt/v1/sensors/camera/<id>/image_raw` |
-| `infrared_node` (×2) | — | `/vehicle_wbt/v1/sensors/ir/<id>` |
+| `camera_node` (×2) | — | `/rak/sensors/camera/<id>/image_raw` |
+| `infrared_node` (×2) | — | `/rak/sensors/ir/<id>` |
 | `mecanum_chassis_node` | `/cmd/vel_safe` | `/state/odom`, `/tf` |
 | `arm_node` | `/cmd/arm/trajectory` | `/state/actuators/<id>` |
 | `safety_gate_node` | `/cmd/vel_raw`, `/safety/*` | `/cmd/vel_safe` |
@@ -77,39 +76,46 @@ Components run as **rclcpp nodes** under `ros2_control`:
 ## Repository layout
 
 ```
-rak-car/
-├── ros2_ws/                              # colcon workspace
-│   └── src/
-│       ├── vehicle_wbt_platform_cpp/     # C++ core (5 rclcpp nodes + ros2_control plugin)
-│       │   ├── include/                  # public headers (BaseController, BaseChassis, MecanumChassis, ...)
-│       │   ├── src/                      # implementations + 5 rclcpp node .cpp
-│       │   ├── msg/                      # LaneResult, DetectionArray, ActuatorState
-│       │   ├── launch/                   # full_system.launch.py + mock_system.launch.py
-│       │   ├── config/                   # cyclonedds.xml + safety.yaml
-│       │   ├── urdf/                     # vehicle_wbt.urdf.xacro + README
-│       │   ├── test/                     # gtest (3 files)
-│       │   ├── CMakeLists.txt
-│       │   └── package.xml
-│       └── vehicle_wbt_platform/         # Python orchestrator (config_loader, SidecarOrchestrator, __main__)
-│           ├── test/                     # pytest (5 files, 45 tests)
-│           └── ...
-├── docs/                                 # comprehensive documentation
-│   ├── README.md                         # doc index
-│   ├── architecture.md                   # 6-layer architecture
-│   ├── hardware-port-mapping.md          # M口/S口/P口/步进 物理映射 (PR #5)
-│   ├── adr/                              # architecture decision records
-│   ├── development/                      # dev/target workflow (5 docs)
-│   ├── migration/                        # JetPack 6 migration (already done!)
-│   ├── contributing/                     # branch strategy
-│   └── superpowers/                      # spec + plan (design docs)
-├── config_sensors.yml                    # sensors/actuators registry (single source of truth)
-├── urdf/                                 # symlink to ros2_ws/.../urdf/
-├── .github/workflows/                    # CI
-├── .devcontainer/                       # dev container (Docker)
-├── CLAUDE.md                             # Claude Code guidance
-├── CONTRIBUTING.md                       # contribution guide
-├── LICENSE                               # license
-└── README.md                             # this file
+rak-car/                          # repo root = colcon workspace (src/ directly under root)
+├── src/
+│   ├── hardware/                 # C++ drivers: MC602 adapter + serial, chassis kinematics,
+│   │   │                         # hardware nodes (camera/ir/chassis/arm/safety), ros2_control plugin
+│   │   ├── include/              # public headers (BaseController, BaseChassis, MecanumChassis, MissionRunner, ...)
+│   │   ├── src/                  # implementations + rclcpp node .cpp
+│   │   ├── test/                 # gtest (8 binaries)
+│   │   ├── CMakeLists.txt
+│   │   └── package.xml
+│   ├── msgs/                     # custom interfaces (CameraMeta, LaneResult, DetectionArray, ActuatorState)
+│   │   ├── msg/
+│   │   ├── CMakeLists.txt
+│   │   └── package.xml
+│   ├── bringup/                  # assembly: launch files, URDF, calibration params, DDS config
+│   │   ├── launch/               # full_system / mock_system / dev_all
+│   │   ├── urdf/                 # rak.urdf.xacro (+ .rviz)
+│   │   ├── params/               # camera_{front,arm}.yaml calibration
+│   │   ├── config/               # cyclonedds.xml
+│   │   ├── CMakeLists.txt
+│   │   └── package.xml
+│   └── cognition/                # Python feature layer: inference bridge (+ future features)
+│       ├── cognition/            # package module (inference/bridge.py)
+│       ├── test/                 # pytest (smoke tests)
+│       ├── setup.py
+│       └── package.xml
+├── scripts/                      # team tooling (onboard / diagnose / start_team_rviz / calibrate_camera)
+├── docs/                         # documentation
+│   ├── README.md                 # doc index
+│   ├── hardware-inventory.md     # what's wired (reference only — node params are the runtime truth)
+│   ├── hardware-port-mapping.md  # M口/S口/P口/步进 物理映射 (PR #5)
+│   ├── adr/                      # architecture decision records
+│   ├── development/              # dev/target workflow
+│   ├── migration/                # JetPack 6 migration (already done!)
+│   ├── contributing/             # branch strategy
+│   └── superpowers/              # historical spec (superseded)
+├── .devcontainer/               # dev container (Docker)
+├── CLAUDE.md                     # Claude Code guidance
+├── CONTRIBUTING.md               # contribution guide
+├── LICENSE                       # license
+└── README.md                     # this file
 ```
 
 ## Documentation

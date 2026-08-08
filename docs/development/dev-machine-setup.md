@@ -83,10 +83,10 @@ cd rak-car
 dev-ros2 bash  # enter container
 # Inside container:
 apt update && apt install -y python3-colcon-common-extensions  # 一次性
-cd ros2_ws && colcon build
+colcon build
 source install/setup.bash
-ros2 pkg list | grep vehicle_wbt
-ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
+ros2 pkg list | grep rak
+ros2 launch bringup cognition.launch.py
 ```
 
 ---
@@ -166,18 +166,18 @@ sudo apt install -y \
 
 ```bash
 # 1. 编辑代码 (host 上)
-$EDITOR ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform/...
+$EDITOR ~/work/rak-car/src/cognition/...
 
 # 2. 跑测试 (dev-ros2 容器内)
 dev-ros2 bash
-cd /work/rak-car/ros2_ws && colcon test
+cd /work/rak-car && colcon test
 # → 单元测试秒回
 
 # 3. 跑仿真 (dev 容器内,带 RViz GUI)
 dev-ros2 bash
-cd /work/rak-car/ros2_ws && colcon build
+cd /work/rak-car && colcon build
 source install/setup.bash
-ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
+ros2 launch bringup cognition.launch.py
 # → 另开一个终端跑 RViz 看 topic
 dev-ros2 rviz2
 

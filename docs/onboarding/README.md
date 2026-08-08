@@ -1,6 +1,6 @@
 # Onboarding — 团队成员入口
 
-> 第一次加入 vehicle_wbt 项目？从这里开始。
+> 第一次加入 rak 项目？从这里开始。
 
 ## 30 秒 TL;DR
 
@@ -16,7 +16,7 @@ bash scripts/start_team_rviz.sh      # 一键通过 RViz 看 Jetson (192.168.3.6
 
 ## 项目 5 句话
 
-1. **vehicle_wbt** 是 2026 百度智能车比赛的小车，NVIDIA Jetson Orin Nano + ROS2 Humble
+1. **rak** 是 2026 百度智能车比赛的小车，NVIDIA Jetson Orin Nano + ROS2 Humble
 2. **架构**：Jetson 跑 sidecar（采集/控制），dev 桌面负责 RViz 监控 + 算法开发
 3. **网络**：Jetson **硬编码 192.168.3.69**，团队 `192.168.3.0/24` 内网（详见 [team-constants.md](../team-constants.md)）
 4. **DDS**：项目用 `ROS_DOMAIN_ID=42`，多机自动发现

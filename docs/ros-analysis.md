@@ -84,7 +84,7 @@ ROS 方式:
 ```
 Phase 1: 基础设施 (1-2 周)
 ├── 安装 ROS2 Humble (对应 JetPack 6.x) 或 Iron
-├── 创建 vehicle_wbt ROS2 包 (ament_python)
+├── 创建 rak ROS2 包 (ament_python)
 ├── 定义消息类型 (msg/): Bbox.msg, LaneResult.msg, ArmCommand.msg
 └── 设置 colcon 工作空间
 

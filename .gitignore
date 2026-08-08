@@ -54,11 +54,6 @@ baidu_smartcar_2026.zip
 fishros
 reference/
 
-# ROS2 Lyrical/Jazzy build artifacts
-ros2_ws/build/
-ros2_ws/install/
-ros2_ws/log/
-
 # Test / coverage
 .pytest_cache/
 *.gcov
@@ -76,6 +71,6 @@ calibration_session/
 # Serena editor state (per-machine)
 **/.serena/
 
-# ROS2 Lyrical colcon artifacts inside package src
-ros2_ws/src/*/AMENT_IGNORE
-ros2_ws/src/*/CMakeFiles/
+# ROS2 colcon artifacts inside package src (workspace = repo root)
+src/*/AMENT_IGNORE
+src/*/CMakeFiles/

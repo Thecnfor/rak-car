@@ -3,7 +3,7 @@
 ## 配置文件分布
 
 ```
-vehicle_wbt/
+rak/
 ├── config_car.yml                    # 主配置（摄像头、IO、PID）
 ├── infer_cs/base/infer.yaml          # 推理服务配置
 ├── vehicle/arm/arm_cfg.yaml          # 机械臂配置

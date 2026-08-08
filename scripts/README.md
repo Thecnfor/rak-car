@@ -43,7 +43,7 @@ bash scripts/diagnose.sh             # 15 项检查
 
 ---
 
-# Calibration workflow — vehicle_wbt Platform
+# Calibration workflow — rak Platform
 
 This directory contains the operator-facing tools for camera intrinsic
 calibration. The pipeline produces real measured intrinsics — it does
@@ -82,10 +82,10 @@ match a standard chessboard:
 
 ```bash
 source /opt/ros/humble/setup.bash
-cd ~/ros2_ws
+cd ~/rak
 source install/setup.bash
 export ROS_DOMAIN_ID=42
-ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
+ros2 launch bringup full_system.launch.py \
     front_device:=/dev/cam4 \
     arm_device:=/dev/cam3
 ```
@@ -93,7 +93,7 @@ ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
 Confirm `image_raw` is flowing:
 
 ```bash
-ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_raw
+ros2 topic hz /rak/sensors/camera/front/image_raw
 ```
 
 ### 3. Capture ~20 frames per camera
@@ -103,7 +103,7 @@ With the chessboard in view, capturing **at varied angles and distances**:
 ```bash
 mkdir -p ~/calib_session
 ros2 bag record -o ~/calib_session/front.bag \
-    /vehicle_wbt/v1/sensors/camera/front/image_raw
+    /rak/sensors/camera/front/image_raw
 # move the chessboard around, hold at varying tilt and distance
 # Ctrl-C after you have ~20 frames
 ```
@@ -119,8 +119,8 @@ The script `calibrate_camera.py` accepts PNGs.
 ```bash
 ros2 run camera_calibration cameracalibrator.py \
     --size 8x6 --square 0.025 \
-    image:=/vehicle_wbt/v1/sensors/camera/front/image_raw \
-    camera:=/vehicle_wbt/v1/sensors/camera/front
+    image:=/rak/sensors/camera/front/image_raw \
+    camera:=/rak/sensors/camera/front
 ```
 
 1. Move the chessboard through all angles while watching the X / Y / Size
@@ -129,7 +129,7 @@ ros2 run camera_calibration cameracalibrator.py \
 3. Click **Save**, point the dialog at:
 
    ```bash
-   /home/xrak/workspace/rak-car/ros2_ws/src/vehicle_wbt_platform_cpp/\
+   ~/rak/src/bringup/\
        params/camera_front.yaml
    ```
 
@@ -144,8 +144,8 @@ mkdir -p ~/calib_session/front_png
 
 python3 scripts/calibrate_camera.py \
     ~/calib_session/front_png/*.png 8 6 0.025 \
-    --out /home/xrak/workspace/rak-car/ros2_ws/src/\
-vehicle_wbt_platform_cpp/params/camera_front.yaml
+    --out ~/rak/src/\
+bringup/params/camera_front.yaml
 ```
 
 The script:
@@ -164,7 +164,7 @@ The script:
 # kill the old one
 pkill -f camera_node
 # relaunch the full system
-ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
+ros2 launch bringup full_system.launch.py \
     front_device:=/dev/cam4 \
     arm_device:=/dev/cam3
 ```
@@ -172,9 +172,9 @@ ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
 After relaunch:
 
 ```bash
-ros2 topic info /vehicle_wbt/v1/sensors/camera/front/camera_info
+ros2 topic info /rak/sensors/camera/front/camera_info
 # QoS: TRANSIENT_LOCAL; Publisher: 1
-ros2 topic echo --once /vehicle_wbt/v1/sensors/camera/front/camera_status | grep calibration_loaded
+ros2 topic echo --once /rak/sensors/camera/front/camera_status | grep calibration_loaded
 # - value: 'true'
 ```
 

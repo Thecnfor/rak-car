@@ -143,7 +143,7 @@ uv pip install -r requirements.txt
 
 ```bash
 # 1. 创建虚拟环境（继承系统包，包括 PaddlePaddle 和 ROS）
-cd /home/jetson/workspace/vehicle_wbt
+cd /home/jetson/workspace/rak
 python3 -m venv --system-site-packages .venv
 
 # 2. 激活
@@ -184,13 +184,13 @@ pip install -r requirements.txt
 
 ```ini
 # 修改 ExecStart 使用虚拟环境中的 Python
-ExecStart=/home/jetson/workspace/vehicle_wbt/.venv/bin/python -u /home/jetson/workspace/vehicle_wbt/main/qqq.py
+ExecStart=/home/jetson/workspace/rak/.venv/bin/python -u /home/jetson/workspace/rak/main/qqq.py
 ```
 
 ### 目录结构
 
 ```
-vehicle_wbt/
+rak/
 ├── .venv/                    # 虚拟环境（gitignored）
 ├── requirements.txt          # 项目直接依赖
 ├── requirements-lock.txt     # 完整锁定文件

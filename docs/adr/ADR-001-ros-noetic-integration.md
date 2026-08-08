@@ -115,7 +115,7 @@
 ```
 ros_bridge/
 ├── launch/
-│   └── vehicle_wbt.launch          # 启动所有节点
+│   └── rak.launch          # 启动所有节点
 ├── nodes/
 │   ├── car_status_node.py          # 发布车辆状态
 │   ├── camera_node.py              # 发布摄像头图像
@@ -231,7 +231,7 @@ Day 5: 实现 tf_broadcaster.py
 Day 1: 实现 rviz_markers_node.py
        检测框、车道线、机械臂的 RViz 标记
 
-Day 2: 配置 RViz 保存文件 (vehicle_wbt.rviz)
+Day 2: 配置 RViz 保存文件 (rak.rviz)
        自动化 launch 文件
 
 Day 3: 测试 rosbag 录制+回放工作流

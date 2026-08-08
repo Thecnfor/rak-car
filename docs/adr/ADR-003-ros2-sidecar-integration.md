@@ -189,7 +189,7 @@ Jetson 上同时跑两个进程组：
 host PC:
   ros-humble-desktop
   ros-humble-ros-gz (Gazebo Garden 桥接)
-  ign gazebo vehicle_wbt.sdf
+  ign gazebo rak.sdf
       ↑ ros_gz bridge
   ros2 topic pub /cmd_vel geometry_msgs/Twist ...
       ↓ ros2 topic echo /odom nav_msgs/Odometry
@@ -199,8 +199,8 @@ host PC:
 URDF 来源：`docs/hardware-port-mapping.md` 已记录 M1-M6 / S2-S3-S7 / stepper_1 / stepper_3 / 真空泵 / 红外 / IO 引脚 P1-P8 的物理映射，xacro 模型直接基于此构建：
 
 ```xml
-<!-- urdf/vehicle_wbt.urdf.xacro -->
-<robot name="vehicle_wbt">
+<!-- urdf/rak.urdf.xacro -->
+<robot name="rak">
   <link name="base_link"/>
   <link name="arm_link"/>      <!-- stepper_1 + stepper_3 -->
   <link name="camera_link"/>   <!-- /dev/cam0 安装位置 -->
@@ -215,17 +215,17 @@ URDF 来源：`docs/hardware-port-mapping.md` 已记录 M1-M6 / S2-S3-S7 / stepp
 
 | Topic | Type | 发布节点 | 频率 |
 |-------|------|----------|------|
-| `/vehicle_wbt/camera/front/image_raw` | sensor_msgs/Image | camera_node | 10 Hz (限频，与下游 10 Hz 推理匹配) |
-| `/vehicle_wbt/camera/side/image_raw` | sensor_msgs/Image | camera_node | 10 Hz |
-| `/vehicle_wbt/odom` | nav_msgs/Odometry | car_status_node | 50 Hz (控制回路需要) |
-| `/vehicle_wbt/joint_states` | sensor_msgs/JointState | car_status_node | 50 Hz |
-| `/vehicle_wbt/arm/state` | vehicle_wbt_msgs/ArmState | car_status_node | 10 Hz |
-| `/vehicle_wbt/perception/detections/task` | vehicle_wbt_msgs/DetectionArray | inference_bridge_node | 10 Hz |
-| `/vehicle_wbt/perception/lane` | vehicle_wbt_msgs/LaneResult | inference_bridge_node | 20 Hz |
-| `/vehicle_wbt/tf`, `/vehicle_wbt/tf_static` | tf2_msgs/TFMessage | tf_broadcaster | 50 Hz / latched |
+| `/rak/camera/front/image_raw` | sensor_msgs/Image | camera_node | 10 Hz (限频，与下游 10 Hz 推理匹配) |
+| `/rak/camera/side/image_raw` | sensor_msgs/Image | camera_node | 10 Hz |
+| `/rak/odom` | nav_msgs/Odometry | car_status_node | 50 Hz (控制回路需要) |
+| `/rak/joint_states` | sensor_msgs/JointState | car_status_node | 50 Hz |
+| `/rak/arm/state` | rak_msgs/ArmState | car_status_node | 10 Hz |
+| `/rak/perception/detections/task` | rak_msgs/DetectionArray | inference_bridge_node | 10 Hz |
+| `/rak/perception/lane` | rak_msgs/LaneResult | inference_bridge_node | 20 Hz |
+| `/rak/tf`, `/rak/tf_static` | tf2_msgs/TFMessage | tf_broadcaster | 50 Hz / latched |
 | `/visualization_marker` | visualization_msgs/Marker | rviz_markers_node | 10 Hz |
 
-> 注：以上 topic 名称与 `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md` 中的完整 schema 完全对齐；命名空间 `/vehicle_wbt/...` 是为了避免与 Jetson 上其他 ROS2 节点冲突。
+> 注：以上 topic 名称与 `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md` 中的完整 schema 完全对齐；命名空间 `/rak/...` 是为了避免与 Jetson 上其他 ROS2 节点冲突。
 
 ### 安全约束（与 CLAUDE.md 一致）
 
@@ -289,9 +289,9 @@ ros2_sidecar/
 ├── systemd/
 │   └── ros2_sidecar.service
 ├── urdf/
-│   └── vehicle_wbt.urdf.xacro            # 来源: hardware-port-mapping.md
+│   └── rak.urdf.xacro            # 来源: hardware-port-mapping.md
 └── rviz/
-    └── vehicle_wbt.rviz
+    └── rak.rviz
 ```
 
 ### Phase 2：Gazebo 仿真回路（赛后第 7-10 天）
@@ -366,7 +366,7 @@ rm -rf /opt/ros/humble  # 完全卸载 ROS2
 
 # host PC 上
 sudo apt remove ros-humble-*
-rm -rf ~/vehicle_wbt_ros2_ws
+rm -rf ~/rak_ros2_ws
 ```
 
 **回滚后系统状态**：与 ADR-001 阶段（ROS1 Noetic sidecar）或零 ROS 状态完全等价。

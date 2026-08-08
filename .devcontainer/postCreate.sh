@@ -13,14 +13,14 @@ apt-get install -y --no-install-recommends \
     ros-humble-ros2control
 
 # Build the workspace
-cd /workspaces/rak-car/ros2_ws
+cd /workspaces/rak-car
 source /opt/ros/humble/setup.bash
-colcon build --packages-up-to vehicle_wbt_platform vehicle_wbt_platform_cpp \
+colcon build --packages-up-to bringup \
     --event-handlers console_direct+
 
 echo "============================================"
-echo "vehicle_wbt dev container ready!"
+echo "rak dev container ready!"
 echo "  source /opt/ros/humble/setup.bash"
-echo "  source /workspaces/rak-car/ros2_ws/install/setup.bash"
-echo "  ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py"
+echo "  source /workspaces/rak-car/install/setup.bash"
+echo "  ros2 launch bringup mock_system.launch.py"
 echo "============================================"

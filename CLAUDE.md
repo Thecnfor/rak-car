@@ -16,12 +16,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**vehicle_wbt** is a ROS2 Humble autonomous vehicle robot. It runs on NVIDIA Jetson Orin Nano (4GB) and is observed/controlled via standard ROS2 topics, services, and ros2_control hardware interfaces. The platform performs lane following, object detection, robotic-arm manipulation, and AI-assisted task execution.
+**rak** is a ROS2 Humble autonomous vehicle robot. It runs on NVIDIA Jetson Orin Nano (4GB) and is observed/controlled via standard ROS2 topics, services, and ros2_control hardware interfaces. The platform performs lane following, object detection, robotic-arm manipulation, and AI-assisted task execution.
 
 Two active branches:
 - `main` — frozen for 2026-08-10 → 08-12 competition. Legacy Python+ZMQ stack.
 - `develop/ros2-sidecar` — the ROS2 future. Pure rclcpp/rclpy implementation. **Most development happens here.** After 2026-08-12 this branch merges to main per `docs/contributing/branch-strategy.md`.
-- `robot-stable` — slim runtime that lives **on the Jetson itself** (IP `192.168.3.69`). Stripped of all dev-only stuff at commit `30f9620`. Keeps only `ros2_ws/`, `config_sensors.yml`, `urdf/`, and `scripts/calibrate_camera.py`. Drivers + minimal app that publishes the `/vehicle_wbt/v1/...` contract to dev desktops over DDS. **New contributors: never commit here directly — push to `develop/ros2-sidecar` first**, then Thecnfor cherry-picks to robot-stable after a real-hardware smoke test. Full split rationale and merge rules: [`docs/driver-app-interface.md`](docs/driver-app-interface.md) and [`docs/contributing/branch-strategy.md`](docs/contributing/branch-strategy.md).
+- `robot-stable` — slim runtime that lives **on the Jetson itself** (IP `192.168.3.69`). Stripped of all dev-only stuff at commit `30f9620`. Keeps only `ros2_ws/`, `config_sensors.yml`, `urdf/`, and `scripts/calibrate_camera.py`. Drivers + minimal app that publishes the `/rak/...` contract to dev desktops over DDS. **New contributors: never commit here directly — push to `develop/ros2-sidecar` first**, then Thecnfor cherry-picks to robot-stable after a real-hardware smoke test. Full split rationale and merge rules: [`docs/driver-app-interface.md`](docs/driver-app-interface.md) and [`docs/contributing/branch-strategy.md`](docs/contributing/branch-strategy.md).
 
 The full platform rationale (why move from ZMQ to DDS) is in the root `README.md`. The 1885-line architecture spec is in `docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md`.
 
@@ -39,11 +39,11 @@ The full platform rationale (why move from ZMQ to DDS) is in the root `README.md
    - **不要凭 spec / 代码推断**话题名、类型、频率、QoS
    - 标准做法（让 team member 跑）：
      ```bash
-     bash scripts/start_team_rviz.sh    # 一键 RViz2 看相机 + 列所有 /vehicle_wbt/v1/... 话题
+     bash scripts/start_team_rviz.sh    # 一键 RViz2 看相机 + 列所有 /rak/... 话题
      # 或纯 CLI：
      ros2 topic list
-     ros2 topic info /vehicle_wbt/v1/sensors/camera/front/image_compressed --verbose
-     ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_compressed
+     ros2 topic info /rak/sensors/camera/front/image_compressed --verbose
+     ros2 topic hz /rak/sensors/camera/front/image_compressed
      ```
    - `config_sensors.yml` 是话题的"权威清单"，但**实时状态**（是否在发、实际频率、QoS 兼容性）必须现场查
    - 帮 team member 加新功能前，先确认 Jetson 端对应话题已发 + QoS 兼容
@@ -70,7 +70,7 @@ The 7 rclcpp nodes (live today):
 | Node | Subscribes | Publishes | Rate |
 |------|------------|-----------|------|
 | `camera_node` (×2: front, arm) | — | `image_raw`+`image_compressed`+`camera_status`+`camera_meta` per camera | 10 Hz image, 1 Hz status |
-| `infrared_node` (×2: left, right) | — | `/vehicle_wbt/v1/sensors/ir/<id>` | 20 Hz |
+| `infrared_node` (×2: left, right) | — | `/rak/sensors/ir/<id>` | 20 Hz |
 | `mecanum_chassis_node` | `/cmd/vel_safe` | `/state/odom`, `/tf` | 50 Hz |
 | `arm_node` | `/cmd/arm/main/trajectory` | `/state/actuators/main` | 50 Hz |
 | `safety_gate_node` | `/cmd/vel_raw` + `/safety/*` | `/cmd/vel_safe` | continuous |
@@ -88,25 +88,25 @@ See root [README.md](README.md) for the complete directory layout. See [docs/REA
 ## Conventions (load-bearing — read before editing)
 
 ### Topic namespace
-**ALL** topics under `/vehicle_wbt/v1/...`. Enforced by `config_loader.py` (rejects anything else) and the C++ nodes. Adding a topic outside this prefix is a violation.
+**ALL** topics under `/rak/...`. Enforced by `config_loader.py` (rejects anything else) and the C++ nodes. Adding a topic outside this prefix is a violation.
 
 ### Adding new hardware
 1. Add 1 entry to `config_sensors.yml` (sensors or actuators list).
-2. Add 1 link to `urdf/vehicle_wbt.urdf.xacro`.
-3. (Optional) Add reserved topic namespace in the spec.
+2. Add 1 link to `src/bringup/urdf/rak.urdf.xacro`.
+3. Wire it into `src/bringup/launch/full_system.launch.py` (topic, port, rate, `mc602_serial_port`/`mc602_baud` if MC602).
 
-**Zero business code touched.** This is the platform-level abstraction principle (documented in CONTRIBUTING.md).
+Full recipe: `docs/hardware-inventory.md`. **Zero business code touched.** This is the platform-level abstraction principle (documented in CONTRIBUTING.md).
 
-### ENABLE_ROS2 gate
-`os.environ["ENABLE_ROS2"]` controls whether the Python sidecar is active. When unset, `__main__.py` returns 0 immediately without importing rclpy. **Main behavior is byte-identical to pre-sidecar state.**
+### ENABLE_ROS2 gate — REMOVED (2026-08-08)
+The Python sidecar (`SidecarOrchestrator` / `feeds` / `config_loader` / `ENABLE_ROS2` gate / `config_sensors.yml`) was deleted in the ROS2-native restructure. The system **is** the ROS2 system — there is no "sidecar you can disable". Config is **params-native**: every node declares its parameters in source, launch files override them. What's wired is documented in `docs/hardware-inventory.md` (reference only, not loaded by code).
 
 ### Camera topic schema (5 streams, per camera)
-Locked in by commit `82fc1d6`. Each camera under `/vehicle_wbt/v1/sensors/camera/<id>/`:
-- `image_raw`         — `sensor_msgs/Image` (bgr8)        QoS: BEST_EFFORT depth=1, 10 Hz
-- `image_compressed`  — `sensor_msgs/CompressedImage`      QoS: BEST_EFFORT depth=1, 10 Hz, JPEG q=85
+Locked in by commit `82fc1d6`. Each camera under `/rak/sensors/camera/<id>/`:
+- `image_raw`         — `sensor_msgs/Image` (bgr8)        QoS: BEST_EFFORT depth=1, 30 Hz
+- `image_compressed`  — `sensor_msgs/CompressedImage`      QoS: BEST_EFFORT depth=1, 30 Hz, JPEG q=85
 - `camera_info`       — `sensor_msgs/CameraInfo`           QoS: TRANSIENT_LOCAL, only if YAML has real K (else NOT published)
 - `camera_status`     — `diagnostic_msgs/DiagnosticArray`  QoS: RELIABLE, 1 Hz (OK / WARN / ERROR)
-- `camera_meta`       — `vehicle_wbt_platform_cpp/msg/CameraMeta` (custom)  QoS: RELIABLE, 1 Hz
+- `camera_meta`       — `msgs/msg/CameraMeta` (custom)  QoS: RELIABLE, 1 Hz
 
 `camera_info_manager::CameraInfoManager` loads `params/camera_<id>.yaml` at startup; all-zero K means "no calibration yet" → `camera_info` topic is **not** published (NEVER fake intrinsics).
 
@@ -119,8 +119,8 @@ The Aveo SP2812 cameras (vendor `1871:0110`, on this dev box `/dev/cam3` and `/d
 
 These are non-negotiable. Each is anchored in real bugs we hit, not generic advice.
 
-1. **No mocks in production code** — see `memory/coding-rules-no-mocks.md` (also loaded via `/home/xrak/.claude/projects/-home-xrak-workspace-rak-car/memory/coding-rules-no-mocks.md`). If a sensor source is missing, the node must `throw` with a clear error and die; never silently publish synthetic frames or plausible-looking fakes (NaN/null is acceptable; plausible numbers are not).
-2. **No hardcoded paths in source** — `/home/<user>/...`, IPs, usernames. Per-machine /dev/cam*N* allowed as launch-arg defaults but NEVER as the only way to configure. Calibration YAMLs come from `package://vehicle_wbt_platform_cpp/params/camera_<id>.yaml`.
+1. **No mocks in production code** — see `memory/coding-rules-no-mocks.md` (loaded via `/home/xrak/.claude/projects/-home-xrak-Desktop-XRAK/memory/coding-rules-no-mocks.md`). If a sensor source is missing, the node must `throw` with a clear error and die; never silently publish synthetic frames or plausible-looking fakes (NaN/null is acceptable; plausible numbers are not).
+2. **No hardcoded paths in source** — `/home/<user>/...`, IPs, usernames. Per-machine /dev/cam*N* allowed as launch-arg defaults but NEVER as the only way to configure. Calibration YAMLs come from `package://bringup/params/camera_<id>.yaml`.
 3. **Never `eval()` LLM output** (legacy rule) — `ernie_bot/base/answer.py` style vulnerabilities are out of scope but the principle stands.
 4. **Never bare `except:`** — use `except Exception as e:` with logging.
 5. **Never `while True: time.sleep(1)`** to mask errors** — raise or return error codes.
@@ -129,47 +129,45 @@ These are non-negotiable. Each is anchored in real bugs we hit, not generic advi
 ## Build / test commands
 
 ```bash
-# Build everything
-cd ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform
+# Build everything (workspace = repo root, 4 包: hardware / msgs / bringup / cognition)
+colcon build --packages-up-to bringup
 
-# Build with tests enabled (CI does this)
-cd ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp \
+# Build with tests enabled
+colcon build --packages-up-to bringup \
                       --cmake-args -DBUILD_TESTING=ON
 
-# Python tests (no ROS2 needed, fast — < 0.5s)
-cd ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/ -q
-# → 45/45 pass
+# Python tests (无 ROS2 也可跑,极快)
+cd src/cognition && PYTHONPATH=. python3 -m pytest test/ -q
+# → 3 smoke tests (结构冒烟,不 import rclpy)
 
-# C++ tests (gtest, requires ROS2 Humble)
-cd ros2_ws && colcon test --packages-select vehicle_wbt_platform_cpp
-# → 5 binaries, 58 testcases total, 0 failures
+# C++ tests (gtest, 需 ROS2 Humble)
+colcon test --packages-select hardware
+# → 8 个 gtest 二进制,全绿
 
-# Single gtest binary (handy for iteration)
-cd ros2_ws
+# Single gtest binary (迭代方便)
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-./build/vehicle_wbt_platform_cpp/test_safety_gate_logic
-./build/vehicle_wbt_platform_cpp/test_base_task
-# (one binary per test/ file)
+./build/hardware/test_mission_runner
+# (test/ 每文件一个二进制)
 
-# Dev mode (no hardware): mock launch
+# Dev mode (无硬件): mock launch
 source /opt/ros/humble/setup.bash
 source install/setup.bash
-ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
-# → 5 nodes spin up; verify in another terminal with RViz2 / `ros2 topic list`
+ros2 launch bringup mock_system.launch.py
+# → 6 节点拉起;另开终端 RViz2 / `ros2 topic list` 验证
 
-# Hardware mode (Jetson target, or this dev box with real cameras):
-ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
+# Hardware mode (Jetson 真机,或本 dev 机带真相机):
+ros2 launch bringup full_system.launch.py \
     front_device:=/dev/cam4 \
     arm_device:=/dev/cam3
-# Both device paths are launch args; per-machine override.
+# 两个设备路径都是 launch args,按机器覆盖。
 
-# Calibration (operator runs once after lens/sensor swap)
-# See scripts/README.md for the full workflow.
-# Interactive: ros2 run camera_calibration cameracalibrator.py --size 8x6 --square 0.025 \
-#   image:=/vehicle_wbt/v1/sensors/camera/front/image_raw
-# Headless:  python3 scripts/calibrate_camera.py /path/to/*.png 8 6 0.025 \
-#             --out /path/to/install/.../params/camera_front.yaml
+# Calibration (换镜头/传感器后跑一次)
+# 详见 scripts/README.md。
+# 交互:  ros2 run camera_calibration cameracalibrator.py --size 8x6 --square 0.025 \
+#           image:=/rak/sensors/camera/front/image_raw
+# 无头:   python3 scripts/calibrate_camera.py /path/to/*.png 8 6 0.025 \
+#           --out <install>/.../share/bringup/params/camera_front.yaml
 ```
 
 ## Onboarding & diagnostics scripts
@@ -190,28 +188,27 @@ bash scripts/diagnose.sh --no-remote    # 只查 dev 端
 
 ```bash
 # 1. Edit
-$EDITOR ros2_ws/src/...              # or scripts/, config_sensors.yml, urdf/
+$EDITOR src/...              # 或 scripts/ 下的工具
 
 # 2. Run fast unit tests (Python, < 0.5s)
-cd ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/ -q
+cd src/cognition && PYTHONPATH=. python3 -m pytest test/ -q
 
 # 3. Full build + test when C++ touched
-cd ros2_ws && colcon build --cmake-args -DBUILD_TESTING=ON \
-    && colcon test --packages-select vehicle_wbt_platform_cpp
+colcon build --cmake-args -DBUILD_TESTING=ON \
+    && colcon test --packages-select hardware
 
 # 4. Smoke test with mock system (no hardware)
 source /opt/ros/humble/setup.bash && source install/setup.bash
-ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
-# In another shell: ros2 topic list  (should see /vehicle_wbt/v1/*)
-#                    ros2 node list   (should see 5 nodes)
+ros2 launch bringup mock_system.launch.py
+# 另开终端: ros2 topic list  (应看到 /rak/*)
+#           ros2 node list   (应看到 6 节点)
 
 # 5. Push to Jetson for real-hardware test
-#    IMPORTANT: dev install/ is **not** ABI-compatible with Jetson (Humble).
-#    Only push source code. Jetson side does its own `colcon build` under
-#    Humble. See docs/team-constants.md for "Jetson vs dev" notes.
+#    注意: dev 的 install/ 与 Jetson(Humble) ABI 不兼容。
+#    只推源码,Jetson 端自己 colcon build。见 docs/team-constants.md。
 git push origin develop/ros2-sidecar
-ssh xrak@192.168.3.69 "cd ~/workspace/rak-car/ros2_ws && git pull && colcon build --packages-up-to vehicle_wbt_platform_cpp"
-ssh xrak@192.168.3.69 "ros2 launch vehicle_wbt_platform_cpp full_system.launch.py"
+ssh xrak@192.168.3.69 "cd ~/rak && git pull && colcon build --packages-up-to bringup"
+ssh xrak@192.168.3.69 "ros2 launch bringup full_system.launch.py"
 ```
 
 ## CI / branch strategy
@@ -225,9 +222,9 @@ ssh xrak@192.168.3.69 "ros2 launch vehicle_wbt_platform_cpp full_system.launch.p
 ```bash
 # After sourcing setup.bash:
 ros2 topic list                                    # all topics
-ros2 topic info /vehicle_wbt/v1/sensors/camera/front/image_raw --verbose   # QoS
-ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_raw            # publish rate
-ros2 topic echo /vehicle_wbt/v1/sensors/camera/front/camera_status --once # status keys
+ros2 topic info /rak/sensors/camera/front/image_raw --verbose   # QoS
+ros2 topic hz /rak/sensors/camera/front/image_raw            # publish rate
+ros2 topic echo /rak/sensors/camera/front/camera_status --once # status keys
 
 ros2 node list
 ros2 node info /camera_front

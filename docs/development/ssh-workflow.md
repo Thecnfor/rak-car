@@ -64,7 +64,7 @@ git push origin develop/ros2-sidecar
 
 # Jetson 机
 ssh xrak@192.168.3.69
-cd ~/work/rak-car  # 或 src/rak-car 在 ros2_ws/src/
+cd ~/work/rak-car  # 或 src/rak-car 在 src/
 git pull
 ```
 
@@ -86,15 +86,15 @@ sshfs xrak@192.168.3.69:~/work/rak-car ~/work/rak-car-jetson
 
 ```bash
 # Dev 触发 Jetson build（无需登录)
-ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && colcon build --packages-up-to vehicle_wbt_platform_cpp"
+ssh xrak@192.168.3.69 "cd ~/rak && source /opt/ros/humble/setup.bash && colcon build --packages-up-to hardware"
 
 # 看 build 输出
-ssh xrak@192.168.3.69 "cd ~/ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp --event-handlers console_direct+"
+ssh xrak@192.168.3.69 "colcon build --packages-up-to hardware --event-handlers console_direct+"
 
 # 长时间 build（30+ 分钟）— 用 tmux 防止断连
 ssh xrak@192.168.3.69
 tmux new -s build
-cd ~/ros2_ws && colcon build ...
+colcon build ...
 # Ctrl-b d  detach
 # ssh xrak@192.168.3.69 -t "tmux attach -t build"  # 重新连上看进度
 ```
@@ -105,12 +105,12 @@ cd ~/ros2_ws && colcon build ...
 
 ```bash
 # 在 Jetson 上跑 Python 单元测试
-ssh xrak@192.168.3.69 "cd ~/ros2_ws && PYTHONPATH=src/vehicle_wbt_platform python3 -m pytest src/vehicle_wbt_platform/test/ -v"
+ssh xrak@192.168.3.69 "cd ~/rak && PYTHONPATH=src/cognition python3 -m pytest src/cognition/test/ -v"
 # 注意: Jetson 上跑测试是浪费 cycles,通常 dev 跑就够了
 # 但 gtest 必须在 Jetson 上跑 (因为 Jetson 才有 rclcpp)
 
 # 远程 gtest (Phase 1.5+)
-ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/setup.bash && colcon test --packages-select vehicle_wbt_platform_cpp"
+ssh xrak@192.168.3.69 "cd ~/rak && source /opt/ros/humble/setup.bash && source install/setup.bash && colcon test --packages-select hardware"
 ```
 
 ---
@@ -121,9 +121,9 @@ ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && sour
 
 ```bash
 ssh xrak@192.168.3.69
-cd ~/ros2_ws && source /opt/ros/humble/setup.bash && source install/setup.bash
+cd ~/rak && source /opt/ros/humble/setup.bash && source install/setup.bash
 export ROS_DOMAIN_ID=42
-ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
+ros2 launch bringup cognition.launch.py
 # 终端留在前台,持续跑
 ```
 
@@ -134,7 +134,7 @@ ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
 dev-ros2 bash
 export ROS_DOMAIN_ID=42
 rviz2
-# Add → By topic → /vehicle_wbt/v1/sensors/ir/left → PointCloud2 (或 LaserScan)
+# Add → By topic → /rak/sensors/ir/left → PointCloud2 (或 LaserScan)
 # 应该看到 Jetson 发布的真实数据
 ```
 
@@ -144,7 +144,7 @@ rviz2
 # Dev 端 (MANUAL mode 已通过物理按钮 3 启用)
 dev-ros2 bash
 export ROS_DOMAIN_ID=42
-ros2 topic pub /vehicle_wbt/v1/cmd/vel_safe geometry_msgs/Twist "{linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.1}}"
+ros2 topic pub /rak/cmd/vel_safe geometry_msgs/Twist "{linear: {x: 0.2, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.1}}"
 # Jetson 端会接收并控制电机
 ```
 
@@ -204,7 +204,7 @@ export ROS_LOCALHOST_ONLY=0  # 0=接受跨机器, 1=仅本机 (调试时用 1)
 # 团队约定：用 IP，不用任何 hostname/别名指向 Jetson
 alias jetson='ssh xrak@192.168.3.69'
 alias push2jetson='rsync -avz --exclude="build/" --exclude="install/" --exclude=".git/" --exclude="__pycache__/" --exclude="*.pyc" --exclude=".pytest_cache/" --exclude="logs/" ~/work/rak-car/ xrak@192.168.3.69:~/work/rak-car/ && rsync -avz ~/work/rak-car/.git xrak@192.168.3.69:~/work/rak-car/'
-alias build2jetson='ssh xrak@192.168.3.69 "cd ~/ros2_ws && source /opt/ros/humble/setup.bash && colcon build --packages-up-to vehicle_wbt_platform_cpp"'
+alias build2jetson='ssh xrak@192.168.3.69 "cd ~/rak && source /opt/ros/humble/setup.bash && colcon build --packages-up-to hardware"'
 alias rviz='dev-ros2 rviz2'
 ```
 
@@ -223,15 +223,15 @@ push2jetson
 build2jetson
 
 # 4. dev 上跑测试 (秒回)
-dev-ros2 pytest ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform/test/
+dev-ros2 pytest ~/work/rak-car/src/cognition/test/
 
 # 5. 启 RViz 看 Jetson 数据
 rviz
 
 # 6. SSH 上启动 sidecar
 jetson
-cd ~/ros2_ws && source install/setup.bash
-ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
+cd ~/rak && source install/setup.bash
+ros2 launch bringup cognition.launch.py
 ```
 
 **5 步日常循环，零 GUI 在 Jetson 上**。

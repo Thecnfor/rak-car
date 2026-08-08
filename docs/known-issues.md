@@ -115,7 +115,7 @@ from ernie_bot import HumAttrPrompt
 
 30+ 处 `sys.path.append`，包括硬编码绝对路径：
 ```python
-sys.path.append("/home/jetson/workspace/vehicle_wbt/")
+sys.path.append("/home/jetson/workspace/rak/")
 ```
 
 ### 11. 通配符 import

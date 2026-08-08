@@ -22,15 +22,15 @@
 #      image_compressed topics.
 #
 # The pre-built layout is at:
-#   ros2_ws/src/vehicle_wbt_platform_cpp/config/team_cameras.rviz
+#   src/bringup/config/team_cameras.rviz
 # Customise by opening RViz2, editing the layout, File → Save Config As.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
-RVIZ_CONFIG="${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform_cpp/config/team_cameras.rviz"
-DDS_CONFIG_SRC="${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml"
+RVIZ_CONFIG="${REPO_ROOT}/src/bringup/config/team_cameras.rviz"
+DDS_CONFIG_SRC="${REPO_ROOT}/src/bringup/config/cyclonedds.xml"
 
 # 1. Domain
 export ROS_DOMAIN_ID=42
@@ -98,7 +98,7 @@ fi
 # Same `set +u` workaround as the distro source above: colcon-generated
 # install/setup.bash references $COLCON_TRACE without a default, which
 # trips `set -u` on distros (e.g. Lyrical) that don't pre-set that var.
-WORKSPACE="${REPO_ROOT}/ros2_ws"
+WORKSPACE="${REPO_ROOT}"
 if [ -f "${WORKSPACE}/install/setup.bash" ]; then
   set +u
   # shellcheck disable=SC1091
@@ -135,9 +135,9 @@ fi
 echo ""
 echo "🚀 Launching RViz2 with team_cameras.rviz ..."
 echo "   Topics visible:"
-echo "     /vehicle_wbt/v1/sensors/camera/{front,arm}/image_compressed"
-echo "     /vehicle_wbt/v1/sensors/camera/{front,arm}/camera_meta"
-echo "     /vehicle_wbt/v1/sensors/camera/{front,arm}/camera_status"
+echo "     /rak/sensors/camera/{front,arm}/image_compressed"
+echo "     /rak/sensors/camera/{front,arm}/camera_meta"
+echo "     /rak/sensors/camera/{front,arm}/camera_status"
 echo "     /tf_static (base_link → *_camera_optical_frame)"
 echo ""
 # Workaround for XWayland bug: hardware OpenGL context creation fails

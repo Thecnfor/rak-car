@@ -1,3 +1,13 @@
+<!--
+SUPERSEDED (2026-08-08) — this spec describes the pre-refactor "sidecar"
+architecture. The workspace was restructured to a professional 4-package
+layout (src/{hardware,msgs,bringup,cognition}) and the Python sidecar
+(SidecarOrchestrator / feeds / config_loader / config_sensors.yml) was
+deleted. Read docs/hardware-inventory.md + CLAUDE.md for the current model.
+Kept for historical context; the old package/topic/sidecar sections below
+are NOT how the system works today.
+-->
+
 
 # ROS2 Sidecar 架构设计 (2026-07-05)
 

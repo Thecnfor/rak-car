@@ -1,6 +1,6 @@
 # Development Workflow — Dev Machine vs Jetson Target
 
-> **本目录定义 vehicle_wbt 项目的开发架构：thick client (dev 桌面) + thin server (Jetson Orin Nano 4GB)**。这是 ROS2 生态最成熟的开发模式（nav2 / moveit / TurtleBot 都用类似架构）。
+> **本目录定义 rak 项目的开发架构：thick client (dev 桌面) + thin server (Jetson Orin Nano 4GB)**。这是 ROS2 生态最成熟的开发模式（nav2 / moveit / TurtleBot 都用类似架构）。
 
 ## 架构总览
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Real camera-calibration flow for vehicle_wbt Platform.
+"""Real camera-calibration flow for rak Platform.
 
 Run sequence (operator does this on the physical robot):
 
@@ -8,20 +8,20 @@ Run sequence (operator does this on the physical robot):
     #    through various angles, ~20 frames at varied distances.
 
     # 2. Start camera_node (the launch file does this):
-    ros2 launch vehicle_wbt_platform_cpp full_system.launch.py \
+    ros2 launch bringup full_system.launch.py \
         front_device:=/dev/cam<your front>
 
     # 3. Capture frames to disk (one for offline analysis, this script
     #    also reads them back for chessboard detection):
     mkdir -p ~/calib_session
     ros2 bag record -o ~/calib_session/front.bag \
-        /vehicle_wbt/v1/sensors/camera/front/image_raw
+        /rak/sensors/camera/front/image_raw
 
     # 4. Run the standard ROS2 calibration tool (cameracalibrator.py opens
     #    a GUI; click Calibrate when you have ~20 good frames, then click
     #    Save and point the dialog at params/camera_front.yaml):
     ros2 run camera_calibration cameracalibrator.py --size 8x6 --square 0.025 \
-        image:=/vehicle_wbt/v1/sensors/camera/front/image_raw
+        image:=/rak/sensors/camera/front/image_raw
 
     # 5. Restart camera_node — isCalibrated() returns true → camera_info
     #    starts being published. Done.
@@ -171,10 +171,15 @@ def main():
         return (f"{name}:\n  rows: {rows}\n  cols: {len(data)//rows}\n"
                 f"  data: [{body}]")
 
+    # camera_name must match the camera_node <id> so camera_info_manager
+    # keys the calibration to the right camera (front / arm). Derive it
+    # from the output filename (camera_arm.yaml -> arm) instead of
+    # hardcoding "front".
+    camera_id = args.out.stem.split("camera_", 1)[-1]
     body = (
         f"image_width: {width}\n"
         f"image_height: {height}\n"
-        f"camera_name: front\n"
+        f"camera_name: {camera_id}\n"
         f"distortion_model: {('rational_polynomial' if len(D_list) > 5 else 'plumb_bob')}\n"
         f"\n"
         f"{arr('camera_matrix', K_list, 3)}\n"

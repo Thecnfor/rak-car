@@ -27,7 +27,7 @@ bash scripts/dev.sh
 
 **这会启动**：
 - `robot_state_publisher` 加载 URDF（dev 上的 `/opt/ros/lyrical` 或 `/opt/ros/humble`），发布 `/tf` + `/robot_description`
-- 5 个 dev-sidecar stub 节点（camera/IR/chassis/arm/safety_gate）发布 stub 数据到 `/vehicle_wbt/v1/...`
+- 5 个 dev-sidecar stub 节点（camera/IR/chassis/arm/safety_gate）发布 stub 数据到 `/rak/...`
 - （可选）RViz2 看到 3D 姿态
 
 不需要 Jetson。不需要仿真器（Gazebo）。不需要真硬件。
@@ -41,17 +41,17 @@ bash scripts/dev.sh
 /robot_description
 /tf
 /tf_static
-/vehicle_wbt/v1/cmd/vel_safe                  (sub by chassis)
-/vehicle_wbt/v1/sensors/camera/front/image_raw
-/vehicle_wbt/v1/sensors/camera/side/image_raw
-/vehicle_wbt/v1/sensors/ir/left
-/vehicle_wbt/v1/sensors/ir/right
-/vehicle_wbt/v1/state/odom
-/vehicle_wbt/v1/state/actuators/main
-/vehicle_wbt/v1/safety/heartbeat
-/vehicle_wbt/v1/safety/estop
-/vehicle_wbt/v1/safety/mode_cmd
-/vehicle_wbt/v1/state/mission_progress        (if mission running)
+/rak/cmd/vel_safe                  (sub by chassis)
+/rak/sensors/camera/front/image_raw
+/rak/sensors/camera/side/image_raw
+/rak/sensors/ir/left
+/rak/sensors/ir/right
+/rak/state/odom
+/rak/state/actuators/main
+/rak/safety/heartbeat
+/rak/safety/estop
+/rak/safety/mode_cmd
+/rak/state/mission_progress        (if mission running)
 ```
 
 ## 跟它交互
@@ -59,14 +59,14 @@ bash scripts/dev.sh
 ### 看 odom 数据流
 
 ```bash
-ros2 topic echo /vehicle_wbt/v1/state/odom
+ros2 topic echo /rak/state/odom
 # header, pose.pose.position, pose.pose.orientation
 ```
 
 ### 让 chassis 移动（发 vel 命令）
 
 ```bash
-ros2 topic pub --once /vehicle_wbt/v1/cmd/vel_safe geometry_msgs/msg/Twist \
+ros2 topic pub --once /rak/cmd/vel_safe geometry_msgs/msg/Twist \
   "{linear: {x: 0.5, y: 0.0, z: 0.0}, angular: {x: 0.0, y: 0.0, z: 0.3}}"
 # 1 秒后 odom 会有 x=0.5, theta=0.3
 ```
@@ -74,14 +74,14 @@ ros2 topic pub --once /vehicle_wbt/v1/cmd/vel_safe geometry_msgs/msg/Twist \
 ### 切换模式（启用 safety_gate）
 
 ```bash
-ros2 topic pub --once /vehicle_wbt/v1/safety/mode_cmd std_msgs/msg/String "{data: MANUAL}"
+ros2 topic pub --once /rak/safety/mode_cmd std_msgs/msg/String "{data: MANUAL}"
 # 之后 /cmd/vel_safe 命令会通过；之前 mode=AUTO 会被 drop
 ```
 
 ### 触发物理急停
 
 ```bash
-ros2 topic pub --once /vehicle_wbt/v1/safety/estop std_msgs/msg/Bool "{data: true}"
+ros2 topic pub --once /rak/safety/estop std_msgs/msg/Bool "{data: true}"
 # 所有 vel 命令立刻失效（zero twist）
 ```
 
@@ -90,7 +90,7 @@ ros2 topic pub --once /vehicle_wbt/v1/safety/estop std_msgs/msg/Bool "{data: tru
 ```bash
 bash scripts/dev.sh --with-mission '[seeding]'
 # 启动 dev + MissionRunnerNode 跑 seeding
-ros2 topic echo /vehicle_wbt/v1/state/mission_progress
+ros2 topic echo /rak/state/mission_progress
 # 会看到: started: 1 tasks → seeding: 1/3 → ... → completed
 ```
 
@@ -99,7 +99,7 @@ ros2 topic echo /vehicle_wbt/v1/state/mission_progress
 ```bash
 # 在有 DISPLAY 的机器上（不是 ssh 远程）
 bash scripts/dev.sh --with-rviz
-# 自动启动 RViz2 + 加载 urdf/vehicle_wbt.rviz 配置
+# 自动启动 RViz2 + 加载 urdf/rak.rviz 配置
 # 你会看到:
 #   - RobotModel: 4 个麦轮 + 4 段机械臂
 #   - TF: odom → base_link → 各个 wheel/arm link
@@ -113,7 +113,7 @@ bash scripts/dev.sh --with-rviz
 
 ```bash
 # 1. 改 src/seeding_task.cpp
-# 2. colcon build --packages-select vehicle_wbt_platform_cpp
+# 2. colcon build --packages-select hardware
 # 3. 重启 dev.sh（Ctrl-C 旧进程，bash scripts/dev.sh --with-mission '[seeding]'）
 # 4. 改完立即生效
 ```
@@ -158,23 +158,23 @@ CI 已经有 4 个 job 验证 Phase 1.5：
 | 症状 | 原因 | 解决 |
 |------|------|------|
 | `colcon: command not found` | 没装 colcon | `pip install colcon-common-extensions` |
-| `Package 'vehicle_wbt_platform_cpp' not found` | 没 colcon build | `cd ros2_ws && colcon build --packages-up-to vehicle_wbt_platform_cpp` |
+| `Package 'hardware' not found` | 没 colcon build | `colcon build --packages-up-to hardware` |
 | `xacro: command not found` | 没装 xacro | `apt install ros-humble-xacro` 或 `pip install xacro` |
 | RViz2 不显示 / 黑屏 | 没有 DISPLAY (ssh 远程) | 本地有 GUI 的机器跑，或 `--no-rviz` |
-| 5 个节点没起来 | workspace 没 build | 看 `ros2_ws/install/` 有没有可执行 |
-| `ModuleNotFoundError: vehicle_wbt_platform_cpp` | 没 source install/setup.bash | dev.sh 自动 source |
+| 5 个节点没起来 | workspace 没 build | 看 `install/` 有没有可执行 |
+| `ModuleNotFoundError: hardware` | 没 source install/setup.bash | dev.sh 自动 source |
 
 ## 文件清单
 
 ```
-ros2_ws/src/vehicle_wbt_platform_cpp/
+src/hardware/
 ├── launch/
 │   ├── full_system.launch.py    # Jetson 真硬件
 │   ├── mock_system.launch.py    # 5 个 dev-sidecar stub 节点（无 URDF）
 │   └── dev_all.launch.py        # ⭐ 一键无真机开发（含 URDF + mission runner）
 ├── urdf/
-│   ├── vehicle_wbt.urdf.xacro   # 14 links / 21 joints
-│   ├── vehicle_wbt.rviz         # ⭐ RViz2 配置（全车概览）
+│   ├── rak.urdf.xacro   # 14 links / 21 joints
+│   ├── rak.rviz         # ⭐ RViz2 配置（全车概览）
 │   └── README.md
 └── src/
     ├── camera_node.cpp

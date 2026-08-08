@@ -39,12 +39,12 @@ colcon --version
 
 ---
 
-## Step 2: 创建 ros2_ws（一次性）
+## Step 2: 创建工作空间(仓库根 = ros workspace,一次性)
 
 ```bash
 ssh xrak@192.168.3.69
-mkdir -p ~/ros2_ws/src
-cd ~/ros2_ws
+mkdir -p ~/rak/src
+cd ~/rak
 # Clone 或 rsync 代码（见 ssh-workflow.md）
 ```
 
@@ -54,10 +54,10 @@ cd ~/ros2_ws
 
 ```bash
 ssh xrak@192.168.3.69
-cd ~/ros2_ws
+cd ~/rak
 # Option A: 从 dev 拉 (rsync) — 详见 ssh-workflow.md
 rsync -avz --exclude='build/' --exclude='install/' --exclude='.git/' \
-  dev-host:~/work/rak-car/ ~/ros2_ws/   # 然后单独 rsync .git
+  dev-host:~/work/rak-car/ ~/rak/   # 然后单独 rsync .git
 
 # Option B: 从 git 拉
 git clone https://github.com/Thecnfor/rak-car.git src/rak-car
@@ -65,9 +65,9 @@ cd src/rak-car
 git checkout develop/ros2-sidecar
 
 # Build (target 只 build 我们自己的包,不 build 第三方)
-cd ~/ros2_ws
+cd ~/rak
 source /opt/ros/humble/setup.bash
-colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform
+colcon build --packages-up-to hardware cognition
 ```
 
 **注意**: target 内存只有 3.5GB，**colcon build 时不可同时跑其他大程序**。如果 build OOM，加 `--executor sequential` 或 `--parallel-workers 1`。
@@ -78,13 +78,13 @@ colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform
 
 ```bash
 ssh xrak@192.168.3.69
-cd ~/ros2_ws
+cd ~/rak
 source /opt/ros/humble/setup.bash
 source install/setup.bash
 export ROS_DOMAIN_ID=42
 export ENABLE_ROS2=1
-ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
-# → sidecar 节点在 Jetson 上跑，publish 真实传感器数据到 /vehicle_wbt/v1/...
+ros2 launch bringup cognition.launch.py
+# → sidecar 节点在 Jetson 上跑，publish 真实传感器数据到 /rak/...
 ```
 
 ---
@@ -98,11 +98,11 @@ ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
 dev-ros2 bash
 export ROS_DOMAIN_ID=42
 ros2 topic list
-# → 看到 /vehicle_wbt/v1/... topics
-ros2 topic echo /vehicle_wbt/v1/sensors/ir/left
+# → 看到 /rak/... topics
+ros2 topic echo /rak/sensors/ir/left
 # → 看到 Jetson 发布的红外数据
 rviz2
-# → Add Topic → /vehicle_wbt/v1/... → 实时可视化
+# → Add Topic → /rak/... → 实时可视化
 ```
 
 **成功标志**：dev 端 RViz 看到 Jetson 真实传感器数据。**这就是"thick client, thin server"**。
@@ -165,7 +165,7 @@ ssh xrak@192.168.3.69 "free -h | head -2"
 | Jetson 上 `colcon build` OOM | 内存不够 | 加 `--executor sequential --parallel-workers 1` |
 | `ros2 node list` 看不到 Jetson 节点 | DDS multicast 被防火墙拦 | `sudo ufw allow 7400-7500/udp` |
 | Jetson 时间不同步 | 无 NTP | `sudo apt install -y chrony && sudo systemctl enable --now chrony` |
-| 找不到 `vehicle_wbt_platform_cpp` 包 | 没 source install/setup.bash | `source ~/ros2_ws/install/setup.bash` |
+| 找不到 `hardware` 包 | 没 source install/setup.bash | `source ~/rak/install/setup.bash` |
 
 ---
 

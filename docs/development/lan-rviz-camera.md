@@ -16,7 +16,7 @@
 
    ```bash
    # On both machines — copy the file from the repo, don't handwrite:
-   sudo cp ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml \
+   sudo cp src/bringup/config/cyclonedds.xml \
            /etc/cyclonedds/cyclonedds.xml
    ```
 
@@ -50,10 +50,10 @@ ros2 node list
 #   /ir_left  /ir_right  /safety_gate
 
 # 2. Cam topics visible?
-ros2 topic list | grep vehicle_wbt/v1/sensors/camera
+ros2 topic list | grep rak/v1/sensors/camera
 # expect 10 topics (5 per camera × 2):
-#   /vehicle_wbt/v1/sensors/camera/front/{image_raw,image_compressed,camera_meta,camera_status}
-#   /vehicle_wbt/v1/sensors/camera/arm/{image_raw,image_compressed,camera_meta,camera_status}
+#   /rak/sensors/camera/front/{image_raw,image_compressed,camera_meta,camera_status}
+#   /rak/sensors/camera/arm/{image_raw,image_compressed,camera_meta,camera_status}
 # camera_info NOT present (calibration YAML still sentinel — that is correct)
 
 # 3. tf_static frame_ids visible? (set by Jetson's camera_node)
@@ -74,11 +74,11 @@ the Jetson (replace 192.168.0.0/16 with your actual subnet).
    rviz2
    # In RViz:
    #   Add → Image
-   #   Image Topic: /vehicle_wbt/v1/sensors/camera/front/image_compressed
+   #   Image Topic: /rak/sensors/camera/front/image_compressed
    ```
 
 2. **Side-by-side front + arm**: open a second Image display in RViz,
-   set its topic to `/vehicle_wbt/v1/sensors/camera/arm/image_compressed`
+   set its topic to `/rak/sensors/camera/arm/image_compressed`
    and move it next to the first one.
 
 3. **Static transforms visible** — RViz should show

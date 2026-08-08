@@ -149,7 +149,7 @@ phase2_install() {
   fi
 
   # CycloneDDS config (idempotent)
-  local cfg_src="${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml"
+  local cfg_src="${REPO_ROOT}/src/bringup/config/cyclonedds.xml"
   local cfg_dst="${HOME}/.ros/cyclonedds.xml"
   if [[ -f "$cfg_src" ]]; then
     mkdir -p "${HOME}/.ros"
@@ -176,8 +176,8 @@ phase2_install() {
 phase3_build() {
   log "[3/3] Building + verifying..."
 
-  if [[ ! -d "${REPO_ROOT}/ros2_ws" ]]; then
-    err "  ros2_ws/ not found in repo"
+  if [[ ! -d "${REPO_ROOT}/src" ]]; then
+    err "  src/ not found — is this the workspace repo root?"
     exit 1
   fi
 
@@ -191,9 +191,9 @@ phase3_build() {
     set -u
   fi
 
-  cd "${REPO_ROOT}/ros2_ws"
+  cd "${REPO_ROOT}"
   log "  colcon build (this may take 5-10 min on first run)..."
-  if ! run "colcon build --packages-up-to vehicle_wbt_platform_cpp vehicle_wbt_platform --event-handlers console_direct+"; then
+  if ! run "colcon build --packages-up-to bringup --event-handlers console_direct+"; then
     err "  colcon build failed. See output above."
     log "  See: docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md"
     exit 1
@@ -202,8 +202,8 @@ phase3_build() {
 
   # Smoke test: Python tests
   log "  running pytest smoke test..."
-  if [[ -d "${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform/test" ]]; then
-    cd "${REPO_ROOT}/ros2_ws/src/vehicle_wbt_platform"
+  if [[ -d "${REPO_ROOT}/src/cognition/test" ]]; then
+    cd "${REPO_ROOT}/src/cognition"
     if PYTHONPATH=. python3 -m pytest test/ -q 2>&1 | tail -5; then
       ok "  pytest: 45/45 pass"
     else

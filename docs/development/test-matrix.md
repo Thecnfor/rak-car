@@ -29,25 +29,25 @@
 
 ```bash
 # Python 单元测试
-cd ~/work/rak-car/ros2_ws/src/vehicle_wbt_platform
+cd ~/work/rak-car/src/cognition
 PYTHONPATH=. python3 -m pytest test/ -v
 # → 0.07s 跑完 45 tests
 
 # C++ 单元测试 (在 dev Jazzy 容器内)
-cd ~/work/rak-car/ros2_ws
+cd ~/work/rak-car
 source /opt/ros/jazzy/setup.bash
-colcon test --packages-select vehicle_wbt_platform_cpp
+colcon test --packages-select hardware
 # → gtest 跑 ~ 25 cases
 
 # Lint
 cd ~/work/rak-car
-flake8 ros2_ws/src/vehicle_wbt_platform/vehicle_wbt_platform/  # Python
-clang-format --dry-run --Werror ros2_ws/src/vehicle_wbt_platform_cpp/  # C++
+flake8 src/cognition/cognition/  # Python
+clang-format --dry-run --Werror src/hardware/  # C++
 
 # Gazebo 仿真
-cd ~/work/rak-car/ros2_ws
+cd ~/work/rak-car
 source /opt/ros/jazzy/setup.bash && source install/setup.bash
-ros2 launch vehicle_wbt_platform_cpp gz_sim.launch.py
+ros2 launch bringup gz_sim.launch.py
 
 # RViz
 ros2 run rviz2 rviz2 -d config/sidecar.rviz
@@ -57,22 +57,22 @@ ros2 run rviz2 rviz2 -d config/sidecar.rviz
 
 ```bash
 ssh xrak@192.168.3.69
-cd ~/ros2_ws
+cd ~/rak
 source /opt/ros/humble/setup.bash && source install/setup.bash
 
 # 真实传感器发布 (代替真硬件集成测试)
 export ROS_DOMAIN_ID=42
-ros2 launch vehicle_wbt_platform_cpp vehicle_wbt_platform.launch.py
-# → Jetson 跑 sidecar 节点, 发布 /vehicle_wbt/v1/sensors/ir/left 等
+ros2 launch bringup cognition.launch.py
+# → Jetson 跑 sidecar 节点, 发布 /rak/sensors/ir/left 等
 # → dev 端 RViz 订阅这些 topic 看到真实数据
 
 # 性能基准 (latency 测量)
-ros2 topic delay /vehicle_wbt/v1/state/odom
-ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_raw
+ros2 topic delay /rak/state/odom
+ros2 topic hz /rak/sensors/camera/front/image_raw
 
 # MANUAL mode 真硬件控制
 # 物理按钮 3 切到 MANUAL, dev 上:
-ros2 topic pub /vehicle_wbt/v1/cmd/vel_safe geometry_msgs/Twist "{...}"
+ros2 topic pub /rak/cmd/vel_safe geometry_msgs/Twist "{...}"
 # → Jetson 接收并驱动电机
 ```
 
@@ -83,13 +83,13 @@ ros2 topic pub /vehicle_wbt/v1/cmd/vel_safe geometry_msgs/Twist "{...}"
 ssh xrak@192.168.3.69
 ros2 bag record -a -o debug_run -b 100  # 100 MB 限制
 # → 拷到 dev 上回放
-rsync -avz xrak@192.168.3.69:~/ros2_ws/debug_run/ ~/work/debug_run/
+rsync -avz xrak@192.168.3.69:~/rak/debug_run/ ~/work/debug_run/
 # dev 上:
 ros2 bag play debug_run/  # RViz 重放
 
 # 集成测试 (端到端)
 ssh xrak@192.168.3.69
-cd ~/ros2_ws && colcon test --packages-select vehicle_wbt_platform_cpp --event-handlers console_direct+
+cd ~/rak && colcon test --packages-select hardware --event-handlers console_direct+
 # → gtest 在 Jetson 跑,验证 rclcpp 节点正常工作
 ```
 
@@ -97,7 +97,7 @@ cd ~/ros2_ws && colcon test --packages-select vehicle_wbt_platform_cpp --event-h
 
 ```bash
 # ❌ 在 Jetson 上跑 Python 单元测试 (浪费)
-ssh xrak@192.168.3.69 "cd ~/ros2_ws/src/vehicle_wbt_platform && PYTHONPATH=. python3 -m pytest test/"
+ssh xrak@192.168.3.69 "cd ~/src/cognition && PYTHONPATH=. python3 -m pytest test/"
 # 错误理由: Jetson 跑得一样慢(甚至更慢),但占用了真机 cycles
 # 正解: dev 跑,Jetson 不跑
 
@@ -147,9 +147,9 @@ Jetson **不进 CI**（4GB 内存跑 CI job 太慢、太贵）。Jetson 只在 P
 ├──────────────────────────────────────────────────────────────┤
 │  真硬件验证 (Jetson)                                          │
 │  ┌────────────────────────────────────────────────────────┐  │
-│  │ ssh xrak@192.168.3.69 "cd ~/ros2_ws && git pull"                      │  │
-│  │ ssh xrak@192.168.3.69 "colcon build --packages-up-to vehicle_wbt_*"   │  │
-│  │ ssh xrak@192.168.3.69 "ros2 launch ... vehicle_wbt_platform.launch.py"│  │
+│  │ ssh xrak@192.168.3.69 "cd ~/rak && git pull"                      │  │
+│  │ ssh xrak@192.168.3.69 "colcon build --packages-up-to rak_*"   │  │
+│  │ ssh xrak@192.168.3.69 "ros2 launch ... cognition.launch.py"│  │
 │  │ dev 上: RViz 看真实数据                                  │  │
 │  │ ssh xrak@192.168.3.69 "ros2 topic hz ..."  # 性能基准                  │  │
 │  └────────────────────────────────────────────────────────┘  │

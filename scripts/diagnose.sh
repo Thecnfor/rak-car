@@ -163,17 +163,17 @@ check_jetson() {
   fi
 
   # 08: workspace built
-  if remote "test -f ~/ros2_ws/install/setup.bash" >/dev/null 2>&1; then
+  if remote "test -f ~/rak/install/setup.bash" >/dev/null 2>&1; then
     add_result "08" "jetson:workspace" "PASS" "built"
   else
-    add_result "08" "jetson:workspace" "WARN" "not built — ssh xrak@192.168.3.69 'cd ros2_ws && colcon build'"
+    add_result "08" "jetson:workspace" "WARN" "not built — ssh xrak@192.168.3.69 'cd ~/rak && colcon build'"
   fi
 
   # 09: full_system running
   if remote "pgrep -f full_system.launch.py" >/dev/null 2>&1; then
     add_result "09" "jetson:sidecar" "PASS" "running"
   else
-    add_result "09" "jetson:sidecar" "WARN" "not running — ssh xrak@192.168.3.69 'ros2 launch vehicle_wbt_platform_cpp full_system.launch.py ...'"
+    add_result "09" "jetson:sidecar" "WARN" "not running — ssh xrak@192.168.3.69 'ros2 launch bringup full_system.launch.py ...'"
   fi
 
   # 10: Jetson disk
@@ -220,7 +220,7 @@ check_dds() {
   # 13: image_compressed publishing — this is the AUTHORITATIVE signal:
   # if we can measure ~30Hz, DDS is working regardless of daemon cache state.
   local rate
-  rate=$(timeout 4 ros2 topic hz /vehicle_wbt/v1/sensors/camera/front/image_compressed 2>/dev/null | grep -oE 'average rate: [0-9.]+' | head -1 | awk '{print $3}' || true)
+  rate=$(timeout 4 ros2 topic hz /rak/sensors/camera/front/image_compressed 2>/dev/null | grep -oE 'average rate: [0-9.]+' | head -1 | awk '{print $3}' || true)
   if [[ -n "$rate" && "${rate%.*}" -ge 5 ]]; then
     add_result "13" "dds:image_topic" "PASS" "${rate} Hz (DDS working)"
   elif [[ -n "$rate" ]]; then
@@ -263,7 +263,7 @@ emit_row() {
 
 emit_text() {
   echo "═══════════════════════════════════════════════════════════════"
-  echo "  vehicle_wbt diagnose — $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "  rak diagnose — $(date '+%Y-%m-%d %H:%M:%S')"
   echo "  target: ${TARGET:-$JETSON_HOST}    remote: $([[ $DO_REMOTE -eq 1 ]] && echo yes || echo no)"
   echo "═══════════════════════════════════════════════════════════════"
   for i in "${!R_ID[@]}"; do

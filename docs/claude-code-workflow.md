@@ -38,7 +38,7 @@ Claude Code 在 `~/.claude/projects/-home-xrak-Desktop-rak-car/memory/` 存**用
 
 ```text
 帮我加一个新的 ROS2 node：my_sensor_node，读 /dev/ttyUSB0 串口数据
-（格式：$RPM,1234\n），发布到 /vehicle_wbt/v1/sensors/my_sensor/rpm (std_msgs/Int32)。
+（格式：$RPM,1234\n），发布到 /rak/sensors/my_sensor/rpm (std_msgs/Int32)。
 
 要求：
 - 用 rclcpp::Node 基类
@@ -66,7 +66,7 @@ Claude Code 在 `~/.claude/projects/-home-xrak-Desktop-rak-car/memory/` 存**用
 参考 docs/development/no-hw-dev.md 加一个新任务 pest_scout：
 - BaseTask 抽象类
 - 任务列表注册到 TaskRegistry
-- 主题：vehicle_wbt/v1/sensors/...
+- 主题：rak/v1/sensors/...
 - 含 dev.sh --with-mission 测试
 ```
 

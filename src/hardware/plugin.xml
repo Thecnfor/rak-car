@@ -1,0 +1,12 @@
+<library path="hardware">
+  <class
+    name="hardware/MC602HardwareInterface"
+    type="hardware::MC602HardwareInterface"
+    base_class_type="hardware_interface::SystemInterface">
+    <description>
+      MC602 motor controller as a ros2_control SystemInterface.
+      Plugs in via URDF: &lt;plugin&gt;hardware/MC602HardwareInterface&lt;/plugin&gt;
+      See docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md §硬件接口插件
+    </description>
+  </class>
+</library>

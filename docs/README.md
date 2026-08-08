@@ -1,4 +1,4 @@
-# vehicle_wbt 项目文档
+# rak 项目文档
 
 > 自主机器人竞赛平台 — NVIDIA Jetson + MC601/MC602 单片机
 

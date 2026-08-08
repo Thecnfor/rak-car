@@ -1,6 +1,6 @@
 # 分支策略与协作工作流
 
-本文档定义 vehicle_wbt 项目团队的 Git 分支管理规范与协作流程。所有人(4-6 人)必须遵守,目标是让 main 分支随时可以上场比赛,同时保留 ROS2 sidecar 等长周期实验的并行空间。
+本文档定义 rak 项目团队的 Git 分支管理规范与协作流程。所有人(4-6 人)必须遵守,目标是让 main 分支随时可以上场比赛,同时保留 ROS2 sidecar 等长周期实验的并行空间。
 
 > **重要**: 本项目采用 dev/target 双机开发架构。开发在桌面机,生产部署在 Jetson Orin。详见 [../development/README.md](../development/README.md)。
 
@@ -33,7 +33,7 @@
                             ┌──────────────────────────────┐
                             │   robot-stable (Jetson)      │
                             │  在 Jetson 上跑的精简 runtime │
-                            │  仅 ros2_ws + config + urdf  │
+                            │  仅 src/ + config + urdf  │
                             │  + scripts/calibrate_camera  │
                             │  30f9620 从 develop 剥离而成 │
                             │  接受 develop 合入 (sparse)  │
@@ -42,7 +42,7 @@
 
 > **机器人侧的真相**：`robot-stable` 是 Jetson 上 git checkout 的那个分支。
 > `develop/ros2-sidecar` 在 dev 机上。这俩通过 `ROS_DOMAIN_ID=42` 上的
-> `/vehicle_wbt/v1/...` topic schema 通信（见 [`docs/driver-app-interface.md`](../driver-app-interface.md)）。
+> `/rak/...` topic schema 通信（见 [`docs/driver-app-interface.md`](../driver-app-interface.md)）。
 > 之前的 `develop/ros2-humble-post-flash` 占位分支已经被 `robot-stable` 取代，**不要再切**。
 
 ## main 分支约定
@@ -83,14 +83,14 @@
 
 `robot-stable` 是 **Jetson 上 git checkout 的那个分支**。`30f9620 chore(robot-stable): strip dev-only docs/scripts/CI for robot-side runtime` 把所有 dev-only 的东西(完整 `docs/`、`scripts/{onboard,dev,diagnose,start_team_rviz}.sh`、`.github/` CI、`.devcontainer/`、`CONTRIBUTING.md`)剥掉,只留:
 
-- `ros2_ws/` (runtime 代码,driver + 最小 app)
+- `src/` (runtime 代码: hardware/msgs/bringup/cognition)
 - `config_sensors.yml` (硬件 source of truth)
 - `urdf/` (机器人模型)
 - `scripts/calibrate_camera.py` (operator 工具,镜头更换时用一次)
 
 **为什么单独一个分支**:Jetson 不需要 dev docs / CI / 多脚本——它只需要"能跑 sidecar + 能被 remote colcon build/update"。剥离后 `git clone` 在 Jetson 上更快、磁盘更省、心智更干净。
 
-**跟 develop 的关系**:Jetson 端 publish `/vehicle_wbt/v1/...` 这一组 topic;dev 端订阅这一组 topic 做应用层工作。**这组 topic schema 是两边的契约**,详见 [`docs/driver-app-interface.md`](../driver-app-interface.md)。
+**跟 develop 的关系**:Jetson 端 publish `/rak/...` 这一组 topic;dev 端订阅这一组 topic 做应用层工作。**这组 topic schema 是两边的契约**,详见 [`docs/driver-app-interface.md`](../driver-app-interface.md)。
 
 **承诺**:
 - robot-stable 上的代码**必须在真车上跑通过**(发布 topic 给 dev 的 RViz 能看到)。
@@ -178,7 +178,7 @@ main (LTS, 比赛线)
 | 新功能 / 重构 | develop/ros2-sidecar | 任一 reviewer 批准 + 作者 push | 必须 |
 | ROS2 sidecar 实验 | develop/ros2-sidecar | 任一 reviewer | 必须 |
 | Driver / hardware bug fix(Jetson 现场) | robot-stable | 仅 Thecnfor(带真机验证截图/log) | 必须,1 reviewer,合后同步回 develop |
-| 跨分支的 `/vehicle_wbt/v1/...` schema 变更 | develop/ros2-sidecar + robot-stable | 仅 Thecnfor | 必须,**breaking change**——见 [`docs/driver-app-interface.md`](../driver-app-interface.md) §"Interface changes are breaking" |
+| 跨分支的 `/rak/...` schema 变更 | develop/ros2-sidecar + robot-stable | 仅 Thecnfor | 必须,**breaking change**——见 [`docs/driver-app-interface.md`](../driver-app-interface.md) §"Interface changes are breaking" |
 | 实验性 spike | experiment/* | 仅自己 | 不需要 PR(直接 push) |
 | 文档更新 | develop/ros2-sidecar(robot-stable 不带 docs/) | 任一 reviewer | 必须 |
 | 配置调参(PID、阈值) | develop/ros2-sidecar | 任一 reviewer | 必须,真机验证后再合 main |

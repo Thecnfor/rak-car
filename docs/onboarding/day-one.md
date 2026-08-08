@@ -99,7 +99,7 @@ bash scripts/start_team_rviz.sh
 | ROS2 没装 | `ros2: command not found` | 重做 Step 2 |
 | SSH 连不上 Jetson | `Permission denied (publickey)` 或 `Connection refused` | 找 Thecnfor 配 / 检查网线 |
 | ROS_DOMAIN_ID 不一致 | 看不到 Jetson topic | `export ROS_DOMAIN_ID=42` + 重启 shell |
-| CycloneDDS 配置没拷 | 看不到 Jetson topic | `cp ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml ~/.ros/` |
+| CycloneDDS 配置没拷 | 看不到 Jetson topic | `cp src/bringup/config/cyclonedds.xml ~/.ros/` |
 | Ping Jetson (192.168.3.69) 不通 | 找不到 Jetson | `ping 192.168.3.69` — 检查网线 / 路由器 / 你在不在内网 |
 | colcon build 失败 | 缺依赖 / 缺包 | 看错误信息，缺什么装什么；不要忘了 `source /opt/ros/<distro>/setup.bash` |
 

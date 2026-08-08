@@ -2,7 +2,7 @@
 
 > **The contract between `origin/robot-stable` (Jetson runtime) and
 > `origin/develop/ros2-sidecar` (dev tree) is the ROS2 topic schema under
-> `/vehicle_wbt/v1/...`. This doc names it and locks down the rules.**
+> `/rak/...`. This doc names it and locks down the rules.**
 
 This file was created to fill a gap: the spec
 [`docs/superpowers/specs/2026-07-05-ros2-sidecar-design.md`](superpowers/specs/2026-07-05-ros2-sidecar-design.md)
@@ -18,10 +18,10 @@ contract**:
 
 | Branch | Where it lives | What it ships |
 |---|---|---|
-| **`origin/robot-stable`** | On the Jetson (git checkout at `192.168.3.69`) | `ros2_ws/` drivers + minimal app that **publishes** the contract topics |
+| **`origin/robot-stable`** | On the Jetson (git checkout at `192.168.3.69`) | `src/hardware` + `src/msgs` drivers + minimal app that **publishes** the contract topics |
 | **`origin/develop/ros2-sidecar`** | On dev desktops | Full dev tree + `mock_system.launch.py` that **also publishes** the contract topics but with `/dev/null` stubs so everyone can test app code locally |
 
-Both branches speak the same `/vehicle_wbt/v1/...` topic schema. `ROS_DOMAIN_ID=42` makes DDS auto-discovery glue them together over LAN. That's the entire interface — there is no other hand-shake.
+Both branches speak the same `/rak/...` topic schema. `ROS_DOMAIN_ID=42` makes DDS auto-discovery glue them together over LAN. That's the entire interface — there is no other hand-shake.
 
 ## The contract
 
@@ -29,7 +29,7 @@ The contract is a **topic schema**, frozen at commit `82fc1d6`. Below is the can
 
 ### Camera topic schema (5 streams, per camera)
 
-Each camera under `/vehicle_wbt/v1/sensors/camera/<id>/`:
+Each camera under `/rak/sensors/camera/<id>/`:
 
 | Stream | Type | QoS | Rate | Notes |
 |---|---|---|---|---|
@@ -37,7 +37,7 @@ Each camera under `/vehicle_wbt/v1/sensors/camera/<id>/`:
 | `image_compressed` | `sensor_msgs/CompressedImage` | BEST_EFFORT, depth=1 | 10 Hz (dev) / 30 Hz (Jetson) | JPEG q=85, ~50 KB/frame. The bandwidth-friendly alternative |
 | `camera_info` | `sensor_msgs/CameraInfo` | TRANSIENT_LOCAL | on-change | **NOT published** when YAML has all-zero K. See [calibration rules](#calibration-required-for-camera_info) below |
 | `camera_status` | `diagnostic_msgs/DiagnosticArray` | RELIABLE, depth=1 | 1 Hz | OK / WARN / ERROR |
-| `camera_meta` | `vehicle_wbt_platform_cpp/msg/CameraMeta` | RELIABLE, depth=1 | 1 Hz | Custom message — see `ros2_ws/src/vehicle_wbt_platform_cpp/msg/CameraMeta.msg` |
+| `camera_meta` | `msgs/msg/CameraMeta` | RELIABLE, depth=1 | 1 Hz | Custom message — see `src/hardware/msg/CameraMeta.msg` |
 
 > **Rate note**: develop's docs say 10 Hz (the current dev-box default for SP2812 cameras in low-light), robot-stable's docs say 30 Hz (the competition target). Both are valid for the same hardware under different lighting. **The contract doesn't pin a single rate** — it pins the schema. Pick whatever rate fits your environment.
 
@@ -46,25 +46,25 @@ Each camera under `/vehicle_wbt/v1/sensors/camera/<id>/`:
 | Node | Subscribes | Publishes | Rate |
 |---|---|---|---|
 | `camera_node` (×2: front, arm) | — | camera topics (above) | 10–30 Hz |
-| `infrared_node` (×2: left, right) | — | `/vehicle_wbt/v1/sensors/ir/<id>` | 20 Hz |
+| `infrared_node` (×2: left, right) | — | `/rak/sensors/ir/<id>` | 20 Hz |
 | `mecanum_chassis_node` | `/cmd/vel_safe` | `/state/odom`, `/tf` | 50 Hz |
 | `arm_node` | `/cmd/arm/main/trajectory` | `/state/actuators/main` | 50 Hz |
 | `safety_gate_node` | `/cmd/vel_raw` + `/safety/*` | `/cmd/vel_safe` | continuous |
 | `MC602HardwareInterface` (ros2_control plugin) | controller_manager | wheel/arm state | — |
 | `mission_runner_node` (Phase 1.5+) | task_list param | per-task state | — |
 
-**Topic prefix**: everything lives under `/vehicle_wbt/v1/`. `config_loader.py` and the C++ nodes reject anything outside this prefix. Adding a topic outside `/vehicle_wbt/v1/...` is a contract violation.
+**Topic prefix**: everything lives under `/rak/`. `config_loader.py` and the C++ nodes reject anything outside this prefix. Adding a topic outside `/rak/...` is a contract violation.
 
 ### Cmd / state / safety channels
 
 | Channel | Direction (Jetson ↔ dev) | Notes |
 |---|---|---|
-| `/vehicle_wbt/v1/cmd/vel_raw` | dev → Jetson | Raw cmd (before safety gate) |
-| `/vehicle_wbt/v1/cmd/vel_safe` | dev → Jetson (consumed by `mecanum_chassis_node`) | Post-safety cmd |
-| `/vehicle_wbt/v1/cmd/arm/main/trajectory` | dev → Jetson (consumed by `arm_node`) | Arm motion plan |
-| `/vehicle_wbt/v1/state/odom` | Jetson → dev | Chassis odometry |
-| `/vehicle_wbt/v1/state/actuators/main` | Jetson → dev | Arm joint state |
-| `/vehicle_wbt/v1/safety/{estop,heartbeat,mode_cmd}` | both | Safety handshake |
+| `/rak/cmd/vel_raw` | dev → Jetson | Raw cmd (before safety gate) |
+| `/rak/cmd/vel_safe` | dev → Jetson (consumed by `mecanum_chassis_node`) | Post-safety cmd |
+| `/rak/cmd/arm/main/trajectory` | dev → Jetson (consumed by `arm_node`) | Arm motion plan |
+| `/rak/state/odom` | Jetson → dev | Chassis odometry |
+| `/rak/state/actuators/main` | Jetson → dev | Arm joint state |
+| `/rak/safety/{estop,heartbeat,mode_cmd}` | both | Safety handshake |
 
 ## Working on drivers (publisher side)
 
@@ -84,7 +84,7 @@ You are on the **dev side** if you're building lane-following, sign detection, m
 
 1. Branch off `develop/ros2-sidecar`.
 2. Subscribe to existing contract topics. **Do not add new topics** — if you need a stream that doesn't exist, talk to the driver owner first.
-3. Test against `ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py` — it satisfies the publisher side of the contract using `/dev/null` stubs, so you can iterate without the Jetson.
+3. Test against `ros2 launch bringup mock_system.launch.py` — it satisfies the publisher side of the contract using `/dev/null` stubs, so you can iterate without the Jetson.
 4. When you need a real-hardware check, ask the team who's at the car, or run `bash scripts/diagnose.sh` to confirm DDS discovery is alive.
 5. PR against `develop/ros2-sidecar`. Thecnfor merges and then **separately** cherry-picks to `robot-stable` if the change touches runtime code paths.
 
@@ -92,7 +92,7 @@ You are on the **dev side** if you're building lane-following, sign detection, m
 
 ## Testing without hardware
 
-The dev-side stub is **`ros2_ws/src/vehicle_wbt_platform_cpp/launch/mock_system.launch.py`**. It is the **functional counterpart** of `full_system.launch.py` (which ships in `robot-stable` and runs on the Jetson):
+The dev-side stub is **`src/bringup/launch/mock_system.launch.py`**. It is the **functional counterpart** of `full_system.launch.py` (which ships in `robot-stable` and runs on the Jetson):
 
 - Same node set
 - Same topic schema
@@ -102,10 +102,10 @@ The dev-side stub is **`ros2_ws/src/vehicle_wbt_platform_cpp/launch/mock_system.
 # Spin up the dev stub
 source /opt/ros/<your_distro>/setup.bash
 source install/setup.bash
-ros2 launch vehicle_wbt_platform_cpp mock_system.launch.py
+ros2 launch bringup mock_system.launch.py
 
 # In another terminal: verify the contract is being published
-ros2 topic list | grep vehicle_wbt/v1
+ros2 topic list | grep rak/v1
 # → expect: cmd/..., state/..., sensors/...
 
 # Iterate your app node against the stub
@@ -118,7 +118,7 @@ For a one-click camera preview: `bash scripts/start_team_rviz.sh` (which auto-fa
 
 `camera_info` is special: it's **NOT published** unless the camera's YAML has real intrinsics (non-zero K matrix). The rule is in `camera_node.cpp` — when `camera_info_manager` loads an all-zero K, the camera_info publisher is never created. **NEVER fake intrinsics**. See [`CLAUDE.md`](../CLAUDE.md) "Critical warnings" #1 (no mocks in production code).
 
-Operator runs `scripts/calibrate_camera.py` after a lens or sensor swap. The output YAML lands at `ros2_ws/install/.../share/.../params/camera_<id>.yaml` and is referenced via `front_calibration_url` / `arm_calibration_url` launch args.
+Operator runs `scripts/calibrate_camera.py` after a lens or sensor swap. The output YAML lands at `install/.../share/bringup/params/camera_<id>.yaml` and is referenced via `front_calibration_url` / `arm_calibration_url` launch args.
 
 ## Interface changes are breaking
 
@@ -139,5 +139,5 @@ If you only need **a new topic** (additive, no rename), the procedure is lighter
 - [`docs/contributing/branch-strategy.md`](contributing/branch-strategy.md) — when to merge where, including a row for cross-branch schema changes
 - [`CLAUDE.md`](../CLAUDE.md) — root conventions including the no-mocks rule and the camera 5-stream schema in its original form
 - [`config_sensors.yml`](../config_sensors.yml) — single source of truth for what's wired to the robot
-- [`ros2_ws/src/vehicle_wbt_platform_cpp/launch/full_system.launch.py`](../ros2_ws/src/vehicle_wbt_platform_cpp/launch/full_system.launch.py) — Jetson launch (in `robot-stable`)
-- [`ros2_ws/src/vehicle_wbt_platform_cpp/launch/mock_system.launch.py`](../ros2_ws/src/vehicle_wbt_platform_cpp/launch/mock_system.launch.py) — dev stub (this branch)
+- [`src/bringup/launch/full_system.launch.py`](../src/bringup/launch/full_system.launch.py) — Jetson launch (in `robot-stable`)
+- [`src/bringup/launch/mock_system.launch.py`](../src/bringup/launch/mock_system.launch.py) — dev stub (this branch)

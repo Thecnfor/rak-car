@@ -10,7 +10,7 @@
 | **团队子网** | `192.168.3.0/24` | 改子网要重做所有防火墙规则 |
 | **dev 端可用 IP 段** | `192.168.3.50 ~ 192.168.3.200` | DHCP 分配避开 Jetson 静态 IP |
 | **ROS_DOMAIN_ID** | **`42`** | 改这个值 dev 端 / Jetson 端 / `~/.bashrc` 全部要改 |
-| **CycloneDDS config** | `ros2_ws/src/vehicle_wbt_platform_cpp/config/cyclonedds.xml` | 全队 `~/.ros/cyclonedds.xml` 来源 |
+| **CycloneDDS config** | `src/bringup/config/cyclonedds.xml` | 全队 `~/.ros/cyclonedds.xml` 来源 |
 
 ## Jetson 网络配置（硬编码）
 

@@ -91,7 +91,7 @@ KERNEL=="ttyUSB[0-9]*",MODE="0666"
 
 ## 硬编码路径清单
 
-以下文件硬编码了 `/home/jetson/workspace/vehicle_wbt/`：
+以下文件硬编码了 `/home/jetson/workspace/rak/`：
 
 | 文件 | 行号 | 内容 | 影响 |
 |------|:---:|------|------|
@@ -106,7 +106,7 @@ KERNEL=="ttyUSB[0-9]*",MODE="0666"
 | `main/boot_py.sh` | 15-16 | systemd 服务路径 | 开机自启 |
 | `main/hri/hri-autostart.service` | 10, 21 | systemd 服务路径 | HRI 自启 |
 
-**结论：** 只要用户名是 `jetson`、项目在 `/home/jetson/workspace/vehicle_wbt/`，就不用改任何路径。
+**结论：** 只要用户名是 `jetson`、项目在 `/home/jetson/workspace/rak/`，就不用改任何路径。
 
 ---
 
@@ -123,8 +123,8 @@ After=network.target
 
 [Service]
 User=jetson
-ExecStart=/usr/bin/python -u /home/jetson/workspace/vehicle_wbt/main/qqq.py
-WorkingDirectory=/home/jetson/workspace/vehicle_wbt/main/
+ExecStart=/usr/bin/python -u /home/jetson/workspace/rak/main/qqq.py
+WorkingDirectory=/home/jetson/workspace/rak/main/
 Restart=on-failure
 RestartSec=5
 
@@ -142,8 +142,8 @@ After=network.target graphical.target
 [Service]
 User=jetson
 Group=jetson
-WorkingDirectory=/home/jetson/workspace/vehicle_wbt/main/hri
-ExecStart=/home/jetson/workspace/vehicle_wbt/main/hri/hri_startup.sh
+WorkingDirectory=/home/jetson/workspace/rak/main/hri
+ExecStart=/home/jetson/workspace/rak/main/hri/hri_startup.sh
 Restart=always
 RestartSec=15
 Environment="DISPLAY=:0"
@@ -208,7 +208,7 @@ HRI 服务期望的显示环境：
 # 第一步：基础系统配置
 # ============================================================
 
-# 确保用户名是 jetson，项目在 /home/jetson/workspace/vehicle_wbt/
+# 确保用户名是 jetson，项目在 /home/jetson/workspace/rak/
 # （如果用其他用户名，需要改 17+ 个文件的硬编码路径）
 
 # Python 软链接
@@ -271,7 +271,7 @@ sudo apt install xvfb x11-utils x11-xserver-utils
 # 第五步：systemd 服务
 # ============================================================
 
-cd /home/jetson/workspace/vehicle_wbt
+cd /home/jetson/workspace/rak
 sudo bash main/boot_py.sh
 sudo cp main/hri/hri-autostart.service /etc/systemd/system/
 sudo systemctl daemon-reload

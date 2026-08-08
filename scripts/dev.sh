@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# vehicle_wbt — one-click "no-hardware development" launcher.
+# rak — one-click "no-hardware development" launcher.
 #
 # Usage:
 #   bash scripts/dev.sh                    # start dev-sidecar stubs + URDF
@@ -44,13 +44,13 @@ echo "[dev.sh] using ROS2: $ROS_DISTRO"
 source /opt/ros/$ROS_DISTRO/setup.bash
 
 # -------- 2. Source the colcon install (if built) --------
-INSTALL_SETUP="${REPO_ROOT}/ros2_ws/install/setup.bash"
+INSTALL_SETUP="${REPO_ROOT}/install/setup.bash"
 if [ -f "$INSTALL_SETUP" ]; then
   source "$INSTALL_SETUP"
   echo "[dev.sh] sourced ${INSTALL_SETUP}"
 else
   echo "[dev.sh] WARNING: ${INSTALL_SETUP} not found; run colcon build first" >&2
-  echo "[dev.sh]          cd ros2_ws && colcon build" >&2
+  echo "[dev.sh]          colcon build (workspace = repo root)" >&2
   exit 1
 fi
 
@@ -84,5 +84,5 @@ done
 
 cd "$REPO_ROOT"
 
-echo "[dev.sh] launching: ros2 launch vehicle_wbt_platform_cpp dev_all.launch.py ${ARGS[*]}"
-exec ros2 launch vehicle_wbt_platform_cpp dev_all.launch.py "${ARGS[@]}"
+echo "[dev.sh] launching: ros2 launch bringup dev_all.launch.py ${ARGS[*]}"
+exec ros2 launch bringup dev_all.launch.py "${ARGS[@]}"
