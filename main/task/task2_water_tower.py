@@ -608,6 +608,101 @@ def _stop_chassis(arm_client: ArmClient) -> None:
 
 # ── 核心动作子流程 ────────────────────────────────────────────────
 
+def _pick_cube_servo_local(
+    arm_client: ArmClient,
+    vision: Dict[str, Any],
+    pick: Dict[str, Any],
+    sp_x: Optional[float],
+    sp_y: Optional[float],
+) -> Dict[str, Any]:
+    """本地视觉伺服 (2026-08-09 闭环下沉): runtime 进程内闭环, main 只发一次目标.
+
+    走 /v1/execute run_arm_servo —— runtime 内每帧读 task_feed 缓存 + 直调 arm
+    (x_speed / set_arm_angle), 无网络往返. 对齐收敛 → y 降 grasp_y + hand 转
+    descend_hand (并发) → 吸气 → 抬回 servo_y. 未收敛抛 RuntimeError.
+    """
+    servo_kw = dict(
+        label=vision.get("label", "water"),
+        hz=float(vision.get("hz", 20.0)),
+        gain_arm=float(vision.get("gain_arm", 0.4)),
+        gain_x=float(vision.get("gain_x", 0.08)),
+        deadzone=float(vision.get("deadzone", 0.03)),
+        max_vel=float(vision.get("max_vel", 0.20)),
+        arm_start=float(pick["arm_angle_deg"]),
+        sign_arm=float(vision.get("sign_arm", 1.0)),
+        sign_x=float(vision.get("sign_x", -1.0)),
+        setpoint_x_norm=sp_x if sp_x is not None else 0.0,
+        setpoint_y_norm=sp_y if sp_y is not None else 0.0,
+        arm_min=float(vision["arm_min"]) if vision.get("arm_min") is not None else -150.0,
+        arm_max=float(vision["arm_max"]) if vision.get("arm_max") is not None else 90.0,
+        timeout=float(vision.get("timeout", 15.0)),
+        settle_hits=int(vision.get("settle_hits", 3)),
+    )
+    logger.info(
+        "cam2 本地视觉伺服: run_arm_servo(setpoint=(%.3f,%.3f) hz=%s gain_arm=%s gain_x=%s "
+        "deadzone=%s max_vel=%s arm=[%s,%s] settle=%s timeout=%s)",
+        servo_kw["setpoint_x_norm"], servo_kw["setpoint_y_norm"],
+        servo_kw["hz"], servo_kw["gain_arm"], servo_kw["gain_x"],
+        servo_kw["deadzone"], servo_kw["max_vel"],
+        servo_kw["arm_min"], servo_kw["arm_max"],
+        servo_kw["settle_hits"], servo_kw["timeout"],
+    )
+    job = arm_client.http.execute(
+        "car", "run_arm_servo", kwargs=servo_kw, sync=True,
+        timeout=float(servo_kw["timeout"]) + 15.0,
+    )
+    result = (job or {}).get("result") if isinstance(job, dict) else None
+    result = result if isinstance(result, dict) else {}
+    if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+        raise RuntimeError(
+            f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
+        )
+    logger.info("cam2 本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                result.get("reason"), result.get("settled"),
+                result.get("trace_hits"), result.get("end_arm"))
+    if not result.get("settled"):
+        raise RuntimeError(
+            f"cam2 本地视觉抓水立方失败 (reason={result.get('reason')}, "
+            f"trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
+        )
+
+    # 对齐完成 → y 降 grasp_y + hand 转 descend_hand (并发) → 吸气 → 抬回 servo_y
+    try:
+        hand_param = vision.get("descend_hand_deg")
+        if hand_param is not None:
+            hand_param = float(hand_param)
+        target_m = float(vision.get("grasp_y_mm", pick["y_descend_mm"])) / 1000.0
+        job_down = arm_client.http.execute(
+            "arm", "composite_run",
+            kwargs=dict(arm=None, x=None, y=target_m,
+                        hand=hand_param, speed=100, timeout=5.0),
+            sync=False,
+        )
+        jid = job_down.get("id") if isinstance(job_down, dict) else None
+        if jid:
+            arm_client.http.wait_job(jid, timeout=5.0)
+        arm_client.http.execute("arm", "grasp", kwargs=dict(value=True), sync=False)
+        # 抬回 servo_y (fire-and-forget, 下游 move_y 并发)
+        servo_y = float(vision.get("servo_y_mm", pick["y_transition_mm"]))
+        arm_client.http.execute(
+            "arm", "composite_run",
+            kwargs=dict(arm=None, x=None, y=servo_y / 1000.0, hand=None,
+                        speed=100, timeout=5.0),
+            sync=False,
+        )
+    except Exception as exc:
+        try:
+            safe_y = float(vision.get("servo_y_mm", pick["y_transition_mm"])) / 1000.0
+            arm_client.http.execute(
+                "arm", "move_y_position",
+                kwargs=dict(target=safe_y, timeout=5.0), sync=False,
+            )
+        except Exception:
+            pass
+        raise RuntimeError(f"cam2 本地视觉抓水立方 grasp 段失败: {exc}") from exc
+    return result
+
+
 def _pick_cube(
     arm_client: ArmClient,
     runner: ArmRunner,
@@ -656,33 +751,42 @@ def _pick_cube(
     )
     import time as _time
     _t0 = _time.time()
-    result = runner.track_velocity_pick(
-        vision.get("label", "water"),
-        x_start=float(cube_x_mm),
-        y_start=float(vision.get("servo_y_mm", pick["y_transition_mm"])),
-        arm_start=float(pick["arm_angle_deg"]),
-        hand_start=float(pick["hand_angle_deg"]),
-        grasp_y_mm=float(vision.get("grasp_y_mm", pick["y_descend_mm"])),
-        timeout=float(vision.get("timeout", 15.0)),
-        hz=float(vision.get("hz", 20.0)),
-        gain_arm=float(vision.get("gain_arm", 0.4)),
-        gain_x=float(vision.get("gain_x", 0.08)),
-        deadzone=float(vision.get("deadzone", 0.03)),
-        max_vel=float(vision.get("max_vel", 0.20)),
-        sign_arm=float(vision.get("sign_arm", 1.0)),
-        sign_x=float(vision.get("sign_x", -1.0)),
-        arm_min=vision.get("arm_min"),
-        arm_max=vision.get("arm_max"),
-        setpoint_x_norm=sp_x,
-        setpoint_y_norm=sp_y,
-        descend_hand_deg=vision.get("descend_hand_deg"),  # 2026-08-04: 下降到位后手爪转 0°
-        settle_hits=int(vision.get("settle_hits", 3)),
-        hold_s=float(vision.get("hold_s", 0.3)),
-        lift_back=True,
-        # 2026-08-06: 前置 _parallel_chassis_arm 已摆好 pick 姿态 (手爪 -10°),
-        # 跳过 runner 内部重复 composite_run
-        skip_pose_align=True,
-    )
+    if vision.get("local_servo"):
+        # 2026-08-09 闭环下沉: runtime 进程内视觉伺服 (main 只发一次目标, 无每帧网络)
+        result = _pick_cube_servo_local(arm_client, vision, pick, sp_x, sp_y)
+    else:
+        result = runner.track_velocity_pick(
+            vision.get("label", "water"),
+            x_start=float(cube_x_mm),
+            y_start=float(vision.get("servo_y_mm", pick["y_transition_mm"])),
+            arm_start=float(pick["arm_angle_deg"]),
+            hand_start=float(pick["hand_angle_deg"]),
+            grasp_y_mm=float(vision.get("grasp_y_mm", pick["y_descend_mm"])),
+            timeout=float(vision.get("timeout", 15.0)),
+            hz=float(vision.get("hz", 20.0)),
+            gain_arm=float(vision.get("gain_arm", 0.4)),
+            gain_x=float(vision.get("gain_x", 0.08)),
+            deadzone=float(vision.get("deadzone", 0.03)),
+            max_vel=float(vision.get("max_vel", 0.20)),
+            sign_arm=float(vision.get("sign_arm", 1.0)),
+            sign_x=float(vision.get("sign_x", -1.0)),
+            arm_min=vision.get("arm_min"),
+            arm_max=vision.get("arm_max"),
+            setpoint_x_norm=sp_x,
+            setpoint_y_norm=sp_y,
+            descend_hand_deg=vision.get("descend_hand_deg"),  # 2026-08-04: 下降到位后手爪转 0°
+            settle_hits=int(vision.get("settle_hits", 3)),
+            hold_s=float(vision.get("hold_s", 0.3)),
+            lift_back=True,
+            # 2026-08-06: 前置 _parallel_chassis_arm 已摆好 pick 姿态 (手爪 -10°),
+            # 跳过 runner 内部重复 composite_run
+            skip_pose_align=True,
+        )
+        if not result.get("ok"):
+            raise RuntimeError(
+                f"cam2 视觉抓水立方失败 (reason={result.get('reason')}, "
+                f"trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
+            )
     logger.info(
         "cam2 视觉对齐完成: cube_x_mm=%.0f, 用时=%.2fs, ok=%s, "
         "trace_hits=%d, settled=%s, end_arm=%.1f°",
@@ -693,11 +797,6 @@ def _pick_cube(
         result.get("settled"),
         float(result.get("end_arm") or 0.0),
     )
-    if not result.get("ok"):
-        raise RuntimeError(
-            f"cam2 视觉抓水立方失败 (reason={result.get('reason')}, "
-            f"trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
-        )
     # 2026-08-06: 打印视觉对齐实际效果 (trace_hits / settled / end_arm),
     # 确认 setpoint 在 X=cube_x_mm 位置是否真的收敛.
     logger.info(

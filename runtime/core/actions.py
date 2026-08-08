@@ -53,6 +53,9 @@ CAR_ACTIONS = {
     "set_pwm_servo_angle": lambda car, *args, **kwargs: car.set_pwm_servo_angle(*args, **kwargs),
     "set_digital_output": lambda car, *args, **kwargs: car.set_digital_output(*args, **kwargs),
     "get_arm_state": lambda car, *args, **kwargs: car.get_arm_state(),
+    # 2026-08-09: 进程内 arm 视觉伺服闭环 (task2 抓取下沉, main 只发目标参数,
+    # 每帧读 task_feed 缓存 + 直调 arm, 无网络往返). 返回 {ok, reason, trace_hits, settled, end_arm}.
+    "run_arm_servo": lambda car, *args, **kwargs: car.run_arm_servo(**kwargs),
     # 2026-08-08: 一鍵啟動 —— 讀 MC602 板上鍵（BoardKey）。純新增，供 run.py --wait-key 輪詢。
     "read_key": lambda car, *args, **kwargs: car.read_key(),
 }
