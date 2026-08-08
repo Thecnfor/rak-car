@@ -208,7 +208,16 @@ class ArmController:
         self.y_pose_last = self.y_pose_now
 
         error = target_pose - self.y_pose_now
-        velocity = self.y_pid(self.y_pose_now)
+
+        # 收敛死区闩锁 (2026-08-09): |err| 一进入阈值内立即停发微速度, 让轴静置,
+        # 连续 5 帧自然凑满收敛. 否则欠阻尼 PID (Kp=6, Kd=1.0 → ζ≈0.2) 在 setpoint
+        # 附近持续下发微速度, 位置绕目标做极限环 (高电压扭矩大时更明显),
+        # "连续 5 帧 |err|<1.5mm" 永远凑不满 → move_y_position 挂死 → 上层
+        # wait_job 超时. 停发后轴停在阈值内, 精度与旧"到位判定"一致 (同为 1.5mm).
+        if abs(error) < POSITION_ERROR_THRESHOLD:
+            velocity = 0.0
+        else:
+            velocity = self.y_pid(self.y_pose_now)
 
         self.y_speed(velocity)
 
