@@ -42,6 +42,12 @@ using namespace std::chrono_literals;
 
 namespace vw = hardware;
 
+// Encoder calibration (hardware-port-mapping.md): 48 * 41.98 counts/rev.
+namespace
+{
+constexpr double kN_COUNTS_PER_REV = 2015.13;
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // OdomHelper — encoder-based odometry via forward kinematics
 // ---------------------------------------------------------------------------
@@ -84,7 +90,7 @@ public:
     }
 
     // Wheel linear speeds (m/s) from encoder deltas.
-    const double counts_per_rev = vw::MC602Adapter::ENCODER_COUNTS_PER_REV;
+    const double counts_per_rev = kN_COUNTS_PER_REV;
     const double circumference = 2.0 * vw::MC602_PI * wheel_radius_;
     std::array<double, 4> ws;
     for (int i = 0; i < 4; ++i) {
@@ -283,7 +289,7 @@ private:
       initialized = true;
     }
 
-    const double counts_per_rev = vw::MC602Adapter::ENCODER_COUNTS_PER_REV;
+    const double counts_per_rev = kN_COUNTS_PER_REV;
     const double wheel_r = chassis_->wheel_radius();
 
     for (int i = 0; i < 4; ++i) {
@@ -304,7 +310,7 @@ private:
       // Only publish stop if we were previously non-zero (avoid serial spam).
       if (last_cmd_.linear.x != 0.0 || last_cmd_.linear.y != 0.0 || last_cmd_.angular.z != 0.0) {
         try {
-          adapter_->write_motor4(0, 0, 0, 0);
+          adapter_->set_motor4(0, 0, 0, 0);
         } catch (...) {}
       }
       return;
@@ -316,23 +322,15 @@ private:
     const double omega = last_cmd_.angular.z;
     const auto ws = chassis_->inverse(vx, vy, omega);
 
-    // Convert rad/s → virtual int8 via MC602Adapter.
+    // Convert wheel speeds → virtual int8 via the driver (m/s → virtual).
     const double r = chassis_->wheel_radius();
-    const int8_t v_fl = static_cast<int8_t>(
-      std::clamp(static_cast<int>(std::round(vw::MC602Adapter::meters_to_virtual(ws.values[0], r))),
-                 -100, 100));
-    const int8_t v_fr = static_cast<int8_t>(
-      std::clamp(static_cast<int>(std::round(vw::MC602Adapter::meters_to_virtual(ws.values[1], r))),
-                 -100, 100));
-    const int8_t v_rl = static_cast<int8_t>(
-      std::clamp(static_cast<int>(std::round(vw::MC602Adapter::meters_to_virtual(ws.values[2], r))),
-                 -100, 100));
-    const int8_t v_rr = static_cast<int8_t>(
-      std::clamp(static_cast<int>(std::round(vw::MC602Adapter::meters_to_virtual(ws.values[3], r))),
-                 -100, 100));
+    const int8_t v_fl = adapter_->mps_to_virtual(ws.values[0], r);
+    const int8_t v_fr = adapter_->mps_to_virtual(ws.values[1], r);
+    const int8_t v_rl = adapter_->mps_to_virtual(ws.values[2], r);
+    const int8_t v_rr = adapter_->mps_to_virtual(ws.values[3], r);
 
     try {
-      adapter_->write_motor4(v_fl, v_fr, v_rl, v_rr);
+      adapter_->set_motor4(v_fl, v_fr, v_rl, v_rr);
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "write_motor4 failed: %s", e.what());

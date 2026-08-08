@@ -87,6 +87,7 @@ endif()
 add_executable(infrared_node
   src/nodes/infrared_node.cpp
   src/mc602_adapter.cpp
+  src/mc602_protocol.cpp
   src/serial_transport.cpp
   src/bridge_transport.cpp
   src/serial_port.cpp
@@ -103,6 +104,7 @@ target_link_libraries(infrared_node PUBLIC
 add_executable(mc602_bridge_node
   src/nodes/mc602_bridge_node.cpp
   src/serial_scheduler.cpp
+  src/mc602_bootloader.cpp
   src/serial_port.cpp
 )
 target_include_directories(mc602_bridge_node PUBLIC include)
@@ -117,6 +119,7 @@ add_executable(mecanum_chassis_node
   src/nodes/mecanum_chassis_node.cpp
   src/mecanum_chassis.cpp
   src/mc602_adapter.cpp
+  src/mc602_protocol.cpp
   src/serial_transport.cpp
   src/bridge_transport.cpp
   src/serial_port.cpp
@@ -137,6 +140,7 @@ target_link_libraries(mecanum_chassis_node PUBLIC
 add_executable(arm_node
   src/nodes/arm_node.cpp
   src/mc602_adapter.cpp
+  src/mc602_protocol.cpp
   src/serial_transport.cpp
   src/bridge_transport.cpp
   src/serial_port.cpp
@@ -253,6 +257,7 @@ if(BUILD_TESTING)
   ament_add_gmock(test_mc602_adapter
     test/test_mc602_adapter.cpp
     src/mc602_adapter.cpp
+    src/mc602_protocol.cpp
     src/serial_transport.cpp
     src/serial_port.cpp
   )
@@ -262,6 +267,7 @@ if(BUILD_TESTING)
   ament_add_gmock(test_mc602_protocol
     test/test_mc602_protocol.cpp
     src/mc602_adapter.cpp
+    src/mc602_protocol.cpp
     src/serial_transport.cpp
     src/serial_port.cpp
   )
@@ -279,12 +285,10 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_serial_scheduler PUBLIC include)
 
-  # SerialPort unit tests — frame building, exchange handshake, timeout handling
+  # SerialPort unit tests — injection seam, frame pass-through, error handling
   ament_add_gmock(test_serial_port
     test/test_serial_port.cpp
     src/serial_port.cpp
-    src/mc602_adapter.cpp
-    src/serial_transport.cpp
   )
   target_include_directories(test_serial_port PUBLIC include)
 

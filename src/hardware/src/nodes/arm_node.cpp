@@ -53,7 +53,8 @@ constexpr double VERT_MAX_SPEED_MPS = 0.04;
 // Steps per meter: ENCODER_COUNTS_PER_REV / perimeter.
 inline double stepper3_steps_per_meter()
 {
-  return vw::MC602Adapter::ENCODER_COUNTS_PER_REV / STEPPER3_PERIMETER;
+  constexpr double kN_COUNTS_PER_REV = 2015.13;  // hardware-port-mapping.md
+  return kN_COUNTS_PER_REV / STEPPER3_PERIMETER;
 }
 
 // M6 horizontal lead screw: perimeter = 0.032 m (from arm_cfg.yaml).
@@ -168,15 +169,13 @@ private:
       positions[i] = point.positions[i];
     }
 
-    // --- Joint 0: M6 horizontal motor (position → m/s via perimeter) ---
+    // --- Joint 0: M6 horizontal motor (position → m/s → virtual speed) ---
     // Arm control uses position commands; we convert to speed for the motor.
     // Speed = position_delta / dt. Here we use a fixed dt = 1.0s per step,
     // so velocity = position (the caller sets velocity in position field).
     const double horiz_speed = std::clamp(positions[J_HORIZ],
       -HORIZ_MAX_SPEED_MPS, HORIZ_MAX_SPEED_MPS);
-    const double horiz_virtual = vw::MC602Adapter::meters_to_virtual(horiz_speed, M6_PERIMETER);
-    const int8_t horiz_cmd = static_cast<int8_t>(
-      std::clamp(static_cast<int>(std::round(horiz_virtual)), -100, 100));
+    const int8_t horiz_cmd = adapter_->mps_to_virtual(horiz_speed, M6_PERIMETER);
 
     // Pack all joint writes for this trajectory tick into ONE burst: a single
     // bridge service call, so the several frames hit the bus atomically and
@@ -189,43 +188,41 @@ private:
     }
 
     try {
-      adapter_->write_actuator(6, "motor", horiz_speed);
+      adapter_->set_motor(6, horiz_cmd);
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "M6 motor write failed: %s", e.what());
     }
 
-    // --- Joint 1: Stepper 3 vertical (position → steps) ---
-    // Vertical position is in meters; convert to angle_deg for stepper.
-    // steps = angle_deg / STEPPER_RAD_PER_STEP → angle_deg = steps * STEPPER_RAD_PER_STEP
-    // We use position (m) → steps directly.
+    // --- Joint 1: Stepper 3 vertical (position → raw steps) ---
+    // Driver speaks (velocity, position); business decides both values.
+    // Position = steps for the target height; velocity = default 50.
     const double vert_pos_m = std::clamp(positions[J_VERT], 0.0, 0.3);  // 0~0.3m range
-    const double vert_steps = vert_pos_m * stepper3_steps_per_meter();
-    const double vert_angle_deg = vert_steps * vw::MC602Adapter::STEPPER_RAD_PER_STEP
-                                  * 180.0 / vw::MC602_PI;
+    const int32_t vert_steps = static_cast<int32_t>(
+      std::round(vert_pos_m * stepper3_steps_per_meter()));
 
     try {
-      adapter_->write_actuator(3, "stepper", vert_angle_deg);
+      adapter_->set_stepper(3, /*velocity=*/50, vert_steps);
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "Stepper3 write failed: %s", e.what());
     }
 
-    // --- Joint 2: S3 rotation servo (position → angle_deg) ---
-    // Position is -1 / 0 / +1 → mapped to -93° / 0° / +93°.
+    // --- Joint 2: S3 rotation servo (raw bus-servo angle byte) ---
+    // Position is -1 / 0 / +1 → mapped to -93° / 0° / +93° (fits signed byte).
     double s3_angle = 0.0;
     const int side_idx = static_cast<int>(std::round(positions[J_ROTATE]));
     if (side_idx >= -1 && side_idx <= 1) {
       s3_angle = S3_ANGLE_MAP[side_idx + 1];
     }
     try {
-      adapter_->write_actuator(3, "servo_bus", s3_angle);
+      adapter_->set_servo_bus(3, static_cast<int>(s3_angle));
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "S3 servo write failed: %s", e.what());
     }
 
-    // --- Joint 3: S7 hand servo (position → angle_deg, 270° mode) ---
+    // --- Joint 3: S7 hand servo (raw pwm angle) ---
     // Position is -1 / 0 / +1 → mapped to -45° / 0° / +46°.
     double s7_angle = 0.0;
     const int grip_idx = static_cast<int>(std::round(positions[J_GRIP]));
@@ -233,7 +230,7 @@ private:
       s7_angle = S7_ANGLE_MAP[grip_idx + 1];
     }
     try {
-      adapter_->write_actuator(7, "servo_pwm", s7_angle);
+      adapter_->set_servo_pwm(7, static_cast<int>(s7_angle));
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "S7 servo write failed: %s", e.what());
@@ -241,17 +238,17 @@ private:
 
     // --- Effort field: effort > 0 → pump ON, effort < 0 → pump OFF ---
     if (!point.effort.empty() && point.effort.size() > J_GRIP) {
-      const uint8_t pump_cmd = (point.effort[J_GRIP] > 0.0) ? PUMP_ON : PUMP_OFF;
+      const int8_t pump_cmd = (point.effort[J_GRIP] > 0.0) ? PUMP_ON : PUMP_OFF;
       try {
-        adapter_->write_actuator(2, "dout", static_cast<double>(pump_cmd));
+        adapter_->set_dout(2, pump_cmd);
       } catch (const std::exception & e) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
           "Pump write failed: %s", e.what());
       }
-      // Valve stays closed (1=hold vacuum) while pump is on.
+      // Valve stays closed (hold vacuum) while pump is on.
       try {
-        adapter_->write_actuator(3, "dout",
-          static_cast<double>((point.effort[J_GRIP] > 0.0) ? VALVE_CLOSE : VALVE_OPEN));
+        adapter_->set_dout(3,
+          (point.effort[J_GRIP] > 0.0) ? VALVE_CLOSE : VALVE_OPEN);
       } catch (...) {}
     }
 

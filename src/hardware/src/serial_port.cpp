@@ -5,10 +5,12 @@
 
 #include "hardware/serial_port.hpp"
 
+#include <algorithm>
 #include <cerrno>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 
 #include <fcntl.h>
 #include <termios.h>
@@ -140,6 +142,60 @@ std::vector<uint8_t> SerialPort::exchange(
   }
 
   return response;
+}
+
+void SerialPort::flush()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (fd_ >= 0) {
+    ::tcflush(fd_, TCIOFLUSH);
+  }
+}
+
+size_t SerialPort::write_raw(const std::vector<uint8_t> & data,
+                             std::chrono::milliseconds byte_delay)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_open()) {
+    throw std::runtime_error("SerialPort::write_raw: port not open");
+  }
+  size_t written = 0;
+  for (uint8_t b : data) {
+    ssize_t n = ::write(fd_, &b, 1);
+    if (n < 0 && errno != EAGAIN && errno != EINTR) {
+      throw std::runtime_error("SerialPort::write_raw: " +
+                               std::string(std::strerror(errno)));
+    }
+    if (n == 1) {
+      ++written;
+      if (byte_delay.count() > 0) {
+        std::this_thread::sleep_for(byte_delay);
+      }
+    }
+  }
+  return written;
+}
+
+std::vector<uint8_t> SerialPort::read_raw(size_t size,
+                                          std::chrono::milliseconds timeout)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<uint8_t> out;
+  out.reserve(size);
+  const auto deadline = std::chrono::steady_clock::now() + timeout;
+  while (out.size() < size && std::chrono::steady_clock::now() < deadline) {
+    uint8_t byte;
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+      deadline - std::chrono::steady_clock::now());
+    if (remaining.count() <= 0) {
+      break;
+    }
+    ssize_t n = timed_read(&byte, 1, std::min(remaining, std::chrono::milliseconds(50)));
+    if (n > 0) {
+      out.push_back(byte);
+    }
+  }
+  return out;
 }
 
 ssize_t SerialPort::timed_read(uint8_t * buf, size_t len,

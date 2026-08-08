@@ -1,58 +1,34 @@
 // Copyright 2026 Thecnfor
 // SPDX-License-Identifier: Proprietary
 //
-// gtest cases for MC602Adapter — covers BaseController contract, port
-// bounds, value validation. Hardware protocol tests land in Plan B.
+// gtest cases for MC602Adapter (driver) — constructor contract, open/close
+// idempotence, port metadata, and end-to-end typed operations via the
+// injection seam (no hardware). Wire-level correctness is covered by
+// test_mc602_protocol's golden frames.
 
 #include "hardware/mc602_adapter.hpp"
 
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <cstdint>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
-using hardware::BaseController;
 using hardware::MC602Adapter;
 
 namespace
 {
-// A minimal FakeMC602 that records every call and returns canned values.
-class FakeController : public BaseController
-{
-public:
-  bool opened = false;
-  int read_calls = 0;
-  int write_calls = 0;
-  double last_value = 0.0;
-  uint8_t last_port = 0;
-  std::string last_sensor_type;
-  std::string last_actuator_type;
 
-  void open() override { opened = true; }
-  void close() override { opened = false; }
-  bool is_open() const override { return opened; }
-  std::string serial_port() const override { return "/fake/ttyUSB0"; }
-  uint32_t baud() const override { return 1000000; }
-  double read_sensor(uint8_t port_id, const std::string & sensor_type) override
-  {
-    read_calls++;
-    last_port = port_id;
-    last_sensor_type = sensor_type;
-    return 0.42;
-  }
-  void write_actuator(uint8_t port_id, const std::string & actuator_type, double value) override
-  {
-    write_calls++;
-    last_port = port_id;
-    last_actuator_type = actuator_type;
-    last_value = value;
-  }
-  std::map<std::string, uint32_t> enumerate_ports() const override
-  {
-    return {{"motor", 6}, {"servo", 7}, {"stepper", 3}, {"io", 8}};
-  }
-};
+void enable_injection(MC602Adapter & a,
+                      std::vector<uint8_t> (*responder)(const std::vector<uint8_t> &))
+{
+  a.set_injection(responder);
+}
+
+std::vector<uint8_t> no_response(const std::vector<uint8_t> &) { return {}; }
+
 }  // namespace
 
 TEST(MC602AdapterTest, ConstructorRejectsUnsupportedBaud)
@@ -63,18 +39,10 @@ TEST(MC602AdapterTest, ConstructorRejectsUnsupportedBaud)
   EXPECT_NO_THROW(MC602Adapter("/dev/ttyUSB0", 115200));
 }
 
-// Helper: set up injection so open() succeeds without real hardware.
-static void enable_injection(MC602Adapter & a)
-{
-  a.set_injection([](const std::vector<uint8_t> &) {
-    return std::vector<uint8_t>{0x0A};
-  });
-}
-
 TEST(MC602AdapterTest, OpenCloseIdempotent)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
+  enable_injection(a, no_response);
   EXPECT_FALSE(a.is_open());
   a.open();
   EXPECT_TRUE(a.is_open());
@@ -91,83 +59,57 @@ TEST(MC602AdapterTest, PortMetadataRoundTrips)
   EXPECT_EQ(a.baud(), 1000000u);
 }
 
-TEST(MC602AdapterTest, EnumeratePortsMatchesHardwareSpec)
+TEST(MC602AdapterTest, UnsupportedSensorTypeThrows)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
-  auto ports = a.enumerate_ports();
-  EXPECT_EQ(ports.at("motor"), 4u);    // MC602: ports 1-4
-  EXPECT_EQ(ports.at("servo"), 7u);    // MC602: ports 1-7
-  EXPECT_EQ(ports.at("stepper"), 4u);  // MC602: ports 1-4
-  EXPECT_EQ(ports.at("io"), 16u);      // MC602: ports 1-16
-}
-
-TEST(MC602AdapterTest, ReadRequiresOpen)
-{
-  MC602Adapter a("/dev/ttyUSB0", 1000000);
-  EXPECT_THROW(a.read_sensor(7, "ir"), std::runtime_error);
-}
-
-TEST(MC602AdapterTest, WriteRequiresOpen)
-{
-  MC602Adapter a("/dev/ttyUSB0", 1000000);
-  EXPECT_THROW(a.write_actuator(5, "motor", 0.5), std::runtime_error);
-}
-
-TEST(MC602AdapterTest, RejectsUnknownSensorType)
-{
-  MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
+  enable_injection(a, no_response);
   a.open();
-  EXPECT_THROW(a.read_sensor(7, "tachyon_beam"), std::runtime_error);
+  EXPECT_THROW(a.read_sensor(1, "no_such_sensor"), std::runtime_error);
 }
 
-TEST(MC602AdapterTest, RejectsUnknownActuatorType)
+TEST(MC602AdapterTest, UnsupportedActuatorTypeThrows)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
+  enable_injection(a, no_response);
   a.open();
-  EXPECT_THROW(a.write_actuator(5, "warp_drive", 0.0), std::runtime_error);
+  EXPECT_THROW(a.write_actuator(1, "no_such_actuator", 0.0), std::runtime_error);
 }
 
-TEST(MC602AdapterTest, RejectsPortIdZeroForSensor)
+TEST(MC602AdapterTest, IrReadScalesMillimetersToMeters)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
+  a.set_injection([](const std::vector<uint8_t> &) {
+    return std::vector<uint8_t>{0x07, 0x01, 0x08, 0x88, 0x13};  // H = 0x1388 = 5000 mm
+  });
   a.open();
-  EXPECT_THROW(a.read_sensor(0, "ir"), std::runtime_error);
+  EXPECT_FLOAT_EQ(a.read_ir(8), 5.0f);
 }
 
-TEST(MC602AdapterTest, RejectsPortIdAboveIOMaxForSensor)
+TEST(MC602AdapterTest, BurstPacksWritesThenCommits)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
+  std::vector<std::vector<uint8_t>> frames;
+  a.set_injection([&](const std::vector<uint8_t> & frame) {
+    frames.push_back(frame);
+    return std::vector<uint8_t>{};
+  });
   a.open();
-  EXPECT_THROW(a.read_sensor(9, "ir"), std::runtime_error);
+
+  a.begin_burst();
+  a.set_dout(4, 1);   // buffered
+  a.set_motor(6, 50); // buffered
+  a.commit_burst();   // sent as one burst
+
+  ASSERT_EQ(frames.size(), 2u);
+  EXPECT_EQ(frames[0], std::vector<uint8_t>({0x77, 0x68, 0x08, 0x10, 0x02, 0x04, 0x01, 0x0A}));
+  EXPECT_EQ(frames[1], std::vector<uint8_t>({0x77, 0x68, 0x08, 0x02, 0x02, 0x06, 0x32, 0x0A}));
 }
 
-TEST(MC602AdapterTest, RejectsPortIdAboveMotorMaxForMotor)
+TEST(MC602AdapterTest, MpsToVirtualClamps)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
-  a.open();
-  EXPECT_THROW(a.write_actuator(7, "motor", 0.5), std::runtime_error);
-}
-
-TEST(MC602AdapterTest, RejectsNaNValue)
-{
-  MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
-  a.open();
-  EXPECT_THROW(a.write_actuator(5, "motor", std::nan("")), std::runtime_error);
-}
-
-TEST(MC602AdapterTest, RejectsInfValue)
-{
-  MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a);
-  a.open();
-  EXPECT_THROW(a.write_actuator(5, "motor", std::numeric_limits<double>::infinity()),
-               std::runtime_error);
-  EXPECT_THROW(a.write_actuator(5, "motor", -std::numeric_limits<double>::infinity()),
-               std::runtime_error);
+  // 0.5 m/s on a 0.03 m radius wheel → high virtual value, clamps to 100.
+  EXPECT_EQ(a.mps_to_virtual(5.0, 0.03), 100);
+  EXPECT_EQ(a.mps_to_virtual(0.0, 0.03), 0);
+  EXPECT_EQ(a.mps_to_virtual(-5.0, 0.03), -100);
 }

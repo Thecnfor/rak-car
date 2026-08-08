@@ -15,6 +15,7 @@
 //   ros2 run hardware mc602_bridge_node --ros-args \
 //     -p mc602_serial_port:=/dev/ttyUSB0 -p mc602_baud:=1000000
 
+#include "hardware/mc602_bootloader.hpp"
 #include "hardware/serial_scheduler.hpp"
 
 #include <msgs/srv/mc602_transaction.hpp>
@@ -60,6 +61,11 @@ public:
     return port_.is_open();
   }
 
+  SerialPort & serial()
+  {
+    return port_;
+  }
+
   std::vector<uint8_t> exchange(
     const std::vector<uint8_t> & frame,
     std::chrono::milliseconds timeout) override
@@ -95,6 +101,29 @@ public:
     } catch (const std::exception & e) {
       RCLCPP_FATAL(this->get_logger(), "MC602 serial open failed: %s", e.what());
       throw;
+    }
+
+    // Bring the controller to program mode if it's sitting in the bootloader
+    // (the app firmware lives at RunA and must be launched with RUNCODE).
+    // Do this BEFORE starting the scheduler so the bus is ready for the
+    // 77 68 protocol when consumers start calling.
+    const auto boot = hardware::recover_to_program(io_->serial());
+    switch (boot.state) {
+      case BootloaderResult::State::PROGRAM:
+        RCLCPP_INFO(this->get_logger(), "MC602 already in program mode");
+        break;
+      case BootloaderResult::State::RECOVERED:
+        RCLCPP_INFO(this->get_logger(),
+          "MC602 recovered: bootloader → program @ 0x%08X", boot.launched_slot);
+        break;
+      case BootloaderResult::State::BOOTLOADER:
+        RCLCPP_WARN(this->get_logger(),
+          "MC602 bootloader alive but app not confirmed — check firmware slot");
+        break;
+      case BootloaderResult::State::NO_CONTROLLER:
+        RCLCPP_WARN(this->get_logger(),
+          "MC602 not responding (neither program nor bootloader) — check power/USB");
+        break;
     }
 
     scheduler_ = std::make_unique<SerialScheduler>(std::move(io));

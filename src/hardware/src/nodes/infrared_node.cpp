@@ -49,10 +49,9 @@ public:
     const int baud = this->get_parameter("mc602_baud").as_int();
     const std::string transport_mode = this->get_parameter("mc602_transport").as_string();
 
-    if (port < 1 || port > static_cast<int>(vw::MC602Adapter::MC602_IO_PORTS)) {
+    if (port < 1 || port > 16) {
       RCLCPP_FATAL(this->get_logger(),
-        "mc602_port %d out of range [1, %d]", port,
-        static_cast<int>(vw::MC602Adapter::MC602_IO_PORTS));
+        "mc602_port %d out of range [1, 16]", port);
       throw std::invalid_argument("mc602_port out of range");
     }
     port_id_ = static_cast<uint8_t>(port);
@@ -92,10 +91,10 @@ private:
     float dist_m = 0.0f;
 
     try {
-      dist_m = adapter_->read_infrared(port_id_);
+      dist_m = adapter_->read_ir(port_id_);  // meters
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
-        "read_infrared(P%d) failed: %s", port_id_, e.what());
+        "read_ir(P%d) failed: %s", port_id_, e.what());
       return;
     }
 

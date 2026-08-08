@@ -64,6 +64,18 @@ public:
     response_handler_ = std::move(handler);
   }
 
+  // Raw byte helpers for the bootloader handshake (fixed-size frames,
+  // byte-by-byte writes). Not for normal 77 68 exchanges.
+  // Writes data one byte at a time (byte_delay between bytes), returns bytes
+  // written. read_raw reads up to size bytes within timeout.
+  size_t write_raw(const std::vector<uint8_t> & data,
+                   std::chrono::milliseconds byte_delay =
+                     std::chrono::milliseconds(0));
+  std::vector<uint8_t> read_raw(size_t size, std::chrono::milliseconds timeout);
+
+  // Drop any pending RX/TX data (handshake hygiene).
+  void flush();
+
 private:
   bool configure_port_();
   ssize_t timed_read(uint8_t * buf, size_t len, std::chrono::milliseconds timeout);
