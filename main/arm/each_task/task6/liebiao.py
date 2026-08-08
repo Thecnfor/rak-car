@@ -46,6 +46,11 @@
     python liebiao.py --load --reset   # 先读 JSON 进来再清空 (罕见, 主要调试)
 """
 
+# Jetson 是 Python 3.8: 不加这行的话, `liaobiao1: list[dict] = []` 这类
+# 模块级注解(PEP 585 内建泛型)会在运行时求值并抛
+# `TypeError: 'type' object is not subscriptable`, 导致 run.py 一启动就崩。
+from __future__ import annotations
+
 import argparse
 import json
 import os
