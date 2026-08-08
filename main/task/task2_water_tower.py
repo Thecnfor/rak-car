@@ -635,21 +635,21 @@ def _pick_cube_servo_local(
         setpoint_y_norm=sp_y if sp_y is not None else 0.0,
         arm_min=float(vision["arm_min"]) if vision.get("arm_min") is not None else -150.0,
         arm_max=float(vision["arm_max"]) if vision.get("arm_max") is not None else 90.0,
-        timeout=float(vision.get("timeout", 15.0)),
+        servo_timeout=float(vision.get("timeout", 15.0)),
         settle_hits=int(vision.get("settle_hits", 3)),
     )
     logger.info(
         "cam2 本地视觉伺服: run_arm_servo(setpoint=(%.3f,%.3f) hz=%s gain_arm=%s gain_x=%s "
-        "deadzone=%s max_vel=%s arm=[%s,%s] settle=%s timeout=%s)",
+        "deadzone=%s max_vel=%s arm=[%s,%s] settle=%s servo_timeout=%s)",
         servo_kw["setpoint_x_norm"], servo_kw["setpoint_y_norm"],
         servo_kw["hz"], servo_kw["gain_arm"], servo_kw["gain_x"],
         servo_kw["deadzone"], servo_kw["max_vel"],
         servo_kw["arm_min"], servo_kw["arm_max"],
-        servo_kw["settle_hits"], servo_kw["timeout"],
+        servo_kw["settle_hits"], servo_kw["servo_timeout"],
     )
     job = arm_client.http.execute(
         "car", "run_arm_servo", kwargs=servo_kw, sync=True,
-        timeout=float(servo_kw["timeout"]) + 15.0,
+        timeout=float(servo_kw["servo_timeout"]) + 15.0,
     )
     result = (job or {}).get("result") if isinstance(job, dict) else None
     result = result if isinstance(result, dict) else {}

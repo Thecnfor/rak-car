@@ -53,14 +53,16 @@ class ArmServoMixin:
         setpoint_y_norm: float = 0.0,
         arm_min: float = -150.0,
         arm_max: float = 90.0,
-        timeout: float = 30.0,
+        servo_timeout: float = 30.0,
         settle_hits: int = 3,
     ) -> dict:
         """跑一轮 arm 视觉伺服对齐，settled 或超时/停止后返回。
 
         参数即 main/arm/vision 同名字段（task_config pick_vision 原样传）：
         label/gain_arm/gain_x/deadzone/max_vel/sign_arm/sign_x/
-        setpoint_x_norm/setpoint_y_norm/arm_min/arm_max/hz/timeout/settle_hits。
+        setpoint_x_norm/setpoint_y_norm/arm_min/arm_max/hz/servo_timeout/settle_hits。
+        ⚠️ 用 servo_timeout 而不是 timeout —— /v1/execute 会把 kwargs 里的 "timeout" 剥掉
+        留给自己用 (runtime/api/routers/_helpers.py), 叫 timeout 永远收不到值 (2026-08-09 实测 30s 兜底)。
         arm_start 是增量微调起点 (task2 = pick_pose.arm_angle_deg = +90)。
 
         Returns:
@@ -97,7 +99,7 @@ class ArmServoMixin:
         settled = False
         reason = "timeout"
         period = 1.0 / max(hz, 1.0)
-        deadline = time.time() + max(0.0, float(timeout))
+        deadline = time.time() + max(0.0, float(servo_timeout))
 
         def _read_pick():
             """读 streamer task_feed 缓存，选离画面中心(吸嘴)最近的目标。"""
