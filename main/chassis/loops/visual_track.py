@@ -23,12 +23,15 @@
 """
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple, Union
 
 from ..api import ChassisClient
 from ..controllers.base import mecanum_inverse
+
+logger = logging.getLogger(__name__)
 
 
 # ============ label 展开 ============
@@ -262,25 +265,17 @@ def track_chassis(
     api: Optional[ChassisClient] = None,
     setpoint_cxcy: Tuple[float, float] = (0.0, 0.0),
     select_mode: SelectMode = "nearest_to_center",
-    # 现场调好的轴符号（2026-08-02 现场对标：画面x↔车前后vx, 画面y↔车横向vy）
-    #   sign_vx=-1, sign_vy=+1 是现场确认的方向：cx 负(画面左/靠前) → vx 负(后退)；
-    #                                                    cy 负(画面上)     → vy 正(右移)
-    # 如果换车/换摄像头，只要改这两个 sign 不需要动控制律
     sign_vx: int = -1,
     sign_vy: int = +1,
-    # 只控前后: True → vy 恒 0, 到达判定只看 cx(前后). task2 水塔对齐用 (2026-08-03 规定)
     vx_only: bool = False,
-    # 控制律（2026-08-02 真机 cylinder_2/h_tu_dou 稳档：纯 P 振荡，所以 kp 保守 + slew 限幅）
-    kp: float = 0.20,          # 比例增益（降 55% 防振荡）
-    v_max: float = 0.12,        # 单向速度上限（绝对值，比前次 0.20 降 40%）
-    deadband: float = 0.05,     # cx/cy 误差都 < 死区 → 判到带内
-    hold_frames: int = 5,       # 连续 5 帧带内 → arrival（3 帧擦过不算）
-    # 限速/平滑
-    v_slew: Optional[float] = 0.02,     # 每帧 vx/vy 最多变 ±0.02 m/s（20Hz=0.4m/s²，不会爆冲）
-    max_lost_frames: int = 60,          # 连续丢 60 帧(≈3s@20Hz) → 停
-    recover_after_lost: bool = True,    # 短时丢帧后 1 帧反向小搜
-    watchdog_ms: Optional[float] = 2000.0,  # task_feed 2s 没刷 → 停
-    # 调度
+    kp: float = 0.20,
+    v_max: float = 0.12,
+    deadband: float = 0.05,
+    hold_frames: int = 5,
+    v_slew: Optional[float] = 0.02,
+    max_lost_frames: int = 60,
+    recover_after_lost: bool = True,
+    watchdog_ms: Optional[float] = 2000.0,
     hz: float = 20.0,
     max_seconds: float = 10.0,
     dry_run: bool = False,
@@ -289,177 +284,60 @@ def track_chassis(
 ) -> TrackChassisResult:
     """通用底盘视觉追踪: 把 target bbox 中心拉到 setpoint_cxcy。
 
-    任选目标:
-      - ``target="h_tu_dou"``  → 土豆(默认)
-      - ``target="water"``     → 匹配 water / water_l1/l2/l3 任一个
-      - ``target="cylinder_2"`` → 圆柱体 2 号
-      - ``target=["water_l1","water_l2"]`` → 列表任一匹配
-      - ``setpoint_cxcy=(-0.1, 0.1)`` → 对齐到非画面中心的标定点
-      - ``select_mode="leftmost"`` → 多目标选画面最左 (cx 最小, 平局取大), task4 采收用
+    控制律已在 runtime 执行；本函数只做一次 HTTP 同步调用
+    ``POST /v1/realtime/chassis-align``，阻塞 1-15s 后返回结果。
 
-    控制律（2026-08-02 现场调好的轴映射 + 符号）:
-      - 画面 cx（横向） ↔ 车前后（vx）: cx 负(画面左/靠前) → vx 负(后退)
-      - 画面 cy（纵向） ↔ 车横向（vy）: cy 负(画面上)     → vy 正(右移)
-      - 公式: ``vx = sign_vx * kp * cx_err``, ``vy = sign_vy * kp * cy_err``
-      - 如果发现反了，改 ``sign_vx=+/-1`` / ``sign_vy=+/-1`` 即可，不动控制律
-      - wz = 0 全程,**不旋转**
-      - ``vx_only=True`` → 只控 vx(前后), vy 恒 0, 到达判定只看 cx（task2 水塔对齐, 横向不做闭环）
-
-    返回 ``TrackChassisResult``: arrived=True / 到达帧信息 / 跑了多少帧。
-
-    sense_fn (可选, 2026-08-07): 注入自定义检测源 (如 LLM 看帧报坐标), 返回
-    TrackFrame 形状, 复用整套控制律; None 时走原 YOLO task_feed 检测。
+    ``on_tick`` / ``sense_fn`` 已废弃（控制律在 runtime 跑，无法注入回调）；
+    传入时记录 warning 日志后忽略。
     """
     if api is None:
         api = ChassisClient.connect()
-    labels = expand_label_set(target)
-    if not labels:
-        return TrackChassisResult(reason="no_target")
-
-    period = 1.0 / max(hz, 1.0)
-    start = time.monotonic()
-    deadline = start + max(0.0, float(max_seconds))
-    next_tick = time.monotonic()
-
-    def _set_vel(vx: float, vy: float) -> None:
-        if dry_run:
-            return
-        # 2026-08-03：单通道下发。旧实现同时发 mecanum_inverse 轮速 + HTTP
-        # chassis-velocity（同一速度两路,服务端 IK 再算一遍,互相覆盖还各占一个
-        # 串口 RTT）。现在只走 set_chassis_velocity（ws 优先,HTTP keep-alive 兜底）。
-        try:
-            api.set_chassis_velocity(vx, vy, 0.0, timeout=1.5)
-        except Exception:
-            try:
-                # ws/HTTP 都挂时最后兜底：本地 IK 直发轮速（短超时,失败即弃,下帧覆盖）
-                api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30), timeout=1.0)
-            except Exception:
-                pass
-
-    frames = 0
-    in_band = 0
-    last_vx = 0.0
-    last_vy = 0.0
-    lost_frames = 0
-    final_frame: Optional[TrackFrame] = None
-    arrived = False
-    reason = "timeout"
-    stopped = False
-    watchdog_triggered = False
-
     try:
-        while True:
-            now = time.monotonic()
-            if now > deadline:
-                reason = "timeout"
-                break
-            sleep_s = next_tick - now
-            if sleep_s > 0:
-                time.sleep(sleep_s)
-            next_tick += period
-            if next_tick < now:
-                next_tick = now + period
-
-            frm = sense_fn() if sense_fn is not None else _sense_frame(
-                api, labels, setpoint_cxcy, select_mode
-            )
-            frames += 1
-            final_frame = frm
-
-            if watchdog_ms is not None and frm.age_ms is not None and frm.target_found:
-                if frm.age_ms > watchdog_ms:
-                    watchdog_triggered = True
-                    break
-
-            if not frm.target_found:
-                lost_frames += 1
-                in_band = 0
-                if lost_frames == 1 and recover_after_lost and (last_vx != 0.0 or last_vy != 0.0):
-                    vx, vy = -last_vx * 0.5, -last_vy * 0.5
-                else:
-                    vx, vy = 0.0, 0.0
-                _set_vel(vx, vy)
-                frm.vx, frm.vy = vx, vy
-                if lost_frames > max_lost_frames:
-                    reason = "no_target"
-                    stopped = True
-                    break
-                if on_tick is not None:
-                    try:
-                        on_tick(frm, (vx, vy))
-                    except Exception:
-                        pass
-                continue
-
-            lost_frames = 0
-
-            cx_err = frm.cx_err if frm.cx_err is not None else 0.0
-            cy_err = frm.cy_err if frm.cy_err is not None else 0.0
-            # 控制律（含 sign_vx / sign_vy，2026-08-02 现场调好）
-            vx = float(sign_vx) * float(kp) * float(cx_err)
-            if vx_only:
-                vy = 0.0                                    # 只控前后, 横向冻结 (task2 水塔)
-            else:
-                vy = float(sign_vy) * float(kp) * float(cy_err)
-            if vx > v_max:
-                vx = v_max
-            elif vx < -v_max:
-                vx = -v_max
-            if vy > v_max:
-                vy = v_max
-            elif vy < -v_max:
-                vy = -v_max
-            if v_slew is not None:
-                dvx = vx - last_vx
-                if abs(dvx) > v_slew:
-                    vx = last_vx + v_slew if dvx > 0 else last_vx - v_slew
-                dvy = vy - last_vy
-                if abs(dvy) > v_slew:
-                    vy = last_vy + v_slew if dvy > 0 else last_vy - v_slew
-
-            if vx_only:
-                in_deadband = abs(cx_err) < deadband        # vx_only: 到达只看前后
-            else:
-                in_deadband = abs(cx_err) < deadband and abs(cy_err) < deadband
-            if in_deadband:
-                vx = 0.0
-                vy = 0.0
-                in_band += 1
-                if in_band >= hold_frames:
-                    arrived = True
-                    reason = "arrived"
-                    break
-            else:
-                in_band = 0
-
-            last_vx, last_vy = vx, vy
-            frm.vx = vx
-            frm.vy = vy
-            _set_vel(vx, vy)
-            if on_tick is not None:
-                try:
-                    on_tick(frm, (vx, vy))
-                except Exception:
-                    pass
+        if on_tick is not None:
+            logger.warning("track_chassis: on_tick ignored (控制律已下沉到 runtime)")
+        if sense_fn is not None:
+            logger.warning("track_chassis: sense_fn ignored (控制律已下沉到 runtime)")
+        resp = api.chassis_align(
+            target=target,
+            setpoint_cxcy=list(setpoint_cxcy),
+            select_mode=select_mode,
+            sign_vx=sign_vx, sign_vy=sign_vy, vx_only=vx_only,
+            kp=kp, v_max=v_max, deadband=deadband, hold_frames=hold_frames,
+            v_slew=v_slew, max_lost_frames=max_lost_frames,
+            recover_after_lost=recover_after_lost,
+            watchdog_ms=watchdog_ms,
+            hz=hz, max_seconds=max_seconds,
+            dry_run=dry_run,
+        )
     finally:
-        _set_vel(0.0, 0.0)
         try:
             api.close()
         except Exception:
             pass
-
-    if watchdog_triggered:
-        reason = "watchdog"
-    if stopped and reason == "unknown":
-        reason = "stopped"
-
-    elapsed = time.monotonic() - start
+    if not isinstance(resp, dict):
+        return TrackChassisResult(reason="error")
+    result_data = resp.get("result", resp)
+    if not isinstance(result_data, dict):
+        return TrackChassisResult(reason="error")
+    final_frame = result_data.get("final_frame")
+    if isinstance(final_frame, dict) and final_frame:
+        final_frame = TrackFrame(
+            target_found=final_frame.get("target_found", False),
+            label=final_frame.get("label"),
+            cx=final_frame.get("cx"), cy=final_frame.get("cy"),
+            area=final_frame.get("area"), score=final_frame.get("score"),
+            cx_err=final_frame.get("cx_err"), cy_err=final_frame.get("cy_err"),
+            vx=final_frame.get("vx"), vy=final_frame.get("vy"),
+            age_ms=final_frame.get("age_ms"),
+        )
+    else:
+        final_frame = None
     return TrackChassisResult(
-        arrived=arrived,
-        reason=reason,
+        arrived=bool(result_data.get("arrived")),
+        reason=result_data.get("reason", "unknown"),
         final_frame=final_frame,
-        frames=frames,
-        elapsed_s=elapsed,
+        frames=int(result_data.get("frames", 0)),
+        elapsed_s=float(result_data.get("elapsed_s", 0.0)),
     )
 
 

@@ -57,6 +57,14 @@ class DoubleLoopRunner:
         crossroad_sustain: int = 3,
     ) -> None:
         self.api = api
+        # 2026-08-09：自动起 lane_state 推送订阅 → 外环 read_lane 走共享缓存零 RTT。
+        # 无该方法（mock / 旧 client）或订阅失败 → 静默回退 req/resp（read_lane 兜底）。
+        try:
+            _starter = getattr(api, "start_lane_subscription", None)
+            if callable(_starter):
+                _starter()
+        except Exception:
+            pass
         self.outer = outer
         self.hz = float(hz)
         self.dt = 1.0 / max(self.hz, 1.0)

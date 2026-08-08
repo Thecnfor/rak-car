@@ -159,6 +159,9 @@ class CarRuntimeService(
         )
         self._feed_watchdog_thread.start()
 
+        # 2026-08-09: 底盘视觉对齐闭环锁。整段 1-15s 闭环独占 chassis velocity 下发。
+        self._chassis_align_lock = threading.Lock()
+
     @property
     def car_lock(self):
         """已废弃：长动作不应再全程持锁。

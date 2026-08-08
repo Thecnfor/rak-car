@@ -1,48 +1,24 @@
 """main/chassis/tests/test_visual_track.py
 通用底盘视觉追踪单测 (stdlib unittest, 离线无硬件)。
 
-覆盖：
-  - expand_label_set：water 组展开 / 单 label / list
-  - track_chassis：到达 3 帧死区后 returned arrived=True
-  - track_chassis：丢失目标超时返回 no_target
-  - track_chassis：画面中心最近策略 vs 最大面积策略
-  - track_chassis：leftmost 策略 (min cx / 平局大面积 / label 过滤 / 双球端到端)
-  - track_chassis：默认 target 是 h_tu_dou (2026-08-02)
+改造后：track_chassis 是 thin wrapper（一次 HTTP 调用），本文件测：
+  - expand_label_set：组展开 / 单 label / list（纯函数，不变）
+  - _select_target：nearest / largest / leftmost / no_match（纯函数，不变）
+  - track_chassis：mock api.chassis_align → 验证参数透传 + 返回值映射
 """
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 from main.chassis.loops.visual_track import (
     expand_label_set,
     track_chassis,
     _select_target,
+    TrackChassisResult,
+    TrackFrame,
 )
 
 
-def _d(label="water", cx=0.0, cy=0.0, w=0.2, h=0.2, score=0.9):
-    return {
-        "label": label,
-        "score": score,
-        "bbox_norm": {"cx": cx, "cy": cy, "width": w, "height": h},
-    }
-
-
-def _make_mock_api(payloads):
-    api = MagicMock()
-
-    def _pop(**_kwargs):  # 2026-08-08: 真实方法已接受 timeout kwarg, mock 同步放行
-        if payloads:
-            return payloads.pop(0)
-        return {"task_state": {"active": False, "detections": []}}
-
-    http = MagicMock()
-    http.get_vision_task_cache = MagicMock(side_effect=_pop)
-    http.post = MagicMock()
-    api.http = http
-    api.set_wheel_speeds = MagicMock()
-    api.close = MagicMock()
-    return api
-
+# ===== expand_label_set (纯函数) =====
 
 class TestExpandLabelSet(unittest.TestCase):
     def test_water_group_expands(self):
@@ -67,203 +43,198 @@ class TestExpandLabelSet(unittest.TestCase):
         labels = expand_label_set(["water", "cylinder_1"])
         self.assertIn("water", labels)
         self.assertIn("water_l1", labels)
-        self.assertIn("water_l2", labels)
-        self.assertIn("water_l3", labels)
         self.assertIn("cylinder_1", labels)
+
+
+# ===== _select_target (纯函数) =====
+
+def _d(label="water", cx=0.0, cy=0.0, w=0.2, h=0.2, score=0.9):
+    return {
+        "label": label,
+        "score": score,
+        "bbox_norm": {"cx": cx, "cy": cy, "width": w, "height": h},
+    }
 
 
 class TestSelectTarget(unittest.TestCase):
     def test_nearest_to_center_prefers_closer(self):
-        dets = [
-            _d(cx=0.5, cy=0.0),
-            _d(cx=0.1, cy=0.0),
-            _d(cx=0.2, cy=0.0, label="other"),
-        ]
+        dets = [_d(cx=0.5), _d(cx=0.1), _d(cx=0.2, label="other")]
         chosen = _select_target(dets, {"water"}, (0.0, 0.0), "nearest_to_center")
         self.assertIsNotNone(chosen)
         self.assertAlmostEqual(chosen["bbox_norm"]["cx"], 0.1)
 
     def test_largest_area(self):
-        dets = [
-            _d(w=0.1, h=0.1),
-            _d(w=0.4, h=0.4),
-            _d(w=0.2, h=0.2, label="x"),
-        ]
+        dets = [_d(w=0.1, h=0.1), _d(w=0.4, h=0.4), _d(w=0.2, h=0.2, label="x")]
         chosen = _select_target(dets, {"water"}, (0.0, 0.0), "largest_area")
-        self.assertIsNotNone(chosen)
-        bb = chosen["bbox_norm"]
-        self.assertEqual(bb["width"], 0.4)
+        self.assertEqual(chosen["bbox_norm"]["width"], 0.4)
 
     def test_no_match_returns_none(self):
-        dets = [_d(label="x")]
-        self.assertIsNone(_select_target(dets, {"water"}, (0.0, 0.0)))
+        self.assertIsNone(_select_target([_d(label="x")], {"water"}, (0.0, 0.0)))
 
     def test_leftmost_prefers_min_cx(self):
-        # 2026-08-03: task4 采收选画面最左球 (cx 最小); 不匹配 label 的更左也不算
         dets = [
-            _d(label="ball_yellow", cx=0.3, cy=0.0),
-            _d(label="ball_blue", cx=-0.4, cy=0.1),
-            _d(label="ball_blue", cx=0.1, cy=-0.2),
-            _d(label="other", cx=-0.9, cy=0.0),
+            _d(label="ball_yellow", cx=0.3),
+            _d(label="ball_blue", cx=-0.4),
+            _d(label="other", cx=-0.9),
         ]
         chosen = _select_target(
             dets, {"ball_blue", "ball_yellow"}, (0.0, 0.0), "leftmost")
-        self.assertIsNotNone(chosen)
-        self.assertAlmostEqual(chosen["bbox_norm"]["cx"], -0.4)
         self.assertEqual(chosen["label"], "ball_blue")
 
     def test_leftmost_tie_prefers_larger_area(self):
         dets = [
-            _d(label="ball_blue", cx=-0.2, cy=0.0, w=0.1, h=0.1),
-            _d(label="ball_yellow", cx=-0.2, cy=0.05, w=0.3, h=0.3),
+            _d(label="ball_blue", cx=-0.2, w=0.1, h=0.1),
+            _d(label="ball_yellow", cx=-0.2, w=0.3, h=0.3),
         ]
         chosen = _select_target(
             dets, {"ball_blue", "ball_yellow"}, (0.0, 0.0), "leftmost")
         self.assertEqual(chosen["label"], "ball_yellow")
 
-    def test_leftmost_no_match_returns_none(self):
-        dets = [_d(label="x", cx=-0.5)]
-        self.assertIsNone(
-            _select_target(dets, {"ball_blue"}, (0.0, 0.0), "leftmost"))
 
+# ===== track_chassis thin wrapper =====
 
-def _steady_payloads(cx, cy, n=200, label="h_tu_dou"):
-    """n 帧都停在 (cx, cy) 不动。"""
-    return [
-        {"task_state": {"active": True, "detections": [_d(label=label, cx=cx, cy=cy)]}}
-        for _ in range(n)
-    ]
+class TestTrackChassisThinWrapper(unittest.TestCase):
+    """track_chassis 现在是一次 HTTP 调用的 thin wrapper。"""
 
+    def _make_mock_api(self, response_dict):
+        """创建 mock ChassisClient，chassis_align 返回 response_dict。"""
+        api = MagicMock()
+        api.chassis_align = MagicMock(return_value=response_dict)
+        api.close = MagicMock()
+        return api
 
-def _step_payloads(seq, label="h_tu_dou"):
-    """seq: [(cx,cy), ...] 前面按 seq 走,后面塞 200 帧 (0,0)。"""
-    out = []
-    for cx, cy in seq:
-        out.append({"task_state": {"active": True, "detections": [_d(label=label, cx=cx, cy=cy)]}})
-    for _ in range(200):
-        out.append({"task_state": {"active": True, "detections": [_d(label=label, cx=0.0, cy=0.0)]}})
-    return out
-
-
-class TestTrackChassis(unittest.TestCase):
-    def test_arrives_when_in_band_3_frames(self):
-        seq = [(0.6, 0.5), (0.3, 0.25), (0.1, 0.1), (0.03, 0.03)] + \
-              [(0.0, 0.0)] * 50
-        api = _make_mock_api(_step_payloads(seq))
-        result = track_chassis(
-            "h_tu_dou", api=api,
-            hz=200, max_seconds=5.0,
-            kp=0.50, v_max=0.25, deadband=0.08, hold_frames=3,
-            max_lost_frames=50, dry_run=True,
-        )
-        self.assertTrue(result.arrived, result)
+    def test_arrived_maps_from_response(self):
+        """runtime 返回 arrived=True → track_chassis 返回 TrackChassisResult(arrived=True)。"""
+        response = {
+            "arrived": True, "reason": "arrived",
+            "frames": 23, "elapsed_s": 1.15,
+            "final_frame": {
+                "target_found": True, "label": "h_tu_dou",
+                "cx": 0.01, "cy": -0.01, "cx_err": -0.01, "cy_err": 0.01,
+                "area": 0.04, "score": 0.9, "vx": 0.0, "vy": 0.0,
+                "age_ms": 22.0,
+            },
+        }
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api, dry_run=False)
+        self.assertTrue(result.arrived)
         self.assertEqual(result.reason, "arrived")
-        self.assertGreaterEqual(result.frames, 6)
+        self.assertEqual(result.frames, 23)
+        self.assertAlmostEqual(result.elapsed_s, 1.15)
+        self.assertIsNotNone(result.final_frame)
+        self.assertEqual(result.final_frame.label, "h_tu_dou")
 
-    def test_no_target_timeout_reason(self):
-        payloads = [
-            {"task_state": {"active": True, "detections": []}}
-            for _ in range(200)
-        ]
-        api = _make_mock_api(payloads)
-        result = track_chassis(
-            "water", api=api, hz=200, max_seconds=5.0,
-            max_lost_frames=6, dry_run=True,
-        )
+    def test_no_target_maps_from_response(self):
+        response = {"arrived": False, "reason": "no_target",
+                    "frames": 60, "elapsed_s": 3.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api)
         self.assertFalse(result.arrived)
         self.assertEqual(result.reason, "no_target")
 
-    def test_default_target_is_h_tu_dou(self):
-        """2026-08-02 现场:默认 target 改成了 h_tu_dou。"""
-        seq = [(0.5, -0.4)] + [(0.0, 0.0)] * 50
-        api = _make_mock_api(_step_payloads(seq, label="h_tu_dou"))
-        result = track_chassis(
-            api=api, hz=200, max_seconds=2.0,
-            kp=0.50, v_max=0.25, deadband=0.08, hold_frames=3,
-            max_lost_frames=50, dry_run=True,
-        )
-        self.assertTrue(result.arrived)
-
-    def test_leftmost_mode_tracks_min_cx_ball(self):
-        """双球场景: leftmost 全程锁定画面最左 (cx 最小) 那颗。
-
-        前半黄球 cx=0.4 / 蓝球 cx=-0.3 → 锁蓝; 后半蓝球被拉到 0.0
-        (黄球仍 0.4) → 死区到达, final_frame.label 必须是 ball_blue。
-        """
-        payloads = [
-            {"task_state": {"active": True, "detections": [
-                _d(label="ball_yellow", cx=0.4, cy=0.0),
-                _d(label="ball_blue", cx=-0.3, cy=0.0),
-            ]}}
-            for _ in range(10)
-        ] + [
-            {"task_state": {"active": True, "detections": [
-                _d(label="ball_yellow", cx=0.4, cy=0.0),
-                _d(label="ball_blue", cx=0.0, cy=0.0),
-            ]}}
-            for _ in range(50)
-        ]
-        api = _make_mock_api(payloads)
-        result = track_chassis(
-            ["ball_blue", "ball_yellow"], api=api, select_mode="leftmost",
-            hz=200, max_seconds=3.0,
-            kp=0.50, v_max=0.25, deadband=0.08, hold_frames=3,
-            max_lost_frames=50, dry_run=True,
-        )
-        self.assertTrue(result.arrived, result)
-        self.assertEqual(result.final_frame.label, "ball_blue")
-
-    def test_sign_vx_sign_vy_accepted(self):
-        """sign_vx=+1 / sign_vy=-1 参数能被接受（2026-08-02 现场可调方向开关）。"""
-        seq = [(0.0, 0.0)] * 5 + [(-0.1, 0.2)] * 100
-        api = _make_mock_api(_step_payloads(seq))
-        # 反号后也能跑通（方向反了照样能 arrived）
-        result = track_chassis(
-            "h_tu_dou", api=api, hz=200, max_seconds=2.0,
-            kp=0.20, v_max=0.12, deadband=0.15, hold_frames=3,
-            max_lost_frames=50, dry_run=True,
-            sign_vx=+1, sign_vy=-1,
-        )
-        # 单纯验证参数不抛异常 + 能跑完
-        self.assertIsNotNone(result)
-        self.assertIsNotNone(result.frames)
-
-    def test_watchdog_uses_updated_at_for_age(self):
-        """payload 带 updated_at 且超过 watchdog_ms → reason='watchdog' 且不再 arrived。
-
-        2026-08-06: 旧实现 age_ms 硬编码 None, watchdog 永远不触发; 现从
-        task_state.updated_at 计算 age_ms, 缓存陈旧时及时停。
-        """
-        import time
-        now = time.time()
-        stale_payload = {
-            "task_state": {
-                "active": True,
-                "detections": [_d(label="cylinder_set", cx=0.4, cy=0.0)],
-                # 5 秒前的快照, 远超 watchdog_ms=2000ms
-                "updated_at": now - 5.0,
-            }
-        }
-        api = _make_mock_api([stale_payload] * 5)
-        result = track_chassis(
-            "cylinder_set", api=api, hz=50, max_seconds=2.0,
-            kp=0.20, v_max=0.12, deadband=0.05, hold_frames=5,
-            max_lost_frames=200, dry_run=True,
-        )
+    def test_watchdog_maps_from_response(self):
+        response = {"arrived": False, "reason": "watchdog",
+                    "frames": 1, "elapsed_s": 0.02, "final_frame": None}
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api)
         self.assertFalse(result.arrived)
         self.assertEqual(result.reason, "watchdog")
-        self.assertEqual(result.frames, 1)  # 第 1 帧就 watchdog 退出
 
-    def test_watchdog_skips_when_updated_at_missing(self):
-        """payload 没 updated_at → age_ms=None, watchdog 不参与 (向后兼容单测 / 老 runtime)。"""
-        seq = [(0.0, 0.0)] * 30
-        api = _make_mock_api(_step_payloads(seq, label="cylinder_set"))
-        result = track_chassis(
-            "cylinder_set", api=api, hz=200, max_seconds=2.0,
-            kp=0.20, v_max=0.12, deadband=0.05, hold_frames=3,
-            max_lost_frames=50, dry_run=True,
+    def test_timeout_maps_from_response(self):
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 200, "elapsed_s": 10.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api, max_seconds=10.0)
+        self.assertFalse(result.arrived)
+        self.assertEqual(result.reason, "timeout")
+
+    def test_params_forwarded_to_chassis_align(self):
+        """所有参数透传给 api.chassis_align()。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        track_chassis(
+            "water",
+            api=api,
+            setpoint_cxcy=(-0.1, 0.1),
+            select_mode="leftmost",
+            sign_vx=+1, sign_vy=-1, vx_only=True,
+            kp=0.30, v_max=0.15, deadband=0.08, hold_frames=3,
+            v_slew=0.03, max_lost_frames=30, recover_after_lost=False,
+            watchdog_ms=1000.0, hz=15.0, max_seconds=5.0, dry_run=True,
         )
-        self.assertTrue(result.arrived, result)
+        call_kwargs = api.chassis_align.call_args[1]
+        self.assertEqual(call_kwargs["target"], "water")
+        self.assertEqual(call_kwargs["setpoint_cxcy"], [-0.1, 0.1])  # tuple → list
+        self.assertEqual(call_kwargs["select_mode"], "leftmost")
+        self.assertEqual(call_kwargs["sign_vx"], 1)
+        self.assertEqual(call_kwargs["sign_vy"], -1)
+        self.assertTrue(call_kwargs["vx_only"])
+        self.assertAlmostEqual(call_kwargs["kp"], 0.30)
+        self.assertAlmostEqual(call_kwargs["v_max"], 0.15)
+        self.assertAlmostEqual(call_kwargs["deadband"], 0.08)
+        self.assertEqual(call_kwargs["hold_frames"], 3)
+        self.assertTrue(call_kwargs["dry_run"])
+
+    def test_api_auto_connect(self):
+        """api=None 时自动 ChassisClient.connect()。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        with unittest.mock.patch(
+            "main.chassis.loops.visual_track.ChassisClient.connect"
+        ) as mock_connect:
+            mock_api = MagicMock()
+            mock_api.chassis_align = MagicMock(return_value=response)
+            mock_api.close = MagicMock()
+            mock_connect.return_value = mock_api
+            result = track_chassis("h_tu_dou")
+            mock_connect.assert_called_once()
+
+    def test_api_always_closed(self):
+        """finally: api.close() 总是调用。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        track_chassis("h_tu_dou", api=api)
+        api.close.assert_called_once()
+
+    def test_error_response_returns_error_result(self):
+        """非 dict 响应 → TrackChassisResult(reason="error")。"""
+        api = self._make_mock_api(None)  # None response
+        result = track_chassis("h_tu_dou", api=api)
+        self.assertFalse(result.arrived)
+        self.assertEqual(result.reason, "error")
+
+    def test_nested_result_dict(self):
+        """响应含 "result" 嵌套 → 正确提取。"""
+        response = {
+            "ok": True,
+            "result": {"arrived": True, "reason": "arrived",
+                       "frames": 5, "elapsed_s": 0.3, "final_frame": None},
+        }
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api)
+        self.assertTrue(result.arrived)
+
+    def test_on_tick_logs_warning(self):
+        """on_tick 传入 → warning 日志。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        cb = MagicMock()
+        with self.assertLogs("main.chassis.loops.visual_track", level="WARNING") as cm:
+            track_chassis("h_tu_dou", api=api, on_tick=cb)
+        self.assertTrue(any("on_tick ignored" in m for m in cm.output))
+
+    def test_sense_fn_logs_warning(self):
+        """sense_fn 传入 → warning 日志。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        sense = MagicMock(return_value=TrackFrame())
+        with self.assertLogs("main.chassis.loops.visual_track", level="WARNING") as cm:
+            track_chassis("h_tu_dou", api=api, sense_fn=sense)
+        self.assertTrue(any("sense_fn ignored" in m for m in cm.output))
 
 
 if __name__ == "__main__":

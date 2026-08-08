@@ -12,6 +12,8 @@ fast-path 约定（2026-07-31）：底盘外环频繁读的 IR / 里程计走 fe
 from dataclasses import dataclass
 from typing import Iterable, Optional, Tuple
 
+import time
+
 from .state import LaneState, IrState, OdometryState
 
 try:
@@ -24,11 +26,22 @@ except ImportError:  # pragma: no cover
 
 @dataclass
 class ChassisClient:
-    """底盘专用 client。"""
+    """底盘专用 client。
+
+    lane_state 两种读取模式（2026-08-09）：
+      - **req/resp（旧）**：外环每帧 `read_lane()` → WS realtime_lane_state 一问一答
+      - **推送（新，默认优先）**：`start_lane_subscription()` 起一条独立订阅连接，
+        服务端 `lane_feed` 每帧推 `lane_state`，订阅线程写共享缓存，外环
+        `read_lane()` 直接读缓存（零每帧 RTT）。订阅断线自动回退 req/resp。
+    """
 
     http: RuntimeApiClient
     ws: RuntimeWsClient
     ws_ready: bool = False
+    # ---- lane_state 推送共享缓存（订阅线程写 / 外环读，GIL 下引用赋值原子）----
+    _lane_sub_stop: Optional[object] = None
+    _latest_lane_state: Optional[dict] = None
+    _latest_lane_mono: Optional[float] = None
 
     @classmethod
     def connect(cls) -> "ChassisClient":
@@ -41,6 +54,56 @@ class ChassisClient:
         except Exception:
             ready = False
         return cls(http=http, ws=ws, ws_ready=ready)
+
+    # ---- lane_state 推送订阅（替代 50Hz req/resp 轮询）----
+
+    def start_lane_subscription(self, hz: float = 50.0) -> bool:
+        """起一条独立 WS 订阅连接，服务端 lane_feed 每帧推 lane_state。
+
+        订阅线程 `on_state` 把最新帧写进共享缓存 `_latest_lane_state`，
+        外环 `read_lane()` 零 RTT 读缓存。幂等：已订阅则直接返回 True。
+
+        返回 True 表示订阅线程已启动（实际连通要等线程握手，`read_lane`
+        内部按 `ws.lane_subscription_active` 判断新鲜度，未通自动回退 req/resp）。
+        """
+        try:
+            stop = self.ws.subscribe_lane(self._on_lane_push, hz=hz)
+            self._lane_sub_stop = stop
+            return True
+        except Exception:
+            return False
+
+    def stop_lane_subscription(self) -> None:
+        """停订阅连接（幂等）。close() 收尾时调用。"""
+        stop = self._lane_sub_stop
+        self._lane_sub_stop = None
+        if stop is not None:
+            try:
+                stop()
+            except Exception:
+                pass
+
+    def _on_lane_push(self, state_dict: dict) -> None:
+        """订阅线程回调：只做引用替换（外环读侧无锁安全）。"""
+        self._latest_lane_state = state_dict
+        self._latest_lane_mono = time.monotonic()
+
+    def _lane_from_push_cache(self) -> Optional[LaneState]:
+        """推送缓存新鲜且订阅线程存活 → 返回 LaneState；否则 None。
+
+        新鲜度用本地 `time.monotonic()` 算（服务端 updated_at 是另一台机的
+        wall clock，跨机时钟可能不同步——本地单调时钟最稳）。
+        """
+        if not self.ws.lane_subscription_active:
+            return None
+        if self._latest_lane_state is None or self._latest_lane_mono is None:
+            return None
+        age_ms = (time.monotonic() - self._latest_lane_mono) * 1000.0
+        if age_ms >= 500.0:
+            return None
+        state = LaneState.from_lane_state_payload(self._latest_lane_state)
+        state.age_ms = age_ms
+        return state
 
     # ---- 业务动作 ----
 
@@ -106,11 +169,19 @@ class ChassisClient:
         return self.http.get(f"{self.http.api_prefix}/vision/lane/state")
 
     def read_lane(self) -> LaneState:
-        """外环每帧调这个：ws 通就走 ws，不通回退 http，异常返回空 LaneState。
+        """外环每帧调这个：**推送缓存优先**，订阅断了回退 req/resp（WS→HTTP）。
+
+        优先级（2026-08-09）：
+          1. 推送订阅缓存（`start_lane_subscription()` 起的独立连接，零每帧 RTT）
+          2. WS realtime_lane_state 一问一答
+          3. HTTP /v1/vision/lane/state
 
         空 LaneState 的 has_error 为 False，控制律会自然输出零速，
         所以调用方不需要自己 try/except。
         """
+        cached = self._lane_from_push_cache()
+        if cached is not None:
+            return cached
         try:
             if self.ws_ready:
                 payload = self.ws.realtime_lane_state() or {}
@@ -266,6 +337,25 @@ class ChassisClient:
             timeout=timeout,
         )
 
+    def chassis_align(self, **kwargs) -> dict:
+        """底盘视觉对齐（下沉到 runtime）。
+
+        单次 HTTP POST 到 /v1/realtime/chassis-align，阻塞 1-15s 直到
+        arrived / timeout / watchdog / no_target，返回完整结果 dict。
+
+        参数全部透传给 runtime ChassisAlignController，详见
+        runtime/services/chassis_align.py::ChassisAlignController.__init__。
+        """
+        payload = dict(kwargs)
+        # setpoint_cxcy 元组 → list（HTTP 可序列化）
+        if "setpoint_cxcy" in payload:
+            payload["setpoint_cxcy"] = list(payload["setpoint_cxcy"])
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/chassis-align",
+            payload=payload,
+            timeout=payload.get("max_seconds", 10.0) + 5.0,
+        )
+
     def set_single_motor(self, port: int, speed: float, reverse: int = 1, timeout: float = 5.0):
         if self.ws_ready:
             try:
@@ -282,10 +372,10 @@ class ChassisClient:
             return False
 
     def close(self) -> None:
-        """退出收尾（#5）：自动发零速 + 关 ws 长连接。
+        """退出收尾（#5）：自动发零速 + 停推送订阅 + 关 ws 长连接。
 
-        流程：先发 [0,0,0,0]（即使 ws 断了也走 HTTP 兜底）→ 再关 ws。
-        失败无所谓（进程要退了）。
+        流程：先发 [0,0,0,0]（即使 ws 断了也走 HTTP 兜底）→ 停独立订阅连接
+        → 再关 ws 主连接。失败无所谓（进程要退了）。
         """
         # 自动发零速（#5）：以前 DoubleLoopRunner finally 与 stop_wheel_speeds 双重发，
         # 现在收敛到 close()。多次调用 close() 也安全（smoother 已清零，不会乱跳）。
@@ -293,6 +383,8 @@ class ChassisClient:
             self.set_wheel_speeds([0.0, 0.0, 0.0, 0.0])
         except Exception:
             pass
+        # 推送订阅是独立连接（_PushSubscriber），不随 ws.close() 关闭——必须显式停
+        self.stop_lane_subscription()
         try:
             self.ws.close()
         except Exception:

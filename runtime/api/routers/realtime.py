@@ -131,6 +131,39 @@ def build_realtime_router(service):
         替代 lane_state 里从未被填的 forward/lateral/angular 字段。"""
         return {"ok": True, "chassis_command": service.get_chassis_command()}
 
+    @router_v1.post("/realtime/chassis-align")
+    def v1_realtime_chassis_align(payload: dict = Body(default={})):
+        """Server-side 底盘视觉对齐闭环（同步阻塞 1-15s）。
+
+        把 client 端的 track_chassis 控制律（P 控 + deadband + slew + arrived + watchdog
+        + lost_frames）整个下沉到 runtime，读 task_state 内存缓存、下发 chassis-velocity
+        直发。client 只发一次 HTTP POST 等结果，不再 50Hz RTT 往返。
+
+        请求字段 (详见 chassis_align.ChassisAlignController.__init__):
+          target, setpoint_cxcy, select_mode, sign_vx, sign_vy, vx_only,
+          kp, v_max, deadband, hold_frames, v_slew, max_lost_frames,
+          recover_after_lost, watchdog_ms, hz, max_seconds, dry_run
+        返回: TrackChassisResult dict (arrived / reason / frames / elapsed_s / final_frame)
+        """
+        try:
+            from runtime.services.chassis_align import ChassisAlignController
+        except ImportError as exc:
+            raise HTTPException(status_code=503, detail="chassis_align 模块不可用") from exc
+        try:
+            car = service.car
+            if car is None:
+                raise RuntimeError("car 未初始化")
+        except RuntimeError:
+            raise HTTPException(status_code=503, detail="car_uninitialized")
+        # 对齐闭环持锁：1-15s 独占 chassis velocity 下发
+        with service._chassis_align_lock:
+            try:
+                ctrl = ChassisAlignController(service, **payload)
+                result = ctrl.run()
+            except RuntimeError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "result": result}
+
     @router_v1.post("/realtime/arm-velocity")
     def v1_realtime_arm_velocity(payload: dict = Body(default={})):
         """arm 4-DOF 直发 — 绕开 arm_queue, 供视觉伺服连续追踪。
