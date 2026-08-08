@@ -100,17 +100,15 @@ public:
     scheduler_ = std::make_unique<SerialScheduler>(std::move(io));
     scheduler_->start();
 
-    // Reentrant group + multi-threaded executor in main(): concurrent service
-    // callbacks can enqueue quickly so the scheduler can batch them.
-    group_ = this->create_callback_group(
-      rclcpp::CallbackGroupType::Reentrant);
+    // Default (mutually exclusive) callback group: service calls serialize,
+    // which mirrors the single-bus reality. Each call may carry a burst of N
+    // frames, so the arm's per-tick packing still lands contiguously.
     srv_ = this->create_service<msgs::srv::Mc602Transaction>(
       "/rak/hw/mc602/transaction",
       [this](const std::shared_ptr<msgs::srv::Mc602Transaction::Request> req,
              std::shared_ptr<msgs::srv::Mc602Transaction::Response> resp) {
         this->on_transaction(req, resp);
-      },
-      rclcpp::ServicesQoS(), group_);
+      });
     status_pub_ = this->create_publisher<std_msgs::msg::String>(
       "/rak/hw/mc602/status", rclcpp::QoS(1).transient_local());
     status_timer_ = this->create_wall_timer(
@@ -198,7 +196,6 @@ private:
   std::unique_ptr<SerialScheduler> scheduler_;
   std::chrono::milliseconds default_timeout_{100};
 
-  rclcpp::CallbackGroup::SharedPtr group_;
   rclcpp::Service<msgs::srv::Mc602Transaction>::SharedPtr srv_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr status_pub_;
   rclcpp::TimerBase::SharedPtr status_timer_;
