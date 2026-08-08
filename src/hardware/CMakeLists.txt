@@ -188,6 +188,18 @@ target_link_libraries(safety_gate_node PUBLIC
   std_msgs::std_msgs
 )
 
+# behavior_demo_node — 行为层编排示例:调组件 Action + 发 TaskStatus
+add_executable(behavior_demo_node src/nodes/behavior_demo_node.cpp)
+target_include_directories(behavior_demo_node PUBLIC include)
+target_link_libraries(behavior_demo_node PUBLIC
+  rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
+  std_msgs::std_msgs
+  std_srvs::std_srvs
+  trajectory_msgs::trajectory_msgs
+  msgs::msgs
+)
+
 # mission_runner_node — thin ROS2 shell; the mission state machine lives in
 # the rclcpp-free MissionRunner class (src/mission_runner.cpp).
 add_executable(mission_runner_node
@@ -219,13 +231,13 @@ endif()
 if(CAMERA_INFO_MANAGER_FOUND)
   install(TARGETS
     camera_node infrared_node mc602_bridge_node mecanum_chassis_node arm_node
-    system_io_node safety_gate_node mission_runner_node
+    system_io_node safety_gate_node mission_runner_node behavior_demo_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 else()
   install(TARGETS
     infrared_node mc602_bridge_node mecanum_chassis_node arm_node system_io_node
-    safety_gate_node mission_runner_node
+    safety_gate_node mission_runner_node behavior_demo_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 endif()

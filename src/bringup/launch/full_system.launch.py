@@ -212,6 +212,15 @@ def generate_launch_description() -> LaunchDescription:
             }],
         ),
 
+        # Behavior demo — 行为层编排示例:调组件 Action 前进→抓取→发 TaskStatus
+        Node(
+            package="hardware",
+            executable="behavior_demo_node",
+            name="behavior_demo",
+            output="screen",
+            parameters=[],
+        ),
+
         # 4-layer safety gate
         Node(
             package="hardware",
