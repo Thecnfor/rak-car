@@ -527,14 +527,18 @@ class Orchestrator:
 
     @staticmethod
     def _read_key_pressed(client) -> Optional[bool]:
-        """讀一次下位機按鍵。回傳 True/False；job 失敗（控制器掉線）回傳 None。"""
+        """讀一次下位機按鍵（走 realtime 快路徑 GET，不進 job_queue）。
+
+        慢的 execute/sync 路徑在 feed 並發下每 call ~0.6s，20Hz 輪詢會全超時；
+        GET /v1/realtime/key/state 單發 ~10ms。回傳 True/False；控制器掉線回傳 None。
+        """
         try:
-            job = client.execute("car", "read_key", sync=True, timeout=0.5)
+            resp = client.get(f"{client.api_prefix}/realtime/key/state", timeout=1.0)
         except Exception:
             return None
-        if not isinstance(job, dict) or job.get("status") != "succeeded":
+        if not isinstance(resp, dict) or not resp.get("ok"):
             return None
-        return bool(job.get("result"))
+        return bool(resp.get("pressed"))
 
     def _wait_board_key(self, client, tui_buf: List[Dict[str, Any]]) -> None:
         """等待 MC602 板上鍵按下（20Hz 輪詢 + 邊沿/去抖）。等待期間屏幕顯示 READY。"""

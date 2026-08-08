@@ -253,4 +253,16 @@ def build_realtime_router(service):
         except RuntimeError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    @router_v1.get("/realtime/key/state")
+    def v1_realtime_key_state():
+        """讀 MC602 板上鍵（realtime 快路徑，不進 job_queue，20Hz 輪詢友好）。
+
+        回傳 {"ok", "pressed": bool, "raw": [bytes...]}——raw 供真機標定按鈕對應。
+        """
+        try:
+            st = service.read_key()
+        except RuntimeError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"ok": True, "pressed": st["pressed"], "raw": st["raw"]}
+
     return router_v1

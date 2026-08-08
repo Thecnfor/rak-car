@@ -43,8 +43,8 @@ def probe_keys() -> None:
     try:
         while True:
             try:
-                job = client.execute("car", "read_key", sync=True, timeout=0.5)
-                raw = job.get("result") if isinstance(job, dict) and job.get("status") == "succeeded" else None
+                resp = client.get(f"{client.api_prefix}/realtime/key/state", timeout=1.0)
+                raw = resp.get("raw") if isinstance(resp, dict) and resp.get("ok") else None
             except Exception as exc:
                 raw = None
                 now = time.time()

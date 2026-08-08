@@ -539,6 +539,19 @@ class CarRuntimeService(
             car = self.car
         return car.read_analog2(port)
 
+    def read_key(self):
+        """讀 MC602 板上鍵（realtime 快路徑，不進 job_queue）。
+
+        回傳 {"pressed": bool, "raw": [...]}。raw 為未標準化 bytes，真機標定用。
+        供 `GET /v1/realtime/key/state`。
+        """
+        with self._realtime_gate:
+            self._realtime_check_locked()
+            car = self.car
+        raw = car.read_key_raw()
+        vals = list(raw) if isinstance(raw, (tuple, list)) else ([raw] if raw is not None else [])
+        return {"pressed": bool(car.read_key()), "raw": vals}
+
     def emergency_stop(self):
         # 关键：不持 car_lock。worker 跑长动作（reset_position / move_* / 巡线）时
         # car_lock 被占，若这里也抢 car_lock 会排队等长动作结束 → 急停失效。

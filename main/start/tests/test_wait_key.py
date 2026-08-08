@@ -129,3 +129,40 @@ class TestWalkWaypointsEmptyCleanup(unittest.TestCase):
         self.assertEqual(completed, [])
         state["runner"].stop.assert_called_once()
         state["api"].stop_wheel_speeds.assert_called_once()
+
+
+class TestReadKeyPressed(unittest.TestCase):
+    """_read_key_pressed：走 realtime GET 快路徑（不進 job_queue）+ 解析 pressed。
+
+    慢的 execute/sync 路徑在 feed 並發下每 call ~0.6s，20Hz 輪詢全超時；
+    GET /v1/realtime/key/state 單發 ~10ms。
+    """
+
+    @staticmethod
+    def _make_client(resp=None, exc=None):
+        from unittest.mock import MagicMock
+        c = MagicMock()
+        c.api_prefix = "/v1"
+        if exc is not None:
+            c.get.side_effect = exc
+        else:
+            c.get.return_value = resp
+        return c
+
+    def test_returns_false_when_not_pressed(self):
+        from main.start.orchestrator import Orchestrator
+        c = self._make_client({"ok": True, "pressed": False, "raw": [0, 0]})
+        self.assertIs(Orchestrator._read_key_pressed(c), False)
+        c.get.assert_called_once_with("/v1/realtime/key/state", timeout=1.0)
+
+    def test_returns_true_when_pressed(self):
+        from main.start.orchestrator import Orchestrator
+        c = self._make_client({"ok": True, "pressed": True, "raw": [1, 0]})
+        self.assertIs(Orchestrator._read_key_pressed(c), True)
+
+    def test_none_on_error_or_not_ok(self):
+        from main.start.orchestrator import Orchestrator
+        c1 = self._make_client(exc=RuntimeError("down"))
+        self.assertIsNone(Orchestrator._read_key_pressed(c1))
+        c2 = self._make_client({"ok": False})
+        self.assertIsNone(Orchestrator._read_key_pressed(c2))

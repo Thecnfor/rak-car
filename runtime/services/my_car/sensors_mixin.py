@@ -63,16 +63,26 @@ class SensorsMixin:
         self._key_mode = key_cfg.get("mode", "any") if isinstance(key_cfg, dict) else "any"
         self._key_button_index = int(key_cfg.get("button_index", 0)) if isinstance(key_cfg, dict) else 0
 
+    def read_key_raw(self):
+        """讀 MC602 板上鍵 raw bytes（未標準化；異常回傳 None）。
+
+        供 realtime 快路徑 `/v1/realtime/key/state` 透傳 raw，真機標定按鈕對應用。
+        """
+        try:
+            return self.key.read()
+        except Exception:
+            return None
+
     def read_key(self) -> bool:
         """讀 MC602 板上鍵，回傳是否按下（異常視為未按下，讓等待迴圈重試）。
 
-        供 `run.py --wait-key` 經 CAR_ACTION read_key 輪詢。映射收斂在
+        供 `run.py --wait-key` 輪詢。映射收斂在
         `runtime/core/key_input.py::board_key_pressed`（mode/button_index 由
         `config_car.yml io.key` 控制）。
         """
         try:
             return board_key_pressed(
-                self.key.read(),
+                self.read_key_raw(),
                 mode=self._key_mode,
                 button_index=self._key_button_index,
             )
