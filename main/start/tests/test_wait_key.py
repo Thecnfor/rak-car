@@ -36,6 +36,19 @@ class TestBoardKeyPressed(unittest.TestCase):
     def test_none_is_released(self):
         self.assertFalse(self._f(None))
 
+    def test_specific_mode_only_target_byte(self):
+        """mode=specific：只認 button_index 那個 byte，其他 byte 觸發無效。"""
+        # button_index=0：認 raw[0]
+        self.assertTrue(self._f((1, 0), mode="specific", button_index=0))
+        self.assertFalse(self._f((0, 1), mode="specific", button_index=0))
+        # button_index=1：認 raw[1]
+        self.assertFalse(self._f((1, 0), mode="specific", button_index=1))
+        self.assertTrue(self._f((0, 1), mode="specific", button_index=1))
+
+    def test_specific_mode_out_of_range(self):
+        """button_index 越界 → 視為未按下（不誤觸發）。"""
+        self.assertFalse(self._f((1, 0, 1), mode="specific", button_index=5))
+
 
 class TestReadKeyActionRegistered(unittest.TestCase):
     def test_car_action_registered(self):

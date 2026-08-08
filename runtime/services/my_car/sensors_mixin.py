@@ -57,16 +57,25 @@ class SensorsMixin:
         self.battery = Battry()
         # 2026-08-08: MC602 板上鍵（BoardKey, dev_id=0x0d）——一鍵啟動用。
         # 純新增；不影響既有初始化流程。raw→bool 映射見 runtime/core/key_input.py。
+        # mode/button_index 走 config io.key；預設 any（任一顆觸發，最保險）。
         self.key = BoardKey()
+        key_cfg = cfg.get("io", {}).get("key", {}) if isinstance(cfg, dict) else {}
+        self._key_mode = key_cfg.get("mode", "any") if isinstance(key_cfg, dict) else "any"
+        self._key_button_index = int(key_cfg.get("button_index", 0)) if isinstance(key_cfg, dict) else 0
 
     def read_key(self) -> bool:
         """讀 MC602 板上鍵，回傳是否按下（異常視為未按下，讓等待迴圈重試）。
 
         供 `run.py --wait-key` 經 CAR_ACTION read_key 輪詢。映射收斂在
-        `runtime/core/key_input.py::board_key_pressed`。
+        `runtime/core/key_input.py::board_key_pressed`（mode/button_index 由
+        `config_car.yml io.key` 控制）。
         """
         try:
-            return board_key_pressed(self.key.read())
+            return board_key_pressed(
+                self.key.read(),
+                mode=self._key_mode,
+                button_index=self._key_button_index,
+            )
         except Exception:
             return False
 

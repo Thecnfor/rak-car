@@ -7,6 +7,14 @@ io:
   left_sensor: 8
   right_sensor: 7
   light: 2
+  # 2026-08-08: MC602 板上鍵（BoardKey, dev_id=0x0d）—— run.py --wait-key 一鍵啟動。
+  #   mode: any        → 任一顆按鈕按下就開始（預設，最保險）
+  #   mode: specific   → 只認 button_index 那一顆（避免誤碰觸發；需真機標定填 button_index）
+  # 真機標定：跑 wait_key 模式時逐顆按鈕按一下，看 raw bytes 哪個 byte 變化，
+  # 然後把 mode 改成 specific 並填對應的 button_index。
+  key:
+    mode: any
+    button_index: 0
 speed:
   x:
     limit: 0.7
