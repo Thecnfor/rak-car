@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent
@@ -17,6 +18,54 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from main.start.orchestrator import Orchestrator
+from main.api_client import RuntimeApiClient
+
+
+def probe_keys() -> None:
+    """--probe-keys 標定模式：連續讀 BoardKey raw bytes 印出來，按 Ctrl+C 退出。
+
+    用法：在 Jetson 跑 `python run.py --probe-keys`，逐顆按/放板上按鈕，
+    觀察每個 byte 的變化，找出「按下時非零」的 byte index。
+    然後填到 config_car.yml io.key 的 button_index（mode=specific）。
+    不啟動 lane runner，不擾動任務邏輯——純離線讀鍵。
+    """
+    client = RuntimeApiClient()
+    if not client.wait_until_ready(timeout=10.0):
+        sys.stderr.write("runtime not ready (pm2 logs rak-car-api)\n")
+        sys.exit(2)
+    sys.stderr.write(
+        "[probe-keys] 按板上每顆按鈕，按 Ctrl+C 退出。\n"
+        "找到「按下時 byte N 從 0 變非零」的 N，填 config_car.yml io.key.button_index。\n"
+        "若所有 byte 全程都是 0 或 wrapper 看不到你按的鈕，告訴我——可能要繞 wrapper。\n"
+    )
+    sys.stderr.flush()
+    last_print = 0.0
+    try:
+        while True:
+            try:
+                job = client.execute("car", "read_key", sync=True, timeout=0.5)
+                raw = job.get("result") if isinstance(job, dict) and job.get("status") == "succeeded" else None
+            except Exception as exc:
+                raw = None
+                now = time.time()
+                if now - last_print >= 1.0:
+                    sys.stderr.write(f"[probe-keys] read error: {exc}\n")
+                    sys.stderr.flush()
+                    last_print = now
+                time.sleep(0.1)
+                continue
+            now = time.time()
+            if now - last_print >= 0.2:
+                vals = list(raw) if isinstance(raw, (tuple, list)) else ([raw] if raw is not None else [])
+                tags = [f"b{i}={'PRESS' if v else '....'}" for i, v in enumerate(vals)]
+                sys.stderr.write(
+                    f"[probe-keys] raw={vals!r:24}  " + "  ".join(tags) + "\n"
+                )
+                sys.stderr.flush()
+                last_print = now
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        sys.stderr.write("[probe-keys] exit\n")
 
 
 def main() -> None:
@@ -37,9 +86,19 @@ def main() -> None:
             "按 MC602 板上键后立即开始完整任务。按下即开始计 时。"
         ),
     )
+    p.add_argument(
+        "--probe-keys", action="store_true",
+        help=(
+            "标定模式：连续读 MC602 BoardKey raw bytes 印出（按 Ctrl+C 退出）。"
+            "找出「按下时 byte N 非零」的 N 填 config_car.yml io.key.button_index。"
+        ),
+    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(name)s] %(message)s")
+    if args.probe_keys:
+        probe_keys()
+        return
     orch = Orchestrator(lane_hz=args.lane_hz,
                         ir_interval_s=args.ir_interval_s)
     if args.wait_key:
