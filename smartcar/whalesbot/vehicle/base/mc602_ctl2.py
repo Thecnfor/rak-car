@@ -186,7 +186,10 @@ class DevCmdInterface:
         return self.send_get(data_bytes)
     
     # 获取操作（读帧：低优先级 + 可共享合并）
-    def get(self, *args, mode=None, port_id=None):
+    # 2026-08-08 修复: 默认 mode=1 (读数据)。9fa1a68 误改成 mode=None→0 (无动作),
+    # MC602 收到 mode=0 回显/空帧 → 编码器/电量等走 get() 的设备全坏 (IR 走 no_act 不受影响)。
+    # 与官方 baidu_smartcar_2026 一致; 调用方可显式传 mode 覆盖。
+    def get(self, *args, mode=1, port_id=None):
         data_bytes = self.get_bytes(*args, mode=mode, port_id=port_id)
         # print(data_bytes)
         return self.send_get(data_bytes, priority=PRIORITY_READ)
