@@ -60,8 +60,11 @@ set(CAMERA_INFO_MANAGER_FOUND ${camera_info_manager_FOUND})
 # (no synthetic fallback). camera_info loaded from YAML via
 # camera_info_manager. Publishes /tf_static for camera optical frame.
 # OPTIONAL: skipped on distros without camera_info_manager (Lyrical).
+#
+# Node entry points (main) live in src/nodes/; core logic (adapters, chassis,
+# state machines) stays in src/. See CLAUDE.md layout conventions.
 if(CAMERA_INFO_MANAGER_FOUND)
-add_executable(camera_node src/camera_node.cpp)
+add_executable(camera_node src/nodes/camera_node.cpp)
 target_include_directories(camera_node PUBLIC include)
 target_link_libraries(camera_node PUBLIC
   rclcpp::rclcpp
@@ -82,7 +85,7 @@ endif()
 
 # infrared_node — uses MC602Adapter::read_infrared for real IR sensor reads
 add_executable(infrared_node
-  src/infrared_node.cpp
+  src/nodes/infrared_node.cpp
   src/mc602_adapter.cpp
   src/serial_port.cpp
 )
@@ -95,7 +98,7 @@ target_link_libraries(infrared_node PUBLIC
 
 # mecanum_chassis_node — also pulls in mecanum_chassis.cpp + mc602_adapter.cpp
 add_executable(mecanum_chassis_node
-  src/mecanum_chassis_node.cpp
+  src/nodes/mecanum_chassis_node.cpp
   src/mecanum_chassis.cpp
   src/mc602_adapter.cpp
   src/serial_port.cpp
@@ -113,7 +116,7 @@ target_link_libraries(mecanum_chassis_node PUBLIC
 
 # arm_node — uses MC602Adapter for joint command dispatch
 add_executable(arm_node
-  src/arm_node.cpp
+  src/nodes/arm_node.cpp
   src/mc602_adapter.cpp
   src/serial_port.cpp
 )
@@ -126,7 +129,7 @@ target_link_libraries(arm_node PUBLIC
 )
 
 # safety_gate_node
-add_executable(safety_gate_node src/safety_gate_node.cpp)
+add_executable(safety_gate_node src/nodes/safety_gate_node.cpp)
 target_include_directories(safety_gate_node PUBLIC include)
 target_link_libraries(safety_gate_node PUBLIC
   rclcpp::rclcpp
@@ -137,7 +140,7 @@ target_link_libraries(safety_gate_node PUBLIC
 # mission_runner_node — thin ROS2 shell; the mission state machine lives in
 # the rclcpp-free MissionRunner class (src/mission_runner.cpp).
 add_executable(mission_runner_node
-  src/mission_runner_node.cpp
+  src/nodes/mission_runner_node.cpp
   src/mission_runner.cpp
 )
 target_include_directories(mission_runner_node PUBLIC include)
