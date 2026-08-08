@@ -22,6 +22,7 @@
 #include <map>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <arpa/inet.h>  // htonl/ntohl for endian conversion
@@ -66,6 +67,24 @@ uint8_t max_ports_for_actuator(const std::string & actuator_type)
   return 0;
 }
 
+// Scheduling hints for reads (bridge read-sharing) and writes (bridge
+// write-coalescing). Ignored by the direct transport.
+ExchangeOpts read_opts(const std::string & share_key)
+{
+  ExchangeOpts o;
+  o.priority = ExchangeOpts::READ;
+  o.share_key = share_key;
+  return o;
+}
+
+ExchangeOpts write_opts(const std::string & coalesce_key, bool urgent = false)
+{
+  ExchangeOpts o;
+  o.priority = urgent ? ExchangeOpts::URGENT : ExchangeOpts::NORMAL;
+  o.coalesce_key = coalesce_key;
+  return o;
+}
+
 } // anonymous namespace
 
 // ---- Constants from the header ----
@@ -95,15 +114,18 @@ constexpr uint8_t MC602Adapter::FRAME_HEADER_1;
 constexpr uint8_t MC602Adapter::FRAME_FOOTER;
 
 MC602Adapter::MC602Adapter(std::string serial_port, uint32_t baud)
-: serial_port_(std::move(serial_port))
-, baud_(baud)
-, fd_(-1)
-, serial_(serial_port_, baud)
+: MC602Adapter(std::make_shared<DirectSerialTransport>(std::move(serial_port), baud))
 {
+  // Preserve legacy validation: MC602 supports 380400/1000000/115200.
   if (baud != 380400 && baud != 1000000 && baud != 115200) {
     throw std::runtime_error("MC602Adapter: unsupported baud " + std::to_string(baud) +
                              "; MC602 supports 380400/1000000/115200");
   }
+}
+
+MC602Adapter::MC602Adapter(std::shared_ptr<SerialTransport> transport)
+: transport_(std::move(transport))
+{
 }
 
 MC602Adapter::~MC602Adapter()
@@ -113,34 +135,89 @@ MC602Adapter::~MC602Adapter()
 
 void MC602Adapter::open()
 {
-  if (is_open()) {
-    return;
+  // When injection is active (test mode), skip real transport open.
+  if (!injection_) {
+    transport_->open();
   }
-  // When injection is active (test mode), skip real serial port open.
-  if (injection_) {
-    fd_ = 42;  // sentinel: satisfies is_open() without real hardware
-    return;
-  }
-  open_serial();
+  opened_ = true;
 }
 
 void MC602Adapter::close()
 {
-  if (!is_open()) {
-    return;
-  }
   try {
-    close_serial();
+    transport_->close();
   } catch (...) {
     // close() must never throw.
   }
-  fd_ = -1;
+  opened_ = false;
+}
+
+bool MC602Adapter::is_open() const
+{
+  return opened_;
+}
+
+std::string MC602Adapter::serial_port() const
+{
+  return transport_->serial_port();
+}
+
+uint32_t MC602Adapter::baud() const
+{
+  return transport_->baud();
 }
 
 void MC602Adapter::set_injection(
   std::function<std::vector<uint8_t>(const std::vector<uint8_t> &)> responder)
 {
   injection_ = std::move(responder);
+}
+
+// ---- Control-cycle packing ----
+
+void MC602Adapter::begin_burst()
+{
+  if (burst_active_) {
+    throw std::runtime_error("MC602Adapter::begin_burst: burst already active");
+  }
+  burst_active_ = true;
+  burst_frames_.clear();
+}
+
+void MC602Adapter::commit_burst()
+{
+  if (!burst_active_) {
+    return;  // idempotent, no-op
+  }
+  burst_active_ = false;
+  if (burst_frames_.empty()) {
+    return;
+  }
+  auto frames = std::move(burst_frames_);
+  burst_frames_.clear();
+
+  if (injection_) {
+    for (const auto & f : frames) {
+      injection_(f);
+    }
+    return;
+  }
+  // One logical transaction: a single bridge service call (or sequential
+  // frames through Direct). NORMAL priority, per-frame bridge default timeout.
+  transport_->exchange_burst(frames, ExchangeOpts{});
+}
+
+void MC602Adapter::send_write(std::vector<uint8_t> frame, const ExchangeOpts & opts)
+{
+  if (burst_active_) {
+    burst_frames_.push_back(std::move(frame));
+    return;
+  }
+  if (injection_) {
+    injection_(frame);
+    return;
+  }
+  exchange(frame, opts);
 }
 
 // ---- BaseController interface ----
@@ -239,7 +316,8 @@ double MC602Adapter::read_sensor(uint8_t port_id, const std::string & sensor_typ
     return static_cast<double>(raw);
   }
 
-  auto payload = exchange(frame);
+  auto payload = exchange(frame, read_opts(
+    "sensor:" + sensor_type + ":" + std::to_string(port_id)));
 
   // Parse payload based on sensor type.
   // Payload layout: dev_id(1) mode(1) port(1) data(N)
@@ -324,11 +402,7 @@ void MC602Adapter::write_actuator(uint8_t port_id, const std::string & actuator_
     int8_t v = clamp_virtual(value);
     std::vector<uint8_t> params = {static_cast<uint8_t>(static_cast<int>(v) & 0xFF)};
     auto frame = build_set(DEV_MOTOR, port_id, params);
-    if (injection_) {
-      injection_(frame);
-      return;
-    }
-    exchange(frame);  // ignore response for SET commands
+    send_write(std::move(frame), write_opts("act:motor:" + std::to_string(port_id)));
 
   } else if (actuator_type == "servo_bus") {
     // Bus servo: dev_id=SERVO_BUS, mode=SET, port, int32 angle(LE), speed(1)
@@ -337,22 +411,17 @@ void MC602Adapter::write_actuator(uint8_t port_id, const std::string & actuator_
     std::memcpy(params.data(), &angle_le, sizeof(angle_le));
     params[4] = 100;  // speed
     auto frame = build_set(DEV_SERVO_BUS, port_id, params);
-    if (injection_) {
-      injection_(frame);
-      return;
-    }
-    exchange(frame);
+    // Bus servo responses can be slow (Python SDK uses 1s timeout).
+    auto opts = write_opts("act:servo_bus:" + std::to_string(port_id));
+    opts.timeout_ms = 1000;
+    send_write(std::move(frame), opts);
 
   } else if (actuator_type == "servo_pwm") {
     // PWM servo: dev_id=SERVO_PWM, mode=SET, port, speed(1), angle(uint8)
     uint16_t angle = angle_to_servo_pwm(value, port_id == 7);  // S7 is 270° mode
     std::vector<uint8_t> params = {100, static_cast<uint8_t>(angle)};  // speed=100, angle
     auto frame = build_set(DEV_SERVO_PWM, port_id, params);
-    if (injection_) {
-      injection_(frame);
-      return;
-    }
-    exchange(frame);
+    send_write(std::move(frame), write_opts("act:servo_pwm:" + std::to_string(port_id)));
 
   } else if (actuator_type == "stepper") {
     // Stepper: dev_id=STEPPER, mode=SET, port, int32 steps(LE), speed(1)
@@ -362,22 +431,14 @@ void MC602Adapter::write_actuator(uint8_t port_id, const std::string & actuator_
     std::memcpy(params.data(), &steps, sizeof(steps));
     params[4] = 50;  // speed
     auto frame = build_set(DEV_STEPPER, port_id, params);
-    if (injection_) {
-      injection_(frame);
-      return;
-    }
-    exchange(frame);
+    send_write(std::move(frame), write_opts("act:stepper:" + std::to_string(port_id)));
 
   } else if (actuator_type == "dout") {
     // Digital output: dev_id=DOUT, mode=SET, port, value(1)
     uint8_t val = (value != 0.0) ? 2 : 1;  // 1=disconnect, 2=connect
     std::vector<uint8_t> params = {val};
     auto frame = build_set(DEV_DOUT, port_id, params);
-    if (injection_) {
-      injection_(frame);
-      return;
-    }
-    exchange(frame);
+    send_write(std::move(frame), write_opts("act:dout:" + std::to_string(port_id)));
   }
 }
 
@@ -413,7 +474,7 @@ std::array<int32_t, 4> MC602Adapter::read_encoder4()
     return result;
   }
 
-  auto payload = exchange(frame);
+  auto payload = exchange(frame, read_opts("encoder4"));
   // Payload: dev_id(1) mode(1) port(1) + 4× int32(LE)
   if (payload.size() < 3 + 4 * 4) {
     throw std::runtime_error("MC602 encoder4 response too short: " + std::to_string(payload.size()));
@@ -446,7 +507,8 @@ float MC602Adapter::read_infrared(uint8_t port_id)
     return static_cast<float>(le16toh(raw)) / 1000.0f;  // mm → m
   }
 
-  auto payload = exchange(frame);
+  auto payload = exchange(frame, read_opts(
+    "ir:" + std::to_string(port_id)));
   // Payload: dev_id(1) mode(1) port(1) + uint16(mm)
   if (payload.size() < 5) {
     throw std::runtime_error("MC602 IR response too short");
@@ -475,12 +537,9 @@ void MC602Adapter::write_motor4(int8_t v_fl, int8_t v_fr, int8_t v_rl, int8_t v_
 
   auto frame = build_set(DEV_MOTOR4, 0, params);
 
-  if (injection_) {
-    injection_(frame);
-    return;
-  }
-
-  exchange(frame);
+  // All-zero = stop → URGENT (jump the queue).
+  const bool stop = (v_fl == 0 && v_fr == 0 && v_rl == 0 && v_rr == 0);
+  send_write(std::move(frame), write_opts("motor4", /*urgent=*/stop));
 }
 
 // ---- Protocol helpers ----
@@ -537,9 +596,15 @@ std::vector<uint8_t> MC602Adapter::build_set(uint8_t dev_id, uint8_t port,
   return frame;
 }
 
-std::vector<uint8_t> MC602Adapter::exchange(const std::vector<uint8_t> & frame)
+std::vector<uint8_t> MC602Adapter::exchange(
+  const std::vector<uint8_t> & frame, ExchangeOpts opts)
 {
-  auto response = serial_.exchange(frame);
+  // Test seam: injection replaces the whole transaction.
+  if (injection_) {
+    return injection_(frame);
+  }
+
+  auto response = transport_->exchange(frame, opts);
 
   // Validate frame structure.
   if (response.size() < 6) {
@@ -617,20 +682,6 @@ int32_t MC602Adapter::angle_to_stepper_steps(double angle_deg)
   // angle_deg → radians → steps
   double rad = angle_deg * MC602_PI / 180.0;
   return static_cast<int32_t>(std::round(rad / STEPPER_RAD_PER_STEP));
-}
-
-// ---- Low-level POSIX ----
-
-void MC602Adapter::open_serial()
-{
-  serial_.set_response_handler(injection_);  // no-op if injection_ is empty
-  serial_.open();
-  fd_ = 1;  // mark as open (actual fd is inside SerialPort)
-}
-
-void MC602Adapter::close_serial()
-{
-  serial_.close();
 }
 
 } // namespace hardware

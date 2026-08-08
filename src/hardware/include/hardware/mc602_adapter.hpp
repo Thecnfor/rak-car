@@ -7,19 +7,22 @@
 //   Frame: 0x77 0x68 | length | dev_id mode port params... | 0x0A
 //   Response payload is res[3:-1] (strips header, length, footer).
 //
-// The adapter wraps a SerialPort (POSIX termios) and exposes the
-// BaseController interface. Independent of ROS2 — testable in isolation.
+// The adapter is the protocol codec (builds frames, parses payloads). Byte
+// transport is pluggable via SerialTransport: DirectSerialTransport (local
+// fd, default) or BridgeTransport (remote via mc602_bridge service — the
+// single-bus owner). Independent of ROS2 — testable in isolation.
 
 #pragma once
 
 #include "hardware/base_controller.hpp"
-#include "hardware/serial_port.hpp"
+#include "hardware/serial_transport.hpp"
 
 #include <array>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -32,19 +35,22 @@ inline constexpr double MC602_PI = 3.14159265358979323846;
 class MC602Adapter : public BaseController
 {
 public:
-  // baud must be one of: 380400 (MC601), 1000000 (MC602 USB), 115200 (MC602 wireless).
+  // Direct transport over a local serial fd (tests, mock, non-bridged use).
   MC602Adapter(std::string serial_port, uint32_t baud);
+
+  // Any transport — e.g. BridgeTransport via mc602_bridge.
+  explicit MC602Adapter(std::shared_ptr<SerialTransport> transport);
   ~MC602Adapter() override;
 
   MC602Adapter(const MC602Adapter &) = delete;
   MC602Adapter & operator=(const MC602Adapter &) = delete;
 
-  // --- BaseController ---
+  // --- BaseController (delegated to transport) ---
   void open() override;
   void close() override;
-  bool is_open() const override { return fd_ >= 0; }
-  std::string serial_port() const override { return serial_port_; }
-  uint32_t baud() const override { return baud_; }
+  bool is_open() const override;
+  std::string serial_port() const override;
+  uint32_t baud() const override;
   double read_sensor(uint8_t port_id, const std::string & sensor_type) override;
   void write_actuator(uint8_t port_id, const std::string & actuator_type, double value) override;
   std::map<std::string, uint32_t> enumerate_ports() const override;
@@ -64,6 +70,14 @@ public:
   // --- Test seam ---
   // When set, read/write use the injection point instead of the real fd.
   void set_injection(std::function<std::vector<uint8_t>(const std::vector<uint8_t> &)> responder);
+
+  // --- Control-cycle packing (RoboMaster-style) ---
+  // begin_burst() → write_actuator()/write_motor4() calls buffer locally →
+  // commit_burst() sends all buffered frames as ONE transport transaction
+  // (one service call through the bridge; sequential frames through Direct).
+  // Reads are never buffered. Safe to nest? No — begin while active throws.
+  void begin_burst();
+  void commit_burst();
 
   // MC602 protocol constants (per docs/hardware-comm.md)
   static constexpr uint8_t DEV_MOTOR4       = 0x01;
@@ -117,9 +131,12 @@ public:
   static std::vector<uint8_t> build_set(uint8_t dev_id, uint8_t port,
                                          std::vector<uint8_t> params);
 
-  // Send frame via serial_, read response, return payload (strips header/footer/length).
+  // Send frame via transport, read response, return payload (strips
+  // header/footer/length). `opts` carry scheduling hints for the bridge
+  // (priority / coalesce / share / timeout); ignored by direct transport.
   // Throws std::runtime_error on timeout or protocol error.
-  std::vector<uint8_t> exchange(const std::vector<uint8_t> & frame);
+  std::vector<uint8_t> exchange(
+    const std::vector<uint8_t> & frame, ExchangeOpts opts = {});
 
   // --- Unit conversion (public for unit tests) ---
   static int8_t clamp_virtual(double v_mps, double wheel_radius = 0.03);  // m/s → int8 [-100,100]
@@ -130,17 +147,19 @@ public:
   static int32_t angle_to_stepper_steps(double angle_deg);  // deg → step count
 
 private:
-  std::string serial_port_;
-  uint32_t baud_;
-  int fd_;  // -1 when closed
-  SerialPort serial_;
+  std::shared_ptr<SerialTransport> transport_;
+  bool opened_ = false;  // tracks open()/close() independent of injection
 
-  // Test injection: replaces the real read() call.
+  // Test injection: replaces the real exchange() call entirely. When set,
+  // exchange() returns injection_(frame) without touching the transport.
   std::function<std::vector<uint8_t>(const std::vector<uint8_t> &)> injection_;
 
-  // Low-level POSIX helpers (delegated to serial_).
-  void open_serial();
-  void close_serial();
+  // Burst state: write_actuator/write_motor4 buffer here while burst_active_.
+  bool burst_active_ = false;
+  std::vector<std::vector<uint8_t>> burst_frames_;
+
+  // Common tail for SET writes: buffer during burst, else inject/exchange.
+  void send_write(std::vector<uint8_t> frame, const ExchangeOpts & opts);
 };
 
 } // namespace hardware

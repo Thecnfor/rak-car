@@ -5,7 +5,7 @@
 <package format="3">
   <name>msgs</name>
   <version>0.1.0</version>
-  <description>rak custom message definitions (camera meta, detections, lane, actuator state)</description>
+  <description>rak custom interface definitions (camera meta, detections, lane, actuator state, MC602 transaction srv)</description>
   <maintainer email="thecnfor@users.noreply.github.com">Thecnfor</maintainer>
   <license>Proprietary</license>
 

@@ -87,6 +87,8 @@ endif()
 add_executable(infrared_node
   src/nodes/infrared_node.cpp
   src/mc602_adapter.cpp
+  src/serial_transport.cpp
+  src/bridge_transport.cpp
   src/serial_port.cpp
 )
 target_include_directories(infrared_node PUBLIC include)
@@ -94,6 +96,20 @@ target_link_libraries(infrared_node PUBLIC
   rclcpp::rclcpp
   sensor_msgs::sensor_msgs
   std_msgs::std_msgs
+  msgs::msgs
+)
+
+# mc602_bridge_node — single owner of the MC602 serial bus (SerialScheduler)
+add_executable(mc602_bridge_node
+  src/nodes/mc602_bridge_node.cpp
+  src/serial_scheduler.cpp
+  src/serial_port.cpp
+)
+target_include_directories(mc602_bridge_node PUBLIC include)
+target_link_libraries(mc602_bridge_node PUBLIC
+  rclcpp::rclcpp
+  std_msgs::std_msgs
+  msgs::msgs
 )
 
 # mecanum_chassis_node — also pulls in mecanum_chassis.cpp + mc602_adapter.cpp
@@ -101,6 +117,8 @@ add_executable(mecanum_chassis_node
   src/nodes/mecanum_chassis_node.cpp
   src/mecanum_chassis.cpp
   src/mc602_adapter.cpp
+  src/serial_transport.cpp
+  src/bridge_transport.cpp
   src/serial_port.cpp
 )
 target_include_directories(mecanum_chassis_node PUBLIC include)
@@ -112,12 +130,15 @@ target_link_libraries(mecanum_chassis_node PUBLIC
   tf2_ros::tf2_ros
   tf2::tf2
   std_msgs::std_msgs
+  msgs::msgs
 )
 
-# arm_node — uses MC602Adapter for joint command dispatch
+# arm_node — uses MC602Adapter for joint command dispatch (burst-packed)
 add_executable(arm_node
   src/nodes/arm_node.cpp
   src/mc602_adapter.cpp
+  src/serial_transport.cpp
+  src/bridge_transport.cpp
   src/serial_port.cpp
 )
 target_include_directories(arm_node PUBLIC include)
@@ -126,6 +147,7 @@ target_link_libraries(arm_node PUBLIC
   trajectory_msgs::trajectory_msgs
   sensor_msgs::sensor_msgs
   std_msgs::std_msgs
+  msgs::msgs
 )
 
 # safety_gate_node
@@ -167,13 +189,13 @@ endif()
 
 if(CAMERA_INFO_MANAGER_FOUND)
   install(TARGETS
-    camera_node infrared_node mecanum_chassis_node arm_node safety_gate_node
-    mission_runner_node
+    camera_node infrared_node mc602_bridge_node mecanum_chassis_node arm_node
+    safety_gate_node mission_runner_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 else()
   install(TARGETS
-    infrared_node mecanum_chassis_node arm_node safety_gate_node
+    infrared_node mc602_bridge_node mecanum_chassis_node arm_node safety_gate_node
     mission_runner_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
@@ -231,6 +253,7 @@ if(BUILD_TESTING)
   ament_add_gmock(test_mc602_adapter
     test/test_mc602_adapter.cpp
     src/mc602_adapter.cpp
+    src/serial_transport.cpp
     src/serial_port.cpp
   )
   target_include_directories(test_mc602_adapter PUBLIC include)
@@ -239,6 +262,7 @@ if(BUILD_TESTING)
   ament_add_gmock(test_mc602_protocol
     test/test_mc602_protocol.cpp
     src/mc602_adapter.cpp
+    src/serial_transport.cpp
     src/serial_port.cpp
   )
   target_include_directories(test_mc602_protocol PUBLIC include)
@@ -248,11 +272,19 @@ if(BUILD_TESTING)
   # must use the plain (un-keyworded) signature here for consistency.
   target_link_libraries(test_mc602_adapter rclcpp::rclcpp pluginlib::pluginlib)
 
+  # SerialScheduler — priority ordering, single-owner serialization, timeouts
+  ament_add_gmock(test_serial_scheduler
+    test/test_serial_scheduler.cpp
+    src/serial_scheduler.cpp
+  )
+  target_include_directories(test_serial_scheduler PUBLIC include)
+
   # SerialPort unit tests — frame building, exchange handshake, timeout handling
   ament_add_gmock(test_serial_port
     test/test_serial_port.cpp
     src/serial_port.cpp
     src/mc602_adapter.cpp
+    src/serial_transport.cpp
   )
   target_include_directories(test_serial_port PUBLIC include)
 

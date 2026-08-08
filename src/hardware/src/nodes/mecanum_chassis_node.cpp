@@ -22,6 +22,7 @@
 #include "hardware/mecanum_chassis.hpp"
 #include "hardware/mc602_adapter.hpp"
 #include "hardware/base_controller.hpp"
+#include "hardware/transport_factory.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -140,26 +141,31 @@ public:
     this->declare_parameter<double>("chassis_Ly", 0.10);
     this->declare_parameter<double>("wheel_radius", 0.03);
     this->declare_parameter<double>("publish_rate_hz", 50.0);
-    this->declare_parameter<std::string>("mc602_port", "/dev/ttyUSB0");
+    this->declare_parameter<std::string>("mc602_serial_port", "/dev/ttyUSB0");
     this->declare_parameter<int>("mc602_baud", 1000000);
+    this->declare_parameter<std::string>("mc602_transport", "direct");
 
     const double Lx = this->get_parameter("chassis_Lx").as_double();
     const double Ly = this->get_parameter("chassis_Ly").as_double();
     const double r = this->get_parameter("wheel_radius").as_double();
     const double rate = this->get_parameter("publish_rate_hz").as_double();
-    const std::string port = this->get_parameter("mc602_port").as_string();
+    const std::string port = this->get_parameter("mc602_serial_port").as_string();
     const int baud = this->get_parameter("mc602_baud").as_int();
+    const std::string transport_mode = this->get_parameter("mc602_transport").as_string();
 
     // --- Pure kinematics (independent of ROS2 / hardware) ---
     chassis_ = std::make_unique<vw::MecanumChassis>("mec1", Lx, Ly, r);
 
     // --- MC602 hardware interface ---
-    adapter_ = std::make_unique<vw::MC602Adapter>(port, static_cast<uint32_t>(baud));
+    adapter_ = std::make_unique<vw::MC602Adapter>(
+      vw::make_mc602_transport(this, transport_mode, port,
+                               static_cast<uint32_t>(baud)));
     adapter_->open();
     odom_.init(Lx, Ly, r);
 
     RCLCPP_INFO(this->get_logger(),
-      "MC602Adapter opened: %s @ %d baud", port.c_str(), baud);
+      "MC602Adapter opened: %s @ %d baud via %s", port.c_str(), baud,
+      transport_mode.c_str());
 
     // --- Subscriptions ---
     cmd_sub_ = this->create_subscription<geometry_msgs::msg::Twist>(
@@ -356,7 +362,12 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<MecanumChassisNode>());
+  // Multi-threaded: bridge mode blocks the callback on a service round-trip;
+  // extra threads keep subscriptions/timers serviced while it waits.
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), 4);
+  executor.add_node(std::make_shared<MecanumChassisNode>());
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

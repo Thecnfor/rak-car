@@ -1,0 +1,22 @@
+# Mc602Transaction.srv
+#
+# 一次 MC602 串口事务的请求/响应,经 mc602_bridge 桥节点仲裁。
+#
+# 事务 = 1..N 个"完整 MC602 帧"(77 68 len payload 0A),一个事务一次 service
+# 调用原子下发(控制周期打包:arm 一个 tick 的多个写合进一次调用)。
+# 帧格式保持单帧原样 —— 不跨帧重编码,不赌多记录 len 语义。
+#
+# 优先级:URGENT = 急停/轮速全零,立即插队;NORMAL = 常规写;READ = 读。
+# 每帧超时由桥执行,失败快速返回,不再有 100ms 级阻塞。
+
+uint8 PRIORITY_URGENT = 0
+uint8 PRIORITY_NORMAL = 1
+uint8 PRIORITY_READ   = 2
+
+uint8 priority       # 见 PRIORITY_* 常量(本事务所有帧共用)
+msgs/Frame[] frames  # 1..N 个完整 MC602 帧,桥逐帧执行、响应按序对应
+float32 timeout_sec  # 每帧超时;0 = 使用桥默认(100ms)
+---
+bool ok              # 全帧成功才 true;任一帧失败则 error 说明
+string error         # "" | "timeout" | "transport" | "not_ready" | "bad_frame"
+msgs/Frame[] frames  # 响应完整帧,与请求 frames 按序一一对应(SET 场景可忽略)

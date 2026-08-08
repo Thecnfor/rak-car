@@ -117,6 +117,22 @@ def generate_launch_description() -> LaunchDescription:
             }],
         ),
 
+        # ---- mc602_bridge: single owner of the MC602 serial bus ----
+        # All MCU traffic (chassis / arm / IR) routes through this node, which
+        # holds the only fd and serializes/coalesces transactions. Consumers
+        # use mc602_transport:=bridge → BridgeTransport (service client).
+        Node(
+            package="hardware",
+            executable="mc602_bridge_node",
+            name="mc602_bridge",
+            output="screen",
+            parameters=[{
+                "mc602_serial_port": LaunchConfiguration("serial_port"),
+                "mc602_baud": LaunchConfiguration("baud"),
+                "default_timeout_ms": 100,
+            }],
+        ),
+
         # IR sensors — P8 left, P7 right per hardware-port-mapping.md
         Node(
             package="hardware",
@@ -131,6 +147,7 @@ def generate_launch_description() -> LaunchDescription:
                 "rate_hz": 20.0,
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
+                "mc602_transport": "bridge",
             }],
         ),
         Node(
@@ -146,6 +163,7 @@ def generate_launch_description() -> LaunchDescription:
                 "rate_hz": 20.0,
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
+                "mc602_transport": "bridge",
             }],
         ),
 
@@ -162,6 +180,7 @@ def generate_launch_description() -> LaunchDescription:
                 "publish_rate_hz": 50.0,
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
+                "mc602_transport": "bridge",
             }],
         ),
 
@@ -176,6 +195,7 @@ def generate_launch_description() -> LaunchDescription:
                 "publish_rate_hz": 50.0,
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
+                "mc602_transport": "bridge",
             }],
         ),
 

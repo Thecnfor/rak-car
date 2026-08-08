@@ -12,6 +12,7 @@
 //   P8 → left IR   (port 8)
 
 #include "hardware/mc602_adapter.hpp"
+#include "hardware/transport_factory.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/range.hpp>
@@ -37,6 +38,7 @@ public:
     this->declare_parameter<double>("rate_hz", 20.0);
     this->declare_parameter<std::string>("mc602_serial_port", "/dev/ttyUSB0");
     this->declare_parameter<int>("mc602_baud", 1000000);
+    this->declare_parameter<std::string>("mc602_transport", "direct");
 
     ir_id_ = this->get_parameter("ir_id").as_string();
     const int port = this->get_parameter("mc602_port").as_int();
@@ -45,6 +47,7 @@ public:
     const double rate = this->get_parameter("rate_hz").as_double();
     const std::string serial_port = this->get_parameter("mc602_serial_port").as_string();
     const int baud = this->get_parameter("mc602_baud").as_int();
+    const std::string transport_mode = this->get_parameter("mc602_transport").as_string();
 
     if (port < 1 || port > static_cast<int>(vw::MC602Adapter::MC602_IO_PORTS)) {
       RCLCPP_FATAL(this->get_logger(),
@@ -58,10 +61,13 @@ public:
     pub_ = this->create_publisher<sensor_msgs::msg::Range>(topic_, 10);
 
     // --- MC602 hardware interface ---
-    adapter_ = std::make_unique<vw::MC602Adapter>(serial_port, static_cast<uint32_t>(baud));
+    adapter_ = std::make_unique<vw::MC602Adapter>(
+      vw::make_mc602_transport(this, transport_mode, serial_port,
+                               static_cast<uint32_t>(baud)));
     adapter_->open();
     RCLCPP_INFO(this->get_logger(),
-      "MC602Adapter opened: %s @ %d baud", serial_port.c_str(), baud);
+      "MC602Adapter opened: %s @ %d baud via %s", serial_port.c_str(), baud,
+      transport_mode.c_str());
 
     const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / rate));
     timer_ = this->create_wall_timer(period, [this]() { this->publish_range(); });
@@ -123,7 +129,12 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<InfraredNode>());
+  // Multi-threaded: bridge mode blocks the callback on a service round-trip;
+  // extra threads keep subscriptions/timers serviced while it waits.
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), 4);
+  executor.add_node(std::make_shared<InfraredNode>());
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }

@@ -17,7 +17,9 @@ rosidl_generate_interfaces(msgs
   "msg/ActuatorState.msg"
   "msg/CameraMeta.msg"
   "msg/DetectionArray.msg"
+  "msg/Frame.msg"
   "msg/LaneResult.msg"
+  "srv/Mc602Transaction.srv"
   DEPENDENCIES builtin_interfaces std_msgs
 )
 

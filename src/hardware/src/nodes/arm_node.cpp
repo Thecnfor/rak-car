@@ -15,6 +15,7 @@
 //   [3] grip_s7    — S7 PWM servo hand (port 7, dev_id=0x05, 270° mode)
 
 #include "hardware/mc602_adapter.hpp"
+#include "hardware/transport_factory.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
@@ -93,22 +94,27 @@ public:
     // --- Parameters ---
     this->declare_parameter<std::string>("arm_id", "main");
     this->declare_parameter<double>("publish_rate_hz", 50.0);
-    this->declare_parameter<std::string>("mc602_port", "/dev/ttyUSB0");
+    this->declare_parameter<std::string>("mc602_serial_port", "/dev/ttyUSB0");
     this->declare_parameter<int>("mc602_baud", 1000000);
+    this->declare_parameter<std::string>("mc602_transport", "direct");
 
     arm_id_ = this->get_parameter("arm_id").as_string();
     const double rate = this->get_parameter("publish_rate_hz").as_double();
-    const std::string port = this->get_parameter("mc602_port").as_string();
+    const std::string port = this->get_parameter("mc602_serial_port").as_string();
     const int baud = this->get_parameter("mc602_baud").as_int();
+    const std::string transport_mode = this->get_parameter("mc602_transport").as_string();
 
     // Joint names must match trajectory message joint_names order.
     joint_names_ = {"horiz_m6", "vert_stepper3", "rotate_s3", "grip_s7"};
 
     // --- MC602 hardware interface ---
-    adapter_ = std::make_unique<vw::MC602Adapter>(port, static_cast<uint32_t>(baud));
+    adapter_ = std::make_unique<vw::MC602Adapter>(
+      vw::make_mc602_transport(this, transport_mode, port,
+                               static_cast<uint32_t>(baud)));
     adapter_->open();
     RCLCPP_INFO(this->get_logger(),
-      "MC602Adapter opened: %s @ %d baud", port.c_str(), baud);
+      "MC602Adapter opened: %s @ %d baud via %s", port.c_str(), baud,
+      transport_mode.c_str());
 
     // --- Subscriptions ---
     const std::string cmd_topic = "/rak/cmd/arm/" + arm_id_ + "/trajectory";
@@ -171,6 +177,16 @@ private:
     const double horiz_virtual = vw::MC602Adapter::meters_to_virtual(horiz_speed, M6_PERIMETER);
     const int8_t horiz_cmd = static_cast<int8_t>(
       std::clamp(static_cast<int>(std::round(horiz_virtual)), -100, 100));
+
+    // Pack all joint writes for this trajectory tick into ONE burst: a single
+    // bridge service call, so the several frames hit the bus atomically and
+    // cost one DDS round-trip. commit_burst() surfaces transport errors.
+    try {
+      adapter_->begin_burst();
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "begin_burst failed: %s", e.what());
+    }
 
     try {
       adapter_->write_actuator(6, "motor", horiz_speed);
@@ -239,6 +255,14 @@ private:
       } catch (...) {}
     }
 
+    // Send the whole tick's writes as one transaction.
+    try {
+      adapter_->commit_burst();
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "burst commit failed: %s", e.what());
+    }
+
     // Store last commanded positions for state publishing.
     last_positions_ = positions;
   }
@@ -287,7 +311,12 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
-  rclcpp::spin(std::make_shared<ArmNode>());
+  // Multi-threaded: bridge mode blocks the callback on a service round-trip;
+  // extra threads keep subscriptions/timers serviced while it waits.
+  rclcpp::executors::MultiThreadedExecutor executor(
+    rclcpp::ExecutorOptions(), 4);
+  executor.add_node(std::make_shared<ArmNode>());
+  executor.spin();
   rclcpp::shutdown();
   return 0;
 }
