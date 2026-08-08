@@ -30,12 +30,21 @@ def main() -> None:
             "不指定时跑全流程 8 任务。"
         ),
     )
+    p.add_argument(
+        "--wait-key", action="store_true",
+        help=(
+            "一键启动（比赛用）: 先完成全部初始化（车不挪动，MC602 屏幕显示 READY），"
+            "按 MC602 板上键后立即开始完整任务。按下即开始计 时。"
+        ),
+    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(name)s] %(message)s")
     orch = Orchestrator(lane_hz=args.lane_hz,
                         ir_interval_s=args.ir_interval_s)
-    if args.task is not None:
+    if args.wait_key:
+        orch.wait_key_then_run()
+    elif args.task is not None:
         orch.run_single_task(args.task)
     else:
         orch.run()
