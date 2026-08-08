@@ -388,22 +388,18 @@ def _deliver_prepare(
     carry_x_mm: float,
     carry_arm_deg: float,
     carry_hand_deg: float,
-    carry_y_mm: float = -75.0,
+    deliver_y_mm: float,
     timeout: float = 10.0,
 ) -> None:
-    """carry 切姿态 (用户 2026-08-06 新规定).
+    """carry 切姿态 (用户 2026-08-08 新规定, 顺序: 收X → 大臂转 → Y降投放深度 → X伸出).
 
-    抓取后到投放位分 2 步:
+    抓取后到投放位 (与旧版 "阶段3 X/Y 并发 + 先到 -75 transit" 不同):
       1) X 收到 -260 (更收回, 远离水塔, 给大臂转动留空间)
-      2) _safe_arm_rotation_sequence (3 阶段顺序):
-         阶段 1: 预热 (cur_x=-260, cur_y=-150 都在安全区, no-op)
-         阶段 2: arm + hand 转 (X/Y 冻结在 -260/-150)
-         阶段 3: X → -115 和 Y → -75 并发 (一次 composite_run, SDK 内部并发)
+      2) _safe_arm_rotation_sequence: 只转 arm + hand (X/Y 冻结在安全位, 不做阶段3 X/Y)
+      3) Y 直接降到投放深度 deliver_y_mm (不再去 -75 transit; 必须在大臂之后)
+      4) X 伸出到 carry_x_mm (必须在 Y 之后)
 
-    Y 保持 -150 (transport) 不主动降到 -110/-75 中间. 阶段 3 大臂转完后, X/Y
-    并发: X 从 -260 伸到 -115 (水塔上方), Y 从 -150 降到 -75 (transit), 同时进行.
-
-    底盘 move_for 回塔 与 臂步骤 1 并发.
+    底盘 move_for 回塔 与 臂步骤并发 (跟旧版一致).
     """
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
@@ -416,7 +412,7 @@ def _deliver_prepare(
                 use_lane_align=True,
             ))
 
-        # 臂 2 步骤顺序 (一个 worker 内串行, 跟底盘并发)
+        # 臂步骤顺序 (一个 worker 内串行, 跟底盘并发; 2026-08-08 改: 不做 X/Y 并发)
         def _arm_prep():
             # 1) X 收到 -260 (更收回)
             _safe_composite_run(
@@ -424,17 +420,27 @@ def _deliver_prepare(
                 x_mm=-260.0, y_mm=None,
                 hand=None, speed=100, timeout=5.0,
             )
-            # 2) 大臂 3 阶段顺序转 (阶段 3 X/Y 并发)
+            # 2) 大臂 + 手爪转 (X/Y 冻结在安全位, 不做阶段3 X/Y)
             _safe_arm_rotation_sequence(
                 arm_client, runner,
                 arm_kwargs=dict(
                     arm=carry_arm_deg,
-                    x_mm=carry_x_mm,
-                    y_mm=carry_y_mm,
                     hand=carry_hand_deg,
                     speed=100,
                     timeout=timeout,
                 ),
+            )
+            # 3) Y 直接降到投放深度 (大臂之后, X 之前)
+            _safe_composite_run(
+                arm_client, arm=None,
+                y_mm=deliver_y_mm, x_mm=None,
+                hand=None, speed=100, timeout=timeout,
+            )
+            # 4) X 伸出到投放位 (Y 之后)
+            _safe_composite_run(
+                arm_client, arm=None,
+                x_mm=carry_x_mm, y_mm=None,
+                hand=None, speed=100, timeout=timeout,
             )
 
         tasks.append(ex.submit(_arm_prep))
@@ -873,55 +879,31 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     # 抓块 (含 vision servo + 自动抬回 transport Y)
                     _pick_cube(arm_client, runner, cfg, pick_x)
 
-                    # 准备 deliver: 底盘回塔 + 臂切 carry 姿态 (用户 2026-08-06 新规定 3 步前置)
-                    #   1) Y 抬升到 -110 (从吸附位 -50 → 中间高度, 留缓冲)
-                    #   2) _safe_arm_rotation_sequence (大臂 3 阶段): X 收到 -260,
-                    #      大臂转 -95° (X/Y 冻结), 阶段 3 X→-115 + Y→-75 并发.
-                    # 底盘 move_for 回塔 与 臂 步骤 1 并发.
+                    # 准备 deliver: 底盘回塔 + 臂切 carry 姿态 (用户 2026-08-08 新规定)
+                    #   顺序: X 收 -260 → 大臂转 → Y 直接降到投放深度 → X 伸到投放位
+                    #   (不再去 -75 transit, 不再 X/Y 并发)
+                    deliver_ys = cfg.get("deliver_y_by_index",
+                                         [-50.0, -65.0, -80.0])
+                    deliver_y = deliver_ys[min(picked, len(deliver_ys) - 1)]
                     d_back = -chassis_at_tower_m
-                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X→-260 + 大臂3阶段, 阶段3 X/Y 并发 → X=%s Y=%s)",
-                                picked + 1, d_back, carry["x_mm"], -75)
+                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收-260 → 大臂转%s° → Y降%.0f → X伸%s)",
+                                picked + 1, d_back, carry["arm_angle_deg"], deliver_y, carry["x_mm"])
                     _deliver_prepare(
                         arm_client, runner,
                         target_dx_m=d_back,
                         carry_x_mm=float(carry["x_mm"]),
                         carry_arm_deg=float(carry["arm_angle_deg"]),
                         carry_hand_deg=float(deliver_hand),
-                        carry_y_mm=-75.0,                              # TRANSIT_Y
+                        deliver_y_mm=deliver_y,
                         timeout=10.0,
                     )
                     chassis_at_tower_m = 0.0
 
-                    # 投放: 单步 move_y → grasp off (Y=-75 → deliver_y)
-                    # 2026-08-06: 到位就放, 不等待. move_y 用 v_max=150mm/s 加速;
-                    # 第 3 块 (deliver_y=-75 == 当前 Y) 跳过 move_y, 直接 grasp off.
-                    deliver_ys = cfg.get("deliver_y_by_index",
-                                         [-50.0, -65.0, -80.0])
-                    deliver_y = deliver_ys[min(picked, len(deliver_ys) - 1)]
-                    logger.info("第 %d 块: 投放 Y=%.0f mm + grasp off",
-                                picked + 1, deliver_y)
-                    # 2026-08-06 提速: 仿 task1_seeding.py:644-666 范式:
-                    # - move_y 走 http.execute(sync=False) + wait_job
-                    # - grasp 走 http.execute(sync=False) fire-and-forget, 不 wait_job
-                    #   (用户 2026-08-06: 放水后立即启动 X 移动, 不要停顿)
-                    # 下一轮 pick 的 _parallel_chassis_arm 同时跑 X + arm 切姿态, 全并发.
-                    try:
-                        cur_y = arm_client.get_state().y_mm
-                    except Exception:
-                        cur_y = None
-                    if cur_y is None or abs(cur_y - deliver_y) > 1.0:
-                        job_y = arm_client.http.execute(
-                            "arm", "composite_run",
-                            kwargs=dict(arm=None, x=None,
-                                        y=float(deliver_y) / 1000.0,
-                                        hand=None, speed=100, timeout=5.0),
-                            sync=False,
-                        )
-                        jid_y = job_y.get("id") if isinstance(job_y, dict) else None
-                        if jid_y:
-                            arm_client.http.wait_job(jid_y, timeout=5.0)
+                    # 投放: grasp off (X/Y 已由 _deliver_prepare 就位; 2026-08-08 不再单步 move_y)
                     # grasp off fire-and-forget: 立即返回, 不等 grasp 物理完成,
                     # 下一轮 pick 的 _parallel_chassis_arm 立即启动 X 移动 (与 grasp 物理并发).
+                    logger.info("第 %d 块: 投放 Y=%.0f mm + grasp off",
+                                picked + 1, deliver_y)
                     arm_client.http.execute(
                         "arm", "grasp", kwargs=dict(value=False), sync=False,
                     )
