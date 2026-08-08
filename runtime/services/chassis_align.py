@@ -146,6 +146,10 @@ class TrackChassisResult:
     final_frame: Optional[TrackFrame] = None
     frames: int = 0
     elapsed_s: float = 0.0
+    # 2026-08-09: 闭环 finally 的零速是否真的下发到轮子 (False = 主路径 + 兜底
+    # 都失败, 底盘可能仍按最后非零指令滑行)。下沉后客户端看不到帧内异常, 只能
+    # 靠这个字段判断"车到底停了没有"。
+    stop_ok: bool = True
 
 
 # ---- 目标轨迹 Kalman 平滑（2026-08-09）----
@@ -229,8 +233,8 @@ class ChassisAlignController:
         self._hz = float(hz)
         self._max_seconds = float(max_seconds)
         self._dry_run = bool(dry_run)
-        # Kalman 平滑（可开关, 默认关保持已验证行为）: 有检测帧时平滑 cx/cy
-        # 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
+        # Kalman 平滑（默认开, 2026-08-09 用户决定; kalman=False 显式关保持原始
+        # 检测）: 有检测帧时平滑 cx/cy 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
         self._kalman = None
         if kalman:
             try:
@@ -253,11 +257,13 @@ class ChassisAlignController:
         next_tick = time.monotonic()
 
         def _set_vel(vx, vy):
+            """下发底盘三速; 返回是否成功 (False = 主路径 + 兜底都失败)."""
             if self._dry_run:
-                return
+                return True
             try:
                 # 优先走 service 直发（内部 IK + 命令追踪）
                 self._service.set_chassis_velocity(vx, vy, 0.0)
+                return True
             except Exception:
                 try:
                     # 兜底: 本地 IK 直发轮速
@@ -265,8 +271,10 @@ class ChassisAlignController:
                     if car_ref is not None:
                         ws = list(car_ref.chassis.calculate_wheel_velocities(vx, vy, 0.0))
                         self._service.set_wheel_speeds([float(s) for s in ws])
+                        return True
                 except Exception:
                     pass
+                return False
 
         frames = 0
         in_band = 0
@@ -277,6 +285,7 @@ class ChassisAlignController:
         arrived = False
         reason = "timeout"
         watchdog_triggered = False
+        stop_ok = True
 
         try:
             while True:
@@ -434,7 +443,7 @@ class ChassisAlignController:
                 frm.vx, frm.vy = vx, vy
                 _set_vel(vx, vy)
         finally:
-            _set_vel(0.0, 0.0)
+            stop_ok = _set_vel(0.0, 0.0)
 
         if watchdog_triggered:
             reason = "watchdog"
@@ -446,5 +455,6 @@ class ChassisAlignController:
             final_frame=final_frame,
             frames=frames,
             elapsed_s=elapsed,
+            stop_ok=stop_ok,
         )
         return result.__dict__

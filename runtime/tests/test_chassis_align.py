@@ -329,6 +329,30 @@ class TestChassisAlignController(unittest.TestCase):
         self.assertTrue(all(v <= 0 for v in vx_values),
                         f"All vx should be <= 0 with sign_vx=-1, got {vx_values}")
 
+    def test_stop_ok_true_normal(self):
+        """正常闭环 → finally 零速成功 → stop_ok=True 且最后一条确实是零速。"""
+        dets = [_d(cx=0.3)] * 10
+        svc = _make_service_with_detections(dets)
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50, max_seconds=3.0)
+        result = _fast_run(ctrl)
+        self.assertIn("stop_ok", result)
+        self.assertTrue(result["stop_ok"])
+        self.assertEqual(svc.set_chassis_velocity_calls[-1][:2], (0.0, 0.0))
+
+    def test_stop_ok_false_when_velocity_write_fails(self):
+        """主路径 + 兜底都失败 → finally 零速未达 → stop_ok=False (客户端可感知)."""
+        dets = [_d(cx=0.3)] * 10
+        svc = _make_service_with_detections(dets)
+
+        def _boom(*a, **k):
+            raise RuntimeError("serial down")
+
+        svc.set_chassis_velocity = _boom
+        svc.set_wheel_speeds = _boom
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50, max_seconds=3.0)
+        result = _fast_run(ctrl)
+        self.assertFalse(result["stop_ok"])
+
 
 # ===== Kalman 平滑（filterpy，2026-08-09）=====
 

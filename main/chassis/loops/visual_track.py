@@ -254,6 +254,8 @@ class TrackChassisResult:
     final_frame: Optional[TrackFrame] = None
     frames: int = 0
     elapsed_s: float = 0.0
+    # runtime 对齐闭环 finally 零速是否到达轮子 (2026-08-09); client 闭环同样跟踪。
+    stop_ok: bool = True
 
 
 # ============ 主函数: track_chassis ============
@@ -301,16 +303,19 @@ def _track_chassis_client_loop(
     deadline = start + max(0.0, float(max_seconds))
     next_tick = time.monotonic()
 
-    def _set_vel(vx: float, vy: float) -> None:
+    def _set_vel(vx: float, vy: float) -> bool:
+        """下发底盘三速; 返回是否成功 (主路径 + 兜底都失败 → False)."""
         if dry_run:
-            return
+            return True
         try:
             api.set_chassis_velocity(vx, vy, 0.0, timeout=1.5)
+            return True
         except Exception:
             try:
                 api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30), timeout=1.0)
+                return True
             except Exception:
-                pass
+                return False
 
     frames = 0
     in_band = 0
@@ -321,6 +326,7 @@ def _track_chassis_client_loop(
     arrived = False
     reason = "timeout"
     watchdog_triggered = False
+    stop_ok = True
 
     try:
         while True:
@@ -415,7 +421,7 @@ def _track_chassis_client_loop(
                 except Exception:
                     pass
     finally:
-        _set_vel(0.0, 0.0)
+        stop_ok = _set_vel(0.0, 0.0)
 
     if watchdog_triggered:
         reason = "watchdog"
@@ -427,6 +433,7 @@ def _track_chassis_client_loop(
         final_frame=final_frame,
         frames=frames,
         elapsed_s=elapsed,
+        stop_ok=stop_ok,
     )
 
 
@@ -530,6 +537,7 @@ def track_chassis(
         final_frame=final_frame,
         frames=int(result_data.get("frames", 0)),
         elapsed_s=float(result_data.get("elapsed_s", 0.0)),
+        stop_ok=bool(result_data.get("stop_ok", True)),
     )
 
 

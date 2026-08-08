@@ -333,6 +333,42 @@ class RuntimeApiClient:
     def realtime_wheel_encoders(self):
         return self.get(f"{self.api_prefix}/realtime/wheels/encoders")
 
+    def wait_wheels_stopped(self, settle_s: float = 0.2, timeout_s: float = 1.0) -> bool:
+        """等底盘真正停稳: 编码器双采样 (间隔 settle_s) 判定 4 轮无位移.
+
+        底盘没有"读轮速"端点 (POST /v1/realtime/wheels/speeds 只能写, GET 405),
+        所以用真实 MC602 编码器弧度累计 (GET /v1/realtime/wheels/encoders) 双采样:
+        两读数 4 轮总位移 < 1.0 rad (≈ 0.5mm) → 判定停稳。与 target4.rearm 的
+        判停逻辑同构 (2026-08-09 统一)。端点异常 → 保守放行 (不阻塞任务)。
+
+        注意 settle_s 是探测位移必需的采样间隔 (Δt=0 时位移恒 0 无法判动),
+        不是无意义的固定 sleep。
+        """
+        import time as _t
+        deadline = _t.monotonic() + float(timeout_s)
+        while _t.monotonic() < deadline:
+            try:
+                e1 = self.realtime_wheel_encoders() or {}
+                enc1 = e1.get("encoders") or []
+                if not isinstance(enc1, list) or len(enc1) < 4:
+                    return True
+                enc1 = [float(x) for x in enc1]
+            except Exception:
+                return True
+            _t.sleep(settle_s)
+            try:
+                e2 = self.realtime_wheel_encoders() or {}
+                enc2 = e2.get("encoders") or []
+                if not isinstance(enc2, list) or len(enc2) < 4:
+                    return True
+                enc2 = [float(x) for x in enc2]
+            except Exception:
+                return True
+            total_delta = sum(abs(enc2[i] - enc1[i]) for i in range(4))
+            if total_delta < 1.0:
+                return True
+        return False
+
     def realtime_motor_speed(self, port, speed, reverse=1):
         return self.post(
             f"{self.api_prefix}/realtime/motor/speed",

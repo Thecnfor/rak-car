@@ -594,16 +594,9 @@ def _stop_chassis(arm_client: ArmClient) -> None:
         )
     except Exception:
         pass
-    # 等底盘轮速归零 (busy-poll, 不 sleep, 立即读一次)
-    deadline = time.monotonic() + 1.0
-    while time.monotonic() < deadline:
-        try:
-            resp = arm_client.http.get("/v1/realtime/wheels/speeds", timeout=1)
-            speeds = (resp or {}).get("speeds") or []
-            if all(abs(float(s)) < 0.01 for s in speeds):
-                break
-        except Exception:
-            break
+    # 等底盘轮速归零: 真实编码器反馈双采样 (2026-08-09 修 — 旧 GET
+    # wheels/speeds 端点只存在 POST, 405 → 等待从未生效)。
+    arm_client.http.wait_wheels_stopped(settle_s=0.15, timeout_s=1.0)
 
 
 # ── 核心动作子流程 ────────────────────────────────────────────────

@@ -148,6 +148,23 @@ class TestTrackChassisThinWrapper(unittest.TestCase):
         self.assertFalse(result.arrived)
         self.assertEqual(result.reason, "timeout")
 
+    def test_stop_ok_parsed_from_response(self):
+        """runtime 返回 stop_ok=False (finally 零速未达) → track_chassis 透传。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 200, "elapsed_s": 2.0, "final_frame": None,
+                    "stop_ok": False}
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api)
+        self.assertFalse(result.stop_ok)
+
+    def test_stop_ok_default_true_when_missing(self):
+        """老 runtime / 无 stop_ok 字段 → 默认 True (兼容不破坏调用方)。"""
+        response = {"arrived": True, "reason": "arrived",
+                    "frames": 20, "elapsed_s": 1.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api)
+        self.assertTrue(result.stop_ok)
+
     def test_params_forwarded_to_chassis_align(self):
         """所有参数透传给 api.chassis_align()。"""
         response = {"arrived": False, "reason": "timeout",
