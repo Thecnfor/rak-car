@@ -85,7 +85,7 @@ task_cfg:
 
     source_position_order: [1, 2]
 
-    tower_spacing_m: 0.35       # 2026-08-08: 0.40 → 0.35 (两塔间距实测)
+    tower_spacing_m: 0.55       # 2026-08-08: 0.35 → 0.55 (前进到第二座塔改 move_for 直推 0.55m)
     group_forward_m: 0.35        # 2026-08-06: 0.33 → 0.35 (tower 1 前向组间距); 2026-08-06: 0.35 → 0.37
     group_backward_m: 0.33       # 2026-08-06: tower 2 后向用 0.33 (3 块回退距离, 不走 0.35)
 
