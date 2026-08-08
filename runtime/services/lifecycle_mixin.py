@@ -160,7 +160,13 @@ class LifecycleMixin:
                 gc.enable()
         self._remember_shared_cameras(car)
         car.STOP_PARAM = self.stop_after_action
-        car.beep()
+        # 2026-08-08: 蜂鸣是装饰性动作, 蜂鸣器无响应会 raise 把 init 卡死
+        # (实测: 每 ~3s 重建 MyCar, initialized 永 False, 无任何进度日志)。
+        # 包一层 try, 失败只 warning 不阻断 init。
+        try:
+            car.beep()
+        except Exception as exc:
+            logger.warning("init beep 失败(继续): %s" % exc)
         time.sleep(1)
         # 2026-08-03 init 新顺序（用户要求）：
         #   ① 存储仓归位 (舵机 close 到 98°)
