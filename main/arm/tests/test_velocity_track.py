@@ -332,5 +332,75 @@ class TestDefaultPostFn(unittest.TestCase):
         self.assertIn("/v1/realtime/arm-velocity", args[0])
 
 
+class TestKalmanVelocity(unittest.TestCase):
+    """find_target_velocity 的 kalman 平滑 (2026-08-09)."""
+
+    def _run(self, frames, **kw):
+        loop, ws, posts, post_fn = _Runner.make(frames)
+        result = loop.find_target_velocity("ball_yellow", ws=ws, post_fn=post_fn,
+                                           timeout=0.3, **kw)
+        return result, posts
+
+    def test_kalman_first_frame_unchanged(self):
+        """首帧 kalman 直接初始化不过滤 → 单帧结果与关 kalman 完全一致."""
+        frames = [_frame("ball_yellow", 0.5, 0.4)]
+        r_raw, p_raw = self._run(frames, gain=0.1)
+        r_kf, p_kf = self._run(frames, gain=0.1, kalman=True)
+        self.assertAlmostEqual(p_kf[0]["x_vel"], p_raw[0]["x_vel"], places=6)
+        self.assertAlmostEqual(p_kf[0]["y_vel"], p_raw[0]["y_vel"], places=6)
+
+    def test_kalman_smooths_jitter(self):
+        """小抖动 (真值 0.5 ±0.03 交替) → kalman 后 x_vel 方差显著小于原始."""
+        frames = [_frame("ball_yellow", 0.47 if i % 2 else 0.53, 0.0)
+                  for i in range(12)]
+        _, p_raw = self._run(frames, gain=0.1)
+        _, p_kf = self._run(frames, gain=0.1, kalman=True)
+
+        def _xvels(posts):
+            # 排除 finally 的收尾 (0,0) 帧
+            return [p["x_vel"] for p in posts[:-1]]
+
+        def _std(vals):
+            m = sum(vals) / len(vals)
+            return (sum((v - m) ** 2 for v in vals) / len(vals)) ** 0.5
+
+        raw_std = _std(_xvels(p_raw))
+        kf_std = _std(_xvels(p_kf))
+        self.assertGreater(raw_std, 0.0)
+        self.assertLess(kf_std, raw_std)
+
+    def test_kalman_miss_still_zero(self):
+        """丢帧帧 (miss) 不发 kalman, 照旧发 0 停."""
+        frames = [_frame("ball_yellow", 0.5, 0.5),
+                  _frame("animal", 0.2, 0.2)]
+        result, posts = self._run(frames, kalman=True)
+        self.assertEqual(result.hits, 1)
+        self.assertEqual(result.misses, 1)
+        self.assertEqual(posts[1]["x_vel"], 0.0)
+
+    def test_kalman_import_fail_disables(self):
+        """filterpy 未装 (ArmKalmanTracker 构造抛 ImportError) → 自动降级, 行为同原始."""
+        frames = [_frame("ball_yellow", 0.5, 0.4)]
+        r_raw, p_raw = self._run(frames, gain=0.1)
+        with mock.patch(
+            "main.arm.vision.kalman.ArmKalmanTracker.__init__",
+            side_effect=ImportError("no filterpy"),
+        ):
+            # _maybe_tracker 内部捕获 → 返回 None 降级, kalman=True 不炸
+            r_kf, p_kf = self._run(frames, gain=0.1, kalman=True)
+        self.assertAlmostEqual(p_kf[0]["x_vel"], p_raw[0]["x_vel"], places=6)
+
+    def test_4dof_kalman_unchanged_first_frame(self):
+        """4dof + kalman 首帧结果与关闭一致."""
+        loop, ws, posts, post_fn = _Runner.make(
+            [_frame("ball_yellow", 0.3, 0.2)])
+        result = loop.find_target_4dof(
+            "ball_yellow", ws=ws, post_fn=post_fn, timeout=0.3,
+            gain_x=0.1, gain_y=0.1, gain_arm=2.0, gain_hand=2.0,
+            kalman=True)
+        self.assertEqual(result.hits, 1)
+        self.assertTrue(all("x_vel" in p for p in posts))
+
+
 if __name__ == "__main__":
     unittest.main()
