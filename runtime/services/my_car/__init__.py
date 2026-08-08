@@ -35,6 +35,7 @@ from smartcar.whalesbot.vehicle import (
     ScreenShow,
 )
 
+from .arm_servo_mixin import ArmServoMixin
 from .detection_mixin import DetectionMixin
 from .feeds import FeedsMixin
 from .hardware_io_mixin import HardwareIOMixin
@@ -52,6 +53,7 @@ class MyCar(
     HardwareIOMixin,
     DetectionMixin,
     MotionMixin,
+    ArmServoMixin,
     FeedsMixin,
 ):
     """
