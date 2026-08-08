@@ -400,16 +400,17 @@ def _init_step1_place_align(
     # ERROR 大声告警但照样放行 (比赛完赛优先)。
     marker_label = cfg.get("marker_label", "cylinder_set")
     align_max_s = float(cfg.get("chassis_align", {}).get("max_seconds", 2.0))
-    from main.chassis import track_chassis, track_trace
+    from main.chassis import track_chassis
     result = None
     for attempt in (1, 2):
         logger.info("  track_chassis #%d (target=%r, dry_run=False, max_seconds=%.1f)",
                     attempt, marker_label, align_max_s)
+        # 2026-08-09: 控制律已下沉 runtime, on_tick 逐帧回调不可用 (会打 warning),
+        # 逐帧轨迹改为 runtime result 的 frames/elapsed_s 摘要。
         result = track_chassis(
             marker_label,
             dry_run=False,
             max_seconds=align_max_s,
-            on_tick=track_trace(1),
         )
         logger.info("  track_chassis #%d result: arrived=%s reason=%s frames=%d",
                     attempt, result.arrived, result.reason, result.frames)

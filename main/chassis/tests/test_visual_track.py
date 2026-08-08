@@ -190,13 +190,25 @@ class TestTrackChassisThinWrapper(unittest.TestCase):
             result = track_chassis("h_tu_dou")
             mock_connect.assert_called_once()
 
-    def test_api_always_closed(self):
-        """finally: api.close() 总是调用。"""
+    def test_api_not_closed_when_passed(self):
+        """调用方传入 api → 不自动 close（生命周期归调用方）。"""
         response = {"arrived": False, "reason": "timeout",
                     "frames": 0, "elapsed_s": 0.0, "final_frame": None}
         api = self._make_mock_api(response)
         track_chassis("h_tu_dou", api=api)
-        api.close.assert_called_once()
+        api.close.assert_not_called()
+
+    def test_own_api_closed(self):
+        """api=None 自建 → 收尾 close。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        with unittest.mock.patch(
+            "main.chassis.loops.visual_track.ChassisClient.connect"
+        ) as mock_connect:
+            mock_api = self._make_mock_api(response)
+            mock_connect.return_value = mock_api
+            track_chassis("h_tu_dou")
+            mock_api.close.assert_called_once()
 
     def test_error_response_returns_error_result(self):
         """非 dict 响应 → TrackChassisResult(reason="error")。"""
@@ -216,25 +228,40 @@ class TestTrackChassisThinWrapper(unittest.TestCase):
         result = track_chassis("h_tu_dou", api=api)
         self.assertTrue(result.arrived)
 
-    def test_on_tick_logs_warning(self):
-        """on_tick 传入 → warning 日志。"""
+    def test_on_tick_alone_stays_runtime(self):
+        """on_tick 单独传入（无 sense_fn）→ 仍走 runtime 下沉 + warning。"""
         response = {"arrived": False, "reason": "timeout",
                     "frames": 0, "elapsed_s": 0.0, "final_frame": None}
         api = self._make_mock_api(response)
         cb = MagicMock()
         with self.assertLogs("main.chassis.loops.visual_track", level="WARNING") as cm:
             track_chassis("h_tu_dou", api=api, on_tick=cb)
+        # 走 runtime：chassis_align 被调，on_tick 未回调
+        api.chassis_align.assert_called_once()
+        cb.assert_not_called()
         self.assertTrue(any("on_tick ignored" in m for m in cm.output))
 
-    def test_sense_fn_logs_warning(self):
-        """sense_fn 传入 → warning 日志。"""
+    def test_sense_fn_triggers_client_loop(self):
+        """sense_fn 传入（如 task6 LLM-as-servo）→ 走 client 闭环。"""
         response = {"arrived": False, "reason": "timeout",
                     "frames": 0, "elapsed_s": 0.0, "final_frame": None}
         api = self._make_mock_api(response)
-        sense = MagicMock(return_value=TrackFrame())
-        with self.assertLogs("main.chassis.loops.visual_track", level="WARNING") as cm:
-            track_chassis("h_tu_dou", api=api, sense_fn=sense)
-        self.assertTrue(any("sense_fn ignored" in m for m in cm.output))
+        calls = []
+        cb = MagicMock()
+
+        def _sense():
+            calls.append(1)
+            return TrackFrame(target_found=True, label="order_card",
+                              cx=0.5, cy=0.5, cx_err=-0.01, cy_err=-0.01)
+
+        result = track_chassis("order_card", api=api, sense_fn=_sense,
+                               setpoint_cxcy=(0.5, 0.5),
+                               deadband=0.05, hold_frames=2,
+                               max_seconds=1.0, max_lost_frames=100)
+        # 走 client 闭环：sense_fn 被反复调用，runtime 未参与
+        api.chassis_align.assert_not_called()
+        self.assertGreater(len(calls), 0)
+        self.assertTrue(result.arrived)
 
 
 if __name__ == "__main__":
