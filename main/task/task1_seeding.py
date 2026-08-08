@@ -422,6 +422,9 @@ def _init_step1_place_align(
         logger.error("  底盘对齐两次均失败 (reason=%s)! task1 放行, 但后续 S/T 列"
                      "网格原点不可信, 请检查 task_feed / 检测 label / realtime 速度通道!",
                      result.reason)
+    if not getattr(result, "stop_ok", True):
+        logger.warning("  align 闭环零速下发失败 (stop_ok=False)! 显式停车兜底, "
+                       "但注意底盘可能仍在按最后非零指令滑行 (串口/下位机异常)")
     # track_chassis 用 realtime/chassis-velocity, 结束后必须显式停车 + 确认停稳!
     # 用户 00:26: pick 第二个时车会往前跑 — 因为零速指令是异步的, 车还没停就开始 pick
     try:
@@ -429,17 +432,12 @@ def _init_step1_place_align(
                              {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
     except Exception:
         pass
-    # 等车真正停稳: 轮速归零才继续 (最多等 1s)
-    _stop_deadline = time.monotonic() + 1.0
-    while time.monotonic() < _stop_deadline:
-        try:
-            ws_resp = arm_client.http.get("/v1/realtime/wheels/speeds", timeout=1)
-            speeds = (ws_resp or {}).get("speeds") or []
-            if all(abs(float(s)) < 0.01 for s in speeds):
-                break
-        except Exception:
-            break
-        time.sleep(0.1)
+    # 等车真正停稳: 真实编码器反馈双采样判定轮子不动才继续 (最多等 1s).
+    # 2026-08-09: 旧实现 GET /v1/realtime/wheels/speeds 端点只存在 POST (405) →
+    # 等待立即 break, "车会往前跑" 的保护从来没生效过; 改为编码器双采样
+    # (与 target4 rearm 判停同构)。停稳失败只 warn, 不阻塞任务 (完赛优先)。
+    if not arm_client.http.wait_wheels_stopped(settle_s=0.2, timeout_s=1.0):
+        logger.warning("  align 后 1s 内轮子未停稳 (编码器仍位移), 继续但注意漂移")
     time.sleep(0.2)  # 额外喘气, 防 504
     def _odom_curr() -> tuple:
         try:

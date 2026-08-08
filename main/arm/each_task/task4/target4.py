@@ -472,6 +472,9 @@ def _track_leftmost_ball(
                 final_frame=ff,
                 frames=res.frames,
                 elapsed_s=res.elapsed_s,
+                stop_ok=getattr(res, "stop_ok", True),
+                motion_ok=getattr(res, "motion_ok", True),
+                enc_delta=getattr(res, "enc_delta", None),
             )
             return res
 
@@ -509,6 +512,13 @@ def _track_leftmost_ball(
                         final_frame=rff,
                         frames=res.frames + retry_res.frames,
                         elapsed_s=res.elapsed_s + retry_res.elapsed_s,
+                        stop_ok=getattr(retry_res, "stop_ok",
+                                        getattr(res, "stop_ok", True)),
+                        motion_ok=getattr(retry_res, "motion_ok",
+                                          getattr(res, "motion_ok", True)),
+                        enc_delta=getattr(
+                            retry_res, "enc_delta",
+                            getattr(res, "enc_delta", None)),
                     )
             # 软重试失败: 也检查宽死区
             rff = retry_res.final_frame
@@ -525,6 +535,13 @@ def _track_leftmost_ball(
                         final_frame=rff,
                         frames=res.frames + retry_res.frames,
                         elapsed_s=res.elapsed_s + retry_res.elapsed_s,
+                        stop_ok=getattr(retry_res, "stop_ok",
+                                        getattr(res, "stop_ok", True)),
+                        motion_ok=getattr(retry_res, "motion_ok",
+                                          getattr(res, "motion_ok", True)),
+                        enc_delta=getattr(
+                            retry_res, "enc_delta",
+                            getattr(res, "enc_delta", None)),
                     )
             # 真正失败: 仍返回原 res (arrived=False, reason=timeout)
             print(f"  [{LOG_PREFIX}] ❌ track 软重试也失败: "
@@ -542,6 +559,9 @@ def _track_leftmost_ball(
                 final_frame=ff,
                 frames=res.frames,
                 elapsed_s=res.elapsed_s,
+                stop_ok=getattr(res, "stop_ok", True),
+                motion_ok=getattr(res, "motion_ok", True),
+                enc_delta=getattr(res, "enc_delta", None),
             )
 
     return res
@@ -1076,7 +1096,29 @@ def step_target4(
                     pass
             print(f"  [{LOG_PREFIX}] track 結束: arrived={track_res.arrived} "
                   f"reason={track_res.reason}")
-            # 2026-08-06: 软成功 / 宽成 提示. arrived=True 但 reason 是 near_arrived_*
+            # 2026-08-09: 下沉后 align 返回 stop_ok / motion_ok —— finally 零速是否
+            # 到达轮子 / 期间轮子是否物理位移 (真实编码器反馈)。stop_ok=False =
+            # 命令路径断了 (串口/下位机异常) 或车仍在滑行; motion_ok=False = 发了
+            # 命令但编码器没动 ("200 但轮不转" 假死)。两者任一 → 先显式停稳,
+            # 再决定是否重武装 (旧代码只 trust track_chassis 内部 finally)。
+            if not dry_run and (
+                not getattr(track_res, "stop_ok", True)
+                or not getattr(track_res, "motion_ok", True)
+            ):
+                print(f"  [{LOG_PREFIX}] ⚠️ track 命令/位移异常 "
+                      f"(stop_ok={getattr(track_res, 'stop_ok', True)} "
+                      f"motion_ok={getattr(track_res, 'motion_ok', True)}), 显式停稳...")
+                try:
+                    http_client.post(
+                        f"{http_client.api_prefix}/realtime/chassis-velocity",
+                        {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
+                except Exception:
+                    pass
+                try:
+                    http_client.wait_wheels_stopped(settle_s=0.15, timeout_s=1.0)
+                except Exception:
+                    pass
+            # 2026-08-06 软成功 / 宽成 提示. arrived=True 但 reason 是 near_arrived_*
             # 表示 timeout 内没硬停但 final_frame 落入软/宽死区, 视为对齐.
             if track_res.arrived and track_res.reason in (
                 "near_arrived_soft", "near_arrived_soft_retry", "near_arrived_wide",
@@ -1100,13 +1142,31 @@ def step_target4(
             #   而不是 "球真的消失". 救治思路: 在 no_target 退出后, 主动检查
             #   encoder 是否真没动, 若没动 → 一次 reset-stop + 强制 0 速重下发
             #   ("重武装"), 给下一拍 set_chassis_velocity 一次干净的环境.
-            if (not track_res.arrived and track_res.reason == "no_target"
-                    and not dry_run):
+            # 2026-08-09: 下沉后 reason 集合变了 — 串口掉线但视觉仍活时车不动,
+            #   cx_err 不收敛 → 满预算 timeout (不是 no_target); 若命令路径彻底
+            #   断了, align 现在会 control_lost 快速退出 + stop_ok=False; 甚至
+            #   arrived 但 motion_ok=False (发了命令编码器没动 = 200 但轮不转)。
+            #   旧代码只在 no_target 触发 rearm → 这些场景全漏 → 每球白烧
+            #   max_seconds 才计失败。统一: 对齐结果不可信 (未 arrived 或 arrived
+            #   但没物理位移) 且 (no_target / watchdog / control_lost / stop_ok=False
+            #   / motion_ok=False) → 重武装 + 重试 1 次。
+            track_trusted = bool(track_res.arrived) and getattr(
+                track_res, "motion_ok", True)
+            needs_rearm = (
+                not dry_run
+                and not track_trusted
+                and (
+                    track_res.reason in ("no_target", "watchdog", "control_lost")
+                    or not getattr(track_res, "stop_ok", True)
+                    or not getattr(track_res, "motion_ok", True)
+                )
+            )
+            if needs_rearm:
                 rear = _chassis_rearm_if_stuck(http_client, settle_s=0.5)
                 if rear:
                     print(f"  [{LOG_PREFIX}] [REARM] 检测到底盘无响应, 已重武装 "
                           f"(reset-stop + 0 速下发), 重试一次 track")
-                    # 重试 1 次: 拿 3s 给一次集中机会, 若再 no_target 就硬失败
+                    # 重试 1 次: 拿 3s 给一次集中机会, 若再失败就硬失败
                     retry = track_chassis(
                         target=BALL_LABELS,
                         select_mode="leftmost",
@@ -1124,12 +1184,12 @@ def step_target4(
                               f"arrived=True reason={retry.reason}")
                 else:
                     print(f"  [{LOG_PREFIX}] [REARM] 底盘有响应 (encoder 在动), "
-                          f"no_target 是视觉真丢, 不重武装")
+                          f"{track_res.reason} 是视觉真丢/车在滑, 不重武装")
 
             # 2026-08-06: track 失败要计入 n_consecutive_failures, 否则
             # 永不触发 max_consecutive_pick_failures 退出 —— 这是 task4
             # "卡住 + 跳过"的隐性根因之一. reason ∈ {arrived} 视为成功,
-            # 其他 {timeout, no_target, watchdog, stopped} 全算失败.
+            # 其他 {timeout, no_target, watchdog, stopped, control_lost} 全算失败.
             track_ok = bool(track_res.arrived)
             if not track_ok and not dry_run:
                 n_consecutive_failures += 1

@@ -574,6 +574,29 @@ class MecanumDriver:
         self._stop_thread = True
         self.odometry_thread.join()
 
+    def ensure_odometry_thread(self):
+        """里程计线程死亡后重建 (2026-08-09)。
+
+        update_odometry_thread 任一轮读/积分异常会永久 break, 且没有任何重启
+        保护 → odom_state 冻结 → 产生"200 但轮不转"假象 (UI/业务读到冻结 odom),
+        更危险的是 move_for (odom PID 闭环) 会一直打到 timeout 跑飞。运行时
+        feed watchdog 定期调本方法兜底: 线程活着直接返回, 死了重建一个
+        (SerialEngine 统一串行字节流, 重建线程与现有串口用户无冲突)。
+
+        Returns:
+            bool: 当前线程存活 (或重建后存活) = True; close() 后 = False。
+        """
+        if getattr(self, "_stop_thread", False):
+            return False
+        t = getattr(self, "odometry_thread", None)
+        if t is not None and t.is_alive():
+            return True
+        self.odometry_thread = threading.Thread(
+            target=self.update_odometry_thread, daemon=True)
+        self.odometry_thread.start()
+        logger.warning("odometry 线程已死亡, 已重建")
+        return True
+
     def move_to_position(
         self,
         target_position,

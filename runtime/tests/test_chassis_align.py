@@ -329,6 +329,149 @@ class TestChassisAlignController(unittest.TestCase):
         self.assertTrue(all(v <= 0 for v in vx_values),
                         f"All vx should be <= 0 with sign_vx=-1, got {vx_values}")
 
+    def test_stop_ok_true_normal(self):
+        """正常闭环 → finally 零速成功 → stop_ok=True 且最后一条确实是零速。"""
+        dets = [_d(cx=0.3)] * 10
+        svc = _make_service_with_detections(dets)
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50, max_seconds=3.0)
+        result = _fast_run(ctrl)
+        self.assertIn("stop_ok", result)
+        self.assertTrue(result["stop_ok"])
+        self.assertEqual(svc.set_chassis_velocity_calls[-1][:2], (0.0, 0.0))
+
+    def test_stop_ok_false_when_velocity_write_fails(self):
+        """主路径 + 兜底都失败 → finally 零速未达 → stop_ok=False (客户端可感知)."""
+        dets = [_d(cx=0.3)] * 10
+        svc = _make_service_with_detections(dets)
+
+        def _boom(*a, **k):
+            raise RuntimeError("serial down")
+
+        svc.set_chassis_velocity = _boom
+        svc.set_wheel_speeds = _boom
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50, max_seconds=3.0)
+        result = _fast_run(ctrl)
+        self.assertFalse(result["stop_ok"])
+
+    def test_control_lost_early_exit_on_write_fail(self):
+        """命令路径连续失败 → 快速 control_lost 退出, 不烧满 max_seconds.
+
+        串口/下位机掉线但视觉仍活 (task_feed 独立于 MC602) 时, 旧行为会满预算
+        timeout (每球白烧 12s); 现在默认 10 帧 ≈ 0.5s 内快速失败, 任务层可立即重武装。
+        """
+        dets = [_d(cx=0.3)] * 100
+        svc = _make_service_with_detections(dets)
+
+        def _boom(*a, **k):
+            raise RuntimeError("serial down")
+
+        svc.set_chassis_velocity = _boom
+        svc.set_wheel_speeds = _boom
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=10.0, max_control_fail_frames=5)
+        result = _fast_run(ctrl)
+        self.assertEqual(result["reason"], "control_lost")
+        self.assertEqual(result["frames"], 5)       # 没烧满 10s, 第 5 帧就退出
+        self.assertFalse(result["stop_ok"])
+
+    def test_control_lost_recovers_on_success(self):
+        """中间成功一帧 → 连续失败计数清零, 不误触 control_lost。"""
+        dets = [_d(cx=0.3)] * 100
+        svc = _make_service_with_detections(dets)
+        call_n = [0]
+        real_set = svc.set_chassis_velocity
+
+        def _flaky(*a, **k):
+            call_n[0] += 1
+            if call_n[0] <= 4:  # 前 4 帧失败, 之后恢复
+                raise RuntimeError("serial busy")
+            return real_set(*a, **k)
+
+        svc.set_chassis_velocity = _flaky
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=10.0, max_control_fail_frames=5)
+        result = _fast_run(ctrl)
+        # 前 4 帧失败 (streak=4 < 5), 第 5 帧成功 → streak 清零 → 不触 control_lost,
+        # 最后因 deadband 收敛或 timeout 正常结束
+        self.assertNotEqual(result["reason"], "control_lost")
+
+    def test_motion_ok_false_when_commanded_but_encoders_static(self):
+        """下发非零命令但编码器没动 (200 但轮不转) → motion_ok=False。"""
+        dets = [_d(cx=0.5)] * 100
+        svc = _make_service_with_detections(dets)
+        svc.get_wheel_encoders = lambda: [0.0, 0.0, 0.0, 0.0]
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=3.0, max_control_fail_frames=200)
+        result = _fast_run(ctrl)
+        self.assertFalse(result["motion_ok"])
+        self.assertAlmostEqual(result["enc_delta"], 0.0, places=6)
+
+    def test_motion_ok_true_when_wheels_moved(self):
+        """编码器位移 ≥ 阈值 → motion_ok=True。"""
+        dets = [_d(cx=0.5)] * 100
+        svc = _make_service_with_detections(dets)
+        calls = [0]
+
+        def _read():
+            calls[0] += 1
+            return [5.0] * 4 if calls[0] > 1 else [0.0] * 4
+
+        svc.get_wheel_encoders = _read
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=3.0, max_control_fail_frames=200)
+        result = _fast_run(ctrl)
+        self.assertTrue(result["motion_ok"])
+        self.assertGreaterEqual(result["enc_delta"], 20.0)  # 4 轮 × 5.0
+
+    def test_motion_ok_true_when_no_command(self):
+        """目标已居中 (命令 0) → 无需位移 → motion_ok=True。"""
+        dets = [_d(cx=0.01, cy=0.01)] * 20
+        svc = _make_service_with_detections(dets)
+        svc.get_wheel_encoders = lambda: [0.0, 0.0, 0.0, 0.0]
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=3.0, max_control_fail_frames=200)
+        result = _fast_run(ctrl)
+        self.assertTrue(result["motion_ok"])
+
+    def test_decouple_xy_drives_single_axis(self):
+        """decouple_xy 默认开: 每帧只驱动误差较大的单轴 (另一轴 0) → 4 轮一起平移。
+
+        cx=0.4, cy=0.2 → |cx|>|cy| → 只动 vx, vy 恒 0; 反之只动 vy。
+        """
+        # x 误差更大 → vx 动, vy 0
+        svc = _make_service_with_detections([_d(cx=0.4, cy=0.2)] * 50)
+        ctrl = _make_controller(svc, kp=0.20, v_slew=0.10,
+                                deadband=0.01, hold_frames=100,
+                                hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl)
+        x_only = [(vx, vy) for vx, vy, _ in svc.set_chassis_velocity_calls[:-1]]
+        self.assertTrue(any(abs(vx) > 1e-6 for vx, _ in x_only))
+        self.assertTrue(all(abs(vy) < 1e-9 for _, vy in x_only),
+                        f"decouple_xy: vy 应恒 0 (x 误差更大), got {x_only[:3]}")
+
+        # y 误差更大 → vy 动, vx 0
+        svc2 = _make_service_with_detections([_d(cx=0.2, cy=0.4)] * 50)
+        ctrl2 = _make_controller(svc2, kp=0.20, v_slew=0.10,
+                                 deadband=0.01, hold_frames=100,
+                                 hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl2)
+        y_only = [(vx, vy) for vx, vy, _ in svc2.set_chassis_velocity_calls[:-1]]
+        self.assertTrue(any(abs(vy) > 1e-6 for _, vy in y_only))
+        self.assertTrue(all(abs(vx) < 1e-9 for vx, _ in y_only),
+                        f"decouple_xy: vx 应恒 0 (y 误差更大), got {y_only[:3]}")
+
+    def test_decouple_xy_false_keeps_diagonal(self):
+        """decouple_xy=False → 保留对角平移 (vx, vy 同时非零)。"""
+        svc = _make_service_with_detections([_d(cx=0.4, cy=0.2)] * 50)
+        ctrl = _make_controller(svc, kp=0.20, v_slew=0.10,
+                                decouple_xy=False,
+                                deadband=0.01, hold_frames=100,
+                                hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl)
+        diag = [(vx, vy) for vx, vy, _ in svc.set_chassis_velocity_calls[:-1]]
+        self.assertTrue(any(abs(vx) > 1e-6 and abs(vy) > 1e-6 for vx, vy in diag),
+                        f"decouple_xy=False 应同时动两轴, got {diag[:3]}")
+
 
 # ===== Kalman 平滑（filterpy，2026-08-09）=====
 

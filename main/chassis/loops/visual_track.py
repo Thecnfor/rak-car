@@ -254,6 +254,11 @@ class TrackChassisResult:
     final_frame: Optional[TrackFrame] = None
     frames: int = 0
     elapsed_s: float = 0.0
+    # runtime 对齐闭环 finally 零速是否到达轮子 (2026-08-09); client 闭环同样跟踪。
+    stop_ok: bool = True
+    # 对齐期间轮子是否物理位移 (真实编码器反馈); runtime 下沉后透传。
+    motion_ok: bool = True
+    enc_delta: Optional[float] = None
 
 
 # ============ 主函数: track_chassis ============
@@ -279,6 +284,7 @@ def _track_chassis_client_loop(
     hz: float = 20.0,
     max_seconds: float = 10.0,
     dry_run: bool = False,
+    decouple_xy: bool = True,
     on_tick: Optional[Callable[[TrackFrame, Tuple[float, float]], None]] = None,
     sense_fn: Optional[Callable[[], TrackFrame]] = None,
 ) -> TrackChassisResult:
@@ -301,16 +307,19 @@ def _track_chassis_client_loop(
     deadline = start + max(0.0, float(max_seconds))
     next_tick = time.monotonic()
 
-    def _set_vel(vx: float, vy: float) -> None:
+    def _set_vel(vx: float, vy: float) -> bool:
+        """下发底盘三速; 返回是否成功 (主路径 + 兜底都失败 → False)."""
         if dry_run:
-            return
+            return True
         try:
             api.set_chassis_velocity(vx, vy, 0.0, timeout=1.5)
+            return True
         except Exception:
             try:
                 api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30), timeout=1.0)
+                return True
             except Exception:
-                pass
+                return False
 
     frames = 0
     in_band = 0
@@ -321,6 +330,7 @@ def _track_chassis_client_loop(
     arrived = False
     reason = "timeout"
     watchdog_triggered = False
+    stop_ok = True
 
     try:
         while True:
@@ -369,10 +379,22 @@ def _track_chassis_client_loop(
 
             cx_err = frm.cx_err if frm.cx_err is not None else 0.0
             cy_err = frm.cy_err if frm.cy_err is not None else 0.0
-            vx = float(sign_vx) * float(kp) * float(cx_err)
             if vx_only:
+                # 只动 x (task6 LLM-as-servo)
+                vx = float(sign_vx) * float(kp) * float(cx_err)
                 vy = 0.0
+            elif decouple_xy:
+                # 4 轮一起平移 (2026-08-09, 与 runtime 同构): 每帧只驱动误差
+                # 较大的单轴, 另一轴 0 → 纯 x/纯 y 平移 4 轮全动, 避免 |vx|≈|vy|
+                # 时 IK 置零一对对角轮导致打滑。
+                if abs(cx_err) >= abs(cy_err):
+                    vx = float(sign_vx) * float(kp) * float(cx_err)
+                    vy = 0.0
+                else:
+                    vx = 0.0
+                    vy = float(sign_vy) * float(kp) * float(cy_err)
             else:
+                vx = float(sign_vx) * float(kp) * float(cx_err)
                 vy = float(sign_vy) * float(kp) * float(cy_err)
             if vx > v_max:
                 vx = v_max
@@ -415,7 +437,7 @@ def _track_chassis_client_loop(
                 except Exception:
                     pass
     finally:
-        _set_vel(0.0, 0.0)
+        stop_ok = _set_vel(0.0, 0.0)
 
     if watchdog_triggered:
         reason = "watchdog"
@@ -427,6 +449,7 @@ def _track_chassis_client_loop(
         final_frame=final_frame,
         frames=frames,
         elapsed_s=elapsed,
+        stop_ok=stop_ok,
     )
 
 
@@ -451,6 +474,7 @@ def track_chassis(
     max_seconds: float = 10.0,
     dry_run: bool = False,
     kalman: bool = True,
+    decouple_xy: bool = True,
     on_tick: Optional[Callable[[TrackFrame, Tuple[float, float]], None]] = None,
     sense_fn: Optional[Callable[[], TrackFrame]] = None,
 ) -> TrackChassisResult:
@@ -465,6 +489,9 @@ def track_chassis(
       - **传了 sense_fn**：走 client 侧闭环（`_track_chassis_client_loop`）。
         检测源（LLM-as-servo，task6）是 client 特有能力，无法下沉 runtime，
         保持旧行为。``kalman`` 仅作用于 runtime 路径, client 闭环不使用。
+      - ``decouple_xy``（默认 True, 2026-08-09 用户决策）：控制律每帧只驱动
+        误差较大的单轴 → 4 轮一起平移, 避免 |vx|≈|vy| 时麦轮 IK 置零一对
+        对角轮导致单对轮打滑。False 保留旧对角平移。
     """
     own_api = api is None
     if api is None:
@@ -483,6 +510,7 @@ def track_chassis(
                 watchdog_ms=watchdog_ms,
                 hz=hz, max_seconds=max_seconds,
                 dry_run=dry_run,
+                decouple_xy=decouple_xy,
                 on_tick=on_tick, sense_fn=sense_fn,
             )
         if on_tick is not None:
@@ -499,6 +527,7 @@ def track_chassis(
             hz=hz, max_seconds=max_seconds,
             dry_run=dry_run,
             kalman=kalman,
+            decouple_xy=decouple_xy,
         )
     finally:
         if own_api:
@@ -530,6 +559,9 @@ def track_chassis(
         final_frame=final_frame,
         frames=int(result_data.get("frames", 0)),
         elapsed_s=float(result_data.get("elapsed_s", 0.0)),
+        stop_ok=bool(result_data.get("stop_ok", True)),
+        motion_ok=bool(result_data.get("motion_ok", True)),
+        enc_delta=result_data.get("enc_delta"),
     )
 
 

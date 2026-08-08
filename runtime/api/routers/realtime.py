@@ -144,7 +144,9 @@ def build_realtime_router(service):
           kp, v_max, deadband, hold_frames, v_slew, max_lost_frames,
           recover_after_lost, watchdog_ms, hz, max_seconds, dry_run,
           kalman (bool, 默认 False: 有检测帧时用 filterpy 常速 Kalman 平滑
-          bbox cx/cy, 抑制帧间抖动; 需 Jetson 装 filterpy, 未装自动禁用)
+          bbox cx/cy, 抑制帧间抖动; 需 Jetson 装 filterpy, 未装自动禁用),
+          decouple_xy (bool, 默认 True: 每帧只驱动误差较大的单轴 → 4 轮一起
+          平移, 避免 |vx|≈|vy| 时麦轮 IK 置零一对对角轮打滑; False=旧对角平移)
         返回: TrackChassisResult dict (arrived / reason / frames / elapsed_s / final_frame)
         """
         try:

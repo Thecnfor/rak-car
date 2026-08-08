@@ -142,10 +142,20 @@ class TrackFrame:
 @dataclass
 class TrackChassisResult:
     arrived: bool = False
-    reason: str = "unknown"  # arrived / timeout / watchdog / no_target
+    reason: str = "unknown"  # arrived / timeout / watchdog / no_target / control_lost
     final_frame: Optional[TrackFrame] = None
     frames: int = 0
     elapsed_s: float = 0.0
+    # 2026-08-09: 闭环 finally 的零速是否真的下发到轮子 (False = 主路径 + 兜底
+    # 都失败, 底盘可能仍按最后非零指令滑行)。下沉后客户端看不到帧内异常, 只能
+    # 靠这个字段判断"车到底停了没有"。
+    stop_ok: bool = True
+    # 2026-08-09: 对齐期间轮子是否物理位移 (真实编码器反馈, 非命令积分)。
+    # 串口/下位机假死时 set_chassis_velocity 可能不报错但轮子不转 (HTTP 200
+    # 但 no-motion) → 即使 stop_ok=True 车也没真正对齐 → motion_ok=False。
+    # 有下发命令但编码器没动 = 命令路径假死; 无命令 (目标已居中) → True。
+    motion_ok: bool = True
+    enc_delta: Optional[float] = None
 
 
 # ---- 目标轨迹 Kalman 平滑（2026-08-09）----
@@ -210,7 +220,9 @@ class ChassisAlignController:
                  v_slew=0.02, max_lost_frames=60, recover_after_lost=True,
                  watchdog_ms=2000.0,
                  hz=20.0, max_seconds=10.0, dry_run=False,
-                 kalman=True):
+                 kalman=True,
+                 max_control_fail_frames: int = 10,
+                 decouple_xy: bool = True):
         self._service = service
         self._target = target
         self._setpoint_cxcy = tuple(float(x) for x in setpoint_cxcy)
@@ -229,8 +241,19 @@ class ChassisAlignController:
         self._hz = float(hz)
         self._max_seconds = float(max_seconds)
         self._dry_run = bool(dry_run)
-        # Kalman 平滑（可开关, 默认关保持已验证行为）: 有检测帧时平滑 cx/cy
-        # 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
+        # 2026-08-09 用户: 微调只动对角轮会打滑 → 4 轮一起平移。麦轮 IK 在
+        # |vx|≈|vy| 的 45° 对角平移时, (vx±vy) 把一对对角轮置 0 → 只剩 2 轮
+        # 提供牵引 → 打滑。decouple_xy=True 时每帧只驱动误差较大的单轴
+        # (另一轴 0): 纯 x / 纯 y 平移 4 轮全动, 永不出现对角死对。
+        # decouple_xy=False 保留旧对角平移 (真机对拍用)。
+        self._decouple_xy = bool(decouple_xy)
+        # 2026-08-09: 命令路径连续失败快速退出。串口/下位机掉线时 _set_vel 一直 False,
+        # 视觉却仍活 (task_feed 独立于 MC602) → cx_err 不收敛 → 满预算 timeout 才退,
+        # task 每球白烧 max_seconds。连续失败 max_control_fail_frames 帧 (默认 10 ≈ 0.5s
+        # @20Hz) → reason=control_lost 提前退出, 任务层可立即重武装而不是干等。
+        self._max_control_fail_frames = int(max(1, max_control_fail_frames))
+        # Kalman 平滑（默认开, 2026-08-09 用户决定; kalman=False 显式关保持原始
+        # 检测）: 有检测帧时平滑 cx/cy 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
         self._kalman = None
         if kalman:
             try:
@@ -253,11 +276,13 @@ class ChassisAlignController:
         next_tick = time.monotonic()
 
         def _set_vel(vx, vy):
+            """下发底盘三速; 返回是否成功 (False = 主路径 + 兜底都失败)."""
             if self._dry_run:
-                return
+                return True
             try:
                 # 优先走 service 直发（内部 IK + 命令追踪）
                 self._service.set_chassis_velocity(vx, vy, 0.0)
+                return True
             except Exception:
                 try:
                     # 兜底: 本地 IK 直发轮速
@@ -265,8 +290,10 @@ class ChassisAlignController:
                     if car_ref is not None:
                         ws = list(car_ref.chassis.calculate_wheel_velocities(vx, vy, 0.0))
                         self._service.set_wheel_speeds([float(s) for s in ws])
+                        return True
                 except Exception:
                     pass
+                return False
 
         frames = 0
         in_band = 0
@@ -277,6 +304,39 @@ class ChassisAlignController:
         arrived = False
         reason = "timeout"
         watchdog_triggered = False
+        stop_ok = True
+        _ctl_fail_streak = 0
+        max_commanded = 0.0
+
+        def _read_encoders():
+            """读真实 4 轮编码器 (弧度累计, MC602 反馈); 失败/无端点 → None."""
+            try:
+                fn = getattr(self._service, "get_wheel_encoders", None)
+                if fn is None:
+                    return None
+                e = fn()
+                if isinstance(e, dict):
+                    e = e.get("encoders")
+                if isinstance(e, (list, tuple)) and len(e) == 4:
+                    return [float(x) for x in e]
+                return None
+            except Exception:
+                return None
+
+        enc0 = _read_encoders()
+
+        def _send(vx, vy) -> bool:
+            """下发三速并跟踪连续失败; 连续失败超阈值 → reason=control_lost, 返回 False."""
+            nonlocal _ctl_fail_streak, reason, max_commanded
+            max_commanded = max(max_commanded, abs(vx), abs(vy))
+            if _set_vel(vx, vy):
+                _ctl_fail_streak = 0
+                return True
+            _ctl_fail_streak += 1
+            if _ctl_fail_streak >= self._max_control_fail_frames:
+                reason = "control_lost"
+                return False
+            return True
 
         try:
             while True:
@@ -377,7 +437,8 @@ class ChassisAlignController:
                         vx, vy = -last_vx * 0.5, -last_vy * 0.5
                     else:
                         vx, vy = 0.0, 0.0
-                    _set_vel(vx, vy)
+                    if not _send(vx, vy):
+                        break
                     frm.vx, frm.vy = vx, vy
                     if lost_frames > self._max_lost_frames:
                         reason = "no_target"
@@ -389,10 +450,21 @@ class ChassisAlignController:
                 cy_err = frm.cy_err if frm.cy_err is not None else 0.0
 
                 # P 控制律
-                vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                 if self._vx_only:
+                    # task6 LLM-as-servo: 只动 x
+                    vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                     vy = 0.0
+                elif self._decouple_xy:
+                    # 4 轮一起平移 (2026-08-09): 每帧只驱动误差较大的单轴, 另一轴 0。
+                    # 同时驱动 vx+vy 且 |vx|≈|vy| 时 IK 置零一对对角轮 → 打滑。
+                    if abs(cx_err) >= abs(cy_err):
+                        vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
+                        vy = 0.0
+                    else:
+                        vx = 0.0
+                        vy = float(self._sign_vy) * float(self._kp) * float(cy_err)
                 else:
+                    vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                     vy = float(self._sign_vy) * float(self._kp) * float(cy_err)
 
                 # v_max 限幅
@@ -432,12 +504,21 @@ class ChassisAlignController:
 
                 last_vx, last_vy = vx, vy
                 frm.vx, frm.vy = vx, vy
-                _set_vel(vx, vy)
+                if not _send(vx, vy):
+                    break
         finally:
-            _set_vel(0.0, 0.0)
+            stop_ok = _set_vel(0.0, 0.0)
+            enc1 = _read_encoders()
 
         if watchdog_triggered:
             reason = "watchdog"
+
+        # 物理位移判定: 命令路径假死 (200 但轮不转) 时编码器位移 ~0。
+        enc_delta = None
+        if enc0 is not None and enc1 is not None:
+            enc_delta = sum(abs(enc1[i] - enc0[i]) for i in range(4))
+        motion_ok = (max_commanded < 0.001) or (
+            enc_delta is not None and enc_delta >= 1.0)
 
         elapsed = time.monotonic() - start
         result = TrackChassisResult(
@@ -446,5 +527,8 @@ class ChassisAlignController:
             final_frame=final_frame,
             frames=frames,
             elapsed_s=elapsed,
+            stop_ok=stop_ok,
+            motion_ok=motion_ok,
+            enc_delta=enc_delta,
         )
         return result.__dict__
