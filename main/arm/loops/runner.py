@@ -481,6 +481,192 @@ class ArmRunner:
                 self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
                                           hand=hand_start, timeout=20.0)
 
+    def track_velocity_pick_4dof(self, label: str, *,
+                                  x_start: float = -190.0, y_start: float = -180.0,
+                                  arm_start: float = -85.0, hand_start: float = -25.0,
+                                  grasp_y_mm: float = -20.0,
+                                  grasp_x_offset_mm: float = 0.0,
+                                  descend_hand_deg: Optional[float] = None,
+                                  mode: str = "pick",
+                                  timeout: float = 30.0, hz: float = 20.0,
+                                  gain_x: float = 0.05, gain_y: float = 0.05,
+                                  gain_arm: float = 2.0, gain_hand: float = 2.0,
+                                  deadzone: float = 0.02, max_vel: float = 0.15,
+                                  hold_y: bool = False,
+                                  arm_min: Optional[float] = None,
+                                  arm_max: Optional[float] = None,
+                                  x_error_source: str = "dx",
+                                  setpoint_x_norm: Optional[float] = None,
+                                  setpoint_y_norm: Optional[float] = None,
+                                  settle_hits: int = 3,
+                                  lift_back: bool = True,
+                                  two_pass: bool = False,
+                                  pass2_y_mm: Optional[float] = None,
+                                  pass2_gain_x: Optional[float] = None,
+                                  pass2_gain_arm: Optional[float] = None,
+                                  pass2_gain_hand: Optional[float] = None,
+                                  pass2_max_vel: Optional[float] = None,
+                                  pass2_timeout: Optional[float] = None) -> dict:
+        """4-DOF 视觉对齐抓取: xy + 大臂 + 手抓 全轴联动 (2026-08-07, task6 蔬菜).
+
+        task6 蔬菜抓取需求: 对齐阶段四轴都要动 (xy 十字 + 大臂 + 手抓), 不是
+        track_velocity_pick 的"大臂控 cx + x 十字控 cy"两轴方案。
+
+        对齐 (find_target_4dof): x_vel 控 dx + y_vel 控 dy + arm/hand 增量转向,
+        hold_y=False → y 十字也动. 收敛 (末段 settle_hits 帧 |dx|,|dy|<deadzone)
+        后 → y 降到 grasp_y + hand 转 descend_hand_deg (并发) → 真空吸 → 抬回.
+
+        grasp_x_offset_mm (2026-08-08): 抓取下降时 X 向 0 方向移动这么多 mm;
+        当前 X 已在 [-10,0] 则不动. 0 = 不额外移 X.
+
+        检测丢失 → xy 停, 角度保持 (find_target_4dof 内部).
+
+        Returns: 同 track_velocity_pick 的 dict {ok, reason, trace_hits, settled,
+                 end_arm, end_hand, steps}.
+        """
+        self.client.composite_run(arm=arm_start, x_mm=x_start, y_mm=y_start,
+                                  hand=hand_start, timeout=20.0)
+        sp = self._resolve_nozzle_setpoint(setpoint_x_norm, setpoint_y_norm, label=label)
+        sx, sy = (sp if sp else (0.0, 0.0))
+        try:
+            self._set_arm_feed(stop=True)
+            result = self.client._make_vision_with_move().find_target_4dof(
+                label, timeout=timeout, hz=hz,
+                gain_x=gain_x, gain_y=gain_y, gain_arm=gain_arm, gain_hand=gain_hand,
+                deadzone=deadzone, max_vel=max_vel,
+                arm_start=arm_start, hand_start=hand_start,
+                hold_y=hold_y,
+                arm_min=arm_min, arm_max=arm_max,
+                x_error_source=x_error_source,
+                setpoint_x_norm=sx, setpoint_y_norm=sy,
+            )
+        finally:
+            self._set_arm_feed(stop=False)
+
+        trace_hits = result.hits
+
+        def _converged(t) -> bool:
+            return not t.miss and abs(t.dx) < deadzone and abs(t.dy) < deadzone
+
+        settled = False
+        tail = list(result.trace[-30:])
+        for start in range(len(tail) - settle_hits + 1):
+            if all(_converged(t) for t in tail[start:start + settle_hits]):
+                settled = True
+                break
+
+        # 两阶段 (2026-08-08): 粗对齐后 Y 先降到 pass2_y_mm 再精对齐 (X 更慢)
+        # 触发条件: 粗对齐**看到过目标** (hits>0) 就继续, 不完全收敛也走精对齐
+        if two_pass and trace_hits > 0:
+            p2x = pass2_gain_x if pass2_gain_x is not None else gain_x
+            p2a = pass2_gain_arm if pass2_gain_arm is not None else gain_arm
+            p2h = pass2_gain_hand if pass2_gain_hand is not None else gain_hand
+            p2v = pass2_max_vel if pass2_max_vel is not None else max_vel
+            p2t = pass2_timeout if pass2_timeout is not None else timeout
+            # 粗对齐到位后 Y 先降 (靠近目标, 精对齐更准)
+            if pass2_y_mm is not None:
+                self.client.composite_run(y_mm=pass2_y_mm, speed=100)
+                logger.info("  [两阶段] Y 降到 %.0fmm 再精对齐", pass2_y_mm)
+            try:
+                self._set_arm_feed(stop=True)
+                result2 = self.client._make_vision_with_move().find_target_4dof(
+                    label, timeout=p2t, hz=hz,
+                    gain_x=p2x, gain_y=gain_y, gain_arm=p2a, gain_hand=p2h,
+                    deadzone=deadzone, max_vel=p2v,
+                    # 精对齐从粗对齐终点接着走, 不重置回起点 (2026-08-08 修)
+                    arm_start=result.end_arm or arm_start,
+                    hand_start=result.end_hand or hand_start,
+                    hold_y=hold_y,
+                    arm_min=arm_min, arm_max=arm_max,
+                    x_error_source=x_error_source,
+                    setpoint_x_norm=sx, setpoint_y_norm=sy,
+                )
+            finally:
+                self._set_arm_feed(stop=False)
+            p2_settled = False
+            p2_tail = list(result2.trace[-30:])
+            for start in range(len(p2_tail) - settle_hits + 1):
+                if all(_converged(t) for t in p2_tail[start:start + settle_hits]):
+                    p2_settled = True
+                    break
+            if p2_settled:
+                logger.info("  [两阶段] 精对齐收敛 (pass2: gain_x=%.2f max_vel=%.2f)",
+                            p2x, p2v)
+                result = result2
+                trace_hits = result.hits
+            else:
+                logger.info("  [两阶段] 精对齐未收敛, 用粗对齐结果")
+
+        steps = {"settled": False, "lower": False, "suck": False, "lift": None}
+        if not settled:
+            return {"ok": False, "reason": "not_settled",
+                    "trace_hits": trace_hits, "settled": False,
+                    "end_arm": result.end_arm, "end_hand": result.end_hand, "steps": steps}
+        steps["settled"] = True
+
+        # 对齐完成 → y 降 grasp_y + hand 转 descend_hand (并发) → 吸气 → 抬回
+        try:
+            hand_param = float(descend_hand_deg) if descend_hand_deg is not None else None
+            # 2026-08-08: grasp_x_offset_mm>0 → 抓取时 X 向 0 方向移 (已在 [-10,0] 不动)
+            grasp_x = None
+            if grasp_x_offset_mm and abs(grasp_x_offset_mm) > 1e-3:
+                try:
+                    cur_x = float(self.client.get_state().x_mm)
+                    if not (-10.0 <= cur_x <= 0.0):
+                        step = grasp_x_offset_mm * (1.0 if cur_x < 0 else -1.0)
+                        grasp_x = (cur_x + step) / 1000.0
+                        logger.info("    [诊断] grasp x偏移: cur_x=%.0fmm → target=%.0fmm",
+                                    cur_x, cur_x + step)
+                    else:
+                        logger.info("    [诊断] grasp x偏移: cur_x=%.0fmm 已在[-10,0], 不动 X",
+                                    cur_x)
+                except Exception as exc:
+                    logger.info("    [诊断] grasp x偏移: 读 x 失败 (%s), 不动 X", exc)
+                    grasp_x = None
+            job_down = self.client.http.execute(
+                "arm", "composite_run",
+                kwargs=dict(arm=None, x=grasp_x, y=float(grasp_y_mm) / 1000.0,
+                            hand=hand_param, speed=100, timeout=5.0),
+                sync=False,
+            )
+            jid_down = job_down.get("id") if isinstance(job_down, dict) else None
+            if jid_down:
+                self.client.http.wait_job(jid_down, timeout=5.0)
+            steps["lower"] = True
+
+            if mode == "drop":
+                self.client.drop_object()
+            else:
+                self.client.grasp(True, timeout=5.0)
+            steps["suck"] = True
+
+            if lift_back:
+                try:
+                    self.client.http.execute(
+                        "arm", "composite_run",
+                        kwargs=dict(arm=None, x=None, y=float(y_start) / 1000.0,
+                                    hand=None, speed=100, timeout=5.0),
+                        sync=False,
+                    )
+                    steps["lift"] = True
+                except Exception:
+                    steps["lift"] = False
+        except Exception as exc:
+            try:
+                self.client.http.execute(
+                    "arm", "move_y_position",
+                    kwargs=dict(target=float(y_start) / 1000.0, timeout=5.0),
+                    sync=False,
+                )
+            except Exception:
+                pass
+            return {"ok": False, "reason": f"grasp_failed:{exc}",
+                    "trace_hits": trace_hits, "settled": True,
+                    "end_arm": result.end_arm, "end_hand": result.end_hand, "steps": steps}
+        return {"ok": True, "reason": None, "trace_hits": trace_hits,
+                "settled": True, "end_arm": result.end_arm, "end_hand": result.end_hand,
+                "steps": steps}
+
     def track_velocity_pick(self, label: str, *,
                             x_start: float = 0.0, y_start: float = -180.0,
                             arm_start: float = -90.0, hand_start: float = 0.0,

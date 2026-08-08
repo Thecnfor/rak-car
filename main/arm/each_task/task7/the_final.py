@@ -529,7 +529,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
-    args = build_parser().parse_args(argv)
+    # parse_known_args: 忽略未知参数 (run.py --task 7 等),
+    # 避免经 orchestrator 派发时 SystemExit(2) 崩掉整个 run.py.
+    args, _ = build_parser().parse_known_args(argv)
     client = ArmClient.connect()
     runner = ArmRunner(client)
     result = run(client, runner,
