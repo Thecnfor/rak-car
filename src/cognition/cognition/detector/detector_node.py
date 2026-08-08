@@ -22,7 +22,7 @@ from .detector import Detector
 class DetectorNode(Node):
     def __init__(self):
         super().__init__("detector_node")
-        self.declare_parameter("camera_topic", "/rak/sensors/camera/front/image_compressed")
+        self.declare_parameter("camera_topic", "/rak/sensors/camera/side/image_compressed")
         self.declare_parameter("image_transport", "compressed")
         self.declare_parameter("engine_path", "/home/xrak/models/ppyoloe_plus_crn_s_80e_coco/model_fp16.engine")
         self.declare_parameter("labels_file", "/home/xrak/models/ppyoloe_plus_crn_s_80e_coco/labels.txt")
