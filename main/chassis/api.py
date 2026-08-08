@@ -266,6 +266,25 @@ class ChassisClient:
             timeout=timeout,
         )
 
+    def chassis_align(self, **kwargs) -> dict:
+        """底盘视觉对齐（下沉到 runtime）。
+
+        单次 HTTP POST 到 /v1/realtime/chassis-align，阻塞 1-15s 直到
+        arrived / timeout / watchdog / no_target，返回完整结果 dict。
+
+        参数全部透传给 runtime ChassisAlignController，详见
+        runtime/services/chassis_align.py::ChassisAlignController.__init__。
+        """
+        payload = dict(kwargs)
+        # setpoint_cxcy 元组 → list（HTTP 可序列化）
+        if "setpoint_cxcy" in payload:
+            payload["setpoint_cxcy"] = list(payload["setpoint_cxcy"])
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/chassis-align",
+            payload=payload,
+            timeout=payload.get("max_seconds", 10.0) + 5.0,
+        )
+
     def set_single_motor(self, port: int, speed: float, reverse: int = 1, timeout: float = 5.0):
         if self.ws_ready:
             try:
