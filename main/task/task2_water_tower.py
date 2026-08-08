@@ -201,6 +201,7 @@ def _parallel_chassis_arm(
     target_dx_m: float = 0.0,
     arm_kwargs: Optional[Dict[str, Any]] = None,
     timeout: float = 10.0,
+    use_lane_align: Optional[bool] = None,
 ) -> None:
     """底盘 move_for + 臂 composite_run 并发 (task1_seeding._parallel_chassis_arm 模式).
 
@@ -209,6 +210,8 @@ def _parallel_chassis_arm(
         arm_kwargs:  传 composite_run 的 kwargs (arm/x_mm/y_mm/hand/speed/timeout),
                      None/{} 跳过臂动作
         timeout:     两个动作的最大等待
+        use_lane_align: 覆盖底盘前进走法. None=默认 (前进→move_along_lane, 后退→move_for);
+                     False=强制 SDK move_for (4 轮等速); True=强制 move_along_lane.
 
     2026-08-06 提速:
       - chassis 0.15m (~0.7s) 与臂切姿态 (~2-3s) 完全并发, 主循环零阻塞.
@@ -231,7 +234,7 @@ def _parallel_chassis_arm(
         # 2026-08-06 实车: tower_spacing 0.7m + group_forward 0.37m 必须走 move_along_lane
         # (沿车道线, 不偏); 后退 (d_back 负值) 走原 move_for (短距离, 已知位置).
         if abs(target_dx_m) > 1e-3:
-            use_lane = target_dx_m > 0   # 仅前进走 lane_align, 后退走 move_for
+            use_lane = (target_dx_m > 0) if use_lane_align is None else use_lane_align
             tasks.append(ex.submit(
                 _chassis_move_for, arm_client, target_dx_m, timeout,
                 use_lane_align=use_lane,
@@ -784,12 +787,15 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # 第 2 座塔: 底盘前进 tower_spacing_m + 切回 detection 姿态 (并发)
             # 2026-08-06 提速: 原版 move_x → chassis → move_x → set_arm → _wait →
             #                 set_hand → sleep 5 步串行 ~8s. 改并发 ~3s, 省 5s.
+            # 2026-08-08: 前进第二座塔改 SDK move_for 直推 (不用 move_along_lane 车道线),
+            #             距离 0.55m (tower_spacing_m 已在 yaml 改).
             if tower_idx > 0:
-                logger.info("底盘前进 %.2f m → 水塔 %s (并发切回 detection 姿态)",
+                logger.info("底盘前进 %.2f m → 水塔 %s (move_for 直推, 并发切回 detection 姿态)",
                             tower_spacing_m, tower_label)
                 _parallel_chassis_arm(
                     arm_client, runner,
                     target_dx_m=tower_spacing_m,
+                    use_lane_align=False,
                     arm_kwargs=dict(
                         arm=float(detection["arm_angle_deg"]),
                         x_mm=x_target_mm,
