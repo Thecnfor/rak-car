@@ -43,5 +43,27 @@ module.exports = {
       /* 兜底: runtime/server.py 单进程泄漏超过 1.2GB 自动 PM2 重启 (仅看父进程 RSS, infer_back_end 子进程管不到) */
       max_memory_restart: "1200M",
     },
+    {
+      /* 一鍵啟動（比賽用）：run.py --wait-key。上電自啟，MC602 板上鍵按下即開始完整任務。
+         業務層經 HTTP 連 runtime，同機用 127.0.0.1 免寫死 LAN IP。 */
+      name: "rak-car-oneclick",
+      cwd: "/home/jetson/workspace/rak-car",
+      script: "run.py",
+      args: ["--wait-key"],
+      interpreter: "/usr/bin/python3",
+      exec_mode: "fork",
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_restarts: 10,
+      restart_delay: 3000,
+      kill_timeout: 5000,
+      env: {
+        PYTHONUNBUFFERED: "1",
+        RAK_CAR_SERVER_ORIGIN: "http://127.0.0.1",
+        RAK_CAR_API_PORT: "5050",
+      },
+      max_memory_restart: "1200M",
+    },
   ],
 };
