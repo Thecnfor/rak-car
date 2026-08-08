@@ -53,6 +53,8 @@ CAR_ACTIONS = {
     "set_pwm_servo_angle": lambda car, *args, **kwargs: car.set_pwm_servo_angle(*args, **kwargs),
     "set_digital_output": lambda car, *args, **kwargs: car.set_digital_output(*args, **kwargs),
     "get_arm_state": lambda car, *args, **kwargs: car.get_arm_state(),
+    # 2026-08-08: 一鍵啟動 —— 讀 MC602 板上鍵（BoardKey）。純新增，供 run.py --wait-key 輪詢。
+    "read_key": lambda car, *args, **kwargs: car.read_key(),
 }
 
 

@@ -9,11 +9,14 @@ import time
 
 from smartcar.whalesbot.vehicle import (
     BluetoothPad,
+    BoardKey,
     Infrared,
     LedLight,
     ServoPwm,
 )
 from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
+
+from runtime.core.key_input import board_key_pressed
 
 
 class SensorsMixin:
@@ -52,6 +55,20 @@ class SensorsMixin:
         self.blue_pad = BluetoothPad()
         self.shoot = PoutD(4)
         self.battery = Battry()
+        # 2026-08-08: MC602 板上鍵（BoardKey, dev_id=0x0d）——一鍵啟動用。
+        # 純新增；不影響既有初始化流程。raw→bool 映射見 runtime/core/key_input.py。
+        self.key = BoardKey()
+
+    def read_key(self) -> bool:
+        """讀 MC602 板上鍵，回傳是否按下（異常視為未按下，讓等待迴圈重試）。
+
+        供 `run.py --wait-key` 經 CAR_ACTION read_key 輪詢。映射收斂在
+        `runtime/core/key_input.py::board_key_pressed`。
+        """
+        try:
+            return board_key_pressed(self.key.read())
+        except Exception:
+            return False
 
     def set_storage(self, state=False):
         """
