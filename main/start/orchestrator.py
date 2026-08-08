@@ -105,8 +105,8 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
              ir_threshold_m=0.70, ir_side="left",
              dis_at_least_m=4.5, trigger_op="OR"),
     Waypoint("task4_harvest",     task_id=4,
-             ir_threshold_m=0.50, ir_side="right",
-             dis_at_least_m=9.00, trigger_op="AND"),
+             ir_threshold_m=0.70, ir_side="left",
+             dis_at_least_m=None, trigger_op="AND"),
     Waypoint("task5_sort",        task_id=5,
              ir_threshold_m=0.50, ir_side="right",
              dis_at_least_m=11.0, trigger_op="AND"),
@@ -145,6 +145,7 @@ class Orchestrator:
                                len(self.waypoints))
         self.lane_hz = lane_hz
         self.ir_interval_s = ir_interval_s
+        self._ball_counts: Dict[str, int] = {}
 
     @staticmethod
     def _load_waypoints_from_yaml(config_path: Optional[str]) -> Optional[List[Waypoint]]:
@@ -275,6 +276,15 @@ class Orchestrator:
                          args=(tui_buf, tui_running),
                          daemon=True, name="tui").start()
 
+        # 后台 D：下位机 led_show 屏幕 UI（250ms 刷新，带帧率限制）
+        display_running = threading.Event()
+        display_running.set()
+        from main.start.display_ui import Mc602Display
+        display_ui = Mc602Display(client, layout="20x5")
+        threading.Thread(target=self._display_ui_loop,
+                         args=(display_ui, tui_buf, display_running),
+                         daemon=True, name="display").start()
+
         completed: List[str] = []
         try:
             for wp in waypoints:
@@ -355,9 +365,27 @@ class Orchestrator:
                     tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
                                   "ir_left": None, "ir_right": None,
                                   "state": "task"}
-                    ok = self._run_task(client, wp)
-                    if not ok:
+                    extra_kwargs: Dict[str, Any] = {}
+                    if wp.task_id == 5:
+                        extra_kwargs["prev_ball_counts"] = dict(self._ball_counts)
+                    task_result = self._run_task(client, wp, **extra_kwargs)
+                    if not task_result.get("ok"):
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
+                    # task4 结束后提取球色统计, 供 task5 使用
+                    if wp.task_id == 4 and task_result.get("ok"):
+                        detail = task_result.get("detail", {})
+                        history = []
+                        if isinstance(detail, dict):
+                            history = detail.get("history", []) or []
+                        counts = {"blue": 0, "yellow": 0}
+                        for entry in history:
+                            if (isinstance(entry, dict)
+                                    and entry.get("action") == "picked"
+                                    and entry.get("color") in counts):
+                                counts[entry["color"]] += 1
+                        self._ball_counts = counts
+                        logger.info("[task4→task5] 采集统计: blue=%d yellow=%d",
+                                    counts["blue"], counts["yellow"])
                 time.sleep(wp.pause_after_s)
                 if wp.task_id == 1:
                     if post_task1 is not None:
@@ -395,8 +423,9 @@ class Orchestrator:
         finally:
             # 终止 runner（#1）：stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
             # join 等其 finally 块跑完（smoother 归零 + api.close()）。
-            # 同时关掉 TUI 后台线程.
+            # 同时关掉 TUI + 下位机屏幕后台线程。
             tui_running.clear()
+            display_running.clear()
             try:
                 api.stop_wheel_speeds()
             except Exception:
@@ -405,6 +434,12 @@ class Orchestrator:
             runner_thread.join(timeout=2.0)
             try:
                 api.stop_lane_feed()
+            except Exception:
+                pass
+            # 下位机屏幕清屏（best-effort）
+            try:
+                display_ui.clear()
+                display_ui.render(throttle_s=0.0)
             except Exception:
                 pass
             # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
@@ -454,6 +489,37 @@ class Orchestrator:
         # 退出时换行
         sys.stdout.write("\n")
         sys.stdout.flush()
+
+    @staticmethod
+    def _display_ui_loop(display_ui, tui_buf: List[Dict[str, Any]],
+                         display_running: threading.Event) -> None:
+        """每 250ms 更新下位机 led_show 屏幕（带节流）。"""
+        while display_running.wait():
+            info = tui_buf[0]
+            state = info.get("state", "?")
+            wp = info.get("wp", "")
+            dis = info.get("dis", 0.0)
+            il = info.get("ir_left")
+            ir = info.get("ir_right")
+            try:
+                display_ui.skin_dashboard(
+                    state=state,
+                    wp=wp,
+                    dis=dis,
+                    ir_left=il,
+                    ir_right=ir,
+                    battery=0.85,  # 可通过 runtime API 读取真实电量
+                )
+                display_ui.render(throttle_s=0.25)
+            except Exception:
+                pass
+            time.sleep(0.25)
+        # 退出时清屏
+        try:
+            display_ui.clear()
+            display_ui.render(throttle_s=0.0)
+        except Exception:
+            pass
 
     # ── 主线程辅助 ──────────────────────────────────────────
 
@@ -706,34 +772,35 @@ class Orchestrator:
                          name="arm-home-reset").start()
 
     @staticmethod
-    def _run_task(client: RuntimeApiClient, wp: Waypoint) -> bool:
-        """按 task_id 查 TASK_RUNNERS 字典, 调 run(). 返回 True 表示成功."""
+    def _run_task(client: RuntimeApiClient, wp: Waypoint,
+                  **task_kwargs) -> Dict[str, Any]:
+        """按 task_id 查 TASK_RUNNERS 字典, 调 run(). 返回完整 result dict。"""
         if wp.task_id is None:
-            # 纯导航段或 finish, 不应到这里
-            return True
+            return {"ok": True, "skipped": True}
         try:
             from main.task import TASK_RUNNERS
             runner = TASK_RUNNERS[wp.task_id]
         except (ImportError, KeyError) as exc:
             logger.warning("task_id=%d not registered in TASK_RUNNERS: %s",
                            wp.task_id, exc)
-            return False
+            return {"ok": False, "error": str(exc)}
         try:
-            result = runner(client)
+            result = runner(client, **task_kwargs)
         except NotImplementedError as exc:
-            # 未实现 task (3/7) 抛 NotImplementedError, warning + 跳过
             logger.warning("task_id=%d not implemented, skipping: %s",
                            wp.task_id, exc)
-            return False
+            return {"ok": False, "error": str(exc), "skipped": True}
         except Exception:
             logger.exception("task %s raised exception", wp.name)
-            return False
-        if isinstance(result, dict) and not result.get("ok"):
+            return {"ok": False, "error": "exception"}
+        if not isinstance(result, dict):
+            result = {"ok": True, "raw": result}
+        if not result.get("ok"):
             logger.warning("task %s failed: %s", wp.name,
                            result.get("error", result.get("detail", "?")))
-            return False
-        logger.info("task %s (id=%d) succeeded -> %s", wp.name, wp.task_id, result)
-        return True
+        else:
+            logger.info("task %s (id=%d) succeeded -> %s", wp.name, wp.task_id, result)
+        return result
 
 
 __all__ = ["Waypoint", "Orchestrator", "DEFAULT_WAYPOINTS"]

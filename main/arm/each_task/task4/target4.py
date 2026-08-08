@@ -89,14 +89,14 @@ LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
 
 # ---- 默认参数 ----
 
-DEFAULT_MAX_PICKS: int = 8
-"""最多抓取数 (比赛正常 6-8 球, 给 buffer)。"""
+DEFAULT_MAX_PICKS: int = 1000
+"""最多抓取数 (距离优先模式下设为极大值, 实际不限制)。"""
 
-DEFAULT_MAX_CREEP_M: float = 0.8
-"""累计前移距离预算 (m, 开环 速度×时间 记账)。"""
+DEFAULT_MAX_CREEP_M: float = 0.58
+"""累计前移距离预算 (m, 开环 速度×时间 记账)。唯一实际生效的终止条件。"""
 
-DEFAULT_MAX_SECONDS: float = 180.0
-"""任务总时长预算 (s)。"""
+DEFAULT_MAX_SECONDS: float = 9999.0
+"""任务总时长预算 (s) (距离优先模式下设为极大值, 实际不限制)。"""
 
 DEFAULT_CREEP_SPEED_MPS: float = 0.06
 """creep 搜索前移速度 (m/s)。"""
@@ -107,8 +107,8 @@ CREEP_POLL_HZ: float = 20.0
 DEFAULT_TRACK_MAX_SECONDS: float = 6.0
 """单球底盘视觉伺服收敛预算 (s)。"""
 
-DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 3
-"""连续 pick 失败超过此数 → 退出。"""
+DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1000
+"""连续 pick 失败超过此数 → 退出 (距离优先模式下设为极大值, 实际不限制)。"""
 
 DEFAULT_MAX_CONSECUTIVE_TRACK_FAILURES: int = 2
 """连续 track 失败超过此数 → 退出。
@@ -134,17 +134,15 @@ DEFAULT_TRACK_WIDE_DEADBAND: float = 0.45
 
 DEFAULT_RETURN_X_MM: Optional[float] = POSE_P_X_MM
 """放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。"""
-
 # ---- P 姿态参数 (可由外部覆盖) ----
-
-TASK4_POSE_P_Y_MM: float = -130.0
-TASK4_POSE_P_X_MM: float = -300.0
+TASK4_POSE_P_Y_MM: float = -160.0
+TASK4_POSE_P_X_MM: float = -295.0
 TASK4_POSE_P_ARM_DEG: float = 90.0
 TASK4_POSE_P_HAND_DEG: float = 10.0
 
 # ---- 抓取 / 中转位姿 ----
 
-X_PICK_MM: float = -245.0
+X_PICK_MM: float = -240.0
 """盲降前横移 x (mm)。"""
 
 Y_PICK_MM: float = -65.0
@@ -158,13 +156,13 @@ X_TRANSIT_MM: float = -220.0
 
 # ---- 放 bin 参数 ----
 
-Y_PUT_MM: float = -130.0
+Y_PUT_MM: float = -140.0
 """放球 y (再深 10mm 防脱落)。"""
 
-BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -75.0}
+BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -60.0}
 """蓝 bin x=0, 黄 bin x=-70。"""
 
-BIN_Y_MM = {COLOR_BLUE: -120.0}
+BIN_Y_MM = {COLOR_BLUE: -140.0}
 """蓝 bin y=-135; 黄沿用 Y_PUT_MM。"""
 
 BIN_HAND_DEG = {COLOR_BLUE: 10.0}
@@ -849,6 +847,26 @@ def step_target4(
         else:
             print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过开仓")
 
+        # ---- 0.c 初始 P 姿态恢复 (task4 开始前确保臂在 P 姿态) ----
+        #    主循环第一球也会恢复 P 姿态, 但此处提前一次确保起始位姿正确。
+        if not dry_run:
+            try:
+                print(f"  [{LOG_PREFIX}] 初始 P 姿态恢复 "
+                      f"(arm={pose_p_arm_deg}° x={pose_p_x_mm}mm "
+                      f"y={pose_p_y_mm}mm hand={pose_p_hand_deg}°)")
+                arm_client.composite_run(
+                    arm=pose_p_arm_deg,
+                    x_mm=pose_p_x_mm,
+                    y_mm=pose_p_y_mm,
+                    hand=pose_p_hand_deg,
+                    speed=60,
+                    timeout=30.0,
+                )
+                print(f"  [{LOG_PREFIX}] 初始 P 姿态恢复完成")
+            except Exception as e:
+                print(f"  [{LOG_PREFIX}] ⚠️ 初始 P 姿态恢复失败: "
+                      f"{type(e).__name__}: {str(e)[:120]}")
+
         # ---- 1. 准备位姿: 已删 ----
         #    开头 target1 准备位姿 (~8s) 是冗余 legacy — 主循环第一球立刻 goto_pose_p 覆盖。
         #    直接从 P 姿态开始 creep, 省 ~8s。
@@ -860,6 +878,7 @@ def step_target4(
         #      c) 再恢复 P 姿态 + creep 继续, 循环到 max_picks
         #      d) 失败一次就退出, 不死循环
         ball_idx = 0
+        last_color = None  # 上一球颜色 (用于优化 P 姿态恢复)
         release_thread = None  # 上一球放仓后台线程, 回 P 前需 join
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
@@ -881,43 +900,69 @@ def step_target4(
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
-            # 2.0 P 姿态 + creep 重排 (2026-08-06 现场拍板):
-            #    - 先 release_thread.join (上一球放仓后台线程收尾)
-            #    - 再 composite_run 回 P 姿态 (主线程同步, 此时**没有任何后台推 vx**)
-            #    - 然后才启动 creep_thread 后台推 vx
-            #    旧版并行有 3 个 bug:
+            # 2.0 P 姿态 + creep 并发 (2026-08-08: 改回并发, 避免 composite_run 期间车子完全静止)
+            #    - release_thread.join (上一球放仓后台线程收尾)
+            #    - 启动 creep_thread (后台推 vx, 和 composite_run 并发)
+            #    - composite_run 回 P 姿态 (主线程同步)
+            #    注意: 并发时有 3 个风险:
             #      a) creep_thread 与 composite_run 同时跑 → 4 路臂命令 + 底盘 vx
-            #         抢 SerialEngine, composite_run 内部 y 下降偶尔卡 200-500ms,
-            #         视觉上"卡住";
+            #         抢 SerialEngine, composite_run 内部 y 下降偶尔卡 200-500ms;
             #      b) 见球瞬间 creep 没主动发 0 速, 靠 track_chassis 第一帧覆盖,
             #         50-150ms 窗口内底盘按 creep 速度窜一下 → "track 开始瞬间抖";
             #      c) arm_feed 守护线程 20Hz 轮询 y/x/arm_angle 跟 composite_run
             #         4 路并发抢 share_key, 进一步加长 composite_run 时间.
-            #    新版顺序: composite_run 单独跑 30s (无任何后台竞争),
-            #    creep 启动时臂已稳态, 见球即停, track_chassis 直接接管.
+            #    如果出现以上问题, 可以改回顺序执行 (把 creep_thread 移到 composite_run 之后).
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=15.0)
+
+            # 启动creep（和composite_run并发）
+            creep_thread = _CreepThread(
+                http_client, speed_mps=creep_speed_mps,
+                max_distance_m=remaining_m,
+                poll_hz=CREEP_POLL_HZ,
+            )
+            creep_thread.start()
+
+            pose_ok = True
             if not dry_run:
                 try:
-                    print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿态 "
-                          f"(composite_run 4 轴同步: y={pose_p_y_mm} → x={pose_p_x_mm} "
-                          f"arm={pose_p_arm_deg}°/hand={pose_p_hand_deg}°) ==========")
-                    arm_client.composite_run(
-                        arm=pose_p_arm_deg,
-                        x_mm=pose_p_x_mm,
-                        y_mm=pose_p_y_mm,
-                        hand=pose_p_hand_deg,
-                        speed=60,
-                        timeout=30.0,
-                    )
-                    print(f"========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿态完成 ==========\n")
-                except Exception as e:
-                    print(f"  [{LOG_PREFIX}] ⚠️ 恢复 P 姿态失败: "
-                          f"{type(e).__name__}: {str(e)[:120]}, 继续")
-            else:
-                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 P 姿态")
+                    # ---- 动态决定传哪些轴 (优化延迟):
+                    #   - 放 bin 后 y 已在 -130 (P 姿態 y), 不需要再動 y
+                    #   - 黃色球 hand 已在 10° (P 姿態 hand), 不需要再動 hand
+                    #   - 藍色球 hand 在 -75°, 需要恢復到 10°
+                    _pose_kwargs: Dict[str, Any] = {
+                        "arm": pose_p_arm_deg,
+                        "x_mm": pose_p_x_mm,
+                        "speed": 100,  # 2026-08-08: 舵機速度 60→100, 減少延遲
+                        "timeout": 30.0,
+                    }
+                    # y 永遠跳過 (放 bin 後已在 -130)
+                    # hand: 黃色已在 10° 跳過, 藍色 (-75°) 和第一球 (None) 需要恢復
+                    if last_color != COLOR_YELLOW:
+                        _pose_kwargs["hand"] = pose_p_hand_deg
 
-            # 2.0.b 启动 creep (在 composite_run 完成后, 见球即停 → track)
+                    axis_str = ", ".join(
+                        f"{k}={v}" for k, v in _pose_kwargs.items()
+                        if k not in ("speed", "timeout")
+                    )
+                    print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
+                          f"(composite_run: {axis_str}) ==========")
+                    arm_client.composite_run(**_pose_kwargs)
+                    print(f"========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態完成 ==========\n")
+                except Exception as e:
+                    print(f"  [{LOG_PREFIX}] ❌ 恢复 P 姿態失敗: "
+                          f"{type(e).__name__}: {str(e)[:120]}")
+                    pose_ok = False
+            else:
+                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 P 姿態")
+
+            if not pose_ok:
+                final_reason = "pick_error_exceeded"
+                print(f"  [{LOG_PREFIX}] ❌ P 姿態恢復失敗, 終止循环")
+                creep_thread.stop_and_join()
+                break
+
+            # 2.0.b 啟動 creep (在 composite_run 完成後, 見球即停 → track)
             creep_thread = _CreepThread(
                 http_client, speed_mps=creep_speed_mps,
                 max_distance_m=remaining_m,
@@ -1072,6 +1117,7 @@ def step_target4(
             if res["ok"]:
                 n_picks += 1
                 n_consecutive_failures = 0
+                last_color = color  # 记录上一球颜色, 供 P 姿态恢复优化
                 print(f"  [{LOG_PREFIX}] ✅ {color} 球完成 (累计 {n_picks})")
             else:
                 n_pick_failures += 1

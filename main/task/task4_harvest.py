@@ -87,12 +87,12 @@ def run(
 
     Args:
         client: 复用 RuntimeApiClient; None 时内部新建连接 (orchestrator 场景走复用).
-        max_picks: 最多抓取数 (比赛正常 6-8 球).
-        max_seconds: 任务总时长预算 (s).
-        max_creep_m: 累计前移距离预算 (m), 耗尽无球 = 采区走完.
+        max_picks: 最多抓取数 (距离优先模式下默认 1000, 实际不限制).
+        max_seconds: 任务总时长预算 (s) (距离优先模式下默认 9999, 实际不限制).
+        max_creep_m: 累计前移距离预算 (m), 耗尽无球 = 采区走完 (唯一实际生效的终止条件).
         creep_speed_mps: creep 前移速度 (m/s), 第一球用此值, 后续减半.
         track_max_seconds: 单球底盘视觉伺服收敛预算 (s).
-        max_consecutive_pick_failures: 连续 pick 失败容忍, 默认 1 (失败一次就退出).
+        max_consecutive_pick_failures: 连续 pick 失败容忍 (距离优先模式下默认 1000, 实际不限制).
         return_x_mm: 放 bin 后 x 回位 (mm); None = 不回; 默认 -300 (P 姿态 x).
         pick_timeout_s: pick_by_vision 总超时 (s).
         do_prep: True 时开头跑 target1 准备位姿 (当前 target4 已删, 保留兼容).

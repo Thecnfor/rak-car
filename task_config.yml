@@ -278,9 +278,9 @@ waypoints:
   - name: task4_harvest
     task_id: 4
     task_module: main.task.task4_harvest
-    ir_threshold_m: 0.50
-    ir_side: right
-    dis_at_least_m: 9.00
+    ir_threshold_m: 0.70
+    ir_side: left
+    dis_at_least_m: null
     trigger_op: AND
 
   # ----- task5 -----

@@ -533,8 +533,13 @@ def _retreat_166mm(client: ArmClient) -> Dict[str, Any]:
 # 主入口: 4 阶段编排
 # ============================================================
 
-def _run_pipeline(client: ArmClient, runner: ArmRunner) -> Dict[str, Any]:
+def _run_pipeline(client: ArmClient, runner: ArmRunner,
+                  prev_ball_counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """task5 端到端 4 阶段流水线 (内联实现)。
+
+    Args:
+        prev_ball_counts: task4 采集到的球色统计 {"blue": N, "yellow": M},
+                           提供则跳过 Phase 2 全色识别, 直接用此统计。
 
     Returns:
         {"ok": True, "high_color": str, "counts": dict,
@@ -563,13 +568,26 @@ def _run_pipeline(client: ArmClient, runner: ArmRunner) -> Dict[str, Any]:
         )
 
     # ========== Phase 2: 识别球数 ==========
-    phase2 = _phase2_count_balls(client, runner)
-    counts = phase2["counts"]
-    n_blue = counts["count_blue"]
-    n_yellow = counts["count_yellow"]
-    n_total = counts["count_total"]
-    print(f"\n  ✅ Phase 2 完成  球数: 总 {n_total}, 黄 {n_yellow}, 蓝 {n_blue}, "
-          f"unknown {counts['count_unknown']}")
+    if prev_ball_counts:
+        # task4 已采集统计, 跳过 Phase 2 全色识别
+        n_blue = int(prev_ball_counts.get("blue", 0))
+        n_yellow = int(prev_ball_counts.get("yellow", 0))
+        n_total = n_blue + n_yellow
+        counts = {
+            "count_total": n_total,
+            "count_yellow": n_yellow,
+            "count_blue": n_blue,
+            "count_unknown": 0,
+        }
+        print(f"\n  ✅ Phase 2 跳过 (使用 task4 统计: 黄={n_yellow} 蓝={n_blue})")
+    else:
+        phase2 = _phase2_count_balls(client, runner)
+        counts = phase2["counts"]
+        n_blue = counts["count_blue"]
+        n_yellow = counts["count_yellow"]
+        n_total = counts["count_total"]
+        print(f"\n  ✅ Phase 2 完成  球数: 总 {n_total}, 黄 {n_yellow}, 蓝 {n_blue}, "
+              f"unknown {counts['count_unknown']}")
 
     # ========== Phase 3: 分拣 + 底盘后退 ==========
     if high_color == "blue":
@@ -623,7 +641,8 @@ def _run_pipeline(client: ArmClient, runner: ArmRunner) -> Dict[str, Any]:
 # 入口: TASK_RUNNERS 兼容
 # ============================================================
 
-def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
+def run(client: Optional[RuntimeApiClient] = None,
+        prev_ball_counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
     """任务五主入口: 自包含实现 4 阶段流水线 (TASK_RUNNERS 兼容)。
 
     与 the_final/main.py 不同, 本函数**自包含**, 不调用 the_final.main,
@@ -631,6 +650,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
     Args:
         client: 形式参数, 实际被忽略 (本函数内部自建 ArmClient / ArmRunner)。
+        prev_ball_counts: task4 采集到的球色统计 {"blue": N, "yellow": M},
+                           提供则跳过 Phase 2 全色识别。
 
     Returns:
         Dict: {"ok": bool, "task": "task5_sort", "rc": 0/1, "detail": str}
@@ -641,7 +662,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     runner = ArmRunner(arm_client)
 
     try:
-        result = _run_pipeline(arm_client, runner)
+        result = _run_pipeline(arm_client, runner,
+                               prev_ball_counts=prev_ball_counts)
         return {
             "ok": True,
             "task": "task5_sort",
