@@ -210,6 +210,13 @@ class LoopsMixin:
         # car 引用可能在 init / recover 切换瞬间变 None，
         # 本 tick 直接跳过，不抛错。
         car_ref = car
+        # 2026-08-09: SDK 里程计线程 (update_odometry_thread) 异常即永久 break,
+        # 无重启保护 → odom_state 冻结 → "200 但轮不转"假象 / move_for odom PID
+        # 跑飞。这里兜底重建 (只在线程真死时行动, 健康时零开销)。
+        try:
+            car_ref.ensure_odometry_thread()
+        except Exception:
+            pass
         now = time.time()
         for (
             feed_name,

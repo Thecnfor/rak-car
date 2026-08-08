@@ -150,6 +150,12 @@ class TrackChassisResult:
     # 都失败, 底盘可能仍按最后非零指令滑行)。下沉后客户端看不到帧内异常, 只能
     # 靠这个字段判断"车到底停了没有"。
     stop_ok: bool = True
+    # 2026-08-09: 对齐期间轮子是否物理位移 (真实编码器反馈, 非命令积分)。
+    # 串口/下位机假死时 set_chassis_velocity 可能不报错但轮子不转 (HTTP 200
+    # 但 no-motion) → 即使 stop_ok=True 车也没真正对齐 → motion_ok=False。
+    # 有下发命令但编码器没动 = 命令路径假死; 无命令 (目标已居中) → True。
+    motion_ok: bool = True
+    enc_delta: Optional[float] = None
 
 
 # ---- 目标轨迹 Kalman 平滑（2026-08-09）----
@@ -293,10 +299,29 @@ class ChassisAlignController:
         watchdog_triggered = False
         stop_ok = True
         _ctl_fail_streak = 0
+        max_commanded = 0.0
+
+        def _read_encoders():
+            """读真实 4 轮编码器 (弧度累计, MC602 反馈); 失败/无端点 → None."""
+            try:
+                fn = getattr(self._service, "get_wheel_encoders", None)
+                if fn is None:
+                    return None
+                e = fn()
+                if isinstance(e, dict):
+                    e = e.get("encoders")
+                if isinstance(e, (list, tuple)) and len(e) == 4:
+                    return [float(x) for x in e]
+                return None
+            except Exception:
+                return None
+
+        enc0 = _read_encoders()
 
         def _send(vx, vy) -> bool:
             """下发三速并跟踪连续失败; 连续失败超阈值 → reason=control_lost, 返回 False."""
-            nonlocal _ctl_fail_streak, reason
+            nonlocal _ctl_fail_streak, reason, max_commanded
+            max_commanded = max(max_commanded, abs(vx), abs(vy))
             if _set_vel(vx, vy):
                 _ctl_fail_streak = 0
                 return True
@@ -465,9 +490,17 @@ class ChassisAlignController:
                     break
         finally:
             stop_ok = _set_vel(0.0, 0.0)
+            enc1 = _read_encoders()
 
         if watchdog_triggered:
             reason = "watchdog"
+
+        # 物理位移判定: 命令路径假死 (200 但轮不转) 时编码器位移 ~0。
+        enc_delta = None
+        if enc0 is not None and enc1 is not None:
+            enc_delta = sum(abs(enc1[i] - enc0[i]) for i in range(4))
+        motion_ok = (max_commanded < 0.001) or (
+            enc_delta is not None and enc_delta >= 1.0)
 
         elapsed = time.monotonic() - start
         result = TrackChassisResult(
@@ -477,5 +510,7 @@ class ChassisAlignController:
             frames=frames,
             elapsed_s=elapsed,
             stop_ok=stop_ok,
+            motion_ok=motion_ok,
+            enc_delta=enc_delta,
         )
         return result.__dict__

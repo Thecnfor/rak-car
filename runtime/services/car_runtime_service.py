@@ -498,6 +498,15 @@ class CarRuntimeService(
                     "last_err": health.get("last_err"),
                     "last_err_at": health.get("last_err_at"),
                 }
+        # 2026-08-09: SDK 里程计线程健康 (update_odometry_thread 一死 odom 冻结,
+        # 产生"200 但轮不转"假象)。feed watchdog 会自动重建, 这里给可见性。
+        try:
+            odom_thread = getattr(car, "odometry_thread", None)
+            out["odometry_thread_alive"] = (
+                odom_thread is not None and odom_thread.is_alive()
+            )
+        except Exception:
+            out["odometry_thread_alive"] = None
         return out
 
     def set_single_motor(self, port, speed, reverse=1):

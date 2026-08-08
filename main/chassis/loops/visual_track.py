@@ -256,6 +256,9 @@ class TrackChassisResult:
     elapsed_s: float = 0.0
     # runtime 对齐闭环 finally 零速是否到达轮子 (2026-08-09); client 闭环同样跟踪。
     stop_ok: bool = True
+    # 对齐期间轮子是否物理位移 (真实编码器反馈); runtime 下沉后透传。
+    motion_ok: bool = True
+    enc_delta: Optional[float] = None
 
 
 # ============ 主函数: track_chassis ============
@@ -538,6 +541,8 @@ def track_chassis(
         frames=int(result_data.get("frames", 0)),
         elapsed_s=float(result_data.get("elapsed_s", 0.0)),
         stop_ok=bool(result_data.get("stop_ok", True)),
+        motion_ok=bool(result_data.get("motion_ok", True)),
+        enc_delta=result_data.get("enc_delta"),
     )
 
 

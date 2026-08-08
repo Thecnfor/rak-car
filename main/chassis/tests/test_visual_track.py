@@ -164,6 +164,18 @@ class TestTrackChassisThinWrapper(unittest.TestCase):
         api = self._make_mock_api(response)
         result = track_chassis("h_tu_dou", api=api)
         self.assertTrue(result.stop_ok)
+        self.assertTrue(result.motion_ok)
+
+    def test_motion_ok_parsed_from_response(self):
+        """runtime 返回 motion_ok=False (200 但轮不转) + enc_delta → 透传。"""
+        response = {"arrived": True, "reason": "arrived",
+                    "frames": 10, "elapsed_s": 0.5, "final_frame": None,
+                    "motion_ok": False, "enc_delta": 0.0}
+        api = self._make_mock_api(response)
+        result = track_chassis("h_tu_dou", api=api)
+        self.assertTrue(result.arrived)
+        self.assertFalse(result.motion_ok)
+        self.assertEqual(result.enc_delta, 0.0)
 
     def test_params_forwarded_to_chassis_align(self):
         """所有参数透传给 api.chassis_align()。"""

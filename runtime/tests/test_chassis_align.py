@@ -395,6 +395,44 @@ class TestChassisAlignController(unittest.TestCase):
         # 最后因 deadband 收敛或 timeout 正常结束
         self.assertNotEqual(result["reason"], "control_lost")
 
+    def test_motion_ok_false_when_commanded_but_encoders_static(self):
+        """下发非零命令但编码器没动 (200 但轮不转) → motion_ok=False。"""
+        dets = [_d(cx=0.5)] * 100
+        svc = _make_service_with_detections(dets)
+        svc.get_wheel_encoders = lambda: [0.0, 0.0, 0.0, 0.0]
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=3.0, max_control_fail_frames=200)
+        result = _fast_run(ctrl)
+        self.assertFalse(result["motion_ok"])
+        self.assertAlmostEqual(result["enc_delta"], 0.0, places=6)
+
+    def test_motion_ok_true_when_wheels_moved(self):
+        """编码器位移 ≥ 阈值 → motion_ok=True。"""
+        dets = [_d(cx=0.5)] * 100
+        svc = _make_service_with_detections(dets)
+        calls = [0]
+
+        def _read():
+            calls[0] += 1
+            return [5.0] * 4 if calls[0] > 1 else [0.0] * 4
+
+        svc.get_wheel_encoders = _read
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=3.0, max_control_fail_frames=200)
+        result = _fast_run(ctrl)
+        self.assertTrue(result["motion_ok"])
+        self.assertGreaterEqual(result["enc_delta"], 20.0)  # 4 轮 × 5.0
+
+    def test_motion_ok_true_when_no_command(self):
+        """目标已居中 (命令 0) → 无需位移 → motion_ok=True。"""
+        dets = [_d(cx=0.01, cy=0.01)] * 20
+        svc = _make_service_with_detections(dets)
+        svc.get_wheel_encoders = lambda: [0.0, 0.0, 0.0, 0.0]
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=3.0, max_control_fail_frames=200)
+        result = _fast_run(ctrl)
+        self.assertTrue(result["motion_ok"])
+
 
 # ===== Kalman 平滑（filterpy，2026-08-09）=====
 
