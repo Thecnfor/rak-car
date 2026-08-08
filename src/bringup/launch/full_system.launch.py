@@ -42,8 +42,8 @@ def generate_launch_description() -> LaunchDescription:
             "serial_port", default_value="/dev/ttyUSB0",
             description="MC602 controller serial device"),
         DeclareLaunchArgument(
-            "baud", default_value="1000000",
-            description="MC602 baud rate"),
+            "baud", default_value="115200",
+            description="MC602 baud rate (115200 per bus budget spec)"),
         DeclareLaunchArgument(
             "front_device", default_value="/dev/cam2",
             description="Front camera device path. Competition target: /dev/cam2. "
@@ -144,7 +144,7 @@ def generate_launch_description() -> LaunchDescription:
                 "mc602_port": 8,  # P8
                 "min_range_m": 0.02,
                 "max_range_m": 0.3,
-                "rate_hz": 20.0,
+                "rate_hz": 10.0,
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
                 "mc602_transport": "bridge",
@@ -160,7 +160,7 @@ def generate_launch_description() -> LaunchDescription:
                 "mc602_port": 7,  # P7
                 "min_range_m": 0.02,
                 "max_range_m": 0.3,
-                "rate_hz": 20.0,
+                "rate_hz": 10.0,
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
                 "mc602_transport": "bridge",
@@ -192,7 +192,20 @@ def generate_launch_description() -> LaunchDescription:
             output="screen",
             parameters=[{
                 "arm_id": "main",
-                "publish_rate_hz": 50.0,
+                "publish_rate_hz": 20.0,   # 115200 总线预算:arm 收敛到 20Hz
+                "mc602_serial_port": LaunchConfiguration("serial_port"),
+                "mc602_baud": LaunchConfiguration("baud"),
+                "mc602_transport": "bridge",
+            }],
+        ),
+
+        # System IO — beep/led/nixie/按键/传感器按需读(非 arm/chassis 杂项设备)
+        Node(
+            package="hardware",
+            executable="system_io_node",
+            name="system_io",
+            output="screen",
+            parameters=[{
                 "mc602_serial_port": LaunchConfiguration("serial_port"),
                 "mc602_baud": LaunchConfiguration("baud"),
                 "mc602_transport": "bridge",
