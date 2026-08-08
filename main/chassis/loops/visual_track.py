@@ -450,6 +450,7 @@ def track_chassis(
     hz: float = 20.0,
     max_seconds: float = 10.0,
     dry_run: bool = False,
+    kalman: bool = False,
     on_tick: Optional[Callable[[TrackFrame, Tuple[float, float]], None]] = None,
     sense_fn: Optional[Callable[[], TrackFrame]] = None,
 ) -> TrackChassisResult:
@@ -459,10 +460,11 @@ def track_chassis(
       - **无 sense_fn（默认）**：控制律在 runtime 执行，本函数只做一次 HTTP
         同步调用 ``POST /v1/realtime/chassis-align``，阻塞 1-15s 返回。
         ``on_tick`` 是调试回调、控制律在 runtime 跑无法逐帧注入——单独传入
-        时记录 warning 后忽略。
+        时记录 warning 后忽略。``kalman=True`` 在 runtime 端对检测 bbox 做
+        Kalman 平滑（抑制帧间抖动, 需 Jetson 装 filterpy）。
       - **传了 sense_fn**：走 client 侧闭环（`_track_chassis_client_loop`）。
         检测源（LLM-as-servo，task6）是 client 特有能力，无法下沉 runtime，
-        保持旧行为。
+        保持旧行为。``kalman`` 仅作用于 runtime 路径, client 闭环不使用。
     """
     own_api = api is None
     if api is None:
@@ -496,6 +498,7 @@ def track_chassis(
             watchdog_ms=watchdog_ms,
             hz=hz, max_seconds=max_seconds,
             dry_run=dry_run,
+            kalman=kalman,
         )
     finally:
         if own_api:

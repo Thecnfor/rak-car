@@ -142,7 +142,9 @@ def build_realtime_router(service):
         请求字段 (详见 chassis_align.ChassisAlignController.__init__):
           target, setpoint_cxcy, select_mode, sign_vx, sign_vy, vx_only,
           kp, v_max, deadband, hold_frames, v_slew, max_lost_frames,
-          recover_after_lost, watchdog_ms, hz, max_seconds, dry_run
+          recover_after_lost, watchdog_ms, hz, max_seconds, dry_run,
+          kalman (bool, 默认 False: 有检测帧时用 filterpy 常速 Kalman 平滑
+          bbox cx/cy, 抑制帧间抖动; 需 Jetson 装 filterpy, 未装自动禁用)
         返回: TrackChassisResult dict (arrived / reason / frames / elapsed_s / final_frame)
         """
         try:
