@@ -24,6 +24,8 @@ setup(
     entry_points={
         "console_scripts": [
             "inference-bridge = cognition.inference.bridge:main",
+            "lane-follower = cognition.lane.lane_follower:main",
+            "detector-node = cognition.detector.detector_node:main",
         ],
     },
 )

@@ -62,6 +62,12 @@ def generate_launch_description() -> LaunchDescription:
         ),
         Node(
             package="hardware",
+            executable="system_io_node", name="system_io",
+            output="screen",
+            parameters=[{"mc602_transport": "direct"}],
+        ),
+        Node(
+            package="hardware",
             executable="safety_gate_node", name="safety_gate",
             output="screen",
             parameters=[{

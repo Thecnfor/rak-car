@@ -22,7 +22,12 @@
 #include "hardware/mecanum_chassis.hpp"
 #include "hardware/mc602_adapter.hpp"
 #include "hardware/base_controller.hpp"
+#include "hardware/nav_controller.hpp"
 #include "hardware/transport_factory.hpp"
+
+#include <msgs/action/chassis_navigate.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/twist.hpp>
@@ -193,6 +198,68 @@ public:
     const auto period = std::chrono::milliseconds(static_cast<int>(1000.0 / rate));
     timer_ = this->create_wall_timer(period, [this]() { this->publish_odometry(); });
 
+    // --- ChassisNavigate action server (point-to-point closed loop) ---
+    nav_ = std::make_unique<vw::NavController>();
+    nav_server_ = rclcpp_action::create_server<NavAction>(
+      this, "/rak/chassis/navigate",
+      [this](const std::array<uint8_t, 16> & /*uuid*/,
+             const typename NavAction::Goal::ConstSharedPtr goal) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        nav_goal_.target.x = goal->target_pose.x;
+        nav_goal_.target.y = goal->target_pose.y;
+        nav_goal_.target.theta = goal->target_pose.theta;
+        nav_goal_.max_linear_speed = goal->max_linear_speed;
+        nav_goal_.max_angular_speed = goal->max_angular_speed;
+        nav_goal_.tolerance_lin = goal->tolerance_lin;
+        nav_goal_.tolerance_ang = goal->tolerance_ang;
+        nav_goal_.timeout_sec = goal->timeout_sec;
+        return rclcpp_action::GoalResponse::ACCEPT_AND_EXECUTE;
+      },
+      [this](const std::shared_ptr<rclcpp_action::ServerGoalHandle<NavAction>> gh) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        nav_active_ = false;
+        auto res = std::make_shared<NavAction::Result>();
+        res->success = false;
+        res->error = "cancelled";
+        gh->abort(res);
+        if (active_goal_ == gh) {
+          active_goal_.reset();
+        }
+        return rclcpp_action::CancelResponse::ACCEPT;
+      },
+      [this](const std::shared_ptr<rclcpp_action::ServerGoalHandle<NavAction>> gh) {
+        std::lock_guard<std::mutex> lock(state_mutex_);
+        // Preemption: an incoming goal aborts the running one.
+        if (active_goal_ && active_goal_->is_active()) {
+          auto res = std::make_shared<NavAction::Result>();
+          res->success = false;
+          res->error = "preempted";
+          active_goal_->abort(res);
+        }
+        active_goal_ = gh;
+        nav_active_ = true;
+        nav_start_ = this->now();
+      });
+
+    // --- Reset encoders + zero odometry (one-shot, rare) ---
+    reset_srv_ = this->create_service<std_srvs::srv::Trigger>(
+      "/rak/chassis/reset_encoders",
+      [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>,
+             std::shared_ptr<std_srvs::srv::Trigger::Response> resp) {
+        {
+          std::lock_guard<std::mutex> lock(state_mutex_);
+          pending_odom_reset_ = true;   // odom_.reset() 在控制线程做,免竞争
+        }
+        try {
+          adapter_->reset_encoder4();
+          resp->success = true;
+          resp->message = "encoders + odom zeroed";
+        } catch (const std::exception & e) {
+          resp->success = false;
+          resp->message = e.what();
+        }
+      });
+
     RCLCPP_INFO(this->get_logger(),
       "MecanumChassisNode ready: Lx=%.3f Ly=%.3f r=%.3f rate=%.1f Hz",
       Lx, Ly, r, rate);
@@ -210,6 +277,15 @@ public:
 private:
   void publish_odometry()
   {
+    // 0. Pending odom reset (requested by /rak/chassis/reset_encoders).
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (pending_odom_reset_) {
+        odom_.reset();
+        pending_odom_reset_ = false;
+      }
+    }
+
     // 1. Read encoders + integrate odometry.
     std::array<int32_t, 4> counts;
     try {
@@ -271,7 +347,53 @@ private:
     // 4. Publish joint states (wheel joints for diff_drive_controller compat).
     publish_joint_states(counts, now);
 
-    // 5. Command motors from last Twist (if recently received).
+    // 5. Navigation control: when a navigate goal is active, NavController
+    // drives the Twist instead of the external /rak/cmd/vel_safe subscriber.
+    {
+      std::lock_guard<std::mutex> lock(state_mutex_);
+      if (nav_active_) {
+        const double elapsed = (this->now() - nav_start_).seconds();
+        vw::NavTwist tw;
+        const auto st = nav_->update(pose, nav_goal_, elapsed, tw);
+
+        last_cmd_.linear.x = tw.vx;
+        last_cmd_.linear.y = tw.vy;
+        last_cmd_.angular.z = tw.omega;
+        last_cmd_time_ = this->now();   // 防 deadman 误停
+
+        if (active_goal_ && active_goal_->is_active()) {
+          auto fb = std::make_shared<NavAction::Feedback>();
+          fb->current_pose.x = pose.x;
+          fb->current_pose.y = pose.y;
+          fb->current_pose.theta = pose.theta;
+          fb->remaining_distance = static_cast<float>(std::hypot(
+            nav_goal_.target.x - pose.x, nav_goal_.target.y - pose.y));
+          active_goal_->publish_feedback(fb);
+        }
+
+        if (st == vw::NavStatus::REACHED || st == vw::NavStatus::ABORTED) {
+          auto res = std::make_shared<NavAction::Result>();
+          res->success = (st == vw::NavStatus::REACHED);
+          res->error = (st == vw::NavStatus::REACHED) ? "none" : "timeout";
+          res->traveled_distance =
+            static_cast<float>(std::hypot(pose.x, pose.y));
+          if (st == vw::NavStatus::REACHED) {
+            active_goal_->succeed(res);
+          } else {
+            active_goal_->abort(res);
+          }
+          active_goal_.reset();
+          nav_active_ = false;
+          // 停轮:清零并刷新时间戳,command_motors 会写全零。
+          last_cmd_.linear.x = 0.0;
+          last_cmd_.linear.y = 0.0;
+          last_cmd_.angular.z = 0.0;
+          last_cmd_time_ = this->now();
+        }
+      }
+    }
+
+    // 6. Command motors from last Twist (if recently received).
     command_motors();
   }
 
@@ -338,6 +460,8 @@ private:
   }
 
   // --- Members ---
+  using NavAction = msgs::action::ChassisNavigate;
+
   std::unique_ptr<vw::MecanumChassis> chassis_;
   std::unique_ptr<vw::MC602Adapter> adapter_;
   OdomHelper odom_;
@@ -346,11 +470,21 @@ private:
   geometry_msgs::msg::Twist last_cmd_;
   rclcpp::Time last_cmd_time_;
 
+  // 导航状态(全部 state_mutex_ 保护)
+  std::unique_ptr<vw::NavController> nav_;
+  std::shared_ptr<rclcpp_action::ServerGoalHandle<NavAction>> active_goal_;
+  vw::NavGoal nav_goal_;
+  bool nav_active_ = false;
+  rclcpp::Time nav_start_;
+  bool pending_odom_reset_ = false;
+
   rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
   rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
   rclcpp::Publisher<sensor_msgs::msg::JointState>::SharedPtr joint_pub_;
   tf2_ros::TransformBroadcaster tf_broadcaster_;
   rclcpp::TimerBase::SharedPtr timer_;
+  rclcpp_action::Server<NavAction>::SharedPtr nav_server_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_srv_;
 };
 
 // ---------------------------------------------------------------------------

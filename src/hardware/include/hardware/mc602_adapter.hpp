@@ -22,6 +22,7 @@
 #pragma once
 
 #include "hardware/base_controller.hpp"
+#include "hardware/mc602_adapter_iface.hpp"
 #include "hardware/mc602_protocol.hpp"
 #include "hardware/serial_transport.hpp"
 
@@ -40,7 +41,7 @@ namespace hardware
 // C++17-safe π.
 inline constexpr double MC602_PI = 3.14159265358979323846;
 
-class MC602Adapter : public BaseController
+class MC602Adapter : public BaseController, public MC602AdapterIface
 {
 public:
   // Direct transport over a local serial fd (tests, mock, non-bridged use).

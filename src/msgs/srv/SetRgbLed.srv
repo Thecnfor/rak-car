@@ -1,0 +1,10 @@
+# SetRgbLed.srv — 单颗 RGB LED。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §6
+
+uint8 led_id
+uint8 r
+uint8 g
+uint8 b
+---
+bool ok
+string error

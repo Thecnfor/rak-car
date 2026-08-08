@@ -1,0 +1,7 @@
+# Nixie.srv — 数码管显示值。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §6
+
+int32 value
+---
+bool ok
+string error

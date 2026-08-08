@@ -35,7 +35,7 @@ public:
     this->declare_parameter<int>("mc602_port", 8);  // P8 per hardware-port-mapping.md
     this->declare_parameter<double>("min_range_m", 0.02);
     this->declare_parameter<double>("max_range_m", 0.3);
-    this->declare_parameter<double>("rate_hz", 20.0);
+    this->declare_parameter<double>("rate_hz", 10.0);   // 115200 总线预算:IR 收敛到 10Hz
     this->declare_parameter<std::string>("mc602_serial_port", "/dev/ttyUSB0");
     this->declare_parameter<int>("mc602_baud", 1000000);
     this->declare_parameter<std::string>("mc602_transport", "direct");

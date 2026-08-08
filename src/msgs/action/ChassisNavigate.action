@@ -1,0 +1,23 @@
+# ChassisNavigate.action — 底盘点到位导航(核心组件接口之一)。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §7.1
+#
+# 行为层调用,chassis 内部自持里程计做闭环点到位。行为层不拼运动学。
+# "平移距离+角度"场景 = target_pose=(dx, dy, dtheta)。
+# 逃生舱: /rak/cmd/vel_safe Twist 仍可直发(手动/调试)。
+
+# Goal
+msgs/Pose2D target_pose               # 底盘系内目标位姿 (x, y, theta)
+float32 max_linear_speed              # m/s
+float32 max_angular_speed             # rad/s
+float32 tolerance_lin                 # 到位容差 (m)
+float32 tolerance_ang                 # 到位容差 (rad)
+float32 timeout_sec                   # 硬超时 → ABORTED
+---
+# Result
+bool success
+string error                          # timeout | transport | stale | none
+float32 traveled_distance             # 本次导航累计移动距离 (m)
+---
+# Feedback
+msgs/Pose2D current_pose              # 当前里程估计
+float32 remaining_distance            # 距目标直线距离 (m)

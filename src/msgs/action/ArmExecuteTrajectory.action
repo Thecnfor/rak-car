@@ -1,0 +1,19 @@
+# ArmExecuteTrajectory.action — 机械臂轨迹执行(核心组件接口之一)。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §7.2
+#
+# 行为层调用。服务端每 tick begin/commit_burst 打包;一次 goal = 组件内部
+# N 个突发帧。预emption:新 goal 自动取消旧 goal。
+# 逃生舱: /rak/cmd/arm/<id>/trajectory JointTrajectory topic 仍保留。
+
+# Goal
+string arm_id
+trajectory_msgs/JointTrajectory trajectory   # 现有关节名 + 目标点(沿用现状语义)
+float32 max_execution_time                    # 硬超时(秒) → ABORTED
+---
+# Result
+bool success
+string error                                  # timeout | transport | out_of_range | none
+float32[] final_positions                     # 执行结束的关节位置;无测量时填 0(诚实,非假数据)
+---
+# Feedback
+trajectory_msgs/JointTrajectoryPoint current  # 执行中的关节位置(无测量时为空)
