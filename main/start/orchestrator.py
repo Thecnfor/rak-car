@@ -613,6 +613,33 @@ class Orchestrator:
         """全流程 8 任务（巡线 + IR/里程计触发 + 顺序执行）。"""
         self._run_mission(self.waypoints)
 
+    def run_tasks(self, task_ids: List[int]) -> None:
+        """多任务模式：按给定顺序巡线到每个任务点位并执行。
+
+        Args:
+            task_ids: 任务编号列表，如 [1, 3, 5]。
+        """
+        # 收集所有可用 task_id
+        available = sorted(
+            {w.task_id for w in self.waypoints if w.task_id is not None}
+        )
+        # 筛选 + 按原始顺序保持
+        selected: List[Waypoint] = []
+        missing: List[int] = []
+        for tid in task_ids:
+            wp = next((w for w in self.waypoints if w.task_id == tid), None)
+            if wp is None:
+                missing.append(tid)
+            else:
+                selected.append(wp)
+        if missing:
+            raise ValueError(
+                f"waypoints 中没有 task_id={missing}，可用: {available}"
+            )
+        logger.info("multi-task mode: task_ids=%s → %d waypoints",
+                    task_ids, len(selected))
+        self._run_mission(selected)
+
     def run_single_task(self, task_id: int) -> None:
         """单任务独立测试模式：只巡线到一个任务点位，触发后执行该任务，然后停止。
 

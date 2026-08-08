@@ -74,10 +74,13 @@ def main() -> None:
     p.add_argument("--ir-interval-s", type=float, default=0.02)
     p.add_argument(
         "--task", type=int, default=None, choices=range(1, 8), metavar="1-7",
-        help=(
-            "只跑单个任务（1-7）: 巡线到该任务点位 → IR/里程计触发 → 执行任务 → 停止。"
-            "不指定时跑全流程 8 任务。"
-        ),
+        help="只跑单个任务（1-7）: 巡线到该任务点位 → IR/里程计触发 → 执行任务 → 停止。"
+             "不指定时跑全流程 8 任务。",
+    )
+    p.add_argument(
+        "--tasks", type=str, default=None, metavar="1,2,3",
+        help="只跑指定任务（逗号分隔）: 例如 --tasks 1,3,5。"
+             "按给定顺序巡线触发执行，跳过未列出的任务。",
     )
     p.add_argument(
         "--wait-key", action="store_true",
@@ -103,6 +106,19 @@ def main() -> None:
                         ir_interval_s=args.ir_interval_s)
     if args.wait_key:
         orch.wait_key_then_run()
+    elif args.tasks is not None:
+        # 解析 --tasks 逗号分隔列表，如 "1,3,5"
+        try:
+            task_ids = [int(t.strip()) for t in args.tasks.split(",") if t.strip()]
+        except ValueError:
+            sys.stderr.write(f"--tasks 格式错误，请用逗号分隔数字，例如: --tasks 1,3,5\n")
+            sys.exit(2)
+        # 校验 task_id 范围
+        invalid = [t for t in task_ids if t not in range(1, 8)]
+        if invalid:
+            sys.stderr.write(f"task_id 必须在 1-7 之间，非法值: {invalid}\n")
+            sys.exit(2)
+        orch.run_tasks(task_ids)
     elif args.task is not None:
         orch.run_single_task(args.task)
     else:
