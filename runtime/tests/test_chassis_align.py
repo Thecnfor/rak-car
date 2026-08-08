@@ -330,6 +330,96 @@ class TestChassisAlignController(unittest.TestCase):
                         f"All vx should be <= 0 with sign_vx=-1, got {vx_values}")
 
 
+# ===== Kalman 平滑（filterpy，2026-08-09）=====
+
+
+class TestKalmanTracker(unittest.TestCase):
+    """_KalmanTracker 封装 filterpy 常速 Kalman 的纯函数测试。"""
+
+    def _tracker(self, **kw):
+        from runtime.services.chassis_align import _KalmanTracker
+        return _KalmanTracker(**kw)
+
+    def test_first_frame_init(self):
+        """首帧直接初始化, 返回原始值。"""
+        tr = self._tracker()
+        cx, cy = tr.update(0.3, 0.2)
+        self.assertAlmostEqual(cx, 0.3)
+        self.assertAlmostEqual(cy, 0.2)
+
+    def test_step_response_lags(self):
+        """阶跃响应滞后 = 平滑: 目标从 0.3 跳到 0.5, 输出应在两者之间。"""
+        tr = self._tracker()
+        tr.update(0.3, 0.0)          # init
+        cx, _ = tr.update(0.5, 0.0)  # 阶跃
+        self.assertGreater(cx, 0.3)
+        self.assertLess(cx, 0.5)
+
+    def test_converges_to_constant(self):
+        """恒定测量反复喂 → 收敛到测量值。"""
+        tr = self._tracker()
+        cx, _ = 0.0, 0.0
+        for _ in range(100):
+            cx, _ = tr.update(0.3, 0.1)
+        self.assertAlmostEqual(cx, 0.3, places=3)
+
+    def test_jitter_smoothed(self):
+        """抖动测量 (0.4±0.1 交替) → 输出变化量 < 原始抖动。"""
+        tr = self._tracker()
+        raw = [0.3, 0.5] * 20
+        tr.update(raw[0], 0.0)
+        out = []
+        for i in range(1, len(raw)):
+            cx, _ = tr.update(raw[i], 0.0)
+            out.append(cx)
+        max_delta_out = max(abs(out[i] - out[i - 1]) for i in range(1, len(out)))
+        self.assertLess(max_delta_out, 0.2)  # < 原始 ±0.1 抖动的最大跳变
+
+
+class TestKalmanController(unittest.TestCase):
+    def test_disabled_by_default(self):
+        """kalman=False（默认）→ 不建 tracker, 保持已验证行为。"""
+        svc = _make_service_with_detections([_d(cx=0.3)] * 10)
+        ctrl = _make_controller(svc)
+        self.assertIsNone(ctrl._kalman)
+
+    def test_enabled_instantiates_tracker(self):
+        """kalman=True → tracker 实例化。"""
+        svc = _make_service_with_detections([_d(cx=0.3)] * 10)
+        ctrl = _make_controller(svc, kalman=True)
+        self.assertIsNotNone(ctrl._kalman)
+
+    def test_tracker_updated_per_found_frame(self):
+        """有检测帧每帧喂 tracker（丢帧帧不喂）。"""
+        dets = [_d(cx=0.3)] * 100
+        svc = _make_service_with_detections(dets)
+        ctrl = _make_controller(svc, kalman=True, deadband=10.0,
+                                hold_frames=100, hz=50, max_seconds=1.0,
+                                max_lost_frames=200)
+        real_update = ctrl._kalman.update
+        calls = []
+
+        def _spy(cx, cy):
+            calls.append((cx, cy))
+            return real_update(cx, cy)
+
+        ctrl._kalman.update = _spy
+        _fast_run(ctrl)
+        self.assertGreater(len(calls), 0)
+        self.assertEqual(calls[0][0], 0.3)
+
+    def test_import_fail_disables_gracefully(self):
+        """filterpy 未装（ImportError）→ kalman 自动禁用, 闭环照常跑。"""
+        svc = _make_service_with_detections([_d(cx=0.3)] * 10)
+        with patch("runtime.services.chassis_align._KalmanTracker",
+                   side_effect=ImportError("no filterpy")):
+            ctrl = _make_controller(svc, kalman=True)
+        self.assertIsNone(ctrl._kalman)
+        # 降级后闭环仍正常工作
+        result = _fast_run(ctrl)
+        self.assertEqual(result["reason"], "timeout")
+
+
 # ===== HTTP endpoint integration test =====
 
 

@@ -15,6 +15,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Collection, Dict, List, Optional, Tuple, Union
 
+import numpy as np
+
 logger = logging.getLogger(__name__)
 
 # ---- label 组定义 ----
@@ -146,6 +148,46 @@ class TrackChassisResult:
     elapsed_s: float = 0.0
 
 
+# ---- 目标轨迹 Kalman 平滑（2026-08-09）----
+
+
+class _KalmanTracker:
+    """常速 Kalman: 平滑 task_feed 检测的 cx/cy, 抑制 bbox 帧间抖动。
+
+    封装 filterpy.kalman.KalmanFilter（CV 模型, 状态 [cx, cy, vcx, vcy]）。
+    filterpy 是纯 numpy 库, Python 3.8 兼容; 未安装时由 ChassisAlignController
+    自动禁用（kalman=False 降级回原始检测）。
+
+    只处理**有检测帧**; 丢帧由外层原逻辑（recover/max_lost_frames）处理,
+    本类不参与——不改动已验证的丢帧行为。Q 小（目标近似静止/缓动）,
+    R 控制平滑强度（bbox 抖动大 → 放大 R 更平滑, 但跟踪变慢）。
+    """
+
+    def __init__(self, dt: float = 0.05, q: float = 1e-3, r: float = 1e-2):
+        from filterpy.kalman import KalmanFilter  # 懒加载: 未装则上层降级
+        self.kf = KalmanFilter(dim_x=4, dim_z=2)
+        self.kf.F = np.array(
+            [[1, 0, dt, 0], [0, 1, 0, dt], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=float,
+        )
+        self.kf.H = np.array([[1, 0, 0, 0], [0, 1, 0, 0]], dtype=float)
+        self.kf.P *= 1.0
+        self.kf.Q = np.eye(4) * q
+        self.kf.R = np.eye(2) * r
+        self._initialized = False
+
+    def update(self, cx: float, cy: float) -> Tuple[float, float]:
+        """喂一帧检测, 返回平滑后的 (cx, cy)。首帧直接初始化（不过滤）。"""
+        z = np.array([[cx], [cy]], dtype=float)
+        if not self._initialized:
+            self.kf.x = np.array([[cx], [cy], [0.0], [0.0]], dtype=float)
+            self._initialized = True
+            return cx, cy
+        self.kf.predict()
+        self.kf.update(z)
+        return float(self.kf.x[0, 0]), float(self.kf.x[1, 0])
+
+
 # ---- 主控制器 ----
 
 
@@ -167,7 +209,8 @@ class ChassisAlignController:
                  kp=0.20, v_max=0.12, deadband=0.05, hold_frames=5,
                  v_slew=0.02, max_lost_frames=60, recover_after_lost=True,
                  watchdog_ms=2000.0,
-                 hz=20.0, max_seconds=10.0, dry_run=False):
+                 hz=20.0, max_seconds=10.0, dry_run=False,
+                 kalman=False):
         self._service = service
         self._target = target
         self._setpoint_cxcy = tuple(float(x) for x in setpoint_cxcy)
@@ -186,6 +229,17 @@ class ChassisAlignController:
         self._hz = float(hz)
         self._max_seconds = float(max_seconds)
         self._dry_run = bool(dry_run)
+        # Kalman 平滑（可开关, 默认关保持已验证行为）: 有检测帧时平滑 cx/cy
+        # 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
+        self._kalman = None
+        if kalman:
+            try:
+                self._kalman = _KalmanTracker(dt=1.0 / max(self._hz, 1.0))
+            except Exception:
+                logger.warning(
+                    "filterpy 未安装, kalman 禁用 (Jetson 需: pip install filterpy)"
+                )
+                self._kalman = None
 
     def run(self) -> dict:
         """执行对齐闭环，返回 TrackChassisResult.__dict__。"""
@@ -293,6 +347,18 @@ class ChassisAlignController:
 
                 frames += 1
                 final_frame = frm
+
+                # Kalman 平滑（可选）: 只处理有检测帧, 用平滑后位置重算误差。
+                # 丢帧帧走原逻辑, 本处不参与。
+                if self._kalman is not None and frm.target_found:
+                    try:
+                        cx_s, cy_s = self._kalman.update(frm.cx, frm.cy)
+                        sx, sy = self._setpoint_cxcy
+                        frm.cx, frm.cy = cx_s, cy_s
+                        frm.cx_err = sx - cx_s
+                        frm.cy_err = sy - cy_s
+                    except Exception:
+                        pass  # kalman 异常回退原始检测帧
 
                 # watchdog: 缓存超时
                 if (self._watchdog_ms is not None

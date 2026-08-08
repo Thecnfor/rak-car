@@ -84,6 +84,28 @@ def _try_post(post_fn: Callable, **kw) -> None:
         logger.warning("velocity post 异常: %s", exc)
 
 
+def _maybe_tracker(kalman: bool, hz: float):
+    """kalman=True 且 filterpy 可装 → ArmKalmanTracker; 否则 None (降级原始检测)."""
+    if not kalman:
+        return None
+    try:
+        from .kalman import ArmKalmanTracker
+        return ArmKalmanTracker(dt=1.0 / max(float(hz), 1.0))
+    except Exception:
+        logger.warning("filterpy 未安装, kalman 禁用 (pip install filterpy)")
+        return None
+
+
+def _smooth_center(tracker, pick):
+    """有 tracker 时平滑 pick 的 bbox 中心; 无 tracker / 异常回退原始值."""
+    if tracker is None:
+        return pick.bbox_norm.x_center, pick.bbox_norm.y_center
+    try:
+        return tracker.update(pick.bbox_norm.x_center, pick.bbox_norm.y_center)
+    except Exception:
+        return pick.bbox_norm.x_center, pick.bbox_norm.y_center
+
+
 class VelocityLoop:
     """velocity 追踪 mixin. 需 self.http (RuntimeApiClient) + 懒建 self.ws."""
 
@@ -201,6 +223,7 @@ class VelocityLoop:
                              sign_x: float = -1.0, sign_y: float = 1.0,
                              setpoint_x_norm: float = 0.0,
                              setpoint_y_norm: float = 0.0,
+                             kalman: bool = False,
                              post_fn: Optional[Callable] = None,
                              ws=None) -> VelocityResult:
         """velocity XY 追踪 (示例 07): 只动十字, 检测丢失即停.
@@ -208,16 +231,20 @@ class VelocityLoop:
         方向: x_vel=-dx·gain, y_vel=+dy·gain (真机实测已固化)。
         setpoint_x/y_norm (2026-08-02): 吸嘴中心偏移 (目标在吸嘴正下方时其 bbox 中心
         坐标)。默认 (0,0)=画面中心; 传标定值即把目标对准吸嘴正下方而非画面中心。
+        kalman (2026-08-09, 默认 False): 有检测帧时用 filterpy 常速 Kalman 平滑
+        bbox 中心再算误差, 抑制检测抖动; 未装 filterpy 自动禁用。
         """
         post_fn = post_fn or self._default_post_fn()
         ws = self._ensure_ws(ws)
+        tracker = _maybe_tracker(kalman, hz)
 
         def step(t: float, pick) -> VelocityTrace:
             if pick is None:
                 _try_post(post_fn, x_vel=0.0, y_vel=0.0)
                 return VelocityTrace(t, 0.0, 0.0, 0.0, 0.0, score=0.0, miss=True)
-            dx = pick.bbox_norm.x_center - setpoint_x_norm
-            dy = pick.bbox_norm.y_center - setpoint_y_norm
+            cx, cy = _smooth_center(tracker, pick)
+            dx = cx - setpoint_x_norm
+            dy = cy - setpoint_y_norm
             x_vel = 0.0 if abs(dx) < deadzone else _clamp(sign_x * dx * gain, -max_vel, max_vel)
             y_vel = 0.0 if abs(dy) < deadzone else _clamp(sign_y * dy * gain, -max_vel, max_vel)
             _try_post(post_fn, x_vel=x_vel, y_vel=y_vel)
@@ -244,6 +271,7 @@ class VelocityLoop:
                          setpoint_x_norm: float = 0.0,
                          setpoint_y_norm: float = 0.0,
                          hold_y: bool = True,
+                         kalman: bool = False,
                          post_fn: Optional[Callable] = None,
                          ws=None) -> VelocityResult:
         """4-DOF 追踪 (示例 08, 方向修正后): x 十字 + 大臂 + 手抓 增量联调.
@@ -255,11 +283,13 @@ class VelocityLoop:
         hold_y (2026-08-02, 默认 True): 用户协议 — 对齐阶段锁死 y 十字 (y_vel=0),
         垂直误差只靠 hand 增量转补偿。原因: y=-180 对齐时一旦 y 十字下移, 目标立刻
         被推出视野 (相机随 y 移动)。水平误差走 x 十字 + arm 转双通道。
+        kalman (2026-08-09, 默认 False): 同 find_target_velocity, 平滑 bbox 中心。
         """
         post_fn = post_fn or self._default_post_fn()
         ws = self._ensure_ws(ws)
         arm_target = arm_start
         hand_target = hand_start
+        tracker = _maybe_tracker(kalman, hz)
 
         def step(t: float, pick) -> VelocityTrace:
             nonlocal arm_target, hand_target
@@ -268,8 +298,9 @@ class VelocityLoop:
                 return VelocityTrace(t, 0.0, 0.0, 0.0, 0.0,
                                      arm=arm_target, hand=hand_target,
                                      score=0.0, miss=True)
-            dx = pick.bbox_norm.x_center - setpoint_x_norm
-            dy = pick.bbox_norm.y_center - setpoint_y_norm
+            cx, cy = _smooth_center(tracker, pick)
+            dx = cx - setpoint_x_norm
+            dy = cy - setpoint_y_norm
             # 2026-08-08: x_error_source="dy" → X 十字跟随垂直误差 (task6 蔬菜几何:
             # X 右移 → 目标框下移, 即 X 影响画面 cy). "dx" 保持原行为 (X 跟随水平).
             x_err = dy if x_error_source == "dy" else dx
