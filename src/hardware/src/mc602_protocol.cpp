@@ -7,6 +7,7 @@
 #include "hardware/mc602_protocol.hpp"
 
 #include <cstddef>
+#include <string>
 #include <utility>
 
 namespace hardware
@@ -228,6 +229,20 @@ const Device & bluetooth()
 const Device & led_light()
 {
   static const Device d = make_device(0x0E, "bbBBBB");
+  return d;
+}
+
+const Device & led_show()
+{
+  // 0x0B "b"×101 — display buffer (make_device copies the slots immediately,
+  // so the temporary format string is safe).
+  static const Device d = make_device(0x0B, std::string(101, 'b').c_str());
+  return d;
+}
+
+const Device & nixietube()
+{
+  static const Device d = make_device(0x0F, "bbi");
   return d;
 }
 

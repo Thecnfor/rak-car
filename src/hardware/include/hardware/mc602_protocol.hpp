@@ -76,6 +76,8 @@ const Device & beep();           // 0x0A "BBB"  — mode + freq + duration (no p
 const Device & board_key();      // 0x0D "bbb"  — mode + port + value
 const Device & bluetooth();      // 0x09 "BBBBi"— mode + pad values
 const Device & led_light();      // 0x0E "bbBBBB"— mode + port + rgb
+const Device & led_show();       // 0x0B "b*101" — mode + display buffer
+const Device & nixietube();      // 0x0F "bbi"   — mode + int32 value
 const Device & dout();           // 0x10 "bbb"   — mode + port + int8 value
 const Device & stepper();        // 0x11 "bbii"  — mode + port + velocity(i32) + position(i32)
 

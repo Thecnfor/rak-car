@@ -329,6 +329,24 @@ void MC602Adapter::set_led_light(uint8_t led_id, int r, int g, int b)
              write_opts("led_light"));
 }
 
+void MC602Adapter::set_nixie(int value)
+{
+  send_write(build_frame(mc602::nixietube(), MODE_SET, std::nullopt, {value}),
+             write_opts("nixietube"));
+}
+
+void MC602Adapter::set_led_show(const std::string & text)
+{
+  // 点阵屏:文本转 ASCII,截断/补齐到 100 字符。
+  std::vector<int64_t> args;
+  args.reserve(100);
+  for (size_t i = 0; i < text.size() && args.size() < 100; ++i) {
+    args.push_back(static_cast<unsigned char>(text[i]));
+  }
+  send_write(build_frame(mc602::led_show(), MODE_SET, std::nullopt, std::move(args)),
+             write_opts("led_show"));
+}
+
 // ---- BaseController legacy ----
 
 double MC602Adapter::read_sensor(uint8_t port_id, const std::string & sensor_type)

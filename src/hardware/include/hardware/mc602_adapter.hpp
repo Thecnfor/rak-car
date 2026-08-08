@@ -104,6 +104,8 @@ public:
   std::vector<int64_t> read_board_key();
   std::vector<int64_t> read_bluetooth_pad();
   void set_led_light(uint8_t led_id, int r, int g, int b);
+  void set_nixie(int value);                          // 数码管显示值
+  void set_led_show(const std::string & text);        // 点阵屏文本(≤100 字符)
 
   // --- Test seam ---
   void set_injection(
