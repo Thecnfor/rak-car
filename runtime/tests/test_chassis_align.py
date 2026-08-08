@@ -353,6 +353,48 @@ class TestChassisAlignController(unittest.TestCase):
         result = _fast_run(ctrl)
         self.assertFalse(result["stop_ok"])
 
+    def test_control_lost_early_exit_on_write_fail(self):
+        """命令路径连续失败 → 快速 control_lost 退出, 不烧满 max_seconds.
+
+        串口/下位机掉线但视觉仍活 (task_feed 独立于 MC602) 时, 旧行为会满预算
+        timeout (每球白烧 12s); 现在默认 10 帧 ≈ 0.5s 内快速失败, 任务层可立即重武装。
+        """
+        dets = [_d(cx=0.3)] * 100
+        svc = _make_service_with_detections(dets)
+
+        def _boom(*a, **k):
+            raise RuntimeError("serial down")
+
+        svc.set_chassis_velocity = _boom
+        svc.set_wheel_speeds = _boom
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=10.0, max_control_fail_frames=5)
+        result = _fast_run(ctrl)
+        self.assertEqual(result["reason"], "control_lost")
+        self.assertEqual(result["frames"], 5)       # 没烧满 10s, 第 5 帧就退出
+        self.assertFalse(result["stop_ok"])
+
+    def test_control_lost_recovers_on_success(self):
+        """中间成功一帧 → 连续失败计数清零, 不误触 control_lost。"""
+        dets = [_d(cx=0.3)] * 100
+        svc = _make_service_with_detections(dets)
+        call_n = [0]
+        real_set = svc.set_chassis_velocity
+
+        def _flaky(*a, **k):
+            call_n[0] += 1
+            if call_n[0] <= 4:  # 前 4 帧失败, 之后恢复
+                raise RuntimeError("serial busy")
+            return real_set(*a, **k)
+
+        svc.set_chassis_velocity = _flaky
+        ctrl = _make_controller(svc, max_lost_frames=200, hz=50,
+                                max_seconds=10.0, max_control_fail_frames=5)
+        result = _fast_run(ctrl)
+        # 前 4 帧失败 (streak=4 < 5), 第 5 帧成功 → streak 清零 → 不触 control_lost,
+        # 最后因 deadband 收敛或 timeout 正常结束
+        self.assertNotEqual(result["reason"], "control_lost")
+
 
 # ===== Kalman 平滑（filterpy，2026-08-09）=====
 

@@ -142,7 +142,7 @@ class TrackFrame:
 @dataclass
 class TrackChassisResult:
     arrived: bool = False
-    reason: str = "unknown"  # arrived / timeout / watchdog / no_target
+    reason: str = "unknown"  # arrived / timeout / watchdog / no_target / control_lost
     final_frame: Optional[TrackFrame] = None
     frames: int = 0
     elapsed_s: float = 0.0
@@ -214,7 +214,8 @@ class ChassisAlignController:
                  v_slew=0.02, max_lost_frames=60, recover_after_lost=True,
                  watchdog_ms=2000.0,
                  hz=20.0, max_seconds=10.0, dry_run=False,
-                 kalman=True):
+                 kalman=True,
+                 max_control_fail_frames: int = 10):
         self._service = service
         self._target = target
         self._setpoint_cxcy = tuple(float(x) for x in setpoint_cxcy)
@@ -233,6 +234,11 @@ class ChassisAlignController:
         self._hz = float(hz)
         self._max_seconds = float(max_seconds)
         self._dry_run = bool(dry_run)
+        # 2026-08-09: 命令路径连续失败快速退出。串口/下位机掉线时 _set_vel 一直 False,
+        # 视觉却仍活 (task_feed 独立于 MC602) → cx_err 不收敛 → 满预算 timeout 才退,
+        # task 每球白烧 max_seconds。连续失败 max_control_fail_frames 帧 (默认 10 ≈ 0.5s
+        # @20Hz) → reason=control_lost 提前退出, 任务层可立即重武装而不是干等。
+        self._max_control_fail_frames = int(max(1, max_control_fail_frames))
         # Kalman 平滑（默认开, 2026-08-09 用户决定; kalman=False 显式关保持原始
         # 检测）: 有检测帧时平滑 cx/cy 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
         self._kalman = None
@@ -286,6 +292,19 @@ class ChassisAlignController:
         reason = "timeout"
         watchdog_triggered = False
         stop_ok = True
+        _ctl_fail_streak = 0
+
+        def _send(vx, vy) -> bool:
+            """下发三速并跟踪连续失败; 连续失败超阈值 → reason=control_lost, 返回 False."""
+            nonlocal _ctl_fail_streak, reason
+            if _set_vel(vx, vy):
+                _ctl_fail_streak = 0
+                return True
+            _ctl_fail_streak += 1
+            if _ctl_fail_streak >= self._max_control_fail_frames:
+                reason = "control_lost"
+                return False
+            return True
 
         try:
             while True:
@@ -386,7 +405,8 @@ class ChassisAlignController:
                         vx, vy = -last_vx * 0.5, -last_vy * 0.5
                     else:
                         vx, vy = 0.0, 0.0
-                    _set_vel(vx, vy)
+                    if not _send(vx, vy):
+                        break
                     frm.vx, frm.vy = vx, vy
                     if lost_frames > self._max_lost_frames:
                         reason = "no_target"
@@ -441,7 +461,8 @@ class ChassisAlignController:
 
                 last_vx, last_vy = vx, vy
                 frm.vx, frm.vy = vx, vy
-                _set_vel(vx, vy)
+                if not _send(vx, vy):
+                    break
         finally:
             stop_ok = _set_vel(0.0, 0.0)
 
