@@ -120,6 +120,7 @@ target_link_libraries(mc602_bridge_node PUBLIC
 add_executable(mecanum_chassis_node
   src/nodes/mecanum_chassis_node.cpp
   src/mecanum_chassis.cpp
+  src/nav_controller.cpp
   src/mc602_adapter.cpp
   src/mc602_protocol.cpp
   src/serial_transport.cpp
@@ -129,12 +130,14 @@ add_executable(mecanum_chassis_node
 target_include_directories(mecanum_chassis_node PUBLIC include)
 target_link_libraries(mecanum_chassis_node PUBLIC
   rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
   geometry_msgs::geometry_msgs
   nav_msgs::nav_msgs
   sensor_msgs::sensor_msgs
   tf2_ros::tf2_ros
   tf2::tf2
   std_msgs::std_msgs
+  std_srvs::std_srvs
   msgs::msgs
 )
 
@@ -335,6 +338,13 @@ if(BUILD_TESTING)
     src/system_io.cpp
   )
   target_include_directories(test_system_io PUBLIC include)
+
+  # NavController — pure point-to-point P control law (arrival/timeout/wrap)
+  ament_add_gmock(test_nav_controller
+    test/test_nav_controller.cpp
+    src/nav_controller.cpp
+  )
+  target_include_directories(test_nav_controller PUBLIC include)
 
   # Pure task framework tests — no rclcpp needed (uses nullptr sentinel)
   ament_add_gmock(test_base_task
