@@ -73,9 +73,11 @@ class ArmServoMixin:
             return {"ok": False, "reason": "streamer 未注入", "trace_hits": 0,
                     "settled": False, "end_arm": None}
 
-        # 伺服前停 arm_feed，释放串口给 x_speed/set_arm_angle (同 main 侧约定)
+        # 伺服前停 arm_feed，释放串口给 x_speed/set_arm_angle (同 main 侧约定).
+        # 必须 force=True: force=False 是 NOOP, arm_feed 20Hz goto_position 轮询
+        # 会 starve 串口队列, 伺服命令饿死 → job 超时 (2026-08-09 真机复现).
         try:
-            self.stop_arm_feed()
+            self.stop_arm_feed(force=True)
         except Exception as exc:
             logger.warning("run_arm_servo: stop_arm_feed 异常 %s", exc)
 
