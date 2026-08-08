@@ -43,3 +43,50 @@ class TestReadKeyActionRegistered(unittest.TestCase):
         self.assertIn("read_key", CAR_ACTIONS)
         car = type("FakeCar", (), {"read_key": lambda self: True})()
         self.assertTrue(CAR_ACTIONS["read_key"](car))
+
+
+class TestPressDetector(unittest.TestCase):
+    """邊沿偵測 + 去抖：釋放→按下連續 confirm_samples 次才觸發；開機按住不誤觸發。"""
+
+    def test_no_fire_when_never_pressed(self):
+        from main.start.orchestrator import PressDetector
+        d = PressDetector(confirm_samples=2)
+        for _ in range(10):
+            self.assertFalse(d.feed(False))
+
+    def test_fire_on_press_edge(self):
+        from main.start.orchestrator import PressDetector
+        d = PressDetector(confirm_samples=2)
+        d.feed(False)          # 穩定釋放
+        d.feed(False)
+        self.assertFalse(d.feed(True))    # 第 1 個按下樣本
+        self.assertTrue(d.feed(True))     # 連續第 2 個 → 觸發
+
+    def test_debounce_short_glitch(self):
+        from main.start.orchestrator import PressDetector
+        d = PressDetector(confirm_samples=2)
+        d.feed(False)
+        d.feed(False)
+        d.feed(True)           # 一次雜訊
+        d.feed(False)          # 又釋放 → 不觸發
+        self.assertFalse(d.feed(True))    # 重新按下，streak 重計
+        self.assertTrue(d.feed(True))
+
+    def test_held_at_boot_does_not_fire(self):
+        from main.start.orchestrator import PressDetector
+        d = PressDetector(confirm_samples=2)
+        # 開機時按鍵已被壓住：首採樣 True，之後持續 True → 永不觸發
+        self.assertFalse(d.feed(True))
+        for _ in range(5):
+            self.assertFalse(d.feed(True))
+        # 釋放後再按才觸發
+        d.feed(False)
+        d.feed(False)
+        d.feed(True)
+        self.assertTrue(d.feed(True))
+
+    def test_confirm_1_fires_immediately(self):
+        from main.start.orchestrator import PressDetector
+        d = PressDetector(confirm_samples=1)
+        d.feed(False)
+        self.assertTrue(d.feed(True))    # 單樣本確認

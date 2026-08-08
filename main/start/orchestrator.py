@@ -126,6 +126,43 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
 ]
 
 
+class PressDetector:
+    """按鍵邊沿偵測 + 去抖（純邏輯，無 IO，可離線單測）。
+
+    ``feed(pressed)`` 每採樣呼叫一次；回傳 True 表示「確認了一次按下事件」。
+    - 邊沿：僅「釋放→按下」後開始累計；開機時按鍵被壓住不會誤觸發（首採樣只記錄）。
+    - 去抖：連續 ``confirm_samples`` 個按下樣本才判定觸發。
+    - 觸發後須等釋放才重新武裝（下一次按下再觸發）。
+    """
+
+    def __init__(self, confirm_samples: int = 2) -> None:
+        self.confirm = max(1, int(confirm_samples))
+        self.prev: Optional[bool] = None
+        self.streak = 0
+        self.armed = False   # 已在一次按壓中（已觸發，或開機即按住）
+
+    def feed(self, pressed: bool) -> bool:
+        pressed = bool(pressed)
+        if self.prev is None:                # 開機首採樣：只記錄，不觸發
+            self.prev = pressed
+            self.armed = pressed             # 開機即按住 → 先視為按壓中
+            self.streak = 1 if pressed else 0
+            return False
+        rising = (not self.prev) and pressed
+        self.prev = pressed
+        if not pressed:                      # 釋放：歸零並重新武裝
+            self.streak = 0
+            self.armed = False
+            return False
+        if self.armed:                       # 已在按壓中（或已觸發過）→ 不再觸發
+            return False
+        self.streak += 1
+        if self.streak >= self.confirm:
+            self.armed = True
+            return True
+        return False
+
+
 class Orchestrator:
     """巡线导航 + 任务点位调度器。"""
 
@@ -184,11 +221,12 @@ class Orchestrator:
         logger.info("loaded %d waypoints from task_config.yml: %s", len(out), wp_summary)
         return out
 
-    def _run_mission(self, waypoints: List[Waypoint]) -> List[str]:
-        """核心逻辑：初始化底盘/巡线/IR/里程计/TUI，按 waypoints 列表顺序导航并执行任务。
+    def _init_mission(self, start_lane: bool = True) -> Dict[str, Any]:
+        """建好整套任務機制並回傳 state（初始化/巡線/IR/里程計/TUI/下位機屏幕）。
 
-        由 run()（全流程）和 run_single_task()（单任务测试）共用。
-        返回 completed 列表。
+        由 _run_mission()（全流程/單任務）與 wait_key_then_run()（--wait-key 一鍵啟動）共用。
+        start_lane=False 時 lane runner 線程**不啟動**：等待階段車子不許動，
+        由 wait_key_then_run 在按鍵按下瞬間才啟動（保證按下即開始、無預移動）。
         """
         client = RuntimeApiClient()
         if not client.wait_until_ready(timeout=10.0):
@@ -255,7 +293,9 @@ class Orchestrator:
             kwargs={"max_seconds": math.inf},
             daemon=True, name="lane",
         )
-        runner_thread.start()
+        # start_lane=False（一鍵啟動等待階段）→ 只建不啟，按鍵按下才 .start()
+        if start_lane:
+            runner_thread.start()
 
         # 后台 B：里程计（全程累计，写共享 buffer）
         dis_buf = [0.0]
@@ -284,6 +324,34 @@ class Orchestrator:
         threading.Thread(target=self._display_ui_loop,
                          args=(display_ui, tui_buf, display_running),
                          daemon=True, name="display").start()
+
+        return {
+            "client": client, "api": api, "runner": runner,
+            "runner_thread": runner_thread,
+            "dis_buf": dis_buf, "dis_epoch": dis_epoch,
+            "tui_buf": tui_buf, "tui_running": tui_running,
+            "display_ui": display_ui, "display_running": display_running,
+            "post_task1": post_task1, "post_task6": post_task6,
+        }
+
+    def _walk_waypoints(self, state: Dict[str, Any],
+                        waypoints: List[Waypoint]) -> List[str]:
+        """按 waypoints 列表顺序导航并执行任务（機制由 _init_mission 建立）。
+
+        返回 completed 列表。结束/异常时清理 runner / 线程 / feeds / 下位机屏幕。
+        """
+        api = state["api"]
+        runner = state["runner"]
+        runner_thread = state["runner_thread"]
+        dis_buf = state["dis_buf"]
+        dis_epoch = state["dis_epoch"]
+        tui_buf = state["tui_buf"]
+        tui_running = state["tui_running"]
+        display_running = state["display_running"]
+        display_ui = state["display_ui"]
+        post_task1 = state["post_task1"]
+        post_task6 = state["post_task6"]
+        client = state["client"]
 
         completed: List[str] = []
         try:
@@ -445,6 +513,85 @@ class Orchestrator:
             # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
             logger.info("mission completed: %s", completed)
         return completed
+
+    def _run_mission(self, waypoints: List[Waypoint]) -> List[str]:
+        """核心逻辑：初始化底盘/巡线/IR/里程计/TUI，按 waypoints 列表顺序导航并执行任务。
+
+        由 run()（全流程）和 run_single_task()（单任务测试）共用。
+        返回 completed 列表。
+        """
+        state = self._init_mission(start_lane=True)
+        return self._walk_waypoints(state, waypoints)
+
+    # ── 一鍵啟動：MC602 板上鍵（--wait-key）─────────────────────────
+
+    @staticmethod
+    def _read_key_pressed(client) -> Optional[bool]:
+        """讀一次下位機按鍵。回傳 True/False；job 失敗（控制器掉線）回傳 None。"""
+        try:
+            job = client.execute("car", "read_key", sync=True, timeout=0.5)
+        except Exception:
+            return None
+        if not isinstance(job, dict) or job.get("status") != "succeeded":
+            return None
+        return bool(job.get("result"))
+
+    def _wait_board_key(self, client, tui_buf: List[Dict[str, Any]]) -> None:
+        """等待 MC602 板上鍵按下（20Hz 輪詢 + 邊沿/去抖）。等待期間屏幕顯示 READY。"""
+        det = PressDetector(confirm_samples=2)
+        error_streak = 0
+        tui_buf[0] = {"wp": "PRESS BOARD KEY", "dis": 0.0,
+                      "ir_left": None, "ir_right": None, "state": "READY"}
+        while True:
+            pressed = self._read_key_pressed(client)
+            if pressed is None:
+                error_streak += 1
+                tui_buf[0] = {"wp": "CTRL ERR", "dis": 0.0,
+                              "ir_left": None, "ir_right": None, "state": "ERR"}
+                time.sleep(min(1.0, 0.1 * error_streak))   # 退避重試
+                continue
+            error_streak = 0
+            tui_buf[0] = {"wp": "PRESS BOARD KEY", "dis": 0.0,
+                          "ir_left": None, "ir_right": None, "state": "READY"}
+            if det.feed(pressed):
+                logger.info("board key pressed → mission start")
+                return
+            time.sleep(0.05)   # 20Hz
+
+    def wait_key_then_run(self) -> None:
+        """--wait-key 模式：預先初始化（不挪車）→ 等 MC602 板上鍵 → 立即開跑完整任務。
+
+        比賽計時從按下開始：等待階段完成全套初始化（含 5s IR feed 等待、lane 模型
+        常駐熱載），按下瞬間只做「啟動 lane runner 線程 + 進 waypoint 迴圈」，
+        beep 非阻塞不擋第一步挪車。任務完成後回 READY 可再按重跑。
+        """
+        state = self._init_mission(start_lane=False)
+        while True:
+            self._wait_board_key(state["client"], state["tui_buf"])
+            # 按下 → 立刻開始：啟動 runner 線程（首幀輪速 ~20-40ms 內下發）
+            state["runner_thread"].start()
+            threading.Thread(target=self._beep_async,
+                             args=(state["client"],), daemon=True).start()
+            try:
+                self._walk_waypoints(state, self.waypoints)
+                threading.Thread(target=self._beep_async,
+                                 args=(state["client"], 3), daemon=True).start()
+            except KeyboardInterrupt:
+                logger.info("interrupted by user, back to READY")
+            except Exception as exc:
+                logger.exception("mission failed: %s", exc)
+            # 完成/失敗 → 重建機制（_walk_waypoints 已清理 runner/線程），回 READY
+            state = self._init_mission(start_lane=False)
+
+    @staticmethod
+    def _beep_async(client, times: int = 1) -> None:
+        """非阻塞蜂鳴：按下確認 beep×1 / 完成 beep×3，跑在背景線程，不擋主流程。"""
+        try:
+            for _ in range(times):
+                client.execute("car", "beep", sync=True, timeout=2.0)
+                time.sleep(0.3)
+        except Exception:
+            pass
 
     def run(self) -> None:
         """全流程 8 任务（巡线 + IR/里程计触发 + 顺序执行）。"""
