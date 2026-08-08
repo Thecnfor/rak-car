@@ -98,8 +98,8 @@ S_POSE_HAND_DEG = 0.0   # 主循环切 S 用 hand (deg)
 PLACE_ARM_DEG = 90.0
 PLACE_HAND_DEG = 0.0
 PLACE_Y_MM = -100.0          # 工作平面安全高度 (mm)
-PLACE_X_MM_FALLBACK = -265.0 # 唯一依据，禁止从 cfg / overrides 覆盖
-PLACE_ALIGN_X_MM = -290.0    # 视觉对齐时稍收回 (mm)
+PLACE_X_MM_FALLBACK = -235.0 # 唯一依据，禁止从 cfg / overrides 覆盖
+PLACE_ALIGN_X_MM = -300.0    # 视觉对齐时稍收回 (mm)
 
 # ── 释放 y 轨迹 (单位 mm; 负 = 向下) ──────────────────────────────────────
 PLACE_DESCEND_MM = -20.0   # 吸住后下降到 -20mm
