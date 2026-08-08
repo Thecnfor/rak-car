@@ -128,7 +128,6 @@ class DetectorNode(Node):
             msg.ys.append(float(y1))
             msg.widths.append(float(x2 - x1))
             msg.heights.append(float(y2 - y1))
-        msg.inference_ms = float(inference_ms) if hasattr(msg, "inference_ms") else 0.0
         self._pub.publish(msg)
 
 
