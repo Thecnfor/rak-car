@@ -221,7 +221,8 @@ class ChassisAlignController:
                  watchdog_ms=2000.0,
                  hz=20.0, max_seconds=10.0, dry_run=False,
                  kalman=True,
-                 max_control_fail_frames: int = 10):
+                 max_control_fail_frames: int = 10,
+                 decouple_xy: bool = True):
         self._service = service
         self._target = target
         self._setpoint_cxcy = tuple(float(x) for x in setpoint_cxcy)
@@ -240,6 +241,12 @@ class ChassisAlignController:
         self._hz = float(hz)
         self._max_seconds = float(max_seconds)
         self._dry_run = bool(dry_run)
+        # 2026-08-09 用户: 微调只动对角轮会打滑 → 4 轮一起平移。麦轮 IK 在
+        # |vx|≈|vy| 的 45° 对角平移时, (vx±vy) 把一对对角轮置 0 → 只剩 2 轮
+        # 提供牵引 → 打滑。decouple_xy=True 时每帧只驱动误差较大的单轴
+        # (另一轴 0): 纯 x / 纯 y 平移 4 轮全动, 永不出现对角死对。
+        # decouple_xy=False 保留旧对角平移 (真机对拍用)。
+        self._decouple_xy = bool(decouple_xy)
         # 2026-08-09: 命令路径连续失败快速退出。串口/下位机掉线时 _set_vel 一直 False,
         # 视觉却仍活 (task_feed 独立于 MC602) → cx_err 不收敛 → 满预算 timeout 才退,
         # task 每球白烧 max_seconds。连续失败 max_control_fail_frames 帧 (默认 10 ≈ 0.5s
@@ -443,10 +450,21 @@ class ChassisAlignController:
                 cy_err = frm.cy_err if frm.cy_err is not None else 0.0
 
                 # P 控制律
-                vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                 if self._vx_only:
+                    # task6 LLM-as-servo: 只动 x
+                    vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                     vy = 0.0
+                elif self._decouple_xy:
+                    # 4 轮一起平移 (2026-08-09): 每帧只驱动误差较大的单轴, 另一轴 0。
+                    # 同时驱动 vx+vy 且 |vx|≈|vy| 时 IK 置零一对对角轮 → 打滑。
+                    if abs(cx_err) >= abs(cy_err):
+                        vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
+                        vy = 0.0
+                    else:
+                        vx = 0.0
+                        vy = float(self._sign_vy) * float(self._kp) * float(cy_err)
                 else:
+                    vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                     vy = float(self._sign_vy) * float(self._kp) * float(cy_err)
 
                 # v_max 限幅

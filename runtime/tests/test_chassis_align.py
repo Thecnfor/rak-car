@@ -433,6 +433,45 @@ class TestChassisAlignController(unittest.TestCase):
         result = _fast_run(ctrl)
         self.assertTrue(result["motion_ok"])
 
+    def test_decouple_xy_drives_single_axis(self):
+        """decouple_xy 默认开: 每帧只驱动误差较大的单轴 (另一轴 0) → 4 轮一起平移。
+
+        cx=0.4, cy=0.2 → |cx|>|cy| → 只动 vx, vy 恒 0; 反之只动 vy。
+        """
+        # x 误差更大 → vx 动, vy 0
+        svc = _make_service_with_detections([_d(cx=0.4, cy=0.2)] * 50)
+        ctrl = _make_controller(svc, kp=0.20, v_slew=0.10,
+                                deadband=0.01, hold_frames=100,
+                                hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl)
+        x_only = [(vx, vy) for vx, vy, _ in svc.set_chassis_velocity_calls[:-1]]
+        self.assertTrue(any(abs(vx) > 1e-6 for vx, _ in x_only))
+        self.assertTrue(all(abs(vy) < 1e-9 for _, vy in x_only),
+                        f"decouple_xy: vy 应恒 0 (x 误差更大), got {x_only[:3]}")
+
+        # y 误差更大 → vy 动, vx 0
+        svc2 = _make_service_with_detections([_d(cx=0.2, cy=0.4)] * 50)
+        ctrl2 = _make_controller(svc2, kp=0.20, v_slew=0.10,
+                                 deadband=0.01, hold_frames=100,
+                                 hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl2)
+        y_only = [(vx, vy) for vx, vy, _ in svc2.set_chassis_velocity_calls[:-1]]
+        self.assertTrue(any(abs(vy) > 1e-6 for _, vy in y_only))
+        self.assertTrue(all(abs(vx) < 1e-9 for vx, _ in y_only),
+                        f"decouple_xy: vx 应恒 0 (y 误差更大), got {y_only[:3]}")
+
+    def test_decouple_xy_false_keeps_diagonal(self):
+        """decouple_xy=False → 保留对角平移 (vx, vy 同时非零)。"""
+        svc = _make_service_with_detections([_d(cx=0.4, cy=0.2)] * 50)
+        ctrl = _make_controller(svc, kp=0.20, v_slew=0.10,
+                                decouple_xy=False,
+                                deadband=0.01, hold_frames=100,
+                                hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl)
+        diag = [(vx, vy) for vx, vy, _ in svc.set_chassis_velocity_calls[:-1]]
+        self.assertTrue(any(abs(vx) > 1e-6 and abs(vy) > 1e-6 for vx, vy in diag),
+                        f"decouple_xy=False 应同时动两轴, got {diag[:3]}")
+
 
 # ===== Kalman 平滑（filterpy，2026-08-09）=====
 

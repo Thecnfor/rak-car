@@ -191,6 +191,7 @@ class TestTrackChassisThinWrapper(unittest.TestCase):
             kp=0.30, v_max=0.15, deadband=0.08, hold_frames=3,
             v_slew=0.03, max_lost_frames=30, recover_after_lost=False,
             watchdog_ms=1000.0, hz=15.0, max_seconds=5.0, dry_run=True,
+            decouple_xy=False,
         )
         call_kwargs = api.chassis_align.call_args[1]
         self.assertEqual(call_kwargs["target"], "water")
@@ -204,6 +205,15 @@ class TestTrackChassisThinWrapper(unittest.TestCase):
         self.assertAlmostEqual(call_kwargs["deadband"], 0.08)
         self.assertEqual(call_kwargs["hold_frames"], 3)
         self.assertTrue(call_kwargs["dry_run"])
+        self.assertFalse(call_kwargs["decouple_xy"])  # 4 轮一起平移开关透传
+
+    def test_decouple_xy_default_true(self):
+        """decouple_xy 默认 True (4 轮一起平移, 2026-08-09 用户决策)。"""
+        response = {"arrived": False, "reason": "timeout",
+                    "frames": 0, "elapsed_s": 0.0, "final_frame": None}
+        api = self._make_mock_api(response)
+        track_chassis("h_tu_dou", api=api)
+        self.assertTrue(api.chassis_align.call_args[1]["decouple_xy"])
 
     def test_api_auto_connect(self):
         """api=None 时自动 ChassisClient.connect()。"""
