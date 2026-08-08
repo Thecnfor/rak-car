@@ -259,6 +259,177 @@ class TrackChassisResult:
 # ============ 主函数: track_chassis ============
 
 
+def _track_chassis_client_loop(
+    target: Union[str, Collection[str]],
+    *,
+    api: ChassisClient,
+    setpoint_cxcy: Tuple[float, float] = (0.0, 0.0),
+    select_mode: SelectMode = "nearest_to_center",
+    sign_vx: int = -1,
+    sign_vy: int = +1,
+    vx_only: bool = False,
+    kp: float = 0.20,
+    v_max: float = 0.12,
+    deadband: float = 0.05,
+    hold_frames: int = 5,
+    v_slew: Optional[float] = 0.02,
+    max_lost_frames: int = 60,
+    recover_after_lost: bool = True,
+    watchdog_ms: Optional[float] = 2000.0,
+    hz: float = 20.0,
+    max_seconds: float = 10.0,
+    dry_run: bool = False,
+    on_tick: Optional[Callable[[TrackFrame, Tuple[float, float]], None]] = None,
+    sense_fn: Optional[Callable[[], TrackFrame]] = None,
+) -> TrackChassisResult:
+    """client 侧控制律闭环（2026-08-09 从 track_chassis 拆分出来）。
+
+    只有带 ``sense_fn`` / ``on_tick`` 的调用才走这里——检测源（LLM 看帧报
+    坐标，task6 LLM-as-servo）或回调是 client 特有能力，无法下沉 runtime。
+    语义与下沉前完全一致；**不负责 api.close()**（调用方收尾）。
+
+    控制律与 runtime ChassisAlignController 1:1 同构：
+      vx = sign_vx * kp * cx_err, vy = sign_vy * kp * cy_err
+      + v_max 限幅 + v_slew 限幅 + deadband/hold_frames 收敛 + 丢帧 recover + watchdog。
+    """
+    labels = expand_label_set(target)
+    if not labels:
+        return TrackChassisResult(reason="no_target")
+
+    period = 1.0 / max(hz, 1.0)
+    start = time.monotonic()
+    deadline = start + max(0.0, float(max_seconds))
+    next_tick = time.monotonic()
+
+    def _set_vel(vx: float, vy: float) -> None:
+        if dry_run:
+            return
+        try:
+            api.set_chassis_velocity(vx, vy, 0.0, timeout=1.5)
+        except Exception:
+            try:
+                api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30), timeout=1.0)
+            except Exception:
+                pass
+
+    frames = 0
+    in_band = 0
+    last_vx = 0.0
+    last_vy = 0.0
+    lost_frames = 0
+    final_frame: Optional[TrackFrame] = None
+    arrived = False
+    reason = "timeout"
+    watchdog_triggered = False
+
+    try:
+        while True:
+            now = time.monotonic()
+            if now > deadline:
+                reason = "timeout"
+                break
+            sleep_s = next_tick - now
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            next_tick += period
+            if next_tick < now:
+                next_tick = now + period
+
+            frm = sense_fn() if sense_fn is not None else _sense_frame(
+                api, labels, setpoint_cxcy, select_mode
+            )
+            frames += 1
+            final_frame = frm
+
+            if watchdog_ms is not None and frm.age_ms is not None and frm.target_found:
+                if frm.age_ms > watchdog_ms:
+                    watchdog_triggered = True
+                    break
+
+            if not frm.target_found:
+                lost_frames += 1
+                in_band = 0
+                if lost_frames == 1 and recover_after_lost and (last_vx != 0.0 or last_vy != 0.0):
+                    vx, vy = -last_vx * 0.5, -last_vy * 0.5
+                else:
+                    vx, vy = 0.0, 0.0
+                _set_vel(vx, vy)
+                frm.vx, frm.vy = vx, vy
+                if lost_frames > max_lost_frames:
+                    reason = "no_target"
+                    break
+                if on_tick is not None:
+                    try:
+                        on_tick(frm, (vx, vy))
+                    except Exception:
+                        pass
+                continue
+
+            lost_frames = 0
+
+            cx_err = frm.cx_err if frm.cx_err is not None else 0.0
+            cy_err = frm.cy_err if frm.cy_err is not None else 0.0
+            vx = float(sign_vx) * float(kp) * float(cx_err)
+            if vx_only:
+                vy = 0.0
+            else:
+                vy = float(sign_vy) * float(kp) * float(cy_err)
+            if vx > v_max:
+                vx = v_max
+            elif vx < -v_max:
+                vx = -v_max
+            if vy > v_max:
+                vy = v_max
+            elif vy < -v_max:
+                vy = -v_max
+            if v_slew is not None:
+                dvx = vx - last_vx
+                if abs(dvx) > v_slew:
+                    vx = last_vx + v_slew if dvx > 0 else last_vx - v_slew
+                dvy = vy - last_vy
+                if abs(dvy) > v_slew:
+                    vy = last_vy + v_slew if dvy > 0 else last_vy - v_slew
+
+            if vx_only:
+                in_deadband = abs(cx_err) < deadband
+            else:
+                in_deadband = abs(cx_err) < deadband and abs(cy_err) < deadband
+            if in_deadband:
+                vx = 0.0
+                vy = 0.0
+                in_band += 1
+                if in_band >= hold_frames:
+                    arrived = True
+                    reason = "arrived"
+                    break
+            else:
+                in_band = 0
+
+            last_vx, last_vy = vx, vy
+            frm.vx = vx
+            frm.vy = vy
+            _set_vel(vx, vy)
+            if on_tick is not None:
+                try:
+                    on_tick(frm, (vx, vy))
+                except Exception:
+                    pass
+    finally:
+        _set_vel(0.0, 0.0)
+
+    if watchdog_triggered:
+        reason = "watchdog"
+
+    elapsed = time.monotonic() - start
+    return TrackChassisResult(
+        arrived=arrived,
+        reason=reason,
+        final_frame=final_frame,
+        frames=frames,
+        elapsed_s=elapsed,
+    )
+
+
 def track_chassis(
     target: Union[str, Collection[str]] = "h_tu_dou",
     *,
@@ -284,19 +455,36 @@ def track_chassis(
 ) -> TrackChassisResult:
     """通用底盘视觉追踪: 把 target bbox 中心拉到 setpoint_cxcy。
 
-    控制律已在 runtime 执行；本函数只做一次 HTTP 同步调用
-    ``POST /v1/realtime/chassis-align``，阻塞 1-15s 后返回结果。
-
-    ``on_tick`` / ``sense_fn`` 已废弃（控制律在 runtime 跑，无法注入回调）；
-    传入时记录 warning 日志后忽略。
+    两条路径（2026-08-09）：
+      - **无 sense_fn（默认）**：控制律在 runtime 执行，本函数只做一次 HTTP
+        同步调用 ``POST /v1/realtime/chassis-align``，阻塞 1-15s 返回。
+        ``on_tick`` 是调试回调、控制律在 runtime 跑无法逐帧注入——单独传入
+        时记录 warning 后忽略。
+      - **传了 sense_fn**：走 client 侧闭环（`_track_chassis_client_loop`）。
+        检测源（LLM-as-servo，task6）是 client 特有能力，无法下沉 runtime，
+        保持旧行为。
     """
+    own_api = api is None
     if api is None:
         api = ChassisClient.connect()
     try:
-        if on_tick is not None:
-            logger.warning("track_chassis: on_tick ignored (控制律已下沉到 runtime)")
         if sense_fn is not None:
-            logger.warning("track_chassis: sense_fn ignored (控制律已下沉到 runtime)")
+            return _track_chassis_client_loop(
+                target,
+                api=api,
+                setpoint_cxcy=setpoint_cxcy,
+                select_mode=select_mode,
+                sign_vx=sign_vx, sign_vy=sign_vy, vx_only=vx_only,
+                kp=kp, v_max=v_max, deadband=deadband, hold_frames=hold_frames,
+                v_slew=v_slew, max_lost_frames=max_lost_frames,
+                recover_after_lost=recover_after_lost,
+                watchdog_ms=watchdog_ms,
+                hz=hz, max_seconds=max_seconds,
+                dry_run=dry_run,
+                on_tick=on_tick, sense_fn=sense_fn,
+            )
+        if on_tick is not None:
+            logger.warning("track_chassis: on_tick ignored (控制律在 runtime 跑, 无法逐帧注入)")
         resp = api.chassis_align(
             target=target,
             setpoint_cxcy=list(setpoint_cxcy),
@@ -310,10 +498,11 @@ def track_chassis(
             dry_run=dry_run,
         )
     finally:
-        try:
-            api.close()
-        except Exception:
-            pass
+        if own_api:
+            try:
+                api.close()
+            except Exception:
+                pass
     if not isinstance(resp, dict):
         return TrackChassisResult(reason="error")
     result_data = resp.get("result", resp)
