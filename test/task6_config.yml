@@ -30,4 +30,13 @@ get_order:
     y_mm: -150              # 读单 Y (2026-08-08: -180 → -150)
     final_x_mm: -150        # 读单最终 X (2026-08-08: -200 → -150)
 
+  # 蔬菜视觉抓取对齐 (2026-08-09 控制闭环下沉, 同 task2 pick_vision 开关):
+  #   local_servo=true  → 新传输方式 (runtime 进程内 run_arm_servo, main 只发一次目标)
+  #   local_servo=false → 旧方式 (网络每帧 find_target_4dof)
+  #   增益/死区/速度上限/臂限位/对齐 setpoint 仍走 task6_get_order.py 的 PICK_* 常量
+  #   (精对齐参数实车标定过), 这里只放开关 + 超时.
+  pick_vision:
+    local_servo: true
+    timeout: 6.0          # 对齐超时秒 (→ run_arm_servo servo_timeout, 同 PICK_FINE_TIMEOUT_S)
+
   v_max_arm_x_mms: 80
