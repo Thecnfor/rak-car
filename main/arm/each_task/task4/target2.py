@@ -69,13 +69,14 @@ except ImportError:  # pragma: no cover — 直接 python target2.py 时无包�
 LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target2"
 
 # ---- cls_id → color fallback (部分模型不返回 label 字符串, 用 cls_id 兜底) ----
-# task4 实测 2026-07-25 PaddleDet 用 cls_id 16=ball_blue / 17=ball_yellow,
-# 早期 0/1 是另一个数据集的约定。两条都列上, 哪个命中算哪个。
+# 2026-08-08: 对齐 task2026 模型真实 label_list (车上 infer_cfg.yml 实测):
+#   17=ball_yellow, 18=ball_blue; 16 现在是 cylinder_1, 0/1 是 water_l3/l2 ——
+#   这些已不是球, 必须从映射里删除, 否则 creep 会把圆柱体/水容器误判成"蓝球见球",
+#   停在假目标上 (track 按 label 正确拒绝 → no_target 连环失败)。
+#   真实球 label 含 blue/yellow, _label_to_color 走 label 分支即可, cls_id 只是兜底。
 CLS_ID_TO_COLOR: dict[int, str] = {
-    0: COLOR_BLUE,    # 旧数据集 (以 label 为准)
-    1: COLOR_YELLOW,
-    16: COLOR_BLUE,   # task4 实测 2026-07-25 PaddleDet 输出
-    17: COLOR_YELLOW,
+    17: COLOR_YELLOW,  # task2026: ball_yellow
+    18: COLOR_BLUE,    # task2026: ball_blue
 }
 
 
@@ -104,7 +105,7 @@ def _norm_xy(bbox_norm: dict) -> tuple[float, float, float, float]:
 
     支持三种 bbox 格式 (按优先级匹配):
       - {"x_center": ..., "y_center": ..., "width": ..., "height": ...}
-        (task4 实测 2026-07-25 — cls_id 16=ball_blue / 17=ball_yellow,
+        (task2026 实测 — cls_id 17=ball_yellow / 18=ball_blue,
          cx/cy 是相对图像中心的归一化, 不是 [0,1] 左上原点)
       - {"cx": ..., "cy": ..., "w": ..., "h": ...}     (部分 PaddleDet 输出)
       - {"x1": ..., "y1": ..., "x2": ..., "y2": ...}   (xyxy 归一化, 左上原点)
