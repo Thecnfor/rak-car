@@ -22,7 +22,7 @@ def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
         DeclareLaunchArgument("front_device", default_value="/dev/video0"),
         DeclareLaunchArgument("side_device", default_value="/dev/video2"),
-        DeclareLaunchArgument("image_rate_hz", default_value="20.0"),
+        DeclareLaunchArgument("image_rate_hz", default_value="30.0"),
 
         # ---- front 相机(循线用)----
         Node(
@@ -53,7 +53,7 @@ def generate_launch_description() -> LaunchDescription:
                 "image_transport": "compressed",
                 "correction_engine": "/home/xrak/models/lane/correction_cnn/correction_cnn_fp16.engine",
                 "cnn_lane_engine": "/home/xrak/models/lane/cnn_lane/cnn_lane_fp16.engine",
-                "publish_rate_hz": 20.0,
+                "publish_rate_hz": 30.0,
             }],
         ),
         # ---- side → task 检测(PP-YOLOE engine)----
