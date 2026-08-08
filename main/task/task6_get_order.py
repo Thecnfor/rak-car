@@ -843,6 +843,45 @@ def _lift_and_carry(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any
     raise NotImplementedError("阶段 5 lift_and_carry - 待实现")
 
 
+def _write_orders_to_liebiao(order_list: Dict[str, Any]) -> bool:
+    """把两轮读单结果**按顺序**写进 task6/.liebiao.json, 供 task7 使用.
+
+    2026-08-08 用户需求: task6 每次运行都要把订单信息传给 task7, 且按顺序:
+      round1 → liaobiao1 (位置1), round2 → liaobiao2 (位置2).
+    实现: 先清空两个列表, 再按 round1→round2 顺序填充, 最后**一次原子写盘**
+    (绕开 append_liaobiao* 内部带 ✅ 的 print —— Windows gbk 控制台会崩).
+    独立 try/except, 写盘失败只告警不影响任务本身.
+
+    Args:
+        order_list: {"round1": [{"name","goods"},...], "round2": [...]}
+
+    Returns:
+        bool: 写盘是否成功 (写盘失败不影响任务, 返回 False)
+    """
+    from main.arm.each_task.task6 import liebiao as task6_liebiao
+    try:
+        task6_liebiao.liaobiao1.clear()
+        task6_liebiao.liaobiao2.clear()
+        written = 0
+        for round_key, target_list in (("round1", task6_liebiao.liaobiao1),
+                                       ("round2", task6_liebiao.liaobiao2)):
+            for o in (order_list or {}).get(round_key, []) or []:
+                name = (o or {}).get("name", "")
+                goods = (o or {}).get("goods", "")
+                if name and goods:
+                    target_list.append({"蔬菜": goods, "人名": name})
+                    written += 1
+                else:
+                    logger.warning("  [写盘task7] 跳过缺字段订单: name=%r goods=%r", name, goods)
+        task6_liebiao._save_to_json()
+        logger.info("  [写盘task7] 完成: liaobiao1=%d 条, liaobiao2=%d 条, 共写 %d 条",
+                    len(task6_liebiao.liaobiao1), len(task6_liebiao.liaobiao2), written)
+        return True
+    except Exception as exc:
+        logger.warning("  [写盘task7] 写盘失败 (不影响任务): %s", exc)
+        return False
+
+
 # ============================================================
 # run() 主入口
 # ============================================================
@@ -874,7 +913,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     runner = ArmRunner(arm_client)
 
     completed: List[str] = []
-    order_list: List[Dict[str, Any]] = []
+    order_list: Dict[str, Any] = {"round1": [], "round2": []}   # 两轮读单结果, 写盘传给 task7
 
     try:
         # ===== 阶段 1: 摆读单姿态 + 底盘对齐 + 第一次读单 (先读后推) =====
@@ -943,6 +982,11 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             "round2": round2.get("orders", []),
         }
 
+        # ===== 阶段 3.5: 订单信息写盘传给 task7 (round1→liaobiao1, round2→liaobiao2) =====
+        # 2026-08-08: 每次运行都覆盖写盘, 按顺序, 即使后续抓取失败 task7 也有最新订单.
+        _write_orders_to_liebiao(order_list)
+        completed.append("write_liebiao")
+
         # ===== 阶段 4: 再前进 + 按菜单顺序视觉抓取订单蔬菜 =====
         logger.info("=== 阶段 4: 再前进 + 按菜单顺序视觉抓取订单蔬菜 ===")
 
@@ -1003,6 +1047,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
     except Exception as exc:
         logger.exception("get_order 任务失败: %s", exc)
+        # 异常路径也写盘 (order_list 可能只有部分轮次/为空): 保证 task7 拿到的
+        # 是本次运行的真实状态, 不残留上一次的陈旧订单.
+        _write_orders_to_liebiao(order_list)
         return {
             "ok": False,
             "completed": completed,
