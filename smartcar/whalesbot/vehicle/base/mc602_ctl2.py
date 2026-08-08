@@ -186,16 +186,16 @@ class DevCmdInterface:
         return self.send_get(data_bytes)
     
     # 获取操作（读帧：低优先级 + 可共享合并）
-    def get(self, *args, port_id=None):
-        data_bytes = self.get_bytes(*args, mode=1, port_id=port_id)
+    def get(self, *args, mode=None, port_id=None):
+        data_bytes = self.get_bytes(*args, mode=mode, port_id=port_id)
         # print(data_bytes)
         return self.send_get(data_bytes, priority=PRIORITY_READ)
     
     # 没有操作符号时
-    def no_act(self, port_id=None):
+    def no_act(self, port_id=None, priority=PRIORITY_NORMAL):
         data_bytes = self.get_bytes(port_id=port_id)
         # print(data_bytes)
-        return self.send_get(data_bytes)
+        return self.send_get(data_bytes, priority=priority)
     
     def act_default(self, *args, port_id=None):
         data_bytes = self.get_bytes(*args, port_id=port_id)
@@ -344,7 +344,7 @@ class BoardKey_2(DevCmdInterface):
         super().__init__(**ctl602_dev_list["board_key"])
     
     def no_act(self):
-        return super().no_act()[1:]
+        return super().no_act(priority=PRIORITY_READ)[1:]
 
 class LedLight_2(DevCmdInterface):
     def __init__(self, port_id=None) -> None:

@@ -141,6 +141,9 @@ class PressDetector:
         self.streak = 0
         self.armed = False   # 已在一次按壓中（已觸發，或開機即按住）
 
+    def is_armed(self) -> bool:
+        return self.armed
+
     def feed(self, pressed: bool) -> bool:
         pressed = bool(pressed)
         if self.prev is None:                # 開機首採樣：只記錄，不觸發
@@ -533,7 +536,7 @@ class Orchestrator:
         GET /v1/realtime/key/state 單發 ~10ms。回傳 True/False；控制器掉線回傳 None。
         """
         try:
-            resp = client.get(f"{client.api_prefix}/realtime/key/state", timeout=1.0)
+            resp = client.get(f"{client.api_prefix}/realtime/key/state", timeout=0.2)
         except Exception:
             return None
         if not isinstance(resp, dict) or not resp.get("ok"):
@@ -541,8 +544,10 @@ class Orchestrator:
         return bool(resp.get("pressed"))
 
     def _wait_board_key(self, client, tui_buf: List[Dict[str, Any]]) -> None:
-        """等待 MC602 板上鍵按下（20Hz 輪詢 + 邊沿/去抖）。等待期間屏幕顯示 READY。"""
-        det = PressDetector(confirm_samples=2)
+        """等待 MC602 板上鍵按下（邊沿 + 40ms 時間窗口去抖）。等待期間屏幕顯示 READY。"""
+        det = PressDetector(confirm_samples=1)
+        press_start = None
+        confirm_duration_s = 0.04
         error_streak = 0
         tui_buf[0] = {"wp": "PRESS BOARD KEY", "dis": 0.0,
                       "ir_left": None, "ir_right": None, "state": "READY"}
@@ -552,15 +557,22 @@ class Orchestrator:
                 error_streak += 1
                 tui_buf[0] = {"wp": "CTRL ERR", "dis": 0.0,
                               "ir_left": None, "ir_right": None, "state": "ERR"}
-                time.sleep(min(1.0, 0.1 * error_streak))   # 退避重試
+                time.sleep(min(0.5, 0.05 * error_streak))   # 退避重試
                 continue
             error_streak = 0
             tui_buf[0] = {"wp": "PRESS BOARD KEY", "dis": 0.0,
                           "ir_left": None, "ir_right": None, "state": "READY"}
             if det.feed(pressed):
-                logger.info("board key pressed → mission start")
-                return
-            time.sleep(0.05)   # 20Hz
+                press_start = time.time()
+            if pressed:
+                if press_start is None and not det.is_armed():
+                    press_start = time.time()
+                if press_start is not None and time.time() - press_start >= confirm_duration_s:
+                    logger.info("board key pressed → mission start")
+                    return
+            else:
+                press_start = None
+            time.sleep(0.01)
 
     def wait_key_then_run(self) -> None:
         """--wait-key 模式：預先初始化（不挪車）→ 等 MC602 板上鍵 → 立即開跑完整任務。
@@ -810,8 +822,28 @@ class Orchestrator:
             logger.info("[post-task1] 恢复视觉 (start_lane_feed)")
         except Exception as exc:
             logger.warning("[post-task1] start_lane_feed 失败: %s", exc)
-        if not self._wait_lane_fresh(api):
-            logger.warning("[post-task1] lane 未在超时内新鲜, resume 可能触发 watchdog 急停")
+
+        # 2026-08-08: _wait_lane_fresh 可能因 inference 延迟 / 车头偏離车道线而超时，
+        # 旧代码单次失败直接 resume → watchdog 急停 → 外环退出 → 卡死。
+        # 改为重试机制：最多 3 次，每次重试前重启 lane_feed。
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            if self._wait_lane_fresh(api):
+                logger.info("[post-task1] lane fresh 成功 (attempt %d/%d)",
+                            attempt, max_retries)
+                break
+            if attempt < max_retries:
+                logger.warning("[post-task1] lane fresh attempt %d/%d 失败，重启 feed 重试...",
+                               attempt, max_retries)
+                try:
+                    api.stop_lane_feed()
+                    time.sleep(0.5)
+                    api.start_lane_feed(hz=self.lane_hz)
+                except Exception as exc:
+                    logger.warning("[post-task1] 重启 lane_feed 失败: %s", exc)
+        else:
+            logger.error("[post-task1] lane fresh %d 次均失败，将强制 resume（ risking watchdog）",
+                         max_retries)
 
     @staticmethod
     def _turn_theta_deg(api: ChassisClient, turn_deg: float,

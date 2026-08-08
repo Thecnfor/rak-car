@@ -926,35 +926,48 @@ def step_target4(
             pose_ok = True
             if not dry_run:
                 try:
-                    # ---- 动态决定传哪些轴 (优化延迟):
-                    #   - 放 bin 后 y 已在 -130 (P 姿態 y), 不需要再動 y
+                    # ---- 動態決定傳哪些軸 (優化延遲):
+                    #   - 放 bin 後 y 已在 -130 (P 姿態 y), 不需要再動 y
                     #   - 黃色球 hand 已在 10° (P 姿態 hand), 不需要再動 hand
                     #   - 藍色球 hand 在 -75°, 需要恢復到 10°
-                    _pose_kwargs: Dict[str, Any] = {
-                        "arm": pose_p_arm_deg,
-                        "x_mm": pose_p_x_mm,
-                        "speed": 100,  # 2026-08-08: 舵機速度 60→100, 減少延遲
-                        "timeout": 30.0,
-                    }
-                    # y 永遠跳過 (放 bin 後已在 -130)
-                    # hand: 黃色已在 10° 跳過, 藍色 (-75°) 和第一球 (None) 需要恢復
+                    #   - x 從 bin_x (0 或 -60) 走到 -295, 行程約 235-295mm,
+                    #     單獨用 200 速度快移, 其餘軸保持 100 不影響安全。
                     if last_color != COLOR_YELLOW:
-                        _pose_kwargs["hand"] = pose_p_hand_deg
-
-                    axis_str = ", ".join(
-                        f"{k}={v}" for k, v in _pose_kwargs.items()
-                        if k not in ("speed", "timeout")
-                    )
-                    print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
-                          f"(composite_run: {axis_str}) ==========")
-                    arm_client.composite_run(**_pose_kwargs)
+                        # 藍色球 / 第一球: 需要恢復 hand, 先快速移 x 再恢復 arm+hand
+                        print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
+                              f"(x 快速橫移 → arm/hand) ==========")
+                        arm_client.composite_run(
+                            x_mm=pose_p_x_mm,
+                            speed=200,
+                            timeout=30.0,
+                        )
+                        arm_client.composite_run(
+                            arm=pose_p_arm_deg,
+                            hand=pose_p_hand_deg,
+                            speed=100,
+                            timeout=30.0,
+                        )
+                    else:
+                        # 黃色球: hand 已在 10°, 只需恢復 arm + x (x 仍快速)
+                        print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
+                              f"(x 快速橫移 → arm) ==========")
+                        arm_client.composite_run(
+                            x_mm=pose_p_x_mm,
+                            speed=200,
+                            timeout=30.0,
+                        )
+                        arm_client.composite_run(
+                            arm=pose_p_arm_deg,
+                            speed=100,
+                            timeout=30.0,
+                        )
                     print(f"========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態完成 ==========\n")
                 except Exception as e:
                     print(f"  [{LOG_PREFIX}] ❌ 恢复 P 姿態失敗: "
                           f"{type(e).__name__}: {str(e)[:120]}")
                     pose_ok = False
             else:
-                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 P 姿態")
+                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳過 P 姿態")
 
             if not pose_ok:
                 final_reason = "pick_error_exceeded"
@@ -983,16 +996,41 @@ def step_target4(
                 print(f"  [{LOG_PREFIX}] 🏁 前移预算内未见球, 视作采区走完")
                 break
 
-            # 2.2 底盘视觉定位 (最左球 → 画面中心)
-            #    只用底盘对齐 (track_chassis), 跳过臂侧 find_target /
-            #    move_to_vision_target —— 假设底盘对齐后吸嘴已在球正上方,
+            # 2.2 底盘视觉定位 (最左球 → 畫面中心)
+            #    只用底盤對齊 (track_chassis), 跳過臂側 find_target /
+            #    move_to_vision_target —— 假設底盤對齊後吸嘴已在球正上方,
             #    直接 composite_run(y_bin高位) → y 下 → grasp 即可。
+            #    2026-08-08: track 段也計入里程計預算, 避免過沖。
+            odo_before = None
+            if not dry_run:
+                try:
+                    odo_before = http_client.call(
+                        "car", "get_odometry", timeout=5.0)
+                except Exception:
+                    pass
             print(f"  [{LOG_PREFIX}] 🎯 track_chassis(leftmost, "
-                  f"≤{track_max_seconds:.0f}s) — 仅底盘对齐, 跳过臂视觉伺服")
+                  f"≤{track_max_seconds:.0f}s) — 僅底盤對齊, 跳過臂視覺伺服")
             track_res = _track_leftmost_ball(
                 max_seconds=track_max_seconds, dry_run=dry_run,
             )
-            print(f"  [{LOG_PREFIX}] track 结束: arrived={track_res.arrived} "
+            if not dry_run and odo_before is not None:
+                try:
+                    odo_after = http_client.call(
+                        "car", "get_odometry", timeout=5.0)
+                    if (isinstance(odo_before, dict) and isinstance(odo_after, dict)
+                            and odo_before.get("status") == "succeeded"
+                            and odo_after.get("status") == "succeeded"):
+                        x_before = (odo_before.get("result") or {}).get("x", 0)
+                        x_after = (odo_after.get("result") or {}).get("x", 0)
+                        track_dist = max(0.0, x_after - x_before)
+                        if track_dist > 0:
+                            total_creep_m += track_dist
+                            print(f"  [{LOG_PREFIX}] 📏 track 段前移 "
+                                  f"{track_dist:.3f}m (里程計差值), "
+                                  f"累計前移 {total_creep_m:.3f}m")
+                except Exception:
+                    pass
+            print(f"  [{LOG_PREFIX}] track 結束: arrived={track_res.arrived} "
                   f"reason={track_res.reason}")
             # 2026-08-06: 软成功 / 宽成 提示. arrived=True 但 reason 是 near_arrived_*
             # 表示 timeout 内没硬停但 final_frame 落入软/宽死区, 视为对齐.

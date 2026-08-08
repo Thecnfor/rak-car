@@ -43,8 +43,8 @@ If uncertain, still choose the most likely result and explain briefly.
 
 DEFAULT_TARGET_COUNT = 4
 DEFAULT_CREEP_SPEED = 0.18          # m/s, 识别段 creep 速度 (2026-08-04 现场: 0.05→0.18)
-DEFAULT_MIN_SCORE = 0.50
-DEFAULT_CENTER_TOL = 0.10
+DEFAULT_MIN_SCORE = 0.40
+DEFAULT_CENTER_TOL = 0.15
 DEFAULT_MIN_GAP = 0.16          # 卡片中心距 16cm → 去重窗口需覆盖一张卡的间距
 DEFAULT_CLASSIFY_WORKERS = 2
 DEFAULT_TARGET_SPACING_M = 0.16       # 卡片 8cm + 间隔 8cm = 中心距 16cm
@@ -203,7 +203,7 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir):
     records = []
     period = max(args.poll_interval, 0.05)
     min_samples = max(2, int(args.target_settle_s / period) + 1)
-    first_window = max(args.center_tol, 0.35)
+    first_window = max(args.center_tol, 0.30)
     slot_window = max(args.center_tol * 2.0, 0.35)
     start_odom = read_traveled(client)
     nominal_travel = 0.0
@@ -441,7 +441,14 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir):
                           "首卡尚未进入中心", flush=True)
             nominal_travel = max(nominal_travel, search_distance)
         if first_det is None:
-            print("[warn] 首卡未在中心窗口内稳定识别", file=sys.stderr)
+            if best_det is not None:
+                print(f"[warn] 首卡未在中心窗口内稳定识别，"
+                      f"用最近接的 best_det (xc={animal_center(best_det):+.3f}) 補救",
+                      file=sys.stderr)
+                first_det = best_det
+                save_slot(first_det, 1)
+            else:
+                print("[warn] 首卡未在中心窗口內穩定識別", file=sys.stderr)
         else:
             save_slot(first_det, 1)
 
@@ -528,7 +535,7 @@ def main():
     parser.add_argument("--target-count", type=int, default=DEFAULT_TARGET_COUNT)
     parser.add_argument("--creep-speed", type=float, default=DEFAULT_CREEP_SPEED,
                         help="recognition creep speed in m/s (default 0.05)")
-    parser.add_argument("--max-travel", type=float, default=1.0,
+    parser.add_argument("--max-travel", type=float, default=1.5,
                         help="safety cap: stop driving after this many meters even if "
                              "fewer than target-count targets were recorded")
     parser.add_argument("--min-score", type=float, default=DEFAULT_MIN_SCORE)

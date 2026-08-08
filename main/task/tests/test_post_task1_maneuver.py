@@ -66,7 +66,7 @@ class TestPostTask1Config(unittest.TestCase):
         seg = load_post_task1()
         self.assertIsNotNone(seg)
         self.assertTrue(seg.get("enabled"))
-        self.assertAlmostEqual(float(seg["straight_m"]), 0.19)
+        self.assertAlmostEqual(float(seg["straight_m"]), 0.09)
         self.assertAlmostEqual(float(seg["turn_deg"]), -45.0)
 
     def test_load_post_task6_present(self):

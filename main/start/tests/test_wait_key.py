@@ -153,12 +153,13 @@ class TestReadKeyPressed(unittest.TestCase):
         from main.start.orchestrator import Orchestrator
         c = self._make_client({"ok": True, "pressed": False, "raw": [0, 0]})
         self.assertIs(Orchestrator._read_key_pressed(c), False)
-        c.get.assert_called_once_with("/v1/realtime/key/state", timeout=1.0)
+        c.get.assert_called_once_with("/v1/realtime/key/state", timeout=0.2)
 
     def test_returns_true_when_pressed(self):
         from main.start.orchestrator import Orchestrator
         c = self._make_client({"ok": True, "pressed": True, "raw": [1, 0]})
         self.assertIs(Orchestrator._read_key_pressed(c), True)
+        c.get.assert_called_once_with("/v1/realtime/key/state", timeout=0.2)
 
     def test_none_on_error_or_not_ok(self):
         from main.start.orchestrator import Orchestrator
