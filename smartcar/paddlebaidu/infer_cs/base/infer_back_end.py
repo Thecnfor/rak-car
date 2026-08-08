@@ -22,6 +22,16 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".
 # 添加项目根目录到Python路径
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")))
 
+# ── Paddle 内存池收窄 (2026-08-09) ───────────────────────────────────────────
+# FLAGS_init_allocator_mb 是 Paddle CPU 分配器的初始池大小, 默认值在 Jetson 上
+# 预分配巨大 → 第一个模型 (lane, eager 预载) 创建 predictor 时 RSS 冲到 ~1.7GB,
+# 整机 3.3GB 被挤爆 → 换页风暴 → task 推理 >500ms 超时 → 对齐 no_target。
+# 实测 (Jetson 真机, Paddle 2.5.2): 只设此 flag, 双 lane predictor 常驻内存
+# 1678MB → 754MB (省 ~0.9GB), 推理速度不变 (6.8ms), 输出逐位一致。
+# setdefault: 外部 env (ecosystem.config.js) 显式设置时以外部为准。
+# 必须在 import paddle 之前设置 (Paddle 在 import 时读这些 FLAGS)。
+os.environ.setdefault("FLAGS_init_allocator_mb", "32")
+
 # 导入infer_front中的函数
 from smartcar.paddlebaidu.infer_cs.base.infer_front import get_yaml, get_path_relative
 from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco, LaneBlendInfer

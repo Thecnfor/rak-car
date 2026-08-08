@@ -38,6 +38,11 @@ module.exports = {
         /* 抑制 Paddle C++ 端的 IR pass verbose (0=INFO, 1=WARNING, 2=ERROR, 3=FATAL) */
         GLOG_minloglevel: "2",
         FLAGS_minloglevel: "2",
+        /* Paddle CPU 分配器初始池收窄到 32MB (2026-08-09): 默认在 Jetson 上预分配
+           巨大, 首个模型 (lane) predictor 创建即 RSS ~1.7GB → 整机换页 → task
+           推理超时。实测 32MB 省 ~0.9GB, 速度/输出不变。infer_back_end.py 里
+           setdefault 同值双保险; 若需调大直接改这里 (以本文件为准)。 */
+        FLAGS_init_allocator_mb: "32",
         PYTHONWARNINGS: "ignore",
       },
       /* 兜底: runtime/server.py 单进程泄漏超过 1.2GB 自动 PM2 重启 (仅看父进程 RSS, infer_back_end 子进程管不到) */
