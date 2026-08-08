@@ -73,8 +73,11 @@ def main() -> None:
     p.add_argument("--lane-hz", type=float, default=50.0)
     p.add_argument("--ir-interval-s", type=float, default=0.02)
     p.add_argument(
-        "--task", type=int, default=None, choices=range(1, 8), metavar="1-7",
-        help="只跑单个任务（1-7）: 巡线到该任务点位 → IR/里程计触发 → 执行任务 → 停止。"
+        "--task", type=str, default=None, metavar="1或1,2,3或1-3",
+        help="只跑单个/多个任务（1-7）。"
+             "单个: --task 4；"
+             "多个逗号: --task 4,5；"
+             "范围: --task 1-3。"
              "不指定时跑全流程 8 任务。",
     )
     p.add_argument(
@@ -113,14 +116,41 @@ def main() -> None:
         except ValueError:
             sys.stderr.write(f"--tasks 格式错误，请用逗号分隔数字，例如: --tasks 1,3,5\n")
             sys.exit(2)
-        # 校验 task_id 范围
-        invalid = [t for t in task_ids if t not in range(1, 8)]
-        if invalid:
-            sys.stderr.write(f"task_id 必须在 1-7 之间，非法值: {invalid}\n")
-            sys.exit(2)
         orch.run_tasks(task_ids)
     elif args.task is not None:
-        orch.run_single_task(args.task)
+        raw = args.task.strip()
+        # 支持 "1,2,3" 或 "1-3" 或单个 "4"
+        if "," in raw or "-" in raw:
+            ids: List[int] = []
+            parts = raw.split(",")
+            for part in parts:
+                part = part.strip()
+                if "-" in part:
+                    try:
+                        start, end = part.split("-", 1)
+                        start_i = int(start.strip())
+                        end_i = int(end.strip())
+                        if start_i > end_i:
+                            start_i, end_i = end_i, start_i
+                        ids.extend(range(start_i, end_i + 1))
+                    except ValueError:
+                        sys.stderr.write(f"--task 范围格式错误: {part!r}，应为 1-3\n")
+                        sys.exit(2)
+                else:
+                    try:
+                        ids.append(int(part))
+                    except ValueError:
+                        sys.stderr.write(f"--task 格式错误: {part!r}，应为数字\n")
+                        sys.exit(2)
+            # 去重 + 排序，保持用户输入顺序不保证，但更规整
+            ids = sorted(set(ids))
+            orch.run_tasks(ids)
+        else:
+            try:
+                orch.run_single_task(int(raw))
+            except ValueError:
+                sys.stderr.write(f"--task 格式错误: {raw!r}，应为 1-7\n")
+                sys.exit(2)
     else:
         orch.run()
 
