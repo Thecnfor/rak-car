@@ -685,6 +685,19 @@ class Orchestrator:
                          display_running: threading.Event) -> None:
         """每 250ms 更新下位机 led_show 屏幕（带节流）。"""
         while display_running.wait():
+            # 2026-08-08 修复: 未初始化 / 队列积压时跳过本轮刷屏。
+            # 显示刷新 4Hz 比 show_text 串口处理快 → 队列无界增长 → current_job_id
+            # 常驻 → runtime _auto_init_loop 被 gate 住 → 车永远初始化不了
+            # (实测 3012+ show_text 排队, initialized=False 卡死)。
+            # 排队 >40 或未初始化就跳过, 让 init 有机会完成后再恢复刷屏。
+            try:
+                hstate = (display_ui.api.get_health() or {}).get("state") or {}
+                if (not hstate.get("initialized")) or (hstate.get("queued_jobs") or 0) > 40:
+                    time.sleep(0.25)
+                    continue
+            except Exception:
+                time.sleep(0.25)
+                continue
             info = tui_buf[0]
             state = info.get("state", "?")
             wp = info.get("wp", "")
