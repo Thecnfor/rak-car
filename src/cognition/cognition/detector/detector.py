@@ -32,7 +32,7 @@ class _OutputAllocator(trt.IOutputAllocator):
     def reallocate_output(self, tensor_name, memory, size, alignment):
         if size > self._capacity:
             if self.mem is not None:
-                cuda.mem_free(self.mem)
+                self.mem.free()   # DeviceAllocation.free()(pycuda 2026 无 mem_free)
             self.mem = cuda.mem_alloc(size)
             self._capacity = size
         return int(self.mem)
@@ -42,7 +42,7 @@ class _OutputAllocator(trt.IOutputAllocator):
 
     def close(self):
         if self.mem is not None:
-            cuda.mem_free(self.mem)
+            self.mem.free()
             self.mem = None
             self._capacity = 0
 
@@ -123,8 +123,8 @@ class Detector:
         if self._output_alloc is not None:
             self._output_alloc.close()
         for d in self._d_inputs.values():
-            cuda.mem_free(d)
-        cuda.mem_free(self._d_num_dets)
+            d.free()
+        self._d_num_dets.free()
 
 
 def cv2_resize(img, size):

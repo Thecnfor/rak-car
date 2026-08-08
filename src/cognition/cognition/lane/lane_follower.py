@@ -25,6 +25,8 @@ from sensor_msgs.msg import CompressedImage, Image
 from msgs.msg import LaneResult
 
 from .models import CorrectionPredictor, LanePredictor
+from .trt_infer import TRTCorrectionPredictor, TRTLanePredictor
+import os
 
 
 class LaneFollower(Node):
@@ -34,6 +36,8 @@ class LaneFollower(Node):
         self.declare_parameter("image_transport", "compressed")   # compressed | raw
         self.declare_parameter("correction_weights", "/home/xrak/models/lane/correction_cnn/correction_cnn.pdparams")
         self.declare_parameter("cnn_lane_dir", "/home/xrak/models/lane/cnn_lane")
+        self.declare_parameter("correction_engine", "/home/xrak/models/lane/correction_cnn/correction_cnn_fp16.engine")
+        self.declare_parameter("cnn_lane_engine", "/home/xrak/models/lane/cnn_lane/cnn_lane_fp16.engine")
         self.declare_parameter("publish_rate_hz", 20.0)
         self.declare_parameter("angle_source", "correction")      # correction | lane | blend
         self.declare_parameter("blend_weight", 0.5)               # blend 时 correction 的权重
@@ -43,11 +47,25 @@ class LaneFollower(Node):
         transport = self.get_parameter("image_transport").value
         rate = self.get_parameter("publish_rate_hz").value
 
-        # 模型加载失败即 raise(no-mocks: 不静默发假数据)。
-        self._correction = CorrectionPredictor(
-            self.get_parameter("correction_weights").value)
-        self._lane = LanePredictor(self.get_parameter("cnn_lane_dir").value)
-        self.get_logger().info("lane models loaded: correction_cnn + cnn_lane")
+        # 推理后端:优先 TRT 引擎(省内存+加速),缺失回落 paddle CPU。
+        corr_engine = self.get_parameter("correction_engine").value
+        lane_engine = self.get_parameter("cnn_lane_engine").value
+        if corr_engine and os.path.isfile(corr_engine):
+            self._correction = TRTCorrectionPredictor(corr_engine)
+            self._corr_backend = "trt"
+        else:
+            self._correction = CorrectionPredictor(
+                self.get_parameter("correction_weights").value)
+            self._corr_backend = "paddle"
+        if lane_engine and os.path.isfile(lane_engine):
+            self._lane = TRTLanePredictor(lane_engine)
+            self._lane_backend = "trt"
+        else:
+            self._lane = LanePredictor(self.get_parameter("cnn_lane_dir").value)
+            self._lane_backend = "paddle"
+        self.get_logger().info(
+            f"lane models loaded: correction_cnn[{self._corr_backend}] "
+            f"+ cnn_lane[{self._lane_backend}]")
 
         # 订阅相机:只缓存最新一帧,定时器按 publish_rate_hz 取帧推理。
         if transport == "raw":
