@@ -178,7 +178,9 @@ def _sense_frame(
 ) -> TrackFrame:
     """读一帧 task_feed, 选目标, 组装 TrackFrame。任何异常 → 空 frame。"""
     try:
-        payload = api.http.get_vision_task_cache()
+        # 2026-08-08：显式短超时。默认 request_timeout=10s，runtime 忙时一次 GET 就能把
+        # 20Hz 闭环冻住 10s（视觉帧反正下一帧会重读，快速失败比阻塞更合理）。
+        payload = api.http.get_vision_task_cache(timeout=1.5)
     except Exception:
         payload = None
     if now_s is None:
@@ -325,8 +327,8 @@ def track_chassis(
             api.set_chassis_velocity(vx, vy, 0.0, timeout=1.5)
         except Exception:
             try:
-                # ws/HTTP 都挂时最后兜底：本地 IK 直发轮速
-                api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30))
+                # ws/HTTP 都挂时最后兜底：本地 IK 直发轮速（短超时,失败即弃,下帧覆盖）
+                api.set_wheel_speeds(mecanum_inverse(vx, vy, 0.0, 0.30), timeout=1.0)
             except Exception:
                 pass
 

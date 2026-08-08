@@ -208,10 +208,15 @@ class RuntimeWsClient:
 
     # === 实时硬件直达 op（car_lock 同步路径，不进 job_queue） ===
 
+    # 2026-08-08：realtime 控制帧（轮速/速度/单电机）一律 auto_reconnect=False。
+    # 这类指令是"幂等、最新覆盖"——死了就直接失败，让调用方走 HTTP 兜底/下一帧重发；
+    # 旧行为断线后 sleep(poll_interval=0.3)+重连+重发，把 20Hz 底盘闭环冻住几百 ms。
+
     def realtime_wheel_speeds(self, speeds, timeout=None):
         return self.request(
             "realtime/wheel_speeds",
             request_timeout=timeout,
+            auto_reconnect=False,
             speeds=list(speeds),
         )
 
@@ -223,6 +228,7 @@ class RuntimeWsClient:
         return self.request(
             "realtime/chassis_velocity",
             request_timeout=timeout,
+            auto_reconnect=False,
             vx=float(vx),
             vy=float(vy),
             wz=float(wz),
@@ -232,6 +238,7 @@ class RuntimeWsClient:
         return self.request(
             "realtime/motor_speed",
             request_timeout=timeout,
+            auto_reconnect=False,
             port=int(port),
             speed=float(speed),
             reverse=int(reverse),

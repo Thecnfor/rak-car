@@ -30,7 +30,7 @@ def _d(label="water", cx=0.0, cy=0.0, w=0.2, h=0.2, score=0.9):
 def _make_mock_api(payloads):
     api = MagicMock()
 
-    def _pop():
+    def _pop(**_kwargs):  # 2026-08-08: 真实方法已接受 timeout kwarg, mock 同步放行
         if payloads:
             return payloads.pop(0)
         return {"task_state": {"active": False, "detections": []}}
