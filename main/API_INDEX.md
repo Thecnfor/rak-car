@@ -170,6 +170,7 @@ client.cancel_job(job_id)
 | POST | `/v1/realtime/motor/speed` | 单电机测速（`port, speed, reverse`） |
 | GET | `/v1/realtime/encoder?port=&reverse=` | 单编码器读 |
 | POST | `/v1/realtime/stepper/rad` | 步进电机按 rad 转（`port, rad, time, reverse, perimeter`） |
+| POST | `/v1/realtime/chassis-align` | 进程内底盘视觉对齐闭环（2026-08-09 下沉）: 一次 HTTP 同步阻塞 1-15s, runtime 内 50Hz 读 task_state 缓存 + 直发轮速（持 `_chassis_align_lock` 独占）。返回 `{arrived, reason, frames, elapsed_s, final_frame}`。client 侧 `track_chassis()` 函数内自动路由: 不传 `sense_fn` 走此端点, 传了走旧 client 闭环 |
 
 ### 5.2 机械臂/总线舵机/PWM
 
@@ -240,6 +241,8 @@ client.get_odom_state()           # 里程计
 | `set_pwm_servo_angle` | PWM 舵机 |
 | `set_digital_output` | 数字输出口 |
 | `get_arm_state` | 机械臂 y/x 位置（`{x, y, side, arm_angle, hand_angle, y_limit}`，与 arm_feed 同源走 SDK 直读，不带 `ref_encoder` / `active` 字段；如需守护线程缓存请用 `/v1/realtime/arm/state`） |
+| `run_arm_servo` | **进程内 arm 视觉伺服闭环**（2026-08-09 下沉）: main 发一次目标参数, runtime 每帧读 task_feed 缓存 + 直调 `arm.x_speed`/`set_arm_angle`, 零网络往返。返回 `{ok, reason, settled, trace_hits, end_arm}`（reason=settled/timeout/stopped）。任务侧用 `task_config.yml → pick_vision.local_servo` 开关切换（true=本闭环, false=旧每帧网络闭环）。⚠️ 前置: `task_feed` 缓存要新鲜、cam2 画面有目标 |
+| `start_arm_feed` / `stop_arm_feed` | arm_feed 守护线程开关（视觉伺服前 `stop_arm_feed(force=True)` 释放串口, 跑完 `start_arm_feed` 恢复; `force=False` 是 NOOP 不会停） |
 
 ### 6.2 机械臂 ARM_ACTIONS（`target="arm"`）
 

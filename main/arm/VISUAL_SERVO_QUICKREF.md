@@ -28,11 +28,24 @@ L3:  S 曲线 Dry ── plan_xy(x0,y0 → x1,y1) ─► 给 L4 估 timeout
 L2:  视觉伺服 ──── PID + depth-aware + 4-DOF ──► (dx_mm, dy_mm) ∈ mm
 L1:  解析选择 ──── bbox parse + TargetSelector ──► Detection {bbox_norm ∈ [-1,+1], bbox_px}
 
-L2 的传输有三条：
+L2 的传输有四条：
   · HTTP /v1/vision/task cache（30Hz 轮询） ──► find_target / find_target_pid / find_target_legacy
   · WS subscribe_task_detection（推流 ~25-60ms）─► find_target_realtime / find_target_track
   · velocity 模式（推荐高频追踪, 免 arm_queue）─► find_target_velocity (XY) / find_target_4dof
     （2026-08-02 封装, 原 07/08 示例抽成 VelocityLoop; ArmRunner.track_velocity / track_4dof 编排）
+  · 进程内闭环（2026-08-09 闭环下沉, **零每帧网络**）──► runtime 读 task_feed 缓存 + 直调
+    arm.x_speed/set_arm_angle, main 只发一次 `run_arm_servo` 等结果
+    （task2 水立方: `task_config.yml → pick_vision.local_servo: true` 走这条;
+      `false` = 退回上面的 velocity 网络闭环, 每条任务只加这一个开关, 旧路径原样保留）
+
+切换说明（2026-08-09）:
+  - **arm**: `task_config.yml` `pick_vision.local_servo: true/false` → true=进程内闭环(runtime),
+    false=旧每帧网络闭环(track_velocity_pick)。判断在 `task2_water_tower.py::_pick_cube`。
+  - **底盘**: `track_chassis()` 函数内自动路由——**不传 `sense_fn`** 走 runtime 闭环
+    (`POST /v1/realtime/chassis-align`, 一次 HTTP), **传了 `sense_fn`**（task6 LLM-as-servo）
+    走旧 client 闭环。task 侧零改动。
+  - ⚠️ 前置: 两个闭环都读 `task_feed` 检测缓存（init 默认 30Hz 启动）, cam2 必须活着、
+    画面里有目标 label, 否则伺服直接找不到目标 → 超时。
 ```
 
 详细函数签名看 `ARM_API.md §0-§10`，单测看 `tests/test_*.py`。
