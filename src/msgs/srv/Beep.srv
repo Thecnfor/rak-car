@@ -1,0 +1,8 @@
+# Beep.srv — 板载蜂鸣器。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §6
+
+uint16 freq           # Hz
+float32 duration_s    # 秒
+---
+bool ok
+string error

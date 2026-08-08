@@ -26,14 +26,15 @@
 
 **Files:**
 - Create: `src/msgs/msg/TaskStatus.msg`
+- Create: `src/msgs/msg/Pose2D.msg`(Lyrical 已移除 geometry_msgs/Pose2D,自建轻量 2D 位姿)
 - Create: `src/msgs/srv/SensorQuery.srv`, `src/msgs/srv/Beep.srv`, `src/msgs/srv/SetRgbLed.srv`, `src/msgs/srv/LedShow.srv`, `src/msgs/srv/Nixie.srv`, `src/msgs/srv/ReadIntArray.srv`
 - Create: `src/msgs/action/ChassisNavigate.action`, `src/msgs/action/ArmExecuteTrajectory.action`
-- Modify: `src/msgs/CMakeLists.txt`(加文件 + `find_package(action_msgs/geometry_msgs/trajectory_msgs)` + DEPENDENCIES;删 ActuatorState.msg)
-- Modify: `src/msgs/package.xml`(加 3 个 depend)
+- Modify: `src/msgs/CMakeLists.txt`(加文件 + `find_package(action_msgs/trajectory_msgs)` + DEPENDENCIES;删 ActuatorState.msg;**不依赖 geometry_msgs**)
+- Modify: `src/msgs/package.xml`(加 action_msgs/trajectory_msgs depend)
 - Delete: `src/msgs/msg/ActuatorState.msg`(已确认全仓库无引用)
 
 **Interfaces:**
-- Produces: `msgs::msg::TaskStatus`; `msgs::srv::{SensorQuery,Beep,SetRgbLed,LedShow,Nixie,ReadIntArray}`; `msgs::action::{ChassisNavigate,ArmExecuteTrajectory}`
+- Produces: `msgs::msg::TaskStatus`; `msgs::msg::Pose2D`; `msgs::srv::{SensorQuery,Beep,SetRgbLed,LedShow,Nixie,ReadIntArray}`; `msgs::action::{ChassisNavigate,ArmExecuteTrajectory}`
 
 - [ ] **Step 1: 写全部接口定义文件**
 
@@ -105,7 +106,7 @@ int64[] values
 `src/msgs/action/ChassisNavigate.action`:
 ```text
 # Goal
-geometry_msgs/Pose2D target_pose
+msgs/Pose2D target_pose
 float32 max_linear_speed
 float32 max_angular_speed
 float32 tolerance_lin
@@ -118,8 +119,15 @@ string error
 float32 traveled_distance
 ---
 # Feedback
-geometry_msgs/Pose2D current_pose
+msgs/Pose2D current_pose
 float32 remaining_distance
+```
+
+`src/msgs/msg/Pose2D.msg`(Lyrical 无 geometry_msgs/Pose2D,自建):
+```text
+float64 x
+float64 y
+float64 theta
 ```
 
 `src/msgs/action/ArmExecuteTrajectory.action`:
@@ -145,7 +153,6 @@ find_package(ament_cmake REQUIRED)
 find_package(builtin_interfaces REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(action_msgs REQUIRED)
-find_package(geometry_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(rosidl_default_generators REQUIRED)
 
@@ -154,6 +161,7 @@ rosidl_generate_interfaces(msgs
   "msg/DetectionArray.msg"
   "msg/Frame.msg"
   "msg/LaneResult.msg"
+  "msg/Pose2D.msg"
   "msg/TaskStatus.msg"
   "srv/Mc602Transaction.srv"
   "srv/Beep.srv"
@@ -164,11 +172,11 @@ rosidl_generate_interfaces(msgs
   "srv/SensorQuery.srv"
   "action/ChassisNavigate.action"
   "action/ArmExecuteTrajectory.action"
-  DEPENDENCIES action_msgs builtin_interfaces geometry_msgs std_msgs trajectory_msgs
+  DEPENDENCIES action_msgs builtin_interfaces std_msgs trajectory_msgs
 )
 ```
 
-- [ ] **Step 3: 更新 `src/msgs/package.xml`** 加 `<depend>action_msgs</depend>` `<depend>geometry_msgs</depend>` `<depend>trajectory_msgs</depend>`。
+- [ ] **Step 3: 更新 `src/msgs/package.xml`** 加 `<depend>action_msgs</depend>` `<depend>trajectory_msgs</depend>`(geometry_msgs 不再需要——Pose2D 已自建)。
 
 - [ ] **Step 4: 构建验证(只 build msgs 包)**
 

@@ -1,0 +1,11 @@
+# ReadIntArray.srv — 读一整组 int64 值(板载按键 / 蓝牙手柄)。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §6
+#
+# std_srvs/Trigger 响应只有 bool+string,装不下 int64[] —— 故用自定义 srv。
+# source: "key" → board_key, "pad" → bluetooth_pad。
+
+string source         # "key" | "pad"
+---
+bool ok
+string error
+int64[] values

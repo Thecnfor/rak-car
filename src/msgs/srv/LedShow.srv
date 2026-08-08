@@ -1,0 +1,8 @@
+# LedShow.srv — 点阵屏文本显示。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §6
+# 文本 ≤100 字符(驱动层约束)。
+
+string text
+---
+bool ok
+string error

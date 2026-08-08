@@ -161,7 +161,7 @@
 
 ```text
 # Goal
-geometry_msgs/Pose2D target_pose      # 底盘系内目标位姿 (x, y, theta)
+msgs/Pose2D target_pose              # 底盘系内目标位姿 (x, y, theta)
 float32 max_linear_speed              # m/s
 float32 max_angular_speed             # rad/s
 float32 tolerance_lin                 # 到位容差 (m)
@@ -174,9 +174,13 @@ string error                          # timeout | transport | stale | none
 float32 traveled_distance
 ---
 # Feedback
-geometry_msgs/Pose2D current_pose     # 当前里程估计
+msgs/Pose2D current_pose              # 当前里程估计
 float32 remaining_distance
 ```
+
+> 注:`msgs/Pose2D` 是自建轻量 2D 位姿(新版 ROS2 Lyrical 已从 geometry_msgs
+> 移除废弃的 Pose2D,改用 3D Pose 需四元数换算,不划算)。与 C++ `hardware::Pose2D`
+> 同构,见 `src/msgs/msg/Pose2D.msg`。
 
 - Action 名字:`/rak/chassis/navigate`(展开为 goal/feedback/result/status 四 topic)。
 - chassis 内部自持里程计做闭环点到位;行为层不再自己拼运动学。

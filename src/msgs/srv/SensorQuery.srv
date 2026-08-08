@@ -1,0 +1,13 @@
+# SensorQuery.srv — 通用按需读传感器。
+# Spec: docs/superpowers/specs/2026-08-09-ros2-layering-interfaces-design.md §6
+#
+# 一次调用读一个 MC602 端口。type 枚举: ir | ultrasonic | analog | touch |
+# ambient | encoder。映射驱动层 MC602Adapter::read_sensor(port, type)。
+# 按需调用,不占串口周期(连续流走 /rak/sensors/ir/<id> 等 topic)。
+
+uint8 port            # MC602 端口号
+string type           # ir | ultrasonic | analog | touch | ambient | encoder
+---
+bool ok
+string error          # "" 成功 | "unsupported sensor type" | 驱动异常信息
+float64 value
