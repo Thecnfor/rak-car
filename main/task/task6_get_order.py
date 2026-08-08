@@ -30,12 +30,13 @@
 """
 from __future__ import annotations
 
+import base64
 import logging
-import re
+import requests
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -46,7 +47,6 @@ import yaml
 from main.api_client import RuntimeApiClient
 from main.arm import ArmClient, ArmRunner
 from main.misc.test_order_read import run as order_read_run
-from main.misc.test_veggie_detect import run as veggie_detect_run
 
 # task6 配置独立保留在 test/task6_config.yml (避免侵入 task_config.yml 其它段)
 _TASK6_CONFIG = Path(_PROJECT_ROOT) / "test" / "task6_config.yml"
@@ -68,50 +68,101 @@ def _load_task6_config() -> Dict[str, Any]:
     return cfg
 
 
-# ── 蔬菜货架 X 坐标映射 (从上到下共 4 行) ──
+# ── 蔬菜视觉抓取 (track_velocity_pick 视觉对齐) ────────────────────────────
+# 2026-08-07: 抓取从"固定坐标盲抓"换成"目标检测 + 视觉对齐".
+# track_velocity_pick 读 cam2 task_feed 的 YOLO 检测 (h_* label) → 选最近目标 →
+# arm 控 cx + X 十字控 cy 对齐到 setpoint → y 降到 grasp_y → 真空吸 → 抬回.
 
-_SHELF_X_BY_ROW = [-50.0, -100.0, -140.0, -180.0]
+# 订单蔬菜名 → YOLO 检测 label (与 main/arm/labels.py 的 h_* 对应)
+PICK_VEGGIE_LABEL_MAP: Dict[str, str] = {
+    "番茄": "h_fan_qie", "土豆": "h_tu_dou", "蘑菇": "h_mo_gu",
+    "青椒": "h_qing_jiao", "油菜": "h_you_cai", "芹菜": "h_qin_cai",
+    "豆角": "h_dou_jiao", "西兰花": "h_xi_lan_hua", "金针菇": "h_jin_zhen_gu",
+}
 
+# 视觉伺服起始姿态 (2026-08-08: -190/-180/-85/-25 → -150/-190/-90/-10; Y 改 -180)
+PICK_START_X_MM = -160.0   # 2026-08-08: -150 → -160 (检测姿态 X)
+PICK_START_Y_MM = -180.0   # 2026-08-08: -190 → -180 (与精对齐 setpoint 测量姿态一致)
+PICK_START_ARM_DEG = -90.0
+PICK_START_HAND_DEG = -10.0
 
-def _pos_to_row(pos: str) -> int:
-    """将 LLM 输出的中文位置文本映射到货架行号 (0=最上第1行, 3=最下第4行).
+# 精对齐 setpoint (2026-08-08 实测): 把目标框拉到的画面点 = 固定
+# (0.168, -0.525) (y=-180, 末端=10), 八个位置 (左右列 × 4 行) 都一样.
+# 每行 cal 的 (cx,cy) 只用于**匹配行号**, 不再当 setpoint.
+PICK_SETPOINT_CXCY: Tuple[float, float] = (0.168, -0.525)
 
-    支持格式示例: "右1"=右排第1行, "左3"=左排第3行.
-    解析失败 fallback 到第 2 行 (下标 1).
-    """
-    pos = (pos or "").strip()
-    m = re.search(r'[左右]\s*(\d)', pos)
-    if m:
-        n = int(m.group(1))
-        return max(0, min(3, n - 1))  # 1→0, 2→1, 3→2, 4→3
-    return 1  # 兜底: 默认第 2 行
+# 下降吸附高度 / 抓取偏移
+PICK_GRASP_Y_MM = -25.0    # 2026-08-08: -20→-50→-30→-25 (目标在中心则末端朝下 + 降-25 吸)
 
+# 放置位 (2026-08-08): 第1个订单蔬菜 → 左, 第2个 → 右; y 2026-08-08: -60 → -70
+PICK_PLACE_1: Dict[str, float] = dict(x_mm=0.0, y_mm=-70.0, arm=86.0, hand=10.0)
+PICK_PLACE_2: Dict[str, float] = dict(x_mm=-58.0, y_mm=-70.0, arm=86.0, hand=10.0)
 
-def _pos_to_side(pos: str) -> str:
-    """根据中文位置判断货架左右排, 返回 'left' 或 'right'."""
-    return "left" if "左" in (pos or "") else "right"
+# 抓菜前任务点前进 (move_along_lane, 2026-08-08 全改用任务点前进)
+PICK_APPROACH_M = 0.14     # 2026-08-08: 0.22→0.13→0.12→0.14 (定位到右侧一列)
+PICK_APPROACH_VX = 0.20
 
+# 一列一列检测 (2026-08-08): 先右列后左列, 不再两排一起检测
+PICK_COLUMN_ORDER = ["right", "left"]
+PICK_COLUMN_MOVE_M = 0.10  # 切到左列的底盘移动 (2026-08-08: 0.2→0.08→0.05→0.10)
+PICK_COLUMN_MOVE_VX = 0.20
 
-# ── 底盘移动 ──────────────────────────────────────────────────
+# 大臂基础增益 (精对齐 = 0.5×, 见 PICK_FINE_GAIN_*)
+PICK_GAIN_ARM = 8.0      # 2026-08-08: 4.0→6.0→8.0
+PICK_DEADZONE = 0.02
+PICK_MAX_VEL = 0.10      # 2026-08-08: 0.15 → 0.10 (X 更慢, 防冲)
+PICK_HOLD_Y = True            # 2026-08-07: 只三轴联动, 不动 y 十字
+PICK_DESCEND_HAND_DEG = 10.0  # 2026-08-08: 0→10 (精对齐/抓取末端都保持 10°)
+PICK_ARM_MIN = -150.0         # 2026-08-08: 大臂下限放宽 (默认 -90 挡住偏左目标)
+PICK_ARM_MAX = 150.0          # 2026-08-08: 大臂上限也放宽到 +150
+PICK_X_ERROR_SOURCE = "dy"    # 2026-08-08: X 跟随垂直误差 (X 右移→目标框下移, 即 X 影响 cy)
 
-def _chassis_move_for(
-    arm_client: ArmClient,
-    dx_m: float,
-    timeout: float,
-) -> dict:
-    """底盘纵向 move_for 阻塞调用 (sync=True 等结果).
+# 精对齐 (2026-08-08, 粗对齐已删): X 到匹配行后, 末端先显式转到 10° (精对齐姿势),
+# 再精对齐 — 末端保持 10° (gain_hand=0, hand_start=10), 只动 X + 大臂,
+# setpoint 固定 (0.168,-0.525) (八个位置一致)
+PICK_FINE_HAND_DEG = 10.0
+# ⚠️ 必须把 hand_min/hand_max 传进 find_target_4dof: 其默认 hand_max=0 会把
+#    hand_start=10 的 clamp 压回 0 (末端变 0° 而非 10°) — 2026-08-08 实机发现
+PICK_FINE_HAND_MIN = -90.0
+PICK_FINE_HAND_MAX = 30.0
+PICK_FINE_GAIN_X = 0.05
+PICK_FINE_GAIN_ARM = PICK_GAIN_ARM * 0.25   # 2026-08-08: 8.0*0.5=4.0 → 8.0*0.25=2.0 (大臂再慢, 原 0.5 倍)
+PICK_FINE_TIMEOUT_S = 6.0   # 2026-08-08: 4.0 → 6.0
 
-    走 ChassisClient.move_for —— move_for 是底盘动作, 不应走
-    ArmClient._call_car. 后者签名是 (name, timeout=20.0, *args, sync=False, **kwargs),
-    第二个位置参数是 timeout, 写成 _call_car("move_for", dx_m, timeout=...)
-    会把 dx_m 误绑给 timeout, 报 "multiple values for argument 'timeout'".
-    """
-    from main.chassis import ChassisClient
-    chassis = ChassisClient.connect()
-    try:
-        return chassis.move_for(dx_m=dx_m, timeout=timeout)
-    finally:
-        chassis.close()
+# 蔬菜布局 (2026-08-08 用户实测标定): 右列 4 行 (从上到下 1-4).
+# 每行: {x_mm, cx_ref, cy_ref} — 检测姿态 (大臂-90 Y-180) 下该行蔬菜框的 (cx,cy),
+# 只用来**匹配行号** (最近邻) → X 移到该行 x_mm → 精对齐.
+# 对齐 setpoint 是固定 PICK_SETPOINT_CXCY (0.168,-0.525), 不用每行 (cx,cy).
+PICK_RIGHT_CAL: Dict[int, Dict[str, float]] = {
+    1: dict(x_mm=-48.0,  cx=0.148, cy=-0.317),
+    2: dict(x_mm=-95.0,  cx=0.119, cy=-0.287),
+    3: dict(x_mm=-146.0, cx=0.113, cy=-0.302),
+    4: dict(x_mm=-190.0, cx=0.158, cy=-0.252),
+}
+PICK_LEFT_CAL: Dict[int, Dict[str, float]] = {
+    1: dict(x_mm=-48.0,  cx=0.148, cy=-0.317),   # 番茄 (最上)
+    2: dict(x_mm=-95.0,  cx=0.119, cy=-0.287),   # 豆角
+    3: dict(x_mm=-146.0, cx=0.113, cy=-0.302),   # 油菜
+    4: dict(x_mm=-190.0, cx=0.158, cy=-0.252),   # 金针菇 (最下)
+}
+# 2026-08-08: 左列 X 与右列同 (-48/-95/-146/-190 从上到下, 用户确认);
+#   左列 (cx,cy) 实测与右列相同 — 检测姿态下蔬菜框落点与货架列无关 (左右列靠底盘横移区分);
+#   行区分主要靠 cy (垂直), cx 每次停位略有漂移.
+# 列检测共同姿态 (2026-08-08)
+PICK_COL_ARM_DEG = -90.0
+PICK_COL_HAND_DEG = -18.0  # 2026-08-08: 0 → -18 (列检测姿态末端)
+PICK_COL_Y_MM = -180.0   # 2026-08-08: -190 → -180 (精对齐 setpoint 测量姿态)
+
+# 列检测静止时长 (2026-08-08): 到检测点停稳后静止检测秒数
+PICK_DETECT_SECONDS_RIGHT = 1.0   # 右列停 1s
+PICK_DETECT_SECONDS_LEFT = 2.0    # 左列停 2s (未标定, 多看几帧)
+
+# 目标检测不到时 X 左右扫 (2026-08-08)
+PICK_SCAN_X_MM = 20.0      # 2026-08-08: 10 → 20
+
+# 列聚类 (2026-08-08): 同列检测框 cx 很近, 列间 cx 差距大 → 按间距聚类分列.
+# 不再用 cx 符号单框阈值 (车未停稳时右列框会抖过 0 被判到左列).
+COLUMN_GAP_CX = 0.25       # 同列相邻框 cx 最大间距; 超出则另起一列
 
 
 # ── Y=0 触底时的动作 (绕开业务层 y 保护区) ────────────────────────
@@ -163,188 +214,487 @@ def _move_x_at_bottom(
     )
 
 
-# ── 单棵蔬菜抓取+投放 (走 ArmRunner + composite_*) ──────────────────
+# ── 单棵蔬菜视觉抓取 + 投放 (track_velocity_pick_4dof) ───────────
 
-def _pick_one_veggie(
-    arm_client: ArmClient,
+def _target_at_center(
     runner: ArmRunner,
-    target_x_mm: float,
-    carry_y_mm: float,
-    drop_y_mm: float,
-    label: str = "",
-) -> None:
-    """单棵蔬菜抓取+投放流程: 抓取预备 → 抓取 → 投放预备 → 投放.
+    label: str,
+    tol: float,
+) -> bool:
+    """读 task_feed 检测, 检查目标 label 是否已在画面中心附近 (|cx|,|cy| < tol).
 
-    执行顺序 (composite_run 内置并发 + SafetyMixin 自动 y 保护区校验):
-      1. composite_run: 大臂 → -95° + 手爪 → -10° + Y → -200 (预备, 并发)
-      2. composite_run: X → target_x_mm + 手爪 → 0° (伸出, 并发)
-      3. move_y → -20 (下降接近蔬菜)
-      4. grasp on + 真空稳定等待
-      5. move_y → carry_y (运输高度, 第 1 棵 -110, 第 2 棵 -140 避免碰撞)
-      6. composite_run: X → 0 + 大臂 → +95° + 手爪 → -20° (投放姿态, 并发)
-      7. move_y → drop_y (第 1 棵 -40, 第 2 棵 -80 防止堆叠)
-      8. grasp off 释放
-
-    Args:
-        target_x_mm: 该蔬菜所在货架行对应的 X 坐标
-        carry_y_mm: 吸取后抬升的 Y
-        drop_y_mm: 投放时下降的 Y
-        label: 用于日志标识的蔬菜名称
+    2026-08-07: 目标已在中心则跳过视觉对齐 (省时间), 直接降+吸.
     """
-    tag = f"[{label}]" if label else ""
-    logger.info("%s 抓取: X=%.0f 抬升Y=%.0f 投放Y=%.0f", tag, target_x_mm, carry_y_mm, drop_y_mm)
+    try:
+        state = (runner.client.http.get_task_state() or {}).get("task_state") or {}
+        dets = state.get("detections") or []
+        for d in dets:
+            if d.get("label") != label:
+                continue
+            bb = d.get("bbox_norm") or {}
+            cx = float(bb.get("x_center", 1.0))
+            cy = float(bb.get("y_center", 1.0))
+            if abs(cx) < tol and abs(cy) < tol:
+                return True
+    except Exception:
+        pass
+    return False
 
-    # 1) 抓取预备姿态: 大臂 → -95° + 手爪 → -10° + Y → -200 (并发)
-    runner.client.composite_run(arm=-95.0, hand=-10.0, y_mm=-200.0)
 
-    # 2) 伸出 + 手爪朝下: X → target_x_mm + 手爪 → 0° (并发)
-    runner.client.composite_run(x_mm=target_x_mm, hand=0.0)
-
-    # 3) 下降到接近蔬菜
-    runner.move_y(-20.0)
-    logger.info("  %s X → %.0f mm, 手爪→0°, Y→-20 mm (抓取就绪)", tag, target_x_mm)
-
-    # 4) 开真空吸盘吸住蔬菜 → 稳定等待
+def _descend_and_grasp(runner: ArmRunner) -> None:
+    """末端保持 10° (hand=10) + y→grasp_y + 真空吸 (2026-08-08, 不再 X 向0偏移)."""
+    runner.client.composite_run(
+        y_mm=PICK_GRASP_Y_MM, hand=PICK_DESCEND_HAND_DEG, speed=100,
+    )
     runner.grasp(on=True)
-    time.sleep(0.5)
-    logger.info("  %s 真空开启 (吸附保持)", tag)
+    runner.move_y(PICK_START_Y_MM)  # 抬回起始高度
 
-    # 5) Y 抬升到运输安全高度
-    runner.move_y(carry_y_mm)
-    logger.info("  %s Y → %.0f mm (运输高度)", tag, carry_y_mm)
 
-    # 6) 投放前转换姿态: X 收回 + 大臂 + 手爪 (并发)
-    runner.client.composite_run(x_mm=0.0, arm=95.0, hand=-20.0)
-    logger.info("  %s X → 0, 大臂→+95°, 手爪→-20° (投放姿态)", tag)
+def _det_cx(d: dict) -> float:
+    bb = (d or {}).get("bbox_norm") or {}
+    try:
+        return float(bb.get("x_center", 0.0))
+    except Exception:
+        return 0.0
 
-    # 7) Y 下降到投放高度
-    runner.move_y(drop_y_mm)
-    logger.info("  %s Y → %.0f mm (投放)", tag, drop_y_mm)
 
-    # 8) 关真空释放蔬菜
+def _det_cy(d: dict) -> float:
+    bb = (d or {}).get("bbox_norm") or {}
+    try:
+        return float(bb.get("y_center", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _cluster_by_cx(dets: List[dict]) -> List[List[dict]]:
+    """按 bbox cx 把检测聚成列 (同列框很近, 列间 cx 差距大). 返回按质心 cx 升序的簇."""
+    s = sorted(dets, key=_det_cx)
+    clusters: List[List[dict]] = []
+    for d in s:
+        if clusters and _det_cx(d) - _det_cx(clusters[-1][-1]) < COLUMN_GAP_CX:
+            clusters[-1].append(d)
+        else:
+            clusters.append([d])
+    return clusters
+
+
+def _wait_chassis_stopped(runner: ArmRunner, timeout: float = 3.0,
+                          eps_m: float = 0.002, dwell_s: float = 0.2) -> bool:
+    """等底盘停稳再检测 (odom 连续 0.15s 位移 ≤ eps 判定停稳).
+
+    2026-08-08: move_along_lane 按里程到达即返回, 车未完全停稳时 task_feed 的
+    检测框在抖 (右列框 cx 会抖过 0 被判到左列). 停稳后再等 dwell 刷新一帧检测.
+    """
+    try:
+        from main.chassis import get_odometry
+        t0 = time.time()
+        prev = get_odometry()[0]
+        while time.time() - t0 < timeout:
+            time.sleep(0.15)
+            cur = get_odometry()[0]
+            if abs(cur - prev) <= eps_m:
+                time.sleep(dwell_s)
+                logger.info("  底盘停稳 (0.15s 位移≤%.0fmm), 开始检测", eps_m * 1000)
+                return True
+            prev = cur
+        logger.warning("  底盘停稳超时 (%.0fs), 直接检测", timeout)
+        return False
+    except Exception as exc:
+        logger.info("  停稳检测跳过 (读里程计失败: %s)", exc)
+        return False
+
+
+def _dump_detections(runner: ArmRunner, label: str) -> None:
+    """诊断: 打印当前 task_feed 里该 label 的所有检测 (cx/cy/score).
+
+    判断抓菜失败是"识别问题" (检测不到目标/无该 label) 还是"对齐问题"
+    (检测到但伺服没收敛). 2026-08-08 用户要求加日志定位.
+    """
+    try:
+        state = (runner.client.http.get_task_state() or {}).get("task_state") or {}
+        dets = state.get("detections") or []
+        mine = [d for d in dets if d.get("label") == label]
+        logger.info("    [诊断] label=%s 检测到 %d 个:", label, len(mine))
+        for d in mine[:5]:
+            bb = d.get("bbox_norm") or {}
+            logger.info("      cx=%+.3f cy=%+.3f score=%.2f",
+                        float(bb.get("x_center", 0.0)),
+                        float(bb.get("y_center", 0.0)),
+                        float(d.get("score", 0.0)))
+        if not mine:
+            logger.warning("    [诊断] 无 %s 检测 — 疑似识别问题 (目标不在视野/模型检不出)",
+                           label)
+    except Exception as exc:
+        logger.info("    [诊断] 读检测失败: %s", exc)
+
+
+def _has_detection(runner: ArmRunner, label: str) -> bool:
+    """task_feed 里是否存在该 label 的检测."""
+    try:
+        state = (runner.client.http.get_task_state() or {}).get("task_state") or {}
+        dets = state.get("detections") or []
+        return any(d.get("label") == label for d in dets)
+    except Exception:
+        return False
+
+
+def _scan_for_target(runner: ArmRunner, label: str) -> bool:
+    """目标检测不到 → X 左右扫 ±10mm 再检测 (2026-08-08). 返回是否找到."""
+    try:
+        cur_x = float(runner.client.get_state().x_mm)
+    except Exception as exc:
+        logger.info("    [诊断] X 扫描: 读 x 失败 (%s), 跳过扫描", exc)
+        return _has_detection(runner, label)
+    for dx in [PICK_SCAN_X_MM, -PICK_SCAN_X_MM]:
+        if _has_detection(runner, label):
+            return True
+        runner.client.composite_run(x_mm=cur_x + dx, speed=100)
+        time.sleep(0.4)  # 等 X 到位 + 检测刷新
+        if _has_detection(runner, label):
+            logger.info("  [%s] X 扫描找到目标 (offset=%.0fmm)", label, dx)
+            return True
+    logger.info("  [%s] X 扫描 ±%.0fmm 后仍无目标", label, PICK_SCAN_X_MM)
+    return _has_detection(runner, label)
+
+
+def _classify_frame(
+    runner: ArmRunner,
+    label: str,
+    cal: Dict[int, Dict[str, float]],
+    column: str,
+) -> Dict[str, Any]:
+    """读一帧 task_feed: 按 cx 聚列 → 给所有蔬菜标 列+行 → 返回目标判定.
+
+    2026-08-08: 列判定用聚类 (同列框很近, 列间 cx 差距大), 不再用 cx 符号
+    单框阈值 (车未停稳时右列框会抖到负). 簇列身份 = 最右簇=右 / 最左簇=左.
+
+    Returns:
+        dict: {
+          "target": Optional[Tuple[int, float]],  # 目标 (行, x_mm) 若在当前列
+          "col": Optional[str],                   # 目标所在列 (left/right), None=未检出
+          "rows": List[dict],                     # 全帧蔬菜: {label, col, row, cx, cy}
+        }
+    """
+    try:
+        state = (runner.client.http.get_task_state() or {}).get("task_state") or {}
+        dets = state.get("detections") or []
+    except Exception:
+        return {"target": None, "col": None, "rows": []}
+    veg = [d for d in dets if d.get("label") in PICK_VEGGIE_LABEL_MAP.values()]
+    clusters = _cluster_by_cx(veg)
+    rows: List[dict] = []
+    target_col = None
+    target_match = None
+    for i, cl in enumerate(clusters):
+        if len(clusters) == 1:
+            side = column
+        elif i == len(clusters) - 1:
+            side = "right"
+        elif i == 0:
+            side = "left"
+        else:
+            side = "?"
+        for d in cl:
+            lab = d.get("label")
+            cx, cy = _det_cx(d), _det_cy(d)
+            row = None
+            if side == column and cal:
+                best_r, best_d2 = None, None
+                for r, ref in cal.items():
+                    d2 = (cx - ref["cx"]) ** 2 + (cy - ref["cy"]) ** 2
+                    if best_d2 is None or d2 < best_d2:
+                        best_d2, best_r = d2, r
+                row = best_r
+            if lab == label:
+                target_col = side
+                if row is not None:
+                    target_match = (row, cal[row]["x_mm"])
+            rows.append({"label": lab, "col": side, "row": row, "cx": cx, "cy": cy})
+    return {"target": target_match, "col": target_col, "rows": rows}
+
+
+def _detect_column_stationary(
+    runner: ArmRunner,
+    label: str,
+    cal: Dict[int, Dict[str, float]],
+    column: str,
+    seconds: float = 1.0,
+    interval_s: float = 0.15,
+) -> Optional[Tuple[int, float]]:
+    """到检测点停稳后静止 ~1s 多帧检测 (不前进), 严格日志输出左右列+行顺序.
+
+    2026-08-08: 用户要求到达检测点先停 1s, 这一秒内多次识别 (不前进), 日志里
+    严格输出 左右列 和 顺序(第几行). 行结果多数票取 (防单帧抖动). 返回 (行, x_mm).
+    """
+    _wait_chassis_stopped(runner)
+    votes: Dict[int, int] = {}
+    n = 0
+    t0 = time.time()
+    while time.time() - t0 < seconds:
+        n += 1
+        det = _classify_frame(runner, label, cal, column)
+        # 严格日志: 每帧全部蔬菜的 列 + 行顺序 + (cx,cy) (方便读标定值)
+        parts = []
+        for r in det["rows"]:
+            col_txt = {"left": "左", "right": "右"}.get(r["col"], str(r["col"] or "?"))
+            row_txt = f"#{r['row']}" if r["row"] is not None else "-"
+            parts.append(f"{r['label']}={col_txt}列{row_txt}({r['cx']:+.2f},{r['cy']:+.2f})")
+        logger.info("  [检测#%d] %s", n, "  ".join(parts))
+        if det["col"] == column and det["target"] is not None:
+            r, _x = det["target"]
+            votes[r] = votes.get(r, 0) + 1
+        time.sleep(interval_s)
+    if votes:
+        best = max(votes, key=votes.get)
+        logger.info("  [检测汇总] %s → %s列 第%d行 %d/%d 票 (X=%.0fmm)",
+                    label, column, best, votes[best], n, cal[best]["x_mm"])
+        return (best, cal[best]["x_mm"])
+    reason = "未标定" if not cal else "未检出/列不匹配"
+    logger.warning("  [检测汇总] %s → %s列 %s (%d 帧)", label, column, reason, n)
+    return None
+
+
+def _align_4dof_phase(
+    runner: ArmRunner,
+    label: str,
+    *,
+    gain_x: float,
+    gain_arm: float,
+    gain_hand: float,
+    max_vel: float,
+    timeout: float,
+    arm_start: float,
+    hand_start: float,
+    hand_min: float = -90.0,
+    hand_max: float = 0.0,
+    setpoint_cxcy: Optional[Tuple[float, float]] = None,
+) -> Tuple[bool, int]:
+    """跑一次 find_target_4dof (velocity 对齐). 返回 (settled, hits).
+
+    gain_x>0 → X 十字也动; gain_hand>0 → 末端也动 (task6 只用精对齐, gain_hand=0).
+    hand_min/hand_max (2026-08-08): 必须显式传 — find_target_4dof 默认 hand_max=0,
+    会把 hand_start=10 的 clamp 压回 0 (末端 0° 而非 10°).
+    setpoint_cxcy (2026-08-08): 目标框拉到的画面点 = 固定
+    PICK_SETPOINT_CXCY=(0.168,-0.525) (八个位置一致), 不再默认画面中心.
+    """
+    sx, sy = setpoint_cxcy if setpoint_cxcy is not None else PICK_SETPOINT_CXCY
+    try:
+        runner._set_arm_feed(stop=True)
+        result = runner.client._make_vision_with_move().find_target_4dof(
+            label, timeout=timeout, hz=20.0,
+            gain_x=gain_x, gain_y=0.05, gain_arm=gain_arm, gain_hand=gain_hand,
+            deadzone=PICK_DEADZONE, max_vel=max_vel,
+            arm_start=arm_start, hand_start=hand_start,
+            arm_min=PICK_ARM_MIN, arm_max=PICK_ARM_MAX,
+            hand_min=hand_min, hand_max=hand_max,
+            hold_y=PICK_HOLD_Y,
+            x_error_source=PICK_X_ERROR_SOURCE,
+            setpoint_x_norm=sx,
+            setpoint_y_norm=sy,
+        )
+    finally:
+        runner._set_arm_feed(stop=False)
+
+    def _conv(t) -> bool:
+        return not t.miss and abs(t.dx) < PICK_DEADZONE and abs(t.dy) < PICK_DEADZONE
+    settled = False
+    tail = list(result.trace[-30:])
+    for start in range(len(tail) - 3 + 1):
+        if all(_conv(t) for t in tail[start:start + 3]):
+            settled = True
+            break
+    return settled, result.hits
+
+
+def _pick_one_veggie_visual(
+    runner: ArmRunner,
+    goods_name: str,
+    label: str,
+    place_pose: Dict[str, float],
+    column: Optional[str] = None,
+) -> bool:
+    """单棵蔬菜: 列姿态 → 匹配行(cx,cy) → X到该行 → 末端转10° → 精对齐 → 降+吸 → 放.
+
+    2026-08-08: 只精对齐 (粗对齐已删). X 到匹配行后, 末端先显式转到 10°, 精对齐
+    只动 X+大臂 (末端保持 10°), setpoint 固定 (0.168,-0.525) 八个位置一致, timeout 6s;
+    每行 (cx,cy) 只用于匹配行号, 一列一列, 左右列各自标定.
+
+    Returns:
+        True=已抓取投放; False=检测不到/匹配不到行 (跳过).
+    """
+    # 0) 切到列检测姿态 (X-160 末端-18 Y-180, 2026-08-08)
+    runner.client.composite_run(
+        x_mm=PICK_START_X_MM, y_mm=PICK_COL_Y_MM,
+        arm=PICK_COL_ARM_DEG, hand=PICK_COL_HAND_DEG, speed=100,
+    )
+    logger.info("  切到列检测姿态: X→%.0f Y→%.0f arm→%.0f hand→%.0f",
+                PICK_START_X_MM, PICK_COL_Y_MM, PICK_COL_ARM_DEG, PICK_COL_HAND_DEG)
+
+    # 1) 到检测点停稳后静止检测 (不前进), 严格日志输出左右列+行顺序 (2026-08-08)
+    #    左右两列都停稳检测 (左列未标定也检测并输出日志; 左列停 2s 右列 1s)
+    cal = PICK_RIGHT_CAL if column == "right" else PICK_LEFT_CAL
+    detect_s = PICK_DETECT_SECONDS_LEFT if column == "left" else PICK_DETECT_SECONDS_RIGHT
+    match = _detect_column_stationary(runner, label, cal, column, seconds=detect_s)
+    if not cal:
+        logger.info("  [%s] %s列未标定, 跳过 (已停 %.0fs 检测)", goods_name, column, detect_s)
+        return False
+    if match is None:
+        logger.info("  [%s] 未检出/列不匹配 (%s列), 跳过", goods_name, column)
+        return False
+    row, x_target = match
+    logger.info("  [%s] 匹配到 %s列 第%d行 → X=%.0f", goods_name, column, row, x_target)
+
+    # 2) 先 X 移到匹配行的 X (精对齐前, 2026-08-08)
+    runner.client.composite_run(x_mm=x_target, speed=100)
+    logger.info("  [%s] X→%.0f (第%d行)", goods_name, x_target, row)
+
+    # 3) 精对齐 (粗对齐已删 2026-08-08): X 到匹配行后, 末端先显式转到 10° (精对齐姿势),
+    #    再精对齐 — 末端保持 10° (gain_hand=0, hand_start=10), 只动 X + 大臂,
+    #    setpoint 固定 (0.168,-0.525) (八个位置一致)
+    runner.client.composite_run(hand=PICK_FINE_HAND_DEG, speed=100)
+    logger.info("  [%s] 精对齐前末端→%.0f°", goods_name, PICK_FINE_HAND_DEG)
+    settled, hits = _align_4dof_phase(
+        runner, label,
+        gain_x=PICK_FINE_GAIN_X, gain_arm=PICK_FINE_GAIN_ARM,
+        gain_hand=0.0,
+        max_vel=PICK_MAX_VEL, timeout=PICK_FINE_TIMEOUT_S,
+        arm_start=PICK_COL_ARM_DEG, hand_start=PICK_FINE_HAND_DEG,
+        hand_min=PICK_FINE_HAND_MIN, hand_max=PICK_FINE_HAND_MAX,
+        setpoint_cxcy=PICK_SETPOINT_CXCY,
+    )
+    logger.info("  [%s] 精对齐(X+大臂, 末端保持10): settled=%s hits=%d",
+                goods_name, settled, hits)
+
+    # 4) 末端朝下 y-30 吸
+    _descend_and_grasp(runner)
+
+    # 5) 放 (用户 2026-08-08 顺序修正): 抓完已抬到 -180, 先在抬升高度转 X/大臂/末端
+    #    到放置位, 再降 y→place_y(-70), 关真空释放, 再抬 y→-180 (先抬升, 再动其它三轴, 防拖拽)
+    runner.client.composite_run(
+        x_mm=place_pose["x_mm"], arm=place_pose["arm"],
+        hand=place_pose["hand"], speed=100,
+    )
+    runner.move_y(place_pose["y_mm"])
     runner.grasp(on=False)
-    time.sleep(0.3)
-    logger.info("  %s 真空关闭 (释放)", tag)
+    runner.move_y(PICK_START_Y_MM)   # 抬回 -180 (先抬升, 再动其它轴)
+    logger.info("  [%s] 已投放 (X→%.0f Y→%.0f arm→%.0f hand→%.0f)",
+                goods_name, place_pose["x_mm"], place_pose["y_mm"],
+                place_pose["arm"], place_pose["hand"])
+    return True
 
 
 # ── 推杆姿态 + 扫牌 + 读单姿态 ──────────────────────────────────────
+
+def _enter_read_pose(
+    arm_client: ArmClient,
+    runner: ArmRunner,
+    cfg: Dict[str, Any],
+) -> None:
+    """从当前姿态 → 读单姿态 (X=-150, Y=-150, arm=-80, hand=-60), 4 轴并行.
+
+    2026-08-07 顺序重排: 第一次读单在推杆**前** (先读后推). 任务启动时臂在
+    init (y=-150, x=0, arm=+90, hand=-90), 4 轴复合一步切到读单姿态 (同推杆
+    姿势的 4 轴并行范式, 无 y 保护区). 同时底盘直行 approach_m 到任务点.
+    """
+    repos = cfg["reposition_pose"]
+    read_x = float(repos.get("final_x_mm", -200.0))
+    read_y = float(repos.get("y_mm", -180.0))
+    read_arm = float(repos.get("arm_angle_deg", -85.0))
+    read_hand = float(repos.get("hand_angle_deg", -45.0))
+    # 前进 0.3m + 4轴摆读单姿态 并发 (2026-08-07: 前进从推杆移到读单前)
+    _approach_straight_parallel(
+        runner, cfg,
+        dict(x_mm=read_x, y_mm=read_y, arm=read_arm, hand=read_hand, speed=100),
+    )
+    logger.info("  读单姿态 (4轴并行): X→%.0f Y→%.0f arm→%.0f hand→%.0f",
+                read_x, read_y, read_arm, read_hand)
+
+
+# 摆读单姿态/摆姿势同时底盘直行到任务点 (move_along_lane, 与 4 轴复合并发)
+STAGE1_APPROACH_M = 0.2     # 直行距离 (m) 2026-08-08: 0.5→0.3→0.2→0.15→0.2
+STAGE1_APPROACH_VX = 0.20   # 直行速度 (m/s)
+
+# 第二次读单位 (推牌完 Y 保持 0 触底直接去, 不专门抬升; 大臂/手爪转读单角; 2026-08-08)
+SECOND_READ_X_MM = -200.0     # 第二次读单 X
+SECOND_READ_ARM_DEG = -80.0   # 第二次读单大臂 (订单机大臂, 2026-08-08: -87→-80)
+SECOND_READ_HAND_DEG = -75.0  # 第二次读单末端 (2026-08-08: -60→-75)
+
+def _approach_straight_parallel(
+    runner: ArmRunner,
+    cfg: Dict[str, Any],
+    composite_kwargs: Dict[str, Any],
+) -> None:
+    """底盘直行 approach_m + 臂 composite_run 并发 (move_along_lane 后台线程).
+
+    2026-08-07: 前进从推杆移到读第一次订单前. 直行(0.3m@0.2=1.5s) 与 4轴复合
+    (~2-3s) 并发; 复合完等直行到位 (车停稳再对齐/读单).
+    """
+    approach_m = float(cfg.get("approach_straight_m", STAGE1_APPROACH_M))
+    approach_vx = float(cfg.get("approach_straight_vx", STAGE1_APPROACH_VX))
+    ex = None
+    drive_fut = None
+    if approach_m > 1e-3:
+        from concurrent.futures import ThreadPoolExecutor
+        from main.chassis import move_along_lane
+        ex = ThreadPoolExecutor(max_workers=1)
+        drive_fut = ex.submit(move_along_lane, vx=approach_vx, distance_m=approach_m)
+        logger.info("  底盘直行 %.2fm (vx=%.2f) 与摆姿态并发", approach_m, approach_vx)
+    try:
+        runner.client.composite_run(**composite_kwargs)
+        if drive_fut is not None:
+            wait_t = abs(approach_m) / max(abs(approach_vx), 0.05) * 2.0 + 3.0
+            drive_fut.result(timeout=wait_t)
+            logger.info("  底盘直行 %.2fm 完成", approach_m)
+    finally:
+        if ex is not None:
+            ex.shutdown(wait=True)
 
 def _enter_push_bar_pose(
     arm_client: ArmClient,
     runner: ArmRunner,
     cfg: Dict[str, Any],
 ) -> None:
-    """推杆姿态准备 → X 扫动推牌 → 调整到读单姿态 — 完整序列.
+    """推杆姿势 → 扫牌 → 直接到第二次读单位 (2026-08-08 重排).
 
-    目标动作顺序 (参数取自 task6_config.yml):
-      第一部分 (推杆姿态准备):
-        1. X 收至 push_bar_pose.x_mm (PID 闭环)
-        2. 大臂 arm → push_bar_pose.arm_angle_deg + 等待 2s 稳定
-        3. 手爪 hand → push_bar_pose.hand_angle_deg + 等待 1s 稳定
-        4. Y 下降 → push_bar_pose.y_mm (PID 闭环, 直至触底限位)
-        5. hand → -55° (推杆姿态就绪, 手爪作为推牌杆)
-      第二部分 (X 扫动推牌, Y 保持 = 0):
-        6. X 扫动: x_mm → sweep_x_end_mm @ sweep_speed_mms
-      第三部分 (调整到读单姿态):
-        7. X 回退 → reposition_pose.x_mm (中途重定位)
-        8. Y 抬升 → reposition_pose.y_mm (先抬 Y 再转大臂, 防 Y=0 转臂碰撞)
-        9. arm → reposition_pose.arm_angle_deg (转到读单/携带姿态)
-       10. hand → reposition_pose.hand_angle_deg (确认)
-       11. X → reposition_pose.final_x_mm (抬升后的最终 X 位置)
+    初始姿势 (任务启动时): y=-150, x=0, arm=+90, hand=-90.
+      (0.15m 前进已移到读第一次订单前, 推杆这里不再直行)
+      1. 进入姿势 (task1 4 轴并行联动, speed=100): X→-220, arm→-92, Y→0, hand→-55
+      2. 推牌: X -220→-120 @ 150mm/s (Y=0 触底)
+      3. 推牌完直接去第二次读单位: X→-200 + arm→-80 + hand→-75, **Y 保持 0 触底** (不抬升)
 
-    ⚠️ 动作顺序硬约束 (防止 Jetson 瞬时大电流掉电 / cam2 USB 断连):
-       先 X → 再 arm(+sleep 2s) → 再 hand(+sleep 1s) → 最后 Y.
-       顺序绝不能换, 否则多个大电流舵机同时启动会触发硬件保护.
+    用 composite_run 走 4 轴/2 轴并行 (该接口无 y 保护区, 用户 23:31 定案).
     """
     pose = cfg["push_bar_pose"]
     sweep_end = cfg.get("sweep_x_end_mm", -120.0)
-    sweep_speed = cfg.get("sweep_speed_mms", 100.0)
-    repos = cfg["reposition_pose"]
+    sweep_speed = cfg.get("sweep_speed_mms", 150.0)
 
-    # === 第一部分: 推杆姿态准备 ===
-    logger.info(
-        "阶段 1: 推杆姿态准备 (x=%.0f arm=%.0f hand=%.0f y=%.0f)",
-        pose["x_mm"], pose["arm_angle_deg"],
-        pose["hand_angle_deg"], pose["y_mm"],
+    # 1) 进入推杆姿势: 4 轴并行 (SDK 内部真并发, 无 y 保护区)
+    runner.client.composite_run(
+        x_mm=float(pose["x_mm"]), arm=float(pose["arm_angle_deg"]),
+        y_mm=float(pose["y_mm"]), hand=float(pose["hand_angle_deg"]),
+        speed=100,
     )
-
-    # === 第零步: 确保 y 在保护区外 (否则下面第一个 move_x 直接被拦) ===
-    # 上一轮任务 / 上一次崩溃可能把 y 留在触底附近, 此时 move_x 会 raise。
-    # move_y 本身从不被安全门拦, 可以无条件先抬。
+    logger.info("  进入推杆姿势: X→%.0f arm→%.0f Y→%.0f hand→%.0f (4 轴并行)",
+                pose["x_mm"], pose["arm_angle_deg"], pose["y_mm"], pose["hand_angle_deg"])
+    # 诊断: 读实际大臂角度 (确认是否真到 -95, 2026-08-08)
     try:
-        cur_y = float(arm_client.get_state().y_mm)
-    except Exception:
-        cur_y = 0.0
-    if cur_y > -30.0:
-        logger.info("  y=%.1fmm 在保护区内, 先抬到 -150mm 再动 X", cur_y)
-        runner.move_y(-150.0)
+        logger.info("    [诊断] 推杆姿势实际大臂 = %s°",
+                    runner.client.get_state().arm_angle)
+    except Exception as exc:
+        logger.info("    [诊断] 读大臂角度失败: %s", exc)
 
-    # a) X 轴: PID 闭环移动到位
-    runner.move_x(float(pose["x_mm"]))
-    logger.info("  X → %.0f mm 完成", pose["x_mm"])
-
-    # b) 大臂旋转 (大扭矩动作, 单独执行 + 长等待稳定)
-    runner.set_arm_angle(float(pose["arm_angle_deg"]), speed=40)
-    time.sleep(2.0)
-    logger.info("  大臂 → %.0f° 完成", pose["arm_angle_deg"])
-
-    # c) 手爪旋转到 -90°
-    arm_client.set_hand_angle(float(pose["hand_angle_deg"]), speed=80, timeout=10.0)
-    time.sleep(1.0)
-    logger.info("  手爪 → %.0f° 完成", pose["hand_angle_deg"])
-
-    # d) Y 轴: PID 闭环下降到底部限位 (必须最后执行 Y)
-    runner.move_y(float(pose["y_mm"]))
-    logger.info("  Y → %.0f mm 完成 (扫动前 Y 已触底)", pose["y_mm"])
-
-    # e) 手爪转到 -55° (与推牌杆配合的推杆姿态)
-    #    此时 Y 已触底 (=0), 走 wrapper 必被 y 保护区拒 → 底层直调
-    _set_hand_angle_at_bottom(arm_client, -55.0)
-    time.sleep(0.5)
-    logger.info("  手爪 → -55° 完成 (推杆姿态就绪)")
-
-    logger.info("推杆姿态就绪 (X=%.0f arm=%.0f hand=-45 Y=%.0f)",
-                pose["x_mm"], pose["arm_angle_deg"], pose["y_mm"])
-
-    # === 第二部分: X 扫动推牌 (Y 保持触底) ===
-    logger.info("阶段 1b: X 扫动推牌 %.0f → %.0f @ %.0f mm/s (Y=%.0f)",
-                pose["x_mm"], sweep_end, sweep_speed, pose["y_mm"])
-    # Y 仍触底 (=0), 走 wrapper 必被 y 保护区拒 → 底层直调
-    # sweep_speed_mms 之前只进了日志没进调用 (实际按默认 40mm/s 跑), 这里补上
+    # 2) 推牌: X -220 → -120 @ 150mm/s (Y=0 触底, 走底层直调)
     _move_x_at_bottom(arm_client, float(sweep_end), v_max_mms=float(sweep_speed))
-    logger.info("  扫动完成, X=%.0f mm", sweep_end)
+    logger.info("  推牌 X→%.0f @ %.0fmm/s 完成", sweep_end, sweep_speed)
 
-    # === 第三部分: 调整到读单姿态 ===
-    logger.info(
-        "阶段 1c: 调整读单姿态 (x=%.0f arm=%.0f hand=%.0f y=%.0f)",
-        repos["x_mm"], repos["arm_angle_deg"],
-        repos["hand_angle_deg"], repos["y_mm"],
+    # 3) 推牌完直接去第二次读单位 (Y 保持 0 触底不抬升; 大臂/手爪转读单角; 2026-08-08)
+    runner.client.composite_run(
+        x_mm=SECOND_READ_X_MM, arm=SECOND_READ_ARM_DEG,
+        hand=SECOND_READ_HAND_DEG, speed=100,
     )
-
-    # f) X 先移到 reposition x (Y 仍触底 → 底层直调)
-    _move_x_at_bottom(arm_client, float(repos["x_mm"]))
-    logger.info("  X → %.0f mm 完成", repos["x_mm"])
-
-    # g) Y 先抬升 (必须先抬 Y 再转大臂, 避免 Y=0 时大臂横扫撞到推牌机构)
-    runner.move_y(float(repos["y_mm"]))
-    logger.info("  Y → %.0f mm 完成", repos["y_mm"])
-
-    # h) 大臂转到读单/携带角度
-    runner.set_arm_angle(float(repos["arm_angle_deg"]), speed=40)
-    time.sleep(1.5)
-    logger.info("  大臂 → %.0f° 完成", repos["arm_angle_deg"])
-
-    # i) 手爪转到确认角度
-    arm_client.set_hand_angle(float(repos["hand_angle_deg"]), speed=80, timeout=10.0)
-    time.sleep(0.5)
-    logger.info("  手爪 → %.0f° 完成", repos["hand_angle_deg"])
-
-    # j) 最后精修 X 坐标 (抬 Y+转臂后编码器可能漂移, 这里不做严格校验避免误杀)
-    final_x = float(repos.get("final_x_mm", -140))
-    runner.move_x(final_x)
-    logger.info("  X → %.0f mm 完成", final_x)
-
-    logger.info("推杆 + 扫牌 + 读单姿态调整完成")
+    logger.info("  直接到第二次读单位: X→%.0f arm→%.0f hand→%.0f (Y=0 触底不抬升)",
+                SECOND_READ_X_MM, SECOND_READ_ARM_DEG, SECOND_READ_HAND_DEG)
+    logger.info("推杆 + 扫牌完成, 已到第二次读单位")
 
 
 # ============================================================
@@ -357,6 +707,132 @@ def _detect_and_ocr(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any
     raise NotImplementedError("阶段 3 detect_and_ocr - 待实现")
 
 
+# ── LLM-as-detector + track_chassis 控制律: 底盘对齐订单牌 ────────
+#
+# 2026-08-07: 订单牌/订单机没有 YOLO 训练数据, 检测 backend 检不出. 改用
+# ERNIE Vision 当"检测器" (看帧报订单牌中心 cx/cy), 但**复用 main.chassis 的
+# track_chassis 整套控制律** (kp/slew/deadband/hold_frames/丢帧/停稳), 只把
+# 检测源从 task_feed 换成 LLM sense_fn (track_chassis 新增 sense_fn 参数).
+#
+# 限制: LLM 慢 (~0.5-1Hz) + 精度 ±10%, 所以 hold_frames/lost_frames 按帧调小.
+# 轴符号沿用 track_chassis 水塔标定 (cx↔vx 前后, cy↔vy 横向); 实车反了改下面.
+
+LLM_ALIGN_SIGN_VX: int = +1   # 2026-08-07: -1 → +1 (实车方向写反了)
+LLM_ALIGN_SIGN_VY: int = +1
+LLM_ALIGN_KP: float = 0.30
+LLM_ALIGN_V_MAX: float = 0.10
+LLM_ALIGN_DEADBAND: float = 0.05
+LLM_ALIGN_HOLD_FRAMES: int = 2
+LLM_ALIGN_MAX_LOST: int = 5
+LLM_ALIGN_MAX_SECONDS: float = 8.0
+LLM_ALIGN_VX_ONLY: bool = True   # 2026-08-07: 只移动底盘前后, 不移动左右
+
+def _llm_align_card(
+    client: RuntimeApiClient,
+    target_cx: float = 0.5,
+    target_cy: float = 0.5,
+    max_seconds: float = LLM_ALIGN_MAX_SECONDS,
+    kp: float = LLM_ALIGN_KP,
+    v_max: float = LLM_ALIGN_V_MAX,
+) -> Tuple[bool, List[Tuple[float, float]]]:
+    """LLM-as-detector + track_chassis 控制律: 把订单牌拉到画面目标点.
+
+    sense_fn 抓 cam2 帧 → ERNIE Vision 报 (card_cx, card_cy, found) → 组装
+    TrackFrame 喂给 track_chassis (vx=sign_vx*kp*cx_err, vy=sign_vy*kp*cy_err,
+    deadband/hold_frames 收敛, max_lost 丢帧停, 结束零速). 轴符号/增益实车标定.
+
+    Args:
+        client: RuntimeApiClient (track_chassis 内部自建 ChassisClient)
+        target_cx, target_cy: 目标位置 (默认 0.5 = 画面中心)
+        max_seconds: 超时秒数
+        kp: 比例增益
+        v_max: 最大速度 m/s
+
+    Returns:
+        (aligned: bool, samples: List[(cx, cy)]) — 是否对齐 + 所有采样
+    """
+    from main.chassis import track_chassis
+    from main.chassis.loops.visual_track import TrackFrame
+    from main.misc.test_order_read import (
+        _call_llm, _load_cfg, _load_token, fetch_frame,
+    )
+    from main.settings import load_settings
+
+    settings = load_settings()
+    cfg = _load_cfg()
+    token = _load_token(cfg)
+    ernie = cfg.get("ernie", {})
+
+    POS_PROMPT = (
+        "你是订单牌定位程序。看这张图找到订单牌(白底蓝色字的卡片)。\n"
+        "返回 STRICT JSON, 不要 Markdown 标记:\n"
+        '{"card_cx": 0.5, "card_cy": 0.5, "found": true}\n'
+        "- card_cx: 订单牌中心水平位置 (0=最左, 0.5=正中, 1=最右)\n"
+        "- card_cy: 订单牌中心垂直位置 (0=最上, 0.5=正中, 1=最下)\n"
+        "- found: 是否看到订单牌 (true/false)\n"
+        "如果没看到订单牌, card_cx=card_cy=0.5, found=false"
+    )
+
+    session = requests.Session()
+    samples: List[Tuple[float, float]] = []
+
+    def _sense() -> TrackFrame:
+        frame = fetch_frame(session, settings.streamer_url)
+        if not frame:
+            logger.info("    [诊断] LLM 对齐: 取帧失败 (丢帧)")
+            return TrackFrame()
+        img = base64.b64encode(frame).decode()
+        d = _call_llm(token, img, POS_PROMPT, ernie)
+        if "error" in d or not d.get("found"):
+            logger.info("    [诊断] LLM 对齐: 没看到订单牌 / LLM 失败 → 丢目标帧")
+            return TrackFrame()   # 没看到牌 / LLM 失败 = 丢目标帧
+        cx = float(d.get("card_cx", 0.5))
+        cy = float(d.get("card_cy", 0.5))
+        samples.append((cx, cy))
+        logger.info("    [诊断] LLM 对齐 #%d: card=(%.2f, %.2f) Δ=(%+.2f, %+.2f)",
+                    len(samples), cx, cy, target_cx - cx, target_cy - cy)
+        return TrackFrame(
+            target_found=True, label="order_card",
+            cx=cx, cy=cy,
+            cx_err=target_cx - cx, cy_err=target_cy - cy,
+            age_ms=None,
+        )
+
+    # 记录对齐前后里程计 x (算前后移动多少)
+    from main.chassis import get_odometry
+    try:
+        x0 = get_odometry()[0]
+    except Exception:
+        x0 = float("nan")
+
+    result = track_chassis(
+        "order_card",
+        setpoint_cxcy=(target_cx, target_cy),
+        sense_fn=_sense,
+        # 控制律 (LLM 慢, 帧计数按帧调小; 轴符号实车反了改 LLM_ALIGN_SIGN_*)
+        # 2026-08-07: 只前后 (vx_only=True), 不动左右
+        kp=kp, v_max=v_max,
+        sign_vx=LLM_ALIGN_SIGN_VX, sign_vy=LLM_ALIGN_SIGN_VY,
+        vx_only=LLM_ALIGN_VX_ONLY,
+        deadband=LLM_ALIGN_DEADBAND, hold_frames=LLM_ALIGN_HOLD_FRAMES,
+        max_lost_frames=LLM_ALIGN_MAX_LOST, recover_after_lost=True,
+        hz=1.0, max_seconds=max_seconds,
+    )
+    try:
+        x1 = get_odometry()[0]
+        dx_m = x1 - x0
+    except Exception:
+        x1 = float("nan")
+        dx_m = float("nan")
+    logger.info(
+        "  LLM-as-servo (track_chassis): %s reason=%s frames=%d elapsed=%.1fs "
+        "识别%d次 前后%+.3fm (x %.3f→%.3f)",
+        "OK" if result.arrived else "FAIL", result.reason,
+        result.frames, result.elapsed_s, len(samples), dx_m, x0, x1,
+    )
+    return result.arrived, samples
+
+
 def _pick_goods(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -> dict:
     """阶段 4 存根: 物理抓取 5cm 订单方块. 当前未实现 (run 中另有实现)."""
     raise NotImplementedError("阶段 4 pick_goods - 待实现")
@@ -365,6 +841,45 @@ def _pick_goods(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -
 def _lift_and_carry(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -> dict:
     """阶段 5 存根: 抬升 + 运输待命姿态 (为任务七做准备). 当前未实现."""
     raise NotImplementedError("阶段 5 lift_and_carry - 待实现")
+
+
+def _write_orders_to_liebiao(order_list: Dict[str, Any]) -> bool:
+    """把两轮读单结果**按顺序**写进 task6/.liebiao.json, 供 task7 使用.
+
+    2026-08-08 用户需求: task6 每次运行都要把订单信息传给 task7, 且按顺序:
+      round1 → liaobiao1 (位置1), round2 → liaobiao2 (位置2).
+    实现: 先清空两个列表, 再按 round1→round2 顺序填充, 最后**一次原子写盘**
+    (绕开 append_liaobiao* 内部带 ✅ 的 print —— Windows gbk 控制台会崩).
+    独立 try/except, 写盘失败只告警不影响任务本身.
+
+    Args:
+        order_list: {"round1": [{"name","goods"},...], "round2": [...]}
+
+    Returns:
+        bool: 写盘是否成功 (写盘失败不影响任务, 返回 False)
+    """
+    from main.arm.each_task.task6 import liebiao as task6_liebiao
+    try:
+        task6_liebiao.liaobiao1.clear()
+        task6_liebiao.liaobiao2.clear()
+        written = 0
+        for round_key, target_list in (("round1", task6_liebiao.liaobiao1),
+                                       ("round2", task6_liebiao.liaobiao2)):
+            for o in (order_list or {}).get(round_key, []) or []:
+                name = (o or {}).get("name", "")
+                goods = (o or {}).get("goods", "")
+                if name and goods:
+                    target_list.append({"蔬菜": goods, "人名": name})
+                    written += 1
+                else:
+                    logger.warning("  [写盘task7] 跳过缺字段订单: name=%r goods=%r", name, goods)
+        task6_liebiao._save_to_json()
+        logger.info("  [写盘task7] 完成: liaobiao1=%d 条, liaobiao2=%d 条, 共写 %d 条",
+                    len(task6_liebiao.liaobiao1), len(task6_liebiao.liaobiao2), written)
+        return True
+    except Exception as exc:
+        logger.warning("  [写盘task7] 写盘失败 (不影响任务): %s", exc)
+        return False
 
 
 # ============================================================
@@ -398,16 +913,32 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     runner = ArmRunner(arm_client)
 
     completed: List[str] = []
-    order_list: List[Dict[str, Any]] = []
+    order_list: Dict[str, Any] = {"round1": [], "round2": []}   # 两轮读单结果, 写盘传给 task7
 
     try:
-        # ===== 阶段 1+2: 推杆姿态准备 + X 扫动推牌 + 调整到读单姿态 =====
-        logger.info("=== 任务六阶段 1+2: 推杆姿态 + 扫牌 + 读单姿态调整 ===")
-        _enter_push_bar_pose(arm_client, runner, cfg)
-        completed.extend(["push_bar_pose", "sweep", "reposition"])
+        # ===== 阶段 1: 摆读单姿态 + 底盘对齐 + 第一次读单 (先读后推) =====
+        logger.info("=== 阶段 1: 摆读单姿态 + 底盘对齐 + 第一次读单 (先读后推) ===")
+        _enter_read_pose(arm_client, runner, cfg)
+        completed.append("read_pose")
 
-        # ===== 阶段 3a: LLM 读单 (第一轮, 当前位置) =====
-        logger.info("=== 阶段 3a: LLM 读单 第一轮 (当前位置) ===")
+        # 底盘对齐订单牌 (LLM-as-detector + track_chassis 控制律)
+        try:
+            align_ok, align_samples = _llm_align_card(
+                client, target_cx=0.5, target_cy=0.5,
+                max_seconds=LLM_ALIGN_MAX_SECONDS, kp=LLM_ALIGN_KP, v_max=LLM_ALIGN_V_MAX,
+            )
+            logger.info(
+                "  LLM-as-servo 结果: %s, samples=%d, last=(%.2f, %.2f)",
+                "OK" if align_ok else "FAIL", len(align_samples),
+                *(align_samples[-1] if align_samples else (0.5, 0.5)),
+            )
+        except Exception as exc:
+            logger.warning("LLM-as-servo 异常 (不影响后续读单): %s", exc)
+            align_ok, align_samples = False, []
+        completed.append("llm_align")
+
+        # 第一次读单 (对齐位)
+        logger.info("=== 阶段 1c: LLM 读单 第一轮 (对齐位) ===")
         round1 = order_read_run()
         if round1.get("ok") and round1.get("orders"):
             logger.info("  [第一轮] 读取到 %d 条订单:", len(round1["orders"]))
@@ -417,22 +948,20 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             logger.warning("  [第一轮] 读取失败: %s", round1.get("error", "未识别到订单"))
         completed.append("order_read_1")
 
-        # ===== 阶段 3b: 调整姿态 (为第二轮读单做不同角度尝试) =====
-        logger.info("=== 阶段 3b: 调整姿态 X→-150 hand→-70° Y→0 准备第二轮读单 ===")
-        runner.move_x(-150.0)
-        logger.info("  X → -150 mm 完成")
-        arm_client.set_hand_angle(-70.0, speed=80, timeout=10.0)
-        time.sleep(0.5)
-        logger.info("  手爪 → -70° 完成")
-        runner.move_y(0.0)
-        logger.info("  Y → 0 mm 完成")
+        # ===== 阶段 2: 回推杆姿势 + 推牌 (approach 0.3m 并发) =====
+        logger.info("=== 阶段 2: 回推杆姿势 + 推牌 ===")
+        _enter_push_bar_pose(arm_client, runner, cfg)
+        completed.extend(["push_bar_pose", "sweep", "reposition"])
 
-        # ===== 阶段 3c: LLM 读单 第二轮 (多角度重试: -70°→-55°→-90°) =====
+        # ===== 阶段 3: 第二次读单 (推牌完已到第二次读单位, 手爪多角度重试) =====
+        # 2026-08-08: _enter_push_bar_pose 推牌完直接到 (X→-200 hand→-70 Y=0 触底),
+        # 这里不再重复调整姿态, 直接多角度重试读.
+        logger.info("=== 阶段 3: LLM 读单 第二轮 (已在第二次读单位) ===")
         round2: Dict[str, Any] = {"ok": False, "orders": [], "error": "no attempts"}
-        for attempt, hand_angle in enumerate([-70.0, -55.0, -90.0]):
-            logger.info("=== 阶段 3c: LLM 读单 第二轮 (手爪=%.0f°, 第 %d 次尝试) ===", hand_angle, attempt + 1)
+        for attempt, hand_angle in enumerate([SECOND_READ_HAND_DEG, -55.0, -90.0]):
+            logger.info("=== 阶段 3: 读单 第二轮 (手爪=%.0f°, 第 %d 次尝试) ===", hand_angle, attempt + 1)
             if attempt > 0:
-                # 此时 Y=0 (阶段 3b 已下降), 走 wrapper 必被 y 保护区拒 → 底层直调
+                # Y=0 触底, 走 wrapper 必被 y 保护区拒 → 底层直调
                 _set_hand_angle_at_bottom(arm_client, hand_angle)
                 time.sleep(0.5)
                 logger.info("  手爪 → %.0f° (重试)", hand_angle)
@@ -453,90 +982,74 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             "round2": round2.get("orders", []),
         }
 
-        # ===== 阶段 4: 识别并抓取订单中的蔬菜 =====
-        logger.info("=== 阶段 4: 抓取订单对应蔬菜 ===")
+        # ===== 阶段 3.5: 订单信息写盘传给 task7 (round1→liaobiao1, round2→liaobiao2) =====
+        # 2026-08-08: 每次运行都覆盖写盘, 按顺序, 即使后续抓取失败 task7 也有最新订单.
+        _write_orders_to_liebiao(order_list)
+        completed.append("write_liebiao")
 
-        # 4a) 调整抓取预备姿态: Y→-200, arm→-95°, hand→-10°
-        #     ⚠️ 阶段 3b 把 Y 压到 0, 此时 composite_run(y_mm=...) 会读当前 y
-        #     并被保护区拒 (composite.py:62)。所以先单独 move_y 抬出保护区
-        #     (move_y 从不被拦), 再并发摆大臂 + 手爪。
-        logger.info("  调整抓取预备姿态: Y→-200 arm→-95 hand→-10")
-        runner.move_y(-200.0)
-        runner.client.composite_run(arm=-95.0, hand=-10.0)
-        logger.info("  抓取预备姿态就绪")
+        # ===== 阶段 4: 再前进 + 按菜单顺序视觉抓取订单蔬菜 =====
+        logger.info("=== 阶段 4: 再前进 + 按菜单顺序视觉抓取订单蔬菜 ===")
 
-        # 4b) 底盘前进 15cm 靠近蔬菜货架
-        _chassis_move_for(arm_client, dx_m=0.15, timeout=30.0)
-        logger.info("  底盘前进 15cm 完成")
+        # 4a) 先抬臂到列检测姿态 (第二次读单 Y=0 触底, 必须抬出再动底盘防拖地)
+        runner.client.composite_run(
+            x_mm=PICK_START_X_MM, y_mm=PICK_COL_Y_MM,
+            arm=PICK_COL_ARM_DEG, hand=PICK_COL_HAND_DEG, speed=100,
+        )
+        logger.info("  抬臂到列检测姿态: X→%.0f Y→%.0f arm→%.0f hand→%.0f",
+                    PICK_START_X_MM, PICK_COL_Y_MM, PICK_COL_ARM_DEG, PICK_COL_HAND_DEG)
 
-        # 4c) LLM 视觉识别货架上所有蔬菜
-        logger.info("  调用 LLM 进行蔬菜识别...")
-        veggie_result = veggie_detect_run()
-        veggie_items = veggie_result.get("items", []) if veggie_result.get("ok") else []
-        if not veggie_items:
-            logger.warning("  蔬菜识别: 未找到任何目标, 跳过抓取")
-        else:
-            logger.info("  蔬菜识别: 共识别到 %d 棵", len(veggie_items))
-            for it in veggie_items:
-                logger.info("    [位置:%s] %s 置信度:%s",
-                            it.get("position", "?"), it.get("name", "?"), it.get("confidence", "?"))
+        # 4b) 底盘前进 13cm 靠近蔬菜货架 (定位到右侧一列, 2026-08-08)
+        from main.chassis import move_along_lane
+        move_along_lane(vx=PICK_APPROACH_VX, distance_m=PICK_APPROACH_M)
+        logger.info("  底盘前进 %.0fcm 完成 (任务点前进)", PICK_APPROACH_M * 100)
 
-        # 4d) 从两轮订单中提取出所有被订购的蔬菜名集合
-        ordered_goods: set = set()
+        # 4c) 订单蔬菜 → YOLO label (按菜单顺序, 去重)
+        ordered_labels: List[Tuple[str, str]] = []
+        seen_labels: set = set()
         for rnd in [round1, round2]:
             for o in (rnd.get("orders") or []):
                 g = o.get("goods", "")
-                if g:
-                    ordered_goods.add(g)
-        logger.info("  订单需求蔬菜集合: %s", ordered_goods)
+                lab = PICK_VEGGIE_LABEL_MAP.get(g)
+                if g and lab and lab not in seen_labels:
+                    seen_labels.add(lab)
+                    ordered_labels.append((g, lab))
+        logger.info("  订单蔬菜 (按菜单顺序): %s",
+                    [(g, lab) for g, lab in ordered_labels])
 
-        # 4e) 匹配: 优先抓取订单里有的蔬菜; 没匹配到时 fallback 抓右侧货架 (兜底)
-        matched = [v for v in veggie_items if v.get("name") in ordered_goods]
-        if not matched:
-            logger.warning("  订单蔬菜未匹配识别结果, 兜底: 取右侧货架上的蔬菜")
-            matched = [v for v in veggie_items if _pos_to_side(v.get("position", "")) == "right"]
-        else:
-            logger.info("  订单匹配成功 %d 棵蔬菜", len(matched))
+        # 4d) 一列一列检测抓取 (先右列后左列, 2026-08-08)
+        # 放置位跟蔬菜本身 (第几个订单) 绑定, 不是跟抓取成功顺序.
+        # 已抓取的蔬菜不再重复尝试 (同一棵在右列抓过后左列还会出现) (2026-08-08)
+        picked_count = 0
+        picked_labels: set = set()
+        for col in PICK_COLUMN_ORDER:
+            # 切到左列 (右列结束后底盘前移)
+            if col == "left" and PICK_COLUMN_MOVE_M > 1e-3:
+                move_along_lane(vx=PICK_COLUMN_MOVE_VX, distance_m=PICK_COLUMN_MOVE_M)
+                logger.info("  切换到左列: 前进 %.2fm", PICK_COLUMN_MOVE_M)
+            for idx, (goods_name, label) in enumerate(ordered_labels):
+                if label in picked_labels:
+                    logger.info("  [%s] 已在 %s列 抓到, 跳过重复抓取", goods_name, col)
+                    continue
+                place = PICK_PLACE_1 if idx == 0 else PICK_PLACE_2
+                logger.info("  → 抓取 '%s' (label=%s, %s列, 订单%d)",
+                            goods_name, label, col, idx + 1)
+                if _pick_one_veggie_visual(runner, goods_name, label, place, column=col):
+                    picked_count += 1
+                    picked_labels.add(label)
+                    completed.append(f"picked_{picked_count}")
+                else:
+                    logger.info("  [%s] %s列 未抓到 (原因见上方检测日志)", goods_name, col)
 
-        # 分左右排: 右侧优先取 (近, 不需要额外底盘位移)
-        right_targets = [v for v in matched if _pos_to_side(v.get("position", "")) == "right"]
-        left_targets = [v for v in matched if _pos_to_side(v.get("position", "")) == "left"]
-        pick_idx = 0
-
-        # ── 先抓右侧货架 (最多 2 棵, 右侧距离近) ──
-        for veg in right_targets[:2]:
-            row = _pos_to_row(veg.get("position", ""))
-            x_pos = _SHELF_X_BY_ROW[min(row, 3)]
-            carry_y = -110.0 if pick_idx == 0 else -140.0
-            drop_y = -40.0 if pick_idx == 0 else -80.0
-            label = veg.get("name", f"item{pick_idx + 1}")
-            logger.info("  → [右侧] 抓取 '%s' 行=%d X=%.0f (第 %d 棵)", label, row, x_pos, pick_idx + 1)
-            _pick_one_veggie(arm_client, runner, x_pos, carry_y, drop_y, label=label)
-            completed.append(f"picked_{pick_idx + 1}")
-            pick_idx += 1
-
-        # ── 再抓左侧货架 (如果还未抓满 2 棵, 需要底盘再前进 12cm 才够到) ──
-        if left_targets and pick_idx < 2:
-            logger.info("  底盘前进 12cm 以够到左侧蔬菜")
-            _chassis_move_for(arm_client, dx_m=0.12, timeout=30.0)
-            for veg in left_targets[:2 - pick_idx]:
-                row = _pos_to_row(veg.get("position", ""))
-                x_pos = _SHELF_X_BY_ROW[min(row, 3)]
-                carry_y = -110.0 if pick_idx == 0 else -140.0
-                drop_y = -50.0 if pick_idx == 0 else -100.0
-                label = veg.get("name", f"item{pick_idx + 1}")
-                logger.info("  → [左侧] 抓取 '%s' 行=%d X=%.0f (第 %d 棵)", label, row, x_pos, pick_idx + 1)
-                _pick_one_veggie(arm_client, runner, x_pos, carry_y, drop_y, label=label)
-                completed.append(f"picked_{pick_idx + 1}")
-                pick_idx += 1
-
-        if pick_idx == 0:
-            logger.warning("  最终未能抓取任何蔬菜 (无可选目标)")
+        if picked_count == 0:
+            logger.warning("  最终未能抓取任何蔬菜 (全部未收敛)")
 
         completed.append("pick_goods")
 
     except Exception as exc:
         logger.exception("get_order 任务失败: %s", exc)
+        # 异常路径也写盘 (order_list 可能只有部分轮次/为空): 保证 task7 拿到的
+        # 是本次运行的真实状态, 不残留上一次的陈旧订单.
+        _write_orders_to_liebiao(order_list)
         return {
             "ok": False,
             "completed": completed,

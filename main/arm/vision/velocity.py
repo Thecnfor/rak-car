@@ -240,6 +240,7 @@ class VelocityLoop:
                          hand_min: float = -90.0, hand_max: float = 0.0,
                          sign_x: float = -1.0, sign_y: float = 1.0,
                          sign_arm: float = 1.0, sign_hand: float = 1.0,
+                         x_error_source: str = "dx",
                          setpoint_x_norm: float = 0.0,
                          setpoint_y_norm: float = 0.0,
                          hold_y: bool = True,
@@ -269,7 +270,10 @@ class VelocityLoop:
                                      score=0.0, miss=True)
             dx = pick.bbox_norm.x_center - setpoint_x_norm
             dy = pick.bbox_norm.y_center - setpoint_y_norm
-            x_vel = 0.0 if abs(dx) < deadzone else _clamp(sign_x * dx * gain_x, -max_vel, max_vel)
+            # 2026-08-08: x_error_source="dy" → X 十字跟随垂直误差 (task6 蔬菜几何:
+            # X 右移 → 目标框下移, 即 X 影响画面 cy). "dx" 保持原行为 (X 跟随水平).
+            x_err = dy if x_error_source == "dy" else dx
+            x_vel = 0.0 if abs(x_err) < deadzone else _clamp(sign_x * x_err * gain_x, -max_vel, max_vel)
             y_vel = 0.0 if hold_y else (
                 0.0 if abs(dy) < deadzone else _clamp(sign_y * dy * gain_y, -max_vel, max_vel))
             d_arm = 0.0 if abs(dx) < deadzone else sign_arm * dx * gain_arm
