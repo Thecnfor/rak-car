@@ -6,7 +6,7 @@
 # 按需调用,不占串口周期(连续流走 /rak/sensors/ir/<id> 等 topic)。
 
 uint8 port            # MC602 端口号
-string type           # ir | ultrasonic | analog | touch | ambient | encoder
+string type           # ir | ultrasonic | analog_input | touch | ambient_light | encoder
 ---
 bool ok
 string error          # "" 成功 | "unsupported sensor type" | 驱动异常信息

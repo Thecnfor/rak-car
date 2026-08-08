@@ -32,8 +32,10 @@ set(CMAKE_INSTALL_RPATH "$ORIGIN")
 # -----------------------------------------------------------------------------
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
@@ -154,6 +156,24 @@ target_link_libraries(arm_node PUBLIC
   msgs::msgs
 )
 
+# system_io_node — 非 arm/chassis 杂项设备(beep/led/nixie/按键/传感器按需读)
+add_executable(system_io_node
+  src/nodes/system_io_node.cpp
+  src/system_io.cpp
+  src/mc602_adapter.cpp
+  src/mc602_protocol.cpp
+  src/serial_transport.cpp
+  src/bridge_transport.cpp
+  src/serial_port.cpp
+)
+target_include_directories(system_io_node PUBLIC include)
+target_link_libraries(system_io_node PUBLIC
+  rclcpp::rclcpp
+  std_msgs::std_msgs
+  std_srvs::std_srvs
+  msgs::msgs
+)
+
 # safety_gate_node
 add_executable(safety_gate_node src/nodes/safety_gate_node.cpp)
 target_include_directories(safety_gate_node PUBLIC include)
@@ -194,13 +214,13 @@ endif()
 if(CAMERA_INFO_MANAGER_FOUND)
   install(TARGETS
     camera_node infrared_node mc602_bridge_node mecanum_chassis_node arm_node
-    safety_gate_node mission_runner_node
+    system_io_node safety_gate_node mission_runner_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 else()
   install(TARGETS
-    infrared_node mc602_bridge_node mecanum_chassis_node arm_node safety_gate_node
-    mission_runner_node
+    infrared_node mc602_bridge_node mecanum_chassis_node arm_node system_io_node
+    safety_gate_node mission_runner_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 endif()
@@ -308,6 +328,13 @@ if(BUILD_TESTING)
     test/test_safety_gate_logic.cpp
   )
   target_include_directories(test_safety_gate_logic PUBLIC include)
+
+  # SystemIo — semantic dispatch for the 7 system device services (injected fake)
+  ament_add_gmock(test_system_io
+    test/test_system_io.cpp
+    src/system_io.cpp
+  )
+  target_include_directories(test_system_io PUBLIC include)
 
   # Pure task framework tests — no rclcpp needed (uses nullptr sentinel)
   ament_add_gmock(test_base_task
