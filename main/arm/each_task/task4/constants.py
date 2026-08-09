@@ -132,7 +132,7 @@ DEFAULT_RETURN_X_MM = POSE_P_X_MM
 """放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。"""
 
 # ---- P 姿态参数 (可由外部覆盖) ----
-TASK4_POSE_P_Y_MM: float = -160.0
+TASK4_POSE_P_Y_MM: float = -180.0
 TASK4_POSE_P_X_MM: float = -295.0
 TASK4_POSE_P_ARM_DEG: float = 90.0
 TASK4_POSE_P_HAND_DEG: float = 10.0
@@ -179,8 +179,8 @@ BALL_LABELS = ["ball_blue", "ball_yellow"]
 #   - 两种球同尺寸 → 蓝/黄共用一份 setpoint。
 
 # ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户最新标定, 2026-08-10)。
-#    手爪智能抓取目标 = (cx, cy) = (0.08, -0.70), 两种球同尺寸共用一份。
-TASK4_SETPOINT_X_NORM: float = 0.08
+#    手爪智能抓取目标 = (cx, cy) = (0.00, -0.70), 两种球同尺寸共用一份。
+TASK4_SETPOINT_X_NORM: float = 0.0
 TASK4_SETPOINT_Y_NORM: float = -0.70
 
 TASK4_SERVO_Y_START_MM: float = TASK4_POSE_P_Y_MM
