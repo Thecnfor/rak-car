@@ -14,10 +14,24 @@ from typing import Optional
 from . import target2  # noqa: E402
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
-    CREEP_POLL_HZ, CREEP_MAX_SECONDS_S,
+    CREEP_POLL_HZ, CREEP_MAX_SECONDS_S, CREEP_STOP_CX_MAX,
     IR_FAR_THRESHOLD_M, IR_FAR_CONFIRM_FRAMES, POST_IR_LOSS_DISTANCE_M,
     LOG_PREFIX_TARGET4 as LOG_PREFIX,
 )
+
+
+def _left_half_balls(balls: list[dict]) -> list[dict]:
+    """过滤出"可停下抓取"的球: 球色合法 且 cx_norm < CREEP_STOP_CX_MAX (画面左半侧)。
+
+    用户拍板 2026-08-10: creep 见球只有当目标 cx<0.5 才停; 停在右半侧的球机械臂够不着,
+    继续前移让球进入左半侧。空列表 = 不满足停车条件, 继续 creep。
+    """
+    return [
+        b for b in balls
+        if b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
+        and b.get("cx_norm") is not None
+        and b.get("cx_norm") < CREEP_STOP_CX_MAX
+    ]
 
 
 class _Task4SearchState:
@@ -193,9 +207,11 @@ class _CreepThread:
                         balls = []
                         print(f"  [{LOG_PREFIX}] 离区确认帧视觉读取异常: "
                               f"{type(e).__name__}: {str(e)[:100]}", file=sys.stderr)
-                    if any(b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
-                           for b in balls):
-                        self.balls = balls
+                    # 见球停车: 只有目标 cx_norm < CREEP_STOP_CX_MAX 才停 (用户拍板)。
+                    # 只保留可抓球 (左半侧), 避免后续 _pick_best_ball 选到右侧球。
+                    pickable = _left_half_balls(balls)
+                    if pickable:
+                        self.balls = pickable
                         self.found_ball = True
                         _set_chassis_vel(self.http, 0.0)
                         break
@@ -231,9 +247,11 @@ class _CreepThread:
                         area_max=0.90,
                         debug=True,
                     )
-                    if any(b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
-                           for b in balls):
-                        self.balls = balls
+                    # 见球停车: 只有目标 cx_norm < CREEP_STOP_CX_MAX 才停 (用户拍板)。
+                    # 只保留可抓球 (左半侧), 避免后续 _pick_best_ball 选到右侧球。
+                    pickable = _left_half_balls(balls)
+                    if pickable:
+                        self.balls = pickable
                         self.found_ball = True
                         _set_chassis_vel(self.http, 0.0)
                         break

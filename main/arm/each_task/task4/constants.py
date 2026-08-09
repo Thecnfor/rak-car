@@ -106,6 +106,10 @@ CREEP_POLL_HZ: float = 20.0
 CREEP_MAX_SECONDS_S: float = 30.0
 """单次 creep 墙钟兜底上限 (s): 距离/IR/见球任一不满足也强制退出, 防 odom 卡死干等。"""
 
+CREEP_STOP_CX_MAX: float = 0.5
+"""creep 见球停车判定 (用户拍板 2026-08-10): 只有目标 cx_norm < 此值 (画面左半侧)
+才停下; 球在右半侧 (cx≥此值) 继续前移, 直到球进入左半侧或退出条件触发。"""
+
 DEFAULT_TRACK_MAX_SECONDS: float = 6.0
 """单球底盘视觉伺服收敛预算 (s)。"""
 
