@@ -13,7 +13,7 @@ from sensor_msgs.msg import CompressedImage, Image
 
 from .overlay_helpers import draw_detection_overlay, draw_lane_overlay, image_data_sequence
 
-Frame = Tuple[np.ndarray, object, str]
+Frame = Tuple[bytes, object, str]
 
 
 class VisionOverlayNode(Node):
@@ -55,24 +55,19 @@ class VisionOverlayNode(Node):
             "VisionOverlay up: front/side images + lane/detections -> RViz overlay topics")
 
     @staticmethod
-    def _decode(msg: CompressedImage) -> Optional[np.ndarray]:
+    def _decode(data: bytes) -> Optional[np.ndarray]:
         try:
-            data = np.frombuffer(msg.data, dtype=np.uint8)
-            return cv2.imdecode(data, cv2.IMREAD_COLOR)
+            return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
         except Exception:
             return None
 
     def _on_front(self, msg: CompressedImage) -> None:
-        frame = self._decode(msg)
-        if frame is not None:
-            with self._lock:
-                self._front = (frame, msg.header.stamp, msg.header.frame_id)
+        with self._lock:
+            self._front = (bytes(msg.data), msg.header.stamp, msg.header.frame_id)
 
     def _on_side(self, msg: CompressedImage) -> None:
-        frame = self._decode(msg)
-        if frame is not None:
-            with self._lock:
-                self._side = (frame, msg.header.stamp, msg.header.frame_id)
+        with self._lock:
+            self._side = (bytes(msg.data), msg.header.stamp, msg.header.frame_id)
 
     def _on_lane(self, msg: LaneResult) -> None:
         with self._lock:
@@ -97,9 +92,9 @@ class VisionOverlayNode(Node):
     def _publish(self) -> None:
         with self._lock:
             front = None if self._front is None else (
-                self._front[0].copy(), self._front[1], self._front[2])
+                self._decode(self._front[0]), self._front[1], self._front[2])
             side = None if self._side is None else (
-                self._side[0].copy(), self._side[1], self._side[2])
+                self._decode(self._side[0]), self._side[1], self._side[2])
             lane = self._lane
             detections = self._detections
         if front is not None:
