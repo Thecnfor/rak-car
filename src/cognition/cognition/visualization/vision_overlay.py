@@ -4,6 +4,7 @@
 import threading
 from typing import Optional, Tuple
 
+import cv2
 import numpy as np
 import rclpy
 from msgs.msg import DetectionArray, LaneResult
@@ -94,14 +95,10 @@ class VisionOverlayNode(Node):
             frame = frame.copy()
             lane = self._lane
             detections = self._detections
-        if self._overlay_type == "lane":
-            if lane is None:
-                return
-            frame = draw_lane_overlay(frame, lane)
+            frame = draw_lane_overlay(frame, lane) if lane is not None else frame
         else:
-            if detections is None:
-                return
-            frame = draw_detection_overlay(frame, detections)
+            frame = draw_detection_overlay(frame, detections) if detections is not None else frame
+        frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
         self._pub.publish(self._to_image(frame, stamp, frame_id))
 
 
