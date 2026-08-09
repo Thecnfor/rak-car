@@ -32,6 +32,7 @@ set(CMAKE_INSTALL_RPATH "$ORIGIN")
 # -----------------------------------------------------------------------------
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(rclcpp_action REQUIRED)
 find_package(rclcpp_lifecycle REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
@@ -175,6 +176,23 @@ target_link_libraries(mission_runner_node PUBLIC
   std_msgs::std_msgs
 )
 
+# arm_cartesian_move_node — ArmCartesianMove action server (middle layer).
+# Thin shell over ArmCartesianPlanner; publishes a JointTrajectory to
+# joint_trajectory_controller and monitors /joint_states for feedback.
+add_executable(arm_cartesian_move_node
+  src/nodes/arm_cartesian_move_node.cpp
+  src/arm_cartesian_planner.cpp
+  src/arm_kinematic_model.cpp
+)
+target_include_directories(arm_cartesian_move_node PUBLIC include)
+target_link_libraries(arm_cartesian_move_node PUBLIC
+  rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
+  sensor_msgs::sensor_msgs
+  trajectory_msgs::trajectory_msgs
+  msgs::msgs
+)
+
 # Optional ros2_control hardware interface plugin
 if(hardware_interface_FOUND AND pluginlib_FOUND)
   add_library(_hardware_plugin SHARED src/mc602_hardware_interface.cpp)
@@ -195,13 +213,13 @@ endif()
 if(CAMERA_INFO_MANAGER_FOUND)
   install(TARGETS
     camera_node infrared_node mc602_bridge_node mecanum_chassis_node arm_node
-    safety_gate_node mission_runner_node
+    safety_gate_node mission_runner_node arm_cartesian_move_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 else()
   install(TARGETS
     infrared_node mc602_bridge_node mecanum_chassis_node arm_node safety_gate_node
-    mission_runner_node
+    mission_runner_node arm_cartesian_move_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 endif()
@@ -305,6 +323,14 @@ if(BUILD_TESTING)
     src/arm_kinematic_model.cpp
   )
   target_include_directories(test_arm_kinematic_model PUBLIC include)
+
+  # ArmCartesianPlanner — goal → joint-space plan + rejection semantics
+  ament_add_gmock(test_arm_cartesian_planner
+    test/test_arm_cartesian_planner.cpp
+    src/arm_cartesian_planner.cpp
+    src/arm_kinematic_model.cpp
+  )
+  target_include_directories(test_arm_cartesian_planner PUBLIC include)
 
   ament_add_gmock(test_base_controller_iface
     test/test_base_controller_iface.cpp
