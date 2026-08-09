@@ -95,6 +95,7 @@ class VisionOverlayNode(Node):
             frame = frame.copy()
             lane = self._lane
             detections = self._detections
+        if self._overlay_type == "lane":
             frame = draw_lane_overlay(frame, lane) if lane is not None else frame
         else:
             frame = draw_detection_overlay(frame, detections) if detections is not None else frame
