@@ -46,6 +46,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -112,6 +113,10 @@ PLACE_LIFT_MM = -40.0      # 释放后抬离到 -40mm, 防拖拽
 # ── 底盘安全约束 ──────────────────────────────────────────────────────────
 # y 高于此值 (mm) 时才允许并发移动底盘 + 机械臂 (防撞)
 CHASSIS_CONCURRENT_Y_THRESHOLD_MM = -30.0
+
+# ── 底盘网格移动速度 (move_for max_velocities) ───────────────────────────
+# 2026-08-10: SDK 默认 0.2 → 0.1 m/s (xy 平移降速, 角速度留 π/3 默认)
+CHASSIS_MOVE_MAX_VEL_MPS = 0.1
 
 # ── composite_run 公共参数 ─────────────────────────────────────────────────
 COMPOSITE_SPEED_DEFAULT = 100
@@ -253,7 +258,7 @@ def _pick_cylinder_servo_local(
     控制律 (arm 控 cx + x 十字控 cy) 与 find_target_arm_cross 同构, 方向符号沿用
     task1 标定: sign_arm=+1, sign_x=-1.
 
-    Returns: run_arm_servo 结果 dict (含 ok/settled/trace_hits/end_arm).
+    Returns: run_arm_servo 结果 dict (含 ok/settled/trace_hits/end_arm/end_x).
     未收敛抛 RuntimeError (主循环跳过该列, 与旧路径一致).
     """
     vision = cfg.get("pick_vision") or {}
@@ -299,9 +304,9 @@ def _pick_cylinder_servo_local(
         return result
 
     result = _servo_once(servo_kw)
-    logger.info("本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+    logger.info("本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s end_x=%s",
                 result.get("reason"), result.get("settled"),
-                result.get("trace_hits"), result.get("end_arm"))
+                result.get("trace_hits"), result.get("end_arm"), result.get("end_x"))
     # 2026-08-09 用户: 对齐失败但这一轮看到过目标 (trace_hits>0) →
     # 加时 3s + 死区调大重试一次。目标还在视野里只是振荡/太慢没进死区,
     # 再给一次机会大概率能锁上; trace_hits=0 全程没看到目标, 重试也白搭。
@@ -321,9 +326,9 @@ def _pick_cylinder_servo_local(
             retry_kw["servo_timeout"], retry_kw["deadzone"],
         )
         result = _servo_once(retry_kw)
-        logger.info("重试视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+        logger.info("重试视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s end_x=%s",
                     result.get("reason"), result.get("settled"),
-                    result.get("trace_hits"), result.get("end_arm"))
+                    result.get("trace_hits"), result.get("end_arm"), result.get("end_x"))
     if not result.get("settled"):
         raise RuntimeError(
             f"S 视觉抓苗未收敛 (reason={result.get('reason')}, "
@@ -840,6 +845,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             arm_client.http.execute_car_action(
                 "move_for", [dx, 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
+                max_velocities=[CHASSIS_MOVE_MAX_VEL_MPS, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
             )
             pos_along[0] = target_along_m
 
@@ -975,6 +981,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 "move_for",
                 [SOURCE_POSITIONS_M[3] - pos_along[0], 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
+                max_velocities=[CHASSIS_MOVE_MAX_VEL_MPS, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
             )
             pos_along[0] = SOURCE_POSITIONS_M[3]
             logger.info("  异常路径也已把底盘移到 S3 (%.3f m)", pos_along[0])
@@ -995,6 +1002,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 "move_for",
                 [s3_dx, 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
+                max_velocities=[CHASSIS_MOVE_MAX_VEL_MPS, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
             )
         else:
             logger.info("task1 结束, 底盘已在 S3 (%.3f m, |dx|=%.3f < 5cm) 跳过移动",
