@@ -42,7 +42,6 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from main.arm import ArmClient, ArmRunner  # noqa: E402
-from main.chassis import track_chassis  # noqa: E402
 from main.arm.each_task.task4 import dipan as _dipan  # noqa: E402
 from main.arm.each_task.task4.constants import (  # noqa: E402
     # 预算 / 终止
@@ -53,7 +52,7 @@ from main.arm.each_task.task4.constants import (  # noqa: E402
     DEFAULT_TRACK_SOFT_DEADBAND, DEFAULT_TRACK_WIDE_DEADBAND,
     CREEP_POLL_HZ, CREEP_MAX_SECONDS_S,
     # 姿态 / 放仓
-    COLOR_BLUE, COLOR_YELLOW, BIN_X_MM, BIN_Y_MM, BIN_HAND_DEG, BALL_LABELS,
+    COLOR_BLUE, COLOR_YELLOW, BIN_X_MM, BIN_Y_MM, BIN_HAND_DEG,
     TASK4_POSE_P_Y_MM, TASK4_POSE_P_X_MM, TASK4_POSE_P_ARM_DEG, TASK4_POSE_P_HAND_DEG,
     X_PICK_MM, Y_PICK_MM, Y_TRANSIT_MM, X_TRANSIT_MM, Y_PUT_MM,
     STORAGE_OPEN_ANGLE_DEG, STORAGE_CLOSE_ANGLE_DEG, STORAGE_OPEN_SPEED,
@@ -456,11 +455,14 @@ def step_target4(
             #   编码器 —— 车已停, 0.5s 内编码器必 < 1.0 → 永远判"底盘无响应"。
             #   重武装只应在"命令路径确实失败"时触发: runtime 已在整个 track
             #   窗口用真实编码器算好 motion_ok / stop_ok / control_lost, 直接信它。
-            track_trusted = bool(track_res.arrived) and getattr(
-                track_res, "motion_ok", True)
+            # 2026-08-10: motion_ok=False 在"软成功/近对齐"(near_arrived_*) 下常是
+            # 假阳性 —— 球本来就接近画面中心, 底盘几乎没动, runtime 便判
+            # "发了命令编码器没动"。对一个**已 arrived** 的 track 再重武装纯属浪费
+            # (0.5s settle + 重试)。重武装只在 track **没到位** 且命令路径确实异常
+            # (control_lost / stop_ok=False / motion_ok=False) 时触发。
             needs_rearm = (
                 not dry_run
-                and not track_trusted
+                and not bool(track_res.arrived)
                 and (
                     track_res.reason == "control_lost"
                     or not getattr(track_res, "stop_ok", True)
@@ -479,15 +481,9 @@ def step_target4(
                       f"{getattr(track_res, 'motion_ok', True)}), "
                       f"重武装后重试一次 track")
                 _chassis_rearm_if_stuck(http_client, settle_s=0.5)
-                # 重试 1 次: 拿 3s 给一次集中机会, 若再失败就硬失败
-                retry = track_chassis(
-                    target=BALL_LABELS,
-                    select_mode="leftmost",
-                    setpoint_cxcy=(0.0, 0.0),
-                    kp=0.10,
-                    v_max=0.08,
-                    hold_frames=3,
-                    v_slew=0.02,
+                # 重试 1 次: 拿 3s 给一次集中机会, **直接用大 kp** (0.20) 走完整
+                # 5 段式成功判据 (2026-08-10 用户拍板"直接默认用大kp"), 若再失败就硬失败。
+                retry = _track_leftmost_ball(
                     max_seconds=min(3.0, track_max_seconds),
                     dry_run=dry_run,
                 )
