@@ -137,3 +137,119 @@ TASK4_LOGS_DIR: str = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", ".remember", "logs")
 )
 TASK4_TARGET_CACHE: str = os.path.join(TASK4_LOGS_DIR, "task4_target_latest.json")
+
+
+# ============================================================================
+# target4 —— 慢速前移搜索 + 底盘视觉定位 (从 target4.py 下沉, 2026-08-10 拆分)
+# ============================================================================
+
+# ---- 预算 (2026-08-10 用户拍板: 冻结为模块默认值, 不再经 step_target4 参数化) ----
+DEFAULT_MAX_PICKS: int = 1000
+"""最多抓取数 (距离优先模式下设为极大值, 实际不限制)。"""
+
+DEFAULT_MAX_CREEP_M: float = 0.58
+"""累计前移距离预算 (m, 开环 速度×时间 记账)。唯一实际生效的终止条件。"""
+
+DEFAULT_MAX_SECONDS: float = 9999.0
+"""任务总时长预算 (s) (距离优先模式下设为极大值, 实际不限制)。"""
+
+DEFAULT_CREEP_SPEED_MPS: float = 0.12
+"""creep 搜索前移速度 (m/s)。2026-08-09 用户: 翻倍 (0.06→0.12) 加快扫区。"""
+
+CREEP_POLL_HZ: float = 20.0
+"""creep 期间 fetch_balls 轮询频率。"""
+
+CREEP_MAX_SECONDS_S: float = 30.0
+"""单次 creep 墙钟兜底上限 (s): 距离/IR/见球任一不满足也强制退出, 防 odom 卡死干等。"""
+
+DEFAULT_TRACK_MAX_SECONDS: float = 6.0
+"""单球底盘视觉伺服收敛预算 (s)。"""
+
+DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES: int = 1000
+"""连续 pick 失败超过此数 → 退出 (距离优先模式下设为极大值, 实际不限制)。"""
+
+DEFAULT_MAX_CONSECUTIVE_TRACK_FAILURES: int = 2
+"""连续 track 失败超过此数 → 退出。"""
+
+DEFAULT_PICK_TIMEOUT_S: float = 60.0
+"""pick_by_vision 总超时 (s)。"""
+
+DEFAULT_TRACK_SOFT_DEADBAND: float = 0.15
+"""track_chassis 软死区 (cx_err/cy_err 绝对值 < 此值视为"接近对齐")。"""
+
+DEFAULT_TRACK_RETRY_SECONDS: float = 1.0
+"""软收敛额外 time budget (s). near_arrived 时再给 <1s 用更大 deadband 重试. """
+
+DEFAULT_TRACK_WIDE_DEADBAND: float = 0.35
+"""track_chassis 宽死区 (cx_err/cy_err 绝对值 < 此值视为"近似对齐可以一试")。"""
+
+from main.arm.each_task.common import POSE_P_X_MM  # noqa: E402
+DEFAULT_RETURN_X_MM = POSE_P_X_MM
+"""放 bin 后 x 回的目标位置 (mm)。默认 = POSE_P_X (P 姿态 x), None = 不回。"""
+
+# ---- P 姿态参数 (可由外部覆盖) ----
+TASK4_POSE_P_Y_MM: float = -160.0
+TASK4_POSE_P_X_MM: float = -295.0
+TASK4_POSE_P_ARM_DEG: float = 90.0
+TASK4_POSE_P_HAND_DEG: float = 10.0
+
+# ---- 抓取 / 中转位姿 ----
+X_PICK_MM: float = -240.0
+"""盲降前横移 x (mm)。"""
+
+Y_PICK_MM: float = -55.0
+"""抓球 y (吸盘贴近球面)。"""
+
+Y_TRANSIT_MM: float = -140.0
+"""中转 y (放仓位之前的过渡位)。"""
+
+X_TRANSIT_MM: float = -220.0
+"""中转 x (车体中线附近, 两次小位移降低 belt-slip 风险)。"""
+
+# ---- 放 bin 参数 ----
+Y_PUT_MM: float = -140.0
+"""放球 y (再深 10mm 防脱落)。"""
+
+BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -60.0}
+"""蓝 bin x=0, 黄 bin x=-70。"""
+
+BIN_Y_MM = {COLOR_BLUE: -140.0}
+"""蓝 bin y=-135; 黄沿用 Y_PUT_MM。"""
+
+BIN_HAND_DEG = {COLOR_BLUE: 10.0}
+"""蓝 bin hand=-30°; 黄沿用 P 姿态 hand=10°。"""
+
+# ---- 其他 ----
+Y_FINAL_MM: float = -140.0
+"""最终 y (识别位姿, 历史值)。"""
+
+BALL_LABELS = ["ball_blue", "ball_yellow"]
+"""track_chassis 目标集 (PaddleDet 模型标签)。"""
+
+# ---- IR 生命周期 ----
+# task4 任务点由 orchestrator 的左 IR < 0.70m 触发。
+# 任务运行期间 IR 回到 > 0.70m, 连续确认后视为离开任务区, 再前进 0.30m 收工。
+IR_FAR_THRESHOLD_M: float = 0.70
+IR_FAR_CONFIRM_FRAMES: int = 2
+POST_IR_LOSS_DISTANCE_M: float = 0.30
+
+# ---- 时间戳辅助 (跨 target4 各子模块共享) ----
+import time as _time  # noqa: E402
+_TASK4_T0 = None
+
+
+def reset_ts(t0) -> None:
+    """把 task4 时间戳起点重置为 t0 (step_target4 启动时调用)。"""
+    global _TASK4_T0
+    _TASK4_T0 = t0
+
+
+def _ts_str() -> str:
+    """距 task4 启动的秒数, 打在每个动作前定位每步延迟。"""
+    global _TASK4_T0
+    if _TASK4_T0 is None:
+        _TASK4_T0 = _time.monotonic()
+    return f"t=+{_time.monotonic() - _TASK4_T0:.1f}s"
+
+
+LOG_PREFIX_TARGET4: str = LOG_PREFIX_TASK4 + "/target4"

@@ -26,7 +26,7 @@ class TestTask4TrackStopOk(unittest.TestCase):
 
         否则上层以为车停了、不显式停稳 → 抓取时车在滑 (下沉后零速失败不可见)。
         """
-        with patch("main.arm.each_task.task4.target4.track_chassis",
+        with patch("main.arm.each_task.task4.track_align.track_chassis",
                    return_value=_res(cx_err=0.03, cy_err=0.02, stop_ok=False)):
             res = _track_leftmost_ball(max_seconds=12.0, dry_run=False)
         self.assertTrue(res.arrived)
@@ -35,14 +35,14 @@ class TestTask4TrackStopOk(unittest.TestCase):
 
     def test_soft_success_default_stop_ok_true(self):
         """正常软成 → stop_ok 默认 True."""
-        with patch("main.arm.each_task.task4.target4.track_chassis",
+        with patch("main.arm.each_task.task4.track_align.track_chassis",
                    return_value=_res(cx_err=0.03, cy_err=0.02)):
             res = _track_leftmost_ball(max_seconds=12.0, dry_run=False)
         self.assertTrue(res.stop_ok)
 
     def test_track_requests_dual_axis_tuned_parameters(self):
         """task4 首轮对齐必须显式使用双轴和现场调好的速度参数。"""
-        with patch("main.arm.each_task.task4.target4.track_chassis",
+        with patch("main.arm.each_task.task4.track_align.track_chassis",
                    return_value=_res(reason="control_lost", arrived=False)) as track:
             _track_leftmost_ball(max_seconds=12.0, dry_run=False)
         kwargs = track.call_args.kwargs
@@ -55,7 +55,7 @@ class TestTask4TrackStopOk(unittest.TestCase):
 
     def test_control_lost_returned_as_is(self):
         """control_lost → 5 段式不参与, 原样返回 (reason 非 timeout)."""
-        with patch("main.arm.each_task.task4.target4.track_chassis",
+        with patch("main.arm.each_task.task4.track_align.track_chassis",
                    return_value=_res(reason="control_lost", stop_ok=False)):
             res = _track_leftmost_ball(max_seconds=12.0, dry_run=False)
         self.assertEqual(res.reason, "control_lost")
@@ -64,7 +64,7 @@ class TestTask4TrackStopOk(unittest.TestCase):
 
     def test_no_target_returned_as_is(self):
         """no_target 不是 timeout → 不触发软成功逻辑, 原样返回."""
-        with patch("main.arm.each_task.task4.target4.track_chassis",
+        with patch("main.arm.each_task.task4.track_align.track_chassis",
                    return_value=_res(reason="no_target", stop_ok=True)):
             res = _track_leftmost_ball(max_seconds=12.0, dry_run=False)
         self.assertEqual(res.reason, "no_target")
