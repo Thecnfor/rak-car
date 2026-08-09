@@ -141,7 +141,7 @@ DEFAULT_TRACK_RETRY_SECONDS: float = 1.0
 最坏 7s track 总时长, 但 max_seconds-bounded 防止极端超时.
 """
 
-DEFAULT_TRACK_WIDE_DEADBAND: float = 0.45
+DEFAULT_TRACK_WIDE_DEADBAND: float = 0.35
 """track_chassis 宽死区 (cx_err/cy_err 绝对值 < 此值视为"近似对齐可以一试").
 """
 
@@ -158,7 +158,7 @@ TASK4_POSE_P_HAND_DEG: float = 10.0
 X_PICK_MM: float = -240.0
 """盲降前横移 x (mm)。"""
 
-Y_PICK_MM: float = -65.0
+Y_PICK_MM: float = -55.0
 """抓球 y (吸盘贴近球面)。"""
 
 Y_TRANSIT_MM: float = -140.0
