@@ -97,16 +97,16 @@ PICK_X_YELLOW_MM: float = -62.0 # 黄球 bin 位置
 # 高塔投球位姿 (high_tower 同款)
 HIGH_MOVE_Y_MM: float = -115.0          # 步骤 1: 出保护区
 HIGH_COMPOSITE_Y_MM: float = -185.0     # 步骤 2
-HIGH_COMPOSITE_X_MM: float = -70.0
+HIGH_COMPOSITE_X_MM: float = -50.0
 HIGH_COMPOSITE_ARM_DEG: float = 90.0
 HIGH_COMPOSITE_HAND_DEG: float = -82.0
-HIGH_GRASP_X_MM: float = -160         # 步骤 3: 伸进塔
+HIGH_GRASP_X_MM: float = -145         # 步骤 3: 伸进塔
 HIGH_RETRACT_X_MM: float = -70.0        # 步骤 5: 退回
 
 # ---------- Phase 3d (取球 + 投低塔) ----------
 LOW_MOVE_Y_MM: float = -176.0           # 步骤 1: 出保护区
 LOW_COMPOSITE_Y_MM: float = -176.0
-LOW_COMPOSITE_X_MM: float = -150.0
+LOW_COMPOSITE_X_MM: float = -135.0
 LOW_COMPOSITE_ARM_DEG: float = 90.0
 LOW_COMPOSITE_HAND_DEG: float = 0.0     # DOWN (与 high_tower -82° UP 不同)
 
@@ -116,7 +116,7 @@ RETREAT_MAX_VEL_MS: float = 0.10
 RETREAT_TIMEOUT_FLOOR_S: float = 15.0   # floor=15s 防网络/队列抖动
 
 # ---------- Phase 0 (底盘前进预备, 2026-08-08 用户新增) ----------
-ADVANCE_DIST_MM: float = 315.0          # ⚠️ 硬编码, 不读外部常量
+ADVANCE_DIST_MM: float = 325.0          # ⚠️ 硬编码, 不读外部常量
 ADVANCE_MAX_VEL_MS: float = 0.10
 ADVANCE_TIMEOUT_FLOOR_S: float = 15.0   # floor=15s 防网络/队列抖动
 
@@ -127,6 +127,12 @@ ANGLE_SPEED: int = 80
 MOVE_X_V_MAX_MMS: float = 80.0
 MOVE_TIMEOUT_S: float = 30.0
 GRASP_TIMEOUT_S: float = 10.0
+
+# ---------- 末尾收尾 4机联动 (2026-08-09 用户新增) ----------
+FINAL_ARM_DEG: float = -80.0
+FINAL_X_MM: float = -150.0
+FINAL_Y_MM: float = -150.0
+FINAL_HAND_DEG: float = -60.0
 
 
 # ============================================================
@@ -540,6 +546,58 @@ def _retreat_166mm(client: ArmClient) -> Dict[str, Any]:
 
 
 # ============================================================
+# Phase 4: 末尾收尾 4机联动 (2026-08-09 用户新增)
+# ============================================================
+
+def _final_composite_pose(client: ArmClient) -> Dict[str, Any]:
+    """task5 末尾收尾: 4机联动 4 轴并行一次到位。
+
+    业务流程:
+      [1/1] composite_run 4 机联动 to (arm=-80°, x=-150, y=-150, hand=-60°)
+
+    设计: pipeline 跑完后固定摆这个位姿, 作为"分拣完成 → 离场" 的过渡姿态
+    (后续 waypoint 会由 orchestrator 接 home reset 接管)。4 轴全传有效值,
+    不依赖 SDK 是否支持 partial (composite_run 不接受 None 偏量)。
+
+    Args:
+        client: ArmClient 实例。
+
+    Returns:
+        composite_run 原始返回 dict (含 status/result/steps)。
+
+    Raises:
+        RuntimeError: composite_run 失败 (status != "succeeded")。
+    """
+    print(f"\n========== {LOG_PREFIX} Phase 4: 末尾 4机联动 收尾位姿 ==========")
+    print(f"  目标: composite_run arm={FINAL_ARM_DEG:+.0f}° "
+          f"x={FINAL_X_MM:.0f}mm y={FINAL_Y_MM:.0f}mm "
+          f"hand={FINAL_HAND_DEG:+.0f}° (speed={COMPOSITE_SPEED}, "
+          f"timeout={COMPOSITE_TIMEOUT_S:.0f}s)")
+    t0 = time.perf_counter()
+    res = client.composite_run(
+        arm=FINAL_ARM_DEG,
+        x_mm=FINAL_X_MM,
+        y_mm=FINAL_Y_MM,
+        hand=FINAL_HAND_DEG,
+        speed=COMPOSITE_SPEED,
+        timeout=COMPOSITE_TIMEOUT_S,
+    )
+    dt = time.perf_counter() - t0
+    ok = (isinstance(res, dict)
+          and res.get("status") == "succeeded"
+          and isinstance(res.get("result"), dict)
+          and res["result"].get("ok", False))
+    status = res.get("status") if isinstance(res, dict) else None
+    steps = (res.get("result") or {}).get("steps", {}) if isinstance(res, dict) else {}
+    if ok:
+        print(f"  ✅ 4 轴并发到位  steps={steps}  (status={status!r}, 耗时={dt:.2f}s)")
+    else:
+        print(f"  ❌ composite_run 失败: status={status!r}  res={res}")
+        raise RuntimeError(f"{LOG_PREFIX} Phase 4 末尾 4机联动 失败: {res}")
+    return res
+
+
+# ============================================================
 # 主入口: 4 阶段编排
 # ============================================================
 
@@ -631,6 +689,13 @@ def _run_pipeline(client: ArmClient, runner: ArmRunner,
                   else (phase3a_runs[-1]["final_pose"] if phase3a_runs
                         else phase2["final_pose"]))
 
+    # ========== Phase 4: 末尾收尾 4机联动 (2026-08-09 用户新增) ==========
+    phase4_final = _final_composite_pose(client)
+    final_pose = {
+        "x_mm": FINAL_X_MM, "y_mm": FINAL_Y_MM,
+        "arm_deg": FINAL_ARM_DEG, "hand_deg": FINAL_HAND_DEG,
+    }
+
     elapsed = time.perf_counter() - t_total
     print(f"\n{'='*70}\n  {LOG_PREFIX} 完成 (高仓={high_color}, 球数 黄={n_yellow} 蓝={n_blue}, "
           f"高塔={len(phase3a_runs)} 次, 低塔={len(phase3d_runs)} 次, "
@@ -645,6 +710,7 @@ def _run_pipeline(client: ArmClient, runner: ArmRunner,
         "phase3a_runs": phase3a_runs,
         "phase3c_retreat": phase3c_retreat,
         "phase3d_runs": phase3d_runs,
+        "phase4_final_composite": phase4_final,
         "final_pose": final_pose,
     }
 
