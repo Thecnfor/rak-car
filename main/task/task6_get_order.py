@@ -30,9 +30,7 @@
 """
 from __future__ import annotations
 
-import base64
 import logging
-import requests
 import sys
 import time
 from pathlib import Path
@@ -108,9 +106,9 @@ PICK_COLUMN_MOVE_M = 0.10  # 切到左列的底盘移动 (2026-08-08: 0.2→0.08
 PICK_COLUMN_MOVE_VX = 0.20
 
 # 大臂基础增益 (精对齐 = 0.5×, 见 PICK_FINE_GAIN_*)
-PICK_GAIN_ARM = 8.0      # 2026-08-08: 4.0→6.0→8.0
-PICK_DEADZONE = 0.02
-PICK_MAX_VEL = 0.10      # 2026-08-08: 0.15 → 0.10 (X 更慢, 防冲)
+PICK_GAIN_ARM = 8.0      # 2026-08-08: 4.0→6.0→8.0 (仅作基础增益参考, 精对齐直接用 PICK_FINE_GAIN_ARM)
+PICK_DEADZONE = 0.04     # 2026-08-09: 0.02 → 0.04 (放宽好锁)
+PICK_MAX_VEL = 0.05      # 2026-08-09: 0.10 → 0.05 (X 更慢, 防冲)
 PICK_HOLD_Y = True            # 2026-08-07: 只三轴联动, 不动 y 十字
 PICK_DESCEND_HAND_DEG = 10.0  # 2026-08-08: 0→10 (精对齐/抓取末端都保持 10°)
 PICK_ARM_MIN = -150.0         # 2026-08-08: 大臂下限放宽 (默认 -90 挡住偏左目标)
@@ -126,7 +124,7 @@ PICK_FINE_HAND_DEG = 10.0
 PICK_FINE_HAND_MIN = -90.0
 PICK_FINE_HAND_MAX = 30.0
 PICK_FINE_GAIN_X = 0.05
-PICK_FINE_GAIN_ARM = PICK_GAIN_ARM * 0.25   # 2026-08-08: 8.0*0.5=4.0 → 8.0*0.25=2.0 (大臂再慢, 原 0.5 倍)
+PICK_FINE_GAIN_ARM = 1.0   # 2026-08-09: 8.0*0.25=2.0 → 1.0 (大臂再慢, 防过冲)
 PICK_FINE_TIMEOUT_S = 6.0   # 2026-08-08: 4.0 → 6.0
 
 # 蔬菜布局 (2026-08-09 重标定): 右列 4 行 (物理底部第1行 X=-48 → 顶部第4行 X=-190).
@@ -492,11 +490,11 @@ def _align_4dof_phase_local(
         arm_min=float(PICK_ARM_MIN),
         arm_max=float(PICK_ARM_MAX),
         servo_timeout=float(timeout),
-        settle_hits=3,   # 与旧 find_target_4dof 的 3 连续帧收敛判定一致
+        settle_hits=4,   # 2026-08-09: 3 → 4 (连续 4 帧进死区才锁, 更稳)
     )
     logger.info(
         "  本地视觉对齐: run_arm_servo(label=%s setpoint=(%.3f,%.3f) hz=20 "
-        "gain_arm=%s gain_x=%s deadzone=%s max_vel=%s arm=[%s,%s] settle=3 servo_timeout=%s)",
+        "gain_arm=%s gain_x=%s deadzone=%s max_vel=%s arm=[%s,%s] settle=4 servo_timeout=%s)",
         label, sx, sy, gain_arm, gain_x, PICK_DEADZONE, max_vel,
         PICK_ARM_MIN, PICK_ARM_MAX, timeout,
     )
@@ -787,132 +785,6 @@ def _detect_and_ocr(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any
     raise NotImplementedError("阶段 3 detect_and_ocr - 待实现")
 
 
-# ── LLM-as-detector + track_chassis 控制律: 底盘对齐订单牌 ────────
-#
-# 2026-08-07: 订单牌/订单机没有 YOLO 训练数据, 检测 backend 检不出. 改用
-# ERNIE Vision 当"检测器" (看帧报订单牌中心 cx/cy), 但**复用 main.chassis 的
-# track_chassis 整套控制律** (kp/slew/deadband/hold_frames/丢帧/停稳), 只把
-# 检测源从 task_feed 换成 LLM sense_fn (track_chassis 新增 sense_fn 参数).
-#
-# 限制: LLM 慢 (~0.5-1Hz) + 精度 ±10%, 所以 hold_frames/lost_frames 按帧调小.
-# 轴符号沿用 track_chassis 水塔标定 (cx↔vx 前后, cy↔vy 横向); 实车反了改下面.
-
-LLM_ALIGN_SIGN_VX: int = +1   # 2026-08-07: -1 → +1 (实车方向写反了)
-LLM_ALIGN_SIGN_VY: int = +1
-LLM_ALIGN_KP: float = 0.30
-LLM_ALIGN_V_MAX: float = 0.10
-LLM_ALIGN_DEADBAND: float = 0.05
-LLM_ALIGN_HOLD_FRAMES: int = 2
-LLM_ALIGN_MAX_LOST: int = 5
-LLM_ALIGN_MAX_SECONDS: float = 8.0
-LLM_ALIGN_VX_ONLY: bool = True   # 2026-08-07: 只移动底盘前后, 不移动左右
-
-def _llm_align_card(
-    client: RuntimeApiClient,
-    target_cx: float = 0.5,
-    target_cy: float = 0.5,
-    max_seconds: float = LLM_ALIGN_MAX_SECONDS,
-    kp: float = LLM_ALIGN_KP,
-    v_max: float = LLM_ALIGN_V_MAX,
-) -> Tuple[bool, List[Tuple[float, float]]]:
-    """LLM-as-detector + track_chassis 控制律: 把订单牌拉到画面目标点.
-
-    sense_fn 抓 cam2 帧 → ERNIE Vision 报 (card_cx, card_cy, found) → 组装
-    TrackFrame 喂给 track_chassis (vx=sign_vx*kp*cx_err, vy=sign_vy*kp*cy_err,
-    deadband/hold_frames 收敛, max_lost 丢帧停, 结束零速). 轴符号/增益实车标定.
-
-    Args:
-        client: RuntimeApiClient (track_chassis 内部自建 ChassisClient)
-        target_cx, target_cy: 目标位置 (默认 0.5 = 画面中心)
-        max_seconds: 超时秒数
-        kp: 比例增益
-        v_max: 最大速度 m/s
-
-    Returns:
-        (aligned: bool, samples: List[(cx, cy)]) — 是否对齐 + 所有采样
-    """
-    from main.chassis import track_chassis
-    from main.chassis.loops.visual_track import TrackFrame
-    from main.misc.test_order_read import (
-        _call_llm, _load_cfg, _load_token, fetch_frame,
-    )
-    from main.settings import load_settings
-
-    settings = load_settings()
-    cfg = _load_cfg()
-    token = _load_token(cfg)
-    ernie = cfg.get("ernie", {})
-
-    POS_PROMPT = (
-        "你是订单牌定位程序。看这张图找到订单牌(白底蓝色字的卡片)。\n"
-        "返回 STRICT JSON, 不要 Markdown 标记:\n"
-        '{"card_cx": 0.5, "card_cy": 0.5, "found": true}\n'
-        "- card_cx: 订单牌中心水平位置 (0=最左, 0.5=正中, 1=最右)\n"
-        "- card_cy: 订单牌中心垂直位置 (0=最上, 0.5=正中, 1=最下)\n"
-        "- found: 是否看到订单牌 (true/false)\n"
-        "如果没看到订单牌, card_cx=card_cy=0.5, found=false"
-    )
-
-    session = requests.Session()
-    samples: List[Tuple[float, float]] = []
-
-    def _sense() -> TrackFrame:
-        frame = fetch_frame(session, settings.streamer_url)
-        if not frame:
-            logger.info("    [诊断] LLM 对齐: 取帧失败 (丢帧)")
-            return TrackFrame()
-        img = base64.b64encode(frame).decode()
-        d = _call_llm(token, img, POS_PROMPT, ernie)
-        if "error" in d or not d.get("found"):
-            logger.info("    [诊断] LLM 对齐: 没看到订单牌 / LLM 失败 → 丢目标帧")
-            return TrackFrame()   # 没看到牌 / LLM 失败 = 丢目标帧
-        cx = float(d.get("card_cx", 0.5))
-        cy = float(d.get("card_cy", 0.5))
-        samples.append((cx, cy))
-        logger.info("    [诊断] LLM 对齐 #%d: card=(%.2f, %.2f) Δ=(%+.2f, %+.2f)",
-                    len(samples), cx, cy, target_cx - cx, target_cy - cy)
-        return TrackFrame(
-            target_found=True, label="order_card",
-            cx=cx, cy=cy,
-            cx_err=target_cx - cx, cy_err=target_cy - cy,
-            age_ms=None,
-        )
-
-    # 记录对齐前后里程计 x (算前后移动多少)
-    from main.chassis import get_odometry
-    try:
-        x0 = get_odometry()[0]
-    except Exception:
-        x0 = float("nan")
-
-    result = track_chassis(
-        "order_card",
-        setpoint_cxcy=(target_cx, target_cy),
-        sense_fn=_sense,
-        # 控制律 (LLM 慢, 帧计数按帧调小; 轴符号实车反了改 LLM_ALIGN_SIGN_*)
-        # 2026-08-07: 只前后 (vx_only=True), 不动左右
-        kp=kp, v_max=v_max,
-        sign_vx=LLM_ALIGN_SIGN_VX, sign_vy=LLM_ALIGN_SIGN_VY,
-        vx_only=LLM_ALIGN_VX_ONLY,
-        deadband=LLM_ALIGN_DEADBAND, hold_frames=LLM_ALIGN_HOLD_FRAMES,
-        max_lost_frames=LLM_ALIGN_MAX_LOST, recover_after_lost=True,
-        hz=1.0, max_seconds=max_seconds,
-    )
-    try:
-        x1 = get_odometry()[0]
-        dx_m = x1 - x0
-    except Exception:
-        x1 = float("nan")
-        dx_m = float("nan")
-    logger.info(
-        "  LLM-as-servo (track_chassis): %s reason=%s frames=%d elapsed=%.1fs "
-        "识别%d次 前后%+.3fm (x %.3f→%.3f)",
-        "OK" if result.arrived else "FAIL", result.reason,
-        result.frames, result.elapsed_s, len(samples), dx_m, x0, x1,
-    )
-    return result.arrived, samples
-
-
 def _pick_goods(arm_client: ArmClient, runner: ArmRunner, cfg: Dict[str, Any]) -> dict:
     """阶段 4 存根: 物理抓取 5cm 订单方块. 当前未实现 (run 中另有实现)."""
     raise NotImplementedError("阶段 4 pick_goods - 待实现")
@@ -998,29 +870,13 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     order_list: Dict[str, Any] = {"round1": [], "round2": []}   # 两轮读单结果, 写盘传给 task7
 
     try:
-        # ===== 阶段 1: 摆读单姿态 + 底盘对齐 + 第一次读单 (先读后推) =====
-        logger.info("=== 阶段 1: 摆读单姿态 + 底盘对齐 + 第一次读单 (先读后推) ===")
+        # ===== 阶段 1: 摆读单姿态 + 第一次读单 (先读后推) =====
+        logger.info("=== 阶段 1: 摆读单姿态 + 第一次读单 (先读后推) ===")
         _enter_read_pose(arm_client, runner, cfg)
         completed.append("read_pose")
 
-        # 底盘对齐订单牌 (LLM-as-detector + track_chassis 控制律)
-        try:
-            align_ok, align_samples = _llm_align_card(
-                client, target_cx=0.5, target_cy=0.5,
-                max_seconds=LLM_ALIGN_MAX_SECONDS, kp=LLM_ALIGN_KP, v_max=LLM_ALIGN_V_MAX,
-            )
-            logger.info(
-                "  LLM-as-servo 结果: %s, samples=%d, last=(%.2f, %.2f)",
-                "OK" if align_ok else "FAIL", len(align_samples),
-                *(align_samples[-1] if align_samples else (0.5, 0.5)),
-            )
-        except Exception as exc:
-            logger.warning("LLM-as-servo 异常 (不影响后续读单): %s", exc)
-            align_ok, align_samples = False, []
-        completed.append("llm_align")
-
-        # 第一次读单 (对齐位)
-        logger.info("=== 阶段 1c: LLM 读单 第一轮 (对齐位) ===")
+        # 第一次读单
+        logger.info("=== 阶段 1c: LLM 读单 第一轮 ===")
         round1 = order_read_run()
         if round1.get("ok") and round1.get("orders"):
             logger.info("  [第一轮] 读取到 %d 条订单:", len(round1["orders"]))
