@@ -14,10 +14,9 @@ from typing import Optional
 from main.arm import ArmRunner  # noqa: E402
 
 from .constants import (  # noqa: E402
-    BALL_LABELS,
     COLOR_BLUE, COLOR_YELLOW,
     TASK4_POSE_P_HAND_DEG,
-    X_PICK_MM, Y_PICK_MM, Y_TRANSIT_MM, X_TRANSIT_MM, Y_PUT_MM,
+    X_PICK_MM, Y_PICK_MM, X_TRANSIT_MM, Y_PUT_MM,
     BIN_X_MM,
     # 机械臂智能抓取 (2026-08-10)
     TASK4_SETPOINT_X_NORM, TASK4_SETPOINT_Y_NORM,
@@ -29,18 +28,6 @@ from .constants import (  # noqa: E402
     _ts_str,
     LOG_PREFIX_TARGET4 as LOG_PREFIX,
 )
-
-
-def _color_from_track(track_res) -> Optional[str]:
-    """从 track 结果 final_frame.label 提球色 (ball_blue → "blue")。
-
-    ⚠️ 2026-08-10 主流程已改用机械臂伺服 (不再走底盘 track), 本函数仅保留兼容。
-    """
-    ff = getattr(track_res, "final_frame", None)
-    label = getattr(ff, "label", None) if ff is not None else None
-    if label in BALL_LABELS:
-        return label.split("_", 1)[1]
-    return None
 
 
 def _pick_best_ball(balls: list) -> Optional[dict]:
@@ -119,13 +106,8 @@ def _pick_and_store(
     runner: ArmRunner,
     *,
     color: str,
-    return_x_mm: Optional[float],  # noqa: ARG001 — 兼容保留 (放 bin 后 x 回位已由 servo/pose 覆盖)
-    pick_timeout_s: float,  # noqa: ARG001 — 兼容保留, 臂伺服超时走 constants
-    pick_x_mm: float = X_PICK_MM,  # noqa: ARG001 — 兼容保留 (臂伺服自行对 x)
     pick_y_mm: float = Y_PICK_MM,  # 盲降抓球目标 y (臂伺服 grasp_y)
-    transit_y_mm: float = Y_TRANSIT_MM,  # noqa: ARG001 — 兼容保留 (伺服已抬回高位, 不再单独抬 y)
     transit_x_mm: float = X_TRANSIT_MM,
-    put_y_mm: float = Y_PUT_MM,  # noqa: ARG001 — 兼容保留
     bin_x_mm: Optional[float] = None,  # None → 按 color 查 BIN_X_MM
     bin_y_mm: float = Y_PUT_MM,
     bin_hand_deg: float = TASK4_POSE_P_HAND_DEG,

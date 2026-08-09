@@ -137,14 +137,7 @@ class _CreepThread:
                     self.finished_by_ir_odom = True
                     break
 
-                try:
-                    self.http.post(
-                        "/v1/realtime/chassis-velocity",
-                        {"vx": float(self.speed_mps), "vy": 0.0, "wz": 0.0},
-                        timeout=1.0,
-                    )
-                except Exception:
-                    pass
+                _set_chassis_vel(self.http, self.speed_mps)
                 time.sleep(period)
 
                 # 优先使用 odom 的本轮增量；读不到或冻结时保留开环兜底。
@@ -204,14 +197,7 @@ class _CreepThread:
                            for b in balls):
                         self.balls = balls
                         self.found_ball = True
-                        try:
-                            self.http.post(
-                                "/v1/realtime/chassis-velocity",
-                                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                                timeout=0.5,
-                            )
-                        except Exception:
-                            pass
+                        _set_chassis_vel(self.http, 0.0)
                         break
                     # IR 丢失阶段禁止再拿新球；确认帧已计入的位移不重复累加。
                     if was_ir_lost and not odom_delta_available:
@@ -249,27 +235,13 @@ class _CreepThread:
                            for b in balls):
                         self.balls = balls
                         self.found_ball = True
-                        try:
-                            self.http.post(
-                                "/v1/realtime/chassis-velocity",
-                                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                                timeout=0.5,
-                            )
-                        except Exception:
-                            pass
+                        _set_chassis_vel(self.http, 0.0)
                         break
                 except Exception as e:
                     print(f"  [{LOG_PREFIX}] fetch_balls 异常: "
                           f"{type(e).__name__}: {str(e)[:100]}", file=sys.stderr)
         finally:
-            try:
-                self.http.post(
-                    "/v1/realtime/chassis-velocity",
-                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                    timeout=1.0,
-                )
-            except Exception:
-                pass
+            _set_chassis_vel(self.http, 0.0)
             self.completion_event.set()
 
     def wait_for_ball(self, timeout_s: float) -> dict:
@@ -287,14 +259,7 @@ class _CreepThread:
         if self._thread.is_alive():
             self._thread.join(timeout=2.0)
         if self._thread.is_alive():
-            try:
-                self.http.post(
-                    "/v1/realtime/chassis-velocity",
-                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                    timeout=1.0,
-                )
-            except Exception:
-                pass
+            _set_chassis_vel(self.http, 0.0)
 
 
 # ---------- 底盘速度 helper ----------

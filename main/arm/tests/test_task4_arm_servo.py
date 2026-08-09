@@ -73,8 +73,7 @@ class TestPickAndStore(unittest.TestCase):
     def test_servo_failure_skips_store(self):
         """臂伺服抓取失败 → 直接失败, 不执行放 bin (composite_run 不调)。"""
         runner, arm = self._mocks(servo_ok=False)
-        res = _pick_and_store(arm, runner, color="blue",
-                              return_x_mm=None, pick_timeout_s=30.0)
+        res = _pick_and_store(arm, runner, color="blue")
         self.assertFalse(res["ok"])
         arm.composite_run.assert_not_called()
         runner.grasp.assert_not_called()
@@ -82,8 +81,7 @@ class TestPickAndStore(unittest.TestCase):
     def test_success_pick_then_store_bin(self):
         """成功: 臂伺服 pick → 中转 → bin_x → 降 → 放气。"""
         runner, arm = self._mocks(servo_ok=True)
-        res = _pick_and_store(arm, runner, color="blue",
-                              return_x_mm=None, pick_timeout_s=30.0)
+        res = _pick_and_store(arm, runner, color="blue")
         self.assertTrue(res["ok"])
         # 臂伺服被调用 (label=ball_blue)
         self.assertEqual(runner.track_velocity_pick.call_args.args[0], "ball_blue")
@@ -97,8 +95,7 @@ class TestPickAndStore(unittest.TestCase):
     def test_yellow_bin_column(self):
         """黄球放黄 bin 列 (BIN_X_MM['yellow'])。"""
         runner, arm = self._mocks(servo_ok=True)
-        _pick_and_store(arm, runner, color="yellow",
-                        return_x_mm=None, pick_timeout_s=30.0)
+        _pick_and_store(arm, runner, color="yellow")
         xs = [c.kwargs.get("x_mm") for c in arm.composite_run.call_args_list]
         self.assertIn(C.BIN_X_MM["yellow"], xs)
 

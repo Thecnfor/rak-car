@@ -11,7 +11,7 @@
                           (`_pick_by_arm_servo` / `_pick_and_store` / `_pick_best_ball`)
   - ``constants.py``      所有位姿/预算/IR/蠕动/臂伺服常量 + 时间戳辅助 (校准表面)
 
-对外符号全部 re-export 于此 (step_target4 / DEFAULT_RETURN_X_MM / _CreepThread /
+对外符号全部 re-export 于此 (step_target4 / _CreepThread /
 _Task4SearchState), 外部 import 无需改动。
 
 流程 (2026-08-10 起用机械臂智能抓取, 替换底盘对齐):
@@ -51,8 +51,7 @@ from main.arm.each_task.task4.constants import (  # noqa: E402
     # 预算 / 终止
     DEFAULT_MAX_PICKS, DEFAULT_MAX_CREEP_M, DEFAULT_MAX_SECONDS,
     DEFAULT_CREEP_SPEED_MPS, DEFAULT_TRACK_MAX_SECONDS,
-    DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES, DEFAULT_PICK_TIMEOUT_S,
-    DEFAULT_RETURN_X_MM,
+    DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
     CREEP_POLL_HZ, CREEP_MAX_SECONDS_S,
     # 姿态 / 放仓
     COLOR_BLUE, COLOR_YELLOW, BIN_X_MM, BIN_Y_MM, BIN_HAND_DEG,
@@ -83,17 +82,13 @@ def step_target4(
     runner: Optional[ArmRunner] = None,
     defer_task5_handoff: bool = False,
     dry_run: bool = False,
-    debug_recognition: bool = False,
     # ---- 姿态参数 (默认值在 constants.py, 可由外部覆盖) ----
     pose_p_y_mm: float = TASK4_POSE_P_Y_MM,
     pose_p_x_mm: float = TASK4_POSE_P_X_MM,
     pose_p_arm_deg: float = TASK4_POSE_P_ARM_DEG,
     pose_p_hand_deg: float = TASK4_POSE_P_HAND_DEG,
-    pick_x_mm: float = X_PICK_MM,
-    pick_y_mm: float = Y_PICK_MM,
-    transit_y_mm: float = Y_TRANSIT_MM,
+    pick_y_mm: float = Y_PICK_MM,  # 盲降抓球目标 y (臂伺服 grasp_y)
     transit_x_mm: float = X_TRANSIT_MM,
-    put_y_mm: float = Y_PUT_MM,
     bin_x_blue_mm: float = BIN_X_MM[COLOR_BLUE],
     bin_x_yellow_mm: float = BIN_X_MM[COLOR_YELLOW],
     bin_y_blue_mm: float = BIN_Y_MM.get(COLOR_BLUE, Y_PUT_MM),
@@ -130,17 +125,12 @@ def step_target4(
     creep_speed_mps = DEFAULT_CREEP_SPEED_MPS
     track_max_seconds = DEFAULT_TRACK_MAX_SECONDS
     max_consecutive_pick_failures = DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES
-    return_x_mm = DEFAULT_RETURN_X_MM
-    pick_timeout_s = DEFAULT_PICK_TIMEOUT_S
-    do_prep = False
     print(f"\n========== {LOG_PREFIX} step_target4 (机械臂智能抓取版) ==========")
     print(f"  模式: {'DRY-RUN (不动硬件)' if dry_run else 'EXECUTE (动硬件)'}")
     print(f"  预算: 前移 ≤{max_creep_m:.2f}m @ {creep_speed_mps:.2f}m/s | "
           f"picks ≤{max_picks} | 总时 ≤{max_seconds:.0f}s")
     print(f"  单球臂伺服预算: {track_max_seconds:.0f}s | 连续失败容忍: "
           f"{max_consecutive_pick_failures}")
-    print(f"  放 bin 后 x 回: {return_x_mm} mm | 准备位姿: "
-          f"{'跑 target1' if do_prep and not dry_run else '跳过'}")
 
     for name, val in (("max_picks", max_picks), ("max_seconds", max_seconds),
                       ("max_creep_m", max_creep_m), ("creep_speed_mps", creep_speed_mps),
@@ -243,7 +233,6 @@ def step_target4(
         #      c) 再恢复 P 姿态 + creep 继续, 循环到 max_picks
         #      d) 失败一次就退出, 不死循环
         ball_idx = 0
-        last_color = None  # 上一球颜色 (用于优化 P 姿态恢复)
         release_thread = None  # 上一球放仓后台线程, 回 P 前需 join
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
@@ -261,35 +250,12 @@ def step_target4(
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
-            # 2.0 P 姿态 + creep 并发 (2026-08-08: 改回并发, 避免 composite_run 期间车子完全静止)
-            #    2026-08-09 用户拍板: **只在任务刚触发 (第 1 球) 并发**, 之后每球
-            #    顺序执行 (先 P 姿态, 再 creep)。并发时 3 个风险:
-            #      a) creep_thread 与 composite_run 同时跑 → 4 路臂命令 + 底盘 vx
-            #         抢 SerialEngine, composite_run 内部 y 下降偶尔卡 200-500ms;
-            #      b) 见球瞬间 creep 没主动发 0 速, 靠 track_chassis 第一帧覆盖,
-            #         50-150ms 窗口内底盘按 creep 速度窜一下 → "track 开始瞬间抖";
-            #      c) arm_feed 守护线程 20Hz 轮询 y/x/arm_angle 跟 composite_run
-            #         4 路并发抢 share_key, 进一步加长 composite_run 时间.
-            #    现场每球 creep 0.000m → 错过球, 这 3 个风险在并发下被放大。
+            # 上一球放仓线程收尾 (防 composite_run 期间臂还在动)
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=15.0)
 
-            # 首球 (任务刚触发): creep 和 P 姿态 composite_run 并发省时间;
-            # 后续球: 顺序 —— 先 P 姿态到位, 再启动 creep, 避免抢串口错过球。
-            # IR 状态跨球共享，首球也参与远端确认；任务触发时已是近 IR。
-            # 先完成 P 姿态，再开始前移；否则首球在摆臂期间就可能丢 IR，
-            # 直接消耗完离开区的 0.3m 预算，还没进入视觉搜索。
-            concurrent_creep = False
+            # 每球先恢复 P 姿态, 再启动 creep (顺序执行; 曾试过并发, 抢串口会错过球)。
             creep_thread = None
-            if concurrent_creep:
-                creep_thread = _CreepThread(
-                    http_client, state=search_state,
-                    speed_mps=creep_speed_mps,
-                    max_distance_m=remaining_m,
-                    poll_hz=CREEP_POLL_HZ,
-                    max_seconds_s=CREEP_MAX_SECONDS_S,
-                )
-                creep_thread.start()
 
             pose_ok = True
             if not dry_run:
@@ -393,12 +359,8 @@ def step_target4(
             res = _pick_and_store(
                 arm_client, runner,
                 color=color,
-                return_x_mm=return_x_mm,
-                pick_timeout_s=pick_timeout_s,
                 pick_y_mm=pick_y_mm,
-                transit_y_mm=transit_y_mm,
                 transit_x_mm=transit_x_mm,
-                put_y_mm=put_y_mm,
                 bin_x_mm=bin_x_blue_mm if color == COLOR_BLUE else bin_x_yellow_mm,
                 bin_y_mm=bin_y_blue_mm if color == COLOR_BLUE else bin_y_yellow_mm,
                 bin_hand_deg=bin_hand_blue_deg if color == COLOR_BLUE else bin_hand_yellow_deg,
@@ -415,7 +377,6 @@ def step_target4(
             if res["ok"]:
                 n_picks += 1
                 n_consecutive_failures = 0
-                last_color = color  # 记录上一球颜色, 供 P 姿态恢复优化
                 print(f"  [{LOG_PREFIX}] ✅ {color} 球完成 (累计 {n_picks})")
             else:
                 n_pick_failures += 1
@@ -541,14 +502,12 @@ def step_target4(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="task4 target4: 慢速前移搜索 + 机械臂智能抓取 + 放 bin (臂伺服) --dry-run 只打印"
-                    "吸嘴中心抓取 (--dry-run 只打印)",
+        description="task4 target4: 慢速前移搜索 + 机械臂智能抓取 + 放 bin "
+                    "(--dry-run 只打印)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--dry-run", action="store_true",
                    help="dry-run 模式 (默认 execute, 真动硬件)")
-    p.add_argument("--debug-recognition", action="store_true",
-                   help="fetch_balls 打印每条 detection 过滤原因")
     p.add_argument("--pose-x", type=float, default=TASK4_POSE_P_X_MM,
                    help=f"P 姿态 x (mm), 默认 {TASK4_POSE_P_X_MM}")
     p.add_argument("--pose-y", type=float, default=TASK4_POSE_P_Y_MM,
@@ -572,7 +531,6 @@ def main(argv=None) -> int:
         arm, http,
         runner=runner,
         dry_run=args.dry_run,
-        debug_recognition=args.debug_recognition,
         pose_p_x_mm=args.pose_x,
         pose_p_y_mm=args.pose_y,
         pose_p_arm_deg=args.pose_arm,
