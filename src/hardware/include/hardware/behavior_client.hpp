@@ -28,6 +28,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 // Forward declarations (rclcpp-free header 保持可单测, 同 base_task.hpp 风格).
@@ -53,6 +54,12 @@ struct BehaviorResult
   Status status{Status::RUNNING};
   std::string error;
 
+  // 构造函数 (非聚合) — 消除 -Wmissing-field-initializers:
+  //   BehaviorResult{Status::RUNNING}           → 单参, error 留空
+  //   BehaviorResult{Status::FAILED, err}       → 两参
+  BehaviorResult() = default;
+  BehaviorResult(Status s, std::string err = "") : status(s), error(std::move(err)) {}
+
   bool running() const { return status == Status::RUNNING; }
   bool ok() const { return status == Status::SUCCESS; }
 };
@@ -63,6 +70,16 @@ struct Waypoint
   double x{0.0};
   double y{0.0};
   double theta{0.0};
+};
+
+// 机械臂航点 — 任务空间, x/z 单位 mm, yaw_deg 单位度。
+// gripper: 0=不动 1=抓(泵开) 2=放(泵关); 仅在本航点生效。
+struct ArmWaypoint
+{
+  double x_mm{0.0};
+  double z_mm{0.0};
+  double yaw_deg{0.0};
+  uint8_t gripper{0};
 };
 
 class BehaviorClient
@@ -90,6 +107,12 @@ public:
   bool start_arm_move_to(double x_mm, double z_mm, double yaw_deg,
                          uint8_t gripper_action, double timeout_sec);
 
+  // 机械臂航点路径 (goal→waypoint→goal): 顺序驱动一串到位, 每段由控制器
+  // 插值平滑 (本地=joint_trajectory_controller, moveit=move_group)。
+  // 注意: arm_node 只取 JointTrajectory 的最后一个点 (不插值), 所以"丝滑"
+  // 多段不能靠往 arm_node 发多点轨迹实现 —— 见 behavior_client.cpp 注释。
+  bool start_arm_path(const std::vector<ArmWaypoint> & waypoints, double timeout_sec);
+
   // ---- 通用 -------------------------------------------------------------
   // 每次任务 tick 调用一次。返回 RUNNING 表示还在跑; SUCCESS/FAILED 终结。
   BehaviorResult poll();
@@ -116,9 +139,13 @@ private:
   bool start_local_arm(double x_mm, double z_mm, double yaw_deg,
                        uint8_t gripper_action, double timeout_sec);
 
+  // 机械臂路径推进: 若还有航点则发起下一个并返回 true; 否则清空返回 false。
+  bool advance_arm_path_if_pending();
+
   BehaviorResult poll_nav2();
   BehaviorResult poll_local_chassis();
   BehaviorResult poll_local_arm();
+  BehaviorResult poll_moveit();
 
   rclcpp::Node * node_{nullptr};
   ChassisBackend chassis_{ChassisBackend::kNone};

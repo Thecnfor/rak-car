@@ -1,0 +1,76 @@
+# servo_parameters.yaml — moveit_servo 连续笛卡尔伺服参数 (Humble 兼容, 2026-08-10).
+#
+# 权威来源: /opt/ros/humble/include/moveit_servo/servo_parameters.h
+#   (ServoParameters::makeServoParameters, ns 默认 "moveit_servo")
+# 与官方 demo (servo_example.launch.py) 一致: 本文件顶层**不**包 moveit_servo:
+# 命名空间, launch 侧用 {"moveit_servo": <yaml>} 包一层。
+#
+# 输入 (命令类型):
+#   command_in_type: "unitless" → cartesian_command_in_topic 收
+#   geometry_msgs/TwistStamped, 按 linear_scale/rotational_scale 缩放
+#   (视觉追踪 ViSP 节点就往这个话题发 TwistStamped)。
+# 输出:
+#   command_out_type: trajectory_msgs/JointTrajectory →
+#   command_out_topic → joint_trajectory_controller (与 middleware 共用).
+#
+# 注意: 无真实标定前用保守增益; max 速度收敛到 scale + 单维限幅。
+
+use_gazebo: false
+
+# ---- 输入命令属性 ----------------------------------------------------------
+# 绝对话题, 不随节点名漂移 (默认是 ~/delta_twist_cmds, 节点相对)。
+cartesian_command_in_topic: /rak/control/arm/servo_twist
+joint_command_in_topic: /rak/control/arm/servo_joint
+robot_link_command_frame: base_link
+command_in_type: "unitless"
+
+# unitless 命令的缩放 (1.0 = 满 scale)
+scale:
+  linear: 0.2        # 最大线速度 [m/s]
+  rotational: 0.5    # 最大角速度 [rad/s]
+  joint: 0.5         # 关节命令缩放
+
+# ---- 伺服计算 --------------------------------------------------------------
+# override_velocity_scaling_factor: 0.0  # 留默认 (0.0 = 内部速度缩放)
+
+# ---- 输出命令属性 ----------------------------------------------------------
+command_out_topic: /joint_trajectory_controller/joint_trajectory
+command_out_type: trajectory_msgs/JointTrajectory
+publish_period: 0.02
+low_latency_mode: true
+
+publish_joint_positions: true
+publish_joint_velocities: true
+publish_joint_accelerations: false
+
+# 平滑 / 反馈
+joint_topic: /joint_states
+smoothing_filter_plugin_name: online_signal_smoothing::ButterworthFilterPlugin
+
+# ---- MoveIt 属性 -----------------------------------------------------------
+move_group_name: arm
+planning_frame: base_link
+ee_frame_name: arm_hand_grip_link
+is_primary_planning_scene_monitor: true
+monitored_planning_scene_topic: /move_group/monitored_planning_scene
+
+# ---- 停止行为 --------------------------------------------------------------
+incoming_command_timeout: 0.1
+num_outgoing_halt_msgs_to_publish: 4
+halt_all_joints_in_joint_mode: true
+halt_all_joints_in_cartesian_mode: true
+
+# ---- 奇异点 / 关节限位 -------------------------------------------------------
+lower_singularity_threshold: 17.0
+hard_stop_singularity_threshold: 30.0
+leaving_singularity_threshold_multiplier: 2.0
+joint_limit_margin: 0.1
+
+# ---- 碰撞检查 --------------------------------------------------------------
+check_collisions: true
+collision_check_rate: 10.0
+self_collision_proximity_threshold: 0.01
+scene_collision_proximity_threshold: 0.02
+
+# 状态话题 (诊断用; 默认 ~/status)
+status_topic: /rak/control/arm/servo_status

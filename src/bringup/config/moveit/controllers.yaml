@@ -1,0 +1,16 @@
+# controllers.yaml — move_group 执行映射 (2026-08-10).
+# arm 的执行走既有的 ros2_control joint_trajectory_controller:
+# move_group 发 /joint_trajectory_controller/follow_joint_trajectory action,
+# 与我们 middleware_controllers.yaml 里的控制器同名同接口。
+controller_names:
+  - joint_trajectory_controller
+
+joint_trajectory_controller:
+  action_ns: follow_joint_trajectory
+  type: FollowJointTrajectory
+  default: true
+  joints:
+    - arm_horiz_joint
+    - arm_vert_joint
+    - arm_hand_rotate_joint
+    - arm_hand_grip_joint

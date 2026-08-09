@@ -1,0 +1,32 @@
+<?xml version="1.0" ?>
+<!-- rak.srdf — moveit 语义描述 (2026-08-10).
+     arm: 4 关节 (2 prismatic + rotate + grip), 固定在底盘 base_link 上.
+     规划帧 = base_link (底盘在 moveit 里视为固定基座). -->
+<robot name="rak">
+  <group name="arm">
+    <joint name="arm_horiz_joint"/>
+    <joint name="arm_vert_joint"/>
+    <joint name="arm_hand_rotate_joint"/>
+    <joint name="arm_hand_grip_joint"/>
+  </group>
+
+  <group name="hand">
+    <link name="arm_hand_grip_link"/>
+  </group>
+
+  <end_effector name="gripper" parent_link="arm_hand_rotate_link" group="hand" parent_group="arm"/>
+
+  <group_state name="home" group="arm">
+    <joint name="arm_horiz_joint" value="0.0"/>
+    <joint name="arm_vert_joint" value="0.0"/>
+    <joint name="arm_hand_rotate_joint" value="0.0"/>
+    <joint name="arm_hand_grip_joint" value="0.0"/>
+  </group_state>
+
+  <virtual_joint name="virtual_joint" type="fixed" parent_frame="base_link" child_link="base_link"/>
+
+  <disable_collisions link1="arm_horiz_link" link2="arm_vert_link" reason="adjacent"/>
+  <disable_collisions link1="arm_vert_link" link2="arm_hand_rotate_link" reason="adjacent"/>
+  <disable_collisions link1="arm_hand_rotate_link" link2="arm_hand_grip_link" reason="adjacent"/>
+  <disable_collisions link1="arm_base_link" link2="arm_horiz_link" reason="adjacent"/>
+</robot>

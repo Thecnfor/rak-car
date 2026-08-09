@@ -1,0 +1,29 @@
+# joint_limits.yaml — moveit 关节限位, 与 URDF limit 一致 (2026-08-10).
+# prismatic 关节用 m, revolute 用 rad.
+joint_limits:
+  arm_horiz_joint:
+    has_position_limits: true
+    min_position: 0.0
+    max_position: 0.3
+    has_velocity_limits: true
+    max_velocity: 0.2
+    has_acceleration_limits: false
+  arm_vert_joint:
+    has_position_limits: true
+    min_position: 0.0
+    max_position: 0.3
+    has_velocity_limits: true
+    max_velocity: 0.04
+    has_acceleration_limits: false
+  arm_hand_rotate_joint:
+    has_position_limits: false
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: false
+  arm_hand_grip_joint:
+    has_position_limits: true
+    min_position: -0.785398  # -45 deg
+    max_position: 0.802851   # 46 deg
+    has_velocity_limits: true
+    max_velocity: 1.0
+    has_acceleration_limits: false

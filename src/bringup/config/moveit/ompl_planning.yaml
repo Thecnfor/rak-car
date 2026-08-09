@@ -1,0 +1,28 @@
+# ompl_planning.yaml — moveit OMPL 规划配置 (2026-08-10).
+# 机械臂以 prismatic 为主, RRTConnect 足够; 保留常用规划器备用。
+planner_configs:
+  RRTConnectkConfigDefault:
+    type: geometric::RRTConnect
+    range: 0.05
+    goal_bias: 0.05
+    border_fraction: 0.9
+    min_valid_path_fraction: 0.5
+  RRTkConfigDefault:
+    type: geometric::RRT
+    range: 0.05
+    goal_bias: 0.05
+    border_fraction: 0.9
+  LBKPIECEkConfigDefault:
+    type: geometric::LBKPIECE
+    range: 0.05
+    border_fraction: 0.9
+    min_valid_path_fraction: 0.5
+
+arm:
+  default_planner_config: RRTConnectkConfigDefault
+  planner_configs:
+    - RRTConnectkConfigDefault
+    - RRTkConfigDefault
+    - LBKPIECEkConfigDefault
+  projection_evaluator: joints(arm_horiz_joint, arm_vert_joint)
+  longest_valid_segment_fraction: 0.05

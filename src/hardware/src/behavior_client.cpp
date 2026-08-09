@@ -4,6 +4,7 @@
 // BehaviorClient — see behavior_client.hpp. 非阻塞 tick 驱动的行为适配层。
 
 #include "hardware/behavior_client.hpp"
+#include "hardware/arm_cartesian_planner.hpp"
 
 #include <rclcpp/rclcpp.hpp>
 #include <rclcpp_action/rclcpp_action.hpp>
@@ -16,6 +17,10 @@
 // "可选依赖" 模式 (ros2_control QUIET 同款)。
 #if defined(RAK_HAVE_NAV2)
 #include <nav2_msgs/action/follow_waypoints.hpp>
+#endif
+// moveit 同理 (moveit_msgs 存在时编译 MoveGroup 后端, 否则降级本地 IK)。
+#if defined(RAK_HAVE_MOVEIT)
+#include <moveit_msgs/action/move_group.hpp>
 #endif
 
 #include <chrono>
@@ -49,6 +54,11 @@ using ArmGoalHandle = rclcpp_action::ClientGoalHandle<msgs::action::ArmCartesian
 using Nav2Client = rclcpp_action::Client<nav2_msgs::action::FollowWaypoints>;
 using Nav2GoalHandle = rclcpp_action::ClientGoalHandle<nav2_msgs::action::FollowWaypoints>;
 #endif
+#if defined(RAK_HAVE_MOVEIT)
+constexpr char kMoveGroupAction[] = "/move_group";
+using MoveItClient = rclcpp_action::Client<moveit_msgs::action::MoveGroup>;
+using MoveItGoalHandle = rclcpp_action::ClientGoalHandle<moveit_msgs::action::MoveGroup>;
+#endif
 
 }  // anonymous namespace
 
@@ -76,7 +86,7 @@ bool goal_was_accepted(const std::shared_ptr<GoalHandleT> & gh)
 // 当前在跑的单个操作 + 其状态机。
 struct BehaviorClient::Impl
 {
-  enum class Op : uint8_t { kNone = 0, kNav2, kLocalChassis, kLocalArm };
+  enum class Op : uint8_t { kNone = 0, kNav2, kLocalChassis, kLocalArm, kMoveIt };
 
   Op op{Op::kNone};
 
@@ -86,10 +96,19 @@ struct BehaviorClient::Impl
 #if defined(RAK_HAVE_NAV2)
   std::shared_ptr<Nav2Client> nav2;
 #endif
+#if defined(RAK_HAVE_MOVEIT)
+  std::shared_ptr<MoveItClient> moveit;
+#endif
 
   // 本地底盘顺序航点队列。
   std::vector<Waypoint> pending_wps;
   std::size_t wp_idx{0};
+
+  // 机械臂航点路径队列 (goal→waypoint→goal, 顺序驱动)。
+  std::vector<ArmWaypoint> pending_arm_wps;
+  std::size_t arm_wp_idx{0};
+  bool arm_path_has_deadline{false};
+  std::chrono::steady_clock::time_point arm_path_deadline{};
 
   // 单次 goal 的状态。
   bool goal_responded{false};
@@ -104,6 +123,9 @@ struct BehaviorClient::Impl
 #if defined(RAK_HAVE_NAV2)
   std::shared_ptr<Nav2GoalHandle> nav2_gh;
 #endif
+#if defined(RAK_HAVE_MOVEIT)
+  std::shared_ptr<MoveItGoalHandle> moveit_gh;
+#endif
 
   // 一次操作结束 → 清空为 kNone, 让下一个 start_* 干净开始。
   void reset_op()
@@ -111,6 +133,10 @@ struct BehaviorClient::Impl
     op = Op::kNone;
     pending_wps.clear();
     wp_idx = 0;
+    pending_arm_wps.clear();
+    arm_wp_idx = 0;
+    arm_path_has_deadline = false;
+    arm_path_deadline = {};
     goal_responded = false;
     goal_accepted = false;
     have_result = false;
@@ -120,6 +146,9 @@ struct BehaviorClient::Impl
     local_arm_gh.reset();
 #if defined(RAK_HAVE_NAV2)
     nav2_gh.reset();
+#endif
+#if defined(RAK_HAVE_MOVEIT)
+    moveit_gh.reset();
 #endif
   }
 };
@@ -146,6 +175,15 @@ void BehaviorClient::resolve_backends()
   if (impl_->local_arm->wait_for_action_server(kProbeTimeout)) {
     arm_ = ArmBackend::kLocalIk;
   }
+
+#if defined(RAK_HAVE_MOVEIT)
+  impl_->moveit = rclcpp_action::create_client<moveit_msgs::action::MoveGroup>(
+    node_, kMoveGroupAction);
+  // moveit 优先: 有 move_group 就用规划栈, 否则保持本地闭式 IK。
+  if (impl_->moveit->wait_for_action_server(kProbeTimeout)) {
+    arm_ = ArmBackend::kMoveIt;
+  }
+#endif
 
 #if defined(RAK_HAVE_NAV2)
   impl_->nav2 = rclcpp_action::create_client<nav2_msgs::action::FollowWaypoints>(
@@ -204,7 +242,7 @@ bool BehaviorClient::start_nav2_waypoints(const std::vector<Waypoint> & waypoint
     return false;
   }
   auto goal = nav2_msgs::action::FollowWaypoints::Goal();
-  goal.number_of_loops = 0;
+  // Humble FollowWaypoints 只有 poses 字段 (无 number_of_loops)。
   goal.poses.resize(waypoints.size());
   for (std::size_t i = 0; i < waypoints.size(); ++i) {
     goal.poses[i].header.frame_id = "odom";
@@ -236,13 +274,17 @@ bool BehaviorClient::start_nav2_waypoints(const std::vector<Waypoint> & waypoint
           gh,
           [impl](const typename Nav2Client::WrappedResult & wr) {
             impl->have_result = true;
+            // Humble FollowWaypoints 结果只有 missed_waypoints:
+            // 空 = 全部航点到达; 非空 = 未到达的航点下标。
             const bool ok =
               (wr.code == rclcpp_action::ResultCode::SUCCEEDED &&
-               wr.result->error_code == nav2_msgs::action::FollowWaypoints::Result::NONE);
+               wr.result != nullptr && wr.result->missed_waypoints.empty());
             impl->succeeded = ok;
             if (!ok) {
+              const std::size_t missed =
+                wr.result ? wr.result->missed_waypoints.size() : 0;
               impl->error = "nav2 FollowWaypoints: " +
-                (wr.result ? wr.result->error_msg : std::string("no result"));
+                std::to_string(missed) + " waypoint(s) missed";
             }
           });
       } else {
@@ -389,10 +431,85 @@ bool BehaviorClient::start_arm_move_to(double x_mm, double z_mm, double yaw_deg,
       client->async_send_goal(goal, options);
       return true;
     }
-    case ArmBackend::kMoveIt:
-      // moveit 后端在 move_group 配置落地后接入 (Increment 3)。
-      if (impl_) { impl_->error = "moveit backend not wired yet"; }
+    case ArmBackend::kMoveIt: {
+#if defined(RAK_HAVE_MOVEIT)
+      if (!impl_ || !impl_->moveit || node_ == nullptr) {
+        if (impl_) { impl_->error = "no moveit client"; }
+        return false;
+      }
+      // 闭式 IK 出关节目标, moveit 做规划/校验/执行 (MoveGroup joint goal)。
+      auto planner = ArmCartesianPlanner::make_default();
+      const std::vector<double> seed(4, 0.0);
+      auto plan = planner.plan("arm_base", x_mm, z_mm, yaw_deg,
+                               false, 0.0, gripper_action,
+                               0.5, 5.0, seed);
+      if (plan.status != ArmCartesianPlanner::Plan::Status::OK) {
+        impl_->error = "moveit IK failed: " + plan.error;
+        return false;
+      }
+
+      auto goal = moveit_msgs::action::MoveGroup::Goal();
+      goal.request.group_name = "arm";
+      goal.request.allowed_planning_time = 2.0;
+      goal.request.num_planning_attempts = 5;
+      goal.request.max_velocity_scaling_factor = 0.5;
+      moveit_msgs::msg::Constraints tc;
+      static const std::vector<std::string> kJointNames = {
+        "arm_horiz_joint", "arm_vert_joint",
+        "arm_hand_rotate_joint", "arm_hand_grip_joint"};
+      for (std::size_t i = 0; i < kJointNames.size(); ++i) {
+        moveit_msgs::msg::JointConstraint jc;
+        jc.joint_name = kJointNames[i];
+        jc.position = plan.q_target[i];
+        jc.tolerance_above = 0.01;
+        jc.tolerance_below = 0.01;
+        jc.weight = 1.0;
+        tc.joint_constraints.push_back(jc);
+      }
+      goal.request.goal_constraints.push_back(tc);
+
+      impl_->op = Impl::Op::kMoveIt;
+      impl_->goal_responded = false;
+      impl_->goal_accepted = false;
+      impl_->have_result = false;
+      impl_->succeeded = false;
+      impl_->error.clear();
+
+      auto client = impl_->moveit;
+      auto impl = impl_;
+      typename MoveItClient::SendGoalOptions options;
+      options.goal_response_callback =
+        [client, impl](typename MoveItGoalHandle::SharedPtr gh) {
+          impl->goal_responded = true;
+          if (goal_was_accepted(gh)) {
+            impl->goal_accepted = true;
+            impl->moveit_gh = gh;
+            client->async_get_result(
+              gh,
+              [impl](const typename MoveItClient::WrappedResult & wr) {
+                impl->have_result = true;
+                // MoveItErrorCodes: SUCCESS == 1
+                impl->succeeded =
+                  (wr.code == rclcpp_action::ResultCode::SUCCEEDED &&
+                   wr.result->error_code.val == 1);
+                if (!impl->succeeded) {
+                  impl->error = "moveit move_group: error_code=" +
+                    std::to_string(wr.result->error_code.val);
+                }
+              });
+          } else {
+            impl->goal_accepted = false;
+            impl->succeeded = false;
+            impl->error = "moveit move_group goal rejected";
+          }
+        };
+      client->async_send_goal(goal, options);
+      return true;
+#else
+      if (impl_) { impl_->error = "moveit support not compiled in"; }
       return false;
+#endif
+    }
     case ArmBackend::kNone:
     default:
       if (impl_) { impl_->error = "no arm backend available"; }
@@ -417,6 +534,8 @@ BehaviorResult BehaviorClient::poll()
       return poll_local_chassis();
     case Impl::Op::kLocalArm:
       return poll_local_arm();
+    case Impl::Op::kMoveIt:
+      return poll_moveit();
     case Impl::Op::kNone:
     default:
       return BehaviorResult{BehaviorResult::Status::SUCCESS};
@@ -466,15 +585,77 @@ BehaviorResult BehaviorClient::poll_local_chassis()
   if (impl_->wp_idx + 1 < impl_->pending_wps.size()) {
     ++impl_->wp_idx;
     // start_local_pose 会重置单次 goal 状态并发起下一个航点。
-    start_local_pose(impl_->pending_wps[impl_->wp_idx], 15.0);
+    if (!start_local_pose(impl_->pending_wps[impl_->wp_idx], 15.0)) {
+      const auto err = impl_->error;
+      impl_->reset_op();
+      return BehaviorResult{BehaviorResult::Status::FAILED, err};
+    }
     return BehaviorResult{BehaviorResult::Status::RUNNING};
   }
   impl_->reset_op();
   return BehaviorResult{BehaviorResult::Status::SUCCESS};
 }
 
+bool BehaviorClient::start_arm_path(const std::vector<ArmWaypoint> & waypoints,
+                                    double timeout_sec)
+{
+  if (waypoints.empty()) {
+    if (impl_) { impl_->error = "empty arm waypoint list"; }
+    return false;
+  }
+  impl_->pending_arm_wps = waypoints;
+  impl_->arm_wp_idx = 0;
+  impl_->arm_path_has_deadline = timeout_sec > 0.0;
+  if (impl_->arm_path_has_deadline) {
+    impl_->arm_path_deadline = std::chrono::steady_clock::now() +
+      std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+      std::chrono::duration<double>(timeout_sec));
+  }
+  const auto & wp = waypoints[0];
+  if (!start_arm_move_to(wp.x_mm, wp.z_mm, wp.yaw_deg, wp.gripper, timeout_sec)) {
+    const auto err = impl_->error;
+    impl_->reset_op();
+    impl_->error = err;
+    return false;
+  }
+  return true;
+}
+
+bool BehaviorClient::advance_arm_path_if_pending()
+{
+  if (impl_->arm_wp_idx + 1 >= impl_->pending_arm_wps.size()) {
+    return false;
+  }
+  if (impl_->arm_path_has_deadline) {
+    const auto remaining = impl_->arm_path_deadline - std::chrono::steady_clock::now();
+    if (remaining <= std::chrono::steady_clock::duration::zero()) {
+      impl_->error = "arm path timeout";
+      return false;
+    }
+  }
+  ++impl_->arm_wp_idx;
+  const auto & wp = impl_->pending_arm_wps[impl_->arm_wp_idx];
+  double segment_timeout = 0.0;
+  if (impl_->arm_path_has_deadline) {
+    segment_timeout = std::chrono::duration<double>(
+      impl_->arm_path_deadline - std::chrono::steady_clock::now()).count();
+  }
+  if (!start_arm_move_to(wp.x_mm, wp.z_mm, wp.yaw_deg, wp.gripper, segment_timeout)) {
+    return false;
+  }
+  return true;
+}
+
 BehaviorResult BehaviorClient::poll_local_arm()
 {
+  if (impl_->arm_path_has_deadline &&
+      std::chrono::steady_clock::now() >= impl_->arm_path_deadline) {
+    if (impl_->local_arm_gh && impl_->local_arm) {
+      impl_->local_arm->async_cancel_goal(impl_->local_arm_gh);
+    }
+    impl_->reset_op();
+    return BehaviorResult{BehaviorResult::Status::FAILED, "arm path timeout"};
+  }
   if (!impl_->goal_responded) { return BehaviorResult{BehaviorResult::Status::RUNNING}; }
   if (!impl_->goal_accepted) {
     const auto err = impl_->error;
@@ -483,12 +664,61 @@ BehaviorResult BehaviorClient::poll_local_arm()
   }
   if (!impl_->have_result) { return BehaviorResult{BehaviorResult::Status::RUNNING}; }
   if (impl_->succeeded) {
+    if (impl_->arm_wp_idx + 1 < impl_->pending_arm_wps.size()) {
+      if (advance_arm_path_if_pending()) {
+        return BehaviorResult{BehaviorResult::Status::RUNNING};
+      }
+      const auto err = impl_->error.empty() ? "arm path advance failed" : impl_->error;
+      impl_->reset_op();
+      return BehaviorResult{BehaviorResult::Status::FAILED, err};
+    }
     impl_->reset_op();
     return BehaviorResult{BehaviorResult::Status::SUCCESS};
   }
   const auto err = impl_->error;
   impl_->reset_op();
   return BehaviorResult{BehaviorResult::Status::FAILED, err};
+}
+
+BehaviorResult BehaviorClient::poll_moveit()
+{
+#if defined(RAK_HAVE_MOVEIT)
+  if (impl_->arm_path_has_deadline &&
+      std::chrono::steady_clock::now() >= impl_->arm_path_deadline) {
+    if (impl_->moveit_gh && impl_->moveit) {
+      impl_->moveit->async_cancel_goal(impl_->moveit_gh);
+    }
+    const auto err = std::string("arm path timeout");
+    impl_->reset_op();
+    return BehaviorResult{BehaviorResult::Status::FAILED, err};
+  }
+  if (!impl_->goal_responded) { return BehaviorResult{BehaviorResult::Status::RUNNING}; }
+  if (!impl_->goal_accepted) {
+    const auto err = impl_->error;
+    impl_->reset_op();
+    return BehaviorResult{BehaviorResult::Status::FAILED, err};
+  }
+  if (!impl_->have_result) { return BehaviorResult{BehaviorResult::Status::RUNNING}; }
+  if (impl_->succeeded) {
+    if (impl_->arm_wp_idx + 1 < impl_->pending_arm_wps.size()) {
+      if (advance_arm_path_if_pending()) {
+        return BehaviorResult{BehaviorResult::Status::RUNNING};
+      }
+      const auto err = impl_->error.empty() ? "arm path advance failed" : impl_->error;
+      impl_->reset_op();
+      return BehaviorResult{BehaviorResult::Status::FAILED, err};
+    }
+    impl_->reset_op();
+    return BehaviorResult{BehaviorResult::Status::SUCCESS};
+  }
+  const auto err = impl_->error;
+  impl_->reset_op();
+  return BehaviorResult{BehaviorResult::Status::FAILED, err};
+#else
+  const auto err = impl_->error;
+  impl_->reset_op();
+  return BehaviorResult{BehaviorResult::Status::NO_STACK, err};
+#endif
 }
 
 void BehaviorClient::cancel()
@@ -513,6 +743,13 @@ void BehaviorClient::cancel()
       if (impl_->local_arm_gh && impl_->local_arm) {
         impl_->local_arm->async_cancel_goal(impl_->local_arm_gh);
       }
+      break;
+    case Impl::Op::kMoveIt:
+#if defined(RAK_HAVE_MOVEIT)
+      if (impl_->moveit_gh && impl_->moveit) {
+        impl_->moveit->async_cancel_goal(impl_->moveit_gh);
+      }
+#endif
       break;
     case Impl::Op::kNone:
     default:

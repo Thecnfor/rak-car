@@ -42,6 +42,7 @@ find_package(tf2 REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(trajectory_msgs REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
+find_package(std_srvs REQUIRED)           # visp_servo_node 的 set_enabled 服务
 find_package(msgs REQUIRED)              # rak custom interfaces
 find_package(OpenCV REQUIRED)
 find_package(camera_info_manager QUIET)   # camera_node loads YAML calibration (Humble-only)
@@ -49,6 +50,14 @@ find_package(hardware_interface QUIET)
 find_package(pluginlib QUIET)
 find_package(rcpputils REQUIRED)
 find_package(nav2_msgs QUIET)             # optional: nav2 FollowWaypoints behavior backend
+find_package(moveit_msgs QUIET)           # optional: moveit MoveGroup arm backend
+# ViSP visual-servo node (Orin-only). 注意必须大写 find_package(VISP):
+# 上游导出的是 VISPConfig.cmake (大写), 小写 find_package(visp) 在区分大小写
+# 的文件系统上找不到 (visp_DIR-NOTFOUND)。
+# COMPONENTS 只取本节点用到的纯数学模块 (vs/visual_features/core):
+# 链接全套 VISP_LIBRARIES 会把 visp_sensor 拉进来, 而它 INTERFACE 依赖
+# 未安装的 libdc1394 → "No rule to make target" 链接失败。
+find_package(VISP COMPONENTS vs visual_features core QUIET)
 
 # Track whether camera_info_manager is available.
 set(CAMERA_INFO_MANAGER_FOUND ${camera_info_manager_FOUND})
@@ -225,6 +234,32 @@ target_link_libraries(chassis_navigate_node PUBLIC
   msgs::msgs
 )
 
+# visp_servo_node — ViSP 视觉伺服 (eye-to-hand 图像居中) → moveit_servo.
+# OPTIONAL: 仅 Orin (Humble) 装了 ViSP 才编译; dev (Lyrical) 无 visp 包跳过,
+# 与 nav2_msgs/moveit_msgs 同一可选依赖模式。package.xml 不声明 visp,
+# 避免 dev 端 colcon 依赖解析失败。
+if(VISP_FOUND)
+  add_executable(visp_servo_node src/nodes/visp_servo_node.cpp)
+  target_include_directories(visp_servo_node PUBLIC
+    include
+    ${VISP_INCLUDE_DIRS}   # visp3/... headers + 依赖的 opencv/eigen 头
+  )
+  target_link_libraries(visp_servo_node PUBLIC
+    rclcpp::rclcpp
+    sensor_msgs::sensor_msgs
+    geometry_msgs::geometry_msgs
+    diagnostic_msgs::diagnostic_msgs
+    std_srvs::std_srvs
+    tf2_ros::tf2_ros
+    tf2::tf2
+    msgs::msgs
+    ${VISP_LIBRARIES}
+  )
+  install(TARGETS visp_servo_node
+    RUNTIME DESTINATION lib/${PROJECT_NAME}
+  )
+endif()
+
 # Optional ros2_control hardware interface plugin
 if(hardware_interface_FOUND AND pluginlib_FOUND)
   # bridge_transport.cpp must be compiled INTO the plugin — a shared library
@@ -319,7 +354,10 @@ install(TARGETS task_registry
 # nav2_msgs is optional: when present the FollowWaypoints backend is compiled
 # in (RAK_HAVE_NAV2); otherwise chassis falls back to the local ChassisNavigate
 # P-loop. Same optional-dependency pattern as ros2_control above.
-add_library(behavior_client SHARED src/behavior_client.cpp)
+add_library(behavior_client SHARED src/behavior_client.cpp
+  src/arm_cartesian_planner.cpp
+  src/arm_kinematic_model.cpp
+)
 target_include_directories(behavior_client PUBLIC include)
 target_link_libraries(behavior_client PUBLIC
   rclcpp::rclcpp
@@ -330,6 +368,10 @@ target_link_libraries(behavior_client PUBLIC
 if(nav2_msgs_FOUND)
   target_compile_definitions(behavior_client PUBLIC RAK_HAVE_NAV2)
   target_link_libraries(behavior_client PUBLIC nav2_msgs::nav2_msgs)
+endif()
+if(moveit_msgs_FOUND)
+  target_compile_definitions(behavior_client PUBLIC RAK_HAVE_MOVEIT)
+  target_link_libraries(behavior_client PUBLIC moveit_msgs::moveit_msgs)
 endif()
 install(TARGETS behavior_client
   LIBRARY DESTINATION lib/${PROJECT_NAME}
@@ -463,12 +505,18 @@ if(BUILD_TESTING)
   ament_add_gmock(test_behavior_client
     test/test_behavior_client.cpp
     src/behavior_client.cpp
+    src/arm_cartesian_planner.cpp
+    src/arm_kinematic_model.cpp
   )
   target_include_directories(test_behavior_client PUBLIC include)
   target_link_libraries(test_behavior_client rclcpp::rclcpp rclcpp_action::rclcpp_action msgs::msgs)
   if(nav2_msgs_FOUND)
     target_compile_definitions(test_behavior_client PUBLIC RAK_HAVE_NAV2)
     target_link_libraries(test_behavior_client nav2_msgs::nav2_msgs)
+  endif()
+  if(moveit_msgs_FOUND)
+    target_compile_definitions(test_behavior_client PUBLIC RAK_HAVE_MOVEIT)
+    target_link_libraries(test_behavior_client moveit_msgs::moveit_msgs)
   endif()
 endif()
 
