@@ -193,6 +193,34 @@ target_link_libraries(arm_cartesian_move_node PUBLIC
   msgs::msgs
 )
 
+# peripheral_node — beep / led / nixie / dout services over the MC602 bridge.
+add_executable(peripheral_node
+  src/nodes/peripheral_node.cpp
+  src/mc602_adapter.cpp
+  src/mc602_protocol.cpp
+  src/serial_transport.cpp
+  src/bridge_transport.cpp
+  src/serial_port.cpp
+)
+target_include_directories(peripheral_node PUBLIC include)
+target_link_libraries(peripheral_node PUBLIC
+  rclcpp::rclcpp
+  msgs::msgs
+)
+
+# chassis_navigate_node — ChassisNavigate action server (pose → cmd_vel).
+add_executable(chassis_navigate_node
+  src/nodes/chassis_navigate_node.cpp
+)
+target_include_directories(chassis_navigate_node PUBLIC include)
+target_link_libraries(chassis_navigate_node PUBLIC
+  rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
+  nav_msgs::nav_msgs
+  geometry_msgs::geometry_msgs
+  msgs::msgs
+)
+
 # Optional ros2_control hardware interface plugin
 if(hardware_interface_FOUND AND pluginlib_FOUND)
   add_library(_hardware_plugin SHARED src/mc602_hardware_interface.cpp)
@@ -214,12 +242,13 @@ if(CAMERA_INFO_MANAGER_FOUND)
   install(TARGETS
     camera_node infrared_node mc602_bridge_node mecanum_chassis_node arm_node
     safety_gate_node mission_runner_node arm_cartesian_move_node
+    peripheral_node chassis_navigate_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 else()
   install(TARGETS
     infrared_node mc602_bridge_node mecanum_chassis_node arm_node safety_gate_node
-    mission_runner_node arm_cartesian_move_node
+    mission_runner_node arm_cartesian_move_node peripheral_node chassis_navigate_node
     RUNTIME DESTINATION lib/${PROJECT_NAME}
   )
 endif()
@@ -331,6 +360,13 @@ if(BUILD_TESTING)
     src/arm_kinematic_model.cpp
   )
   target_include_directories(test_arm_cartesian_planner PUBLIC include)
+
+  # CommandArbiter — long-action mutual exclusion + URGENT preempt
+  ament_add_gmock(test_command_arbiter
+    test/test_command_arbiter.cpp
+    src/command_arbiter.cpp
+  )
+  target_include_directories(test_command_arbiter PUBLIC include)
 
   ament_add_gmock(test_base_controller_iface
     test/test_base_controller_iface.cpp
