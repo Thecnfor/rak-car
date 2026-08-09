@@ -591,28 +591,46 @@ def _align_to_tower(
     track_chassis 阻塞式跑闭环, 把 water 等级标 bbox 中心拉到 setpoint_cxcy.
     vx_only=True (规定, 2026-08-03) → 只控 vx(前后), vy 恒 0, 横向不做闭环.
     退出时零速命令是异步的 → 显式停稳 (task1_seeding.py:337-344 的范式).
+
+    2026-08-10: 对齐失败(超时/丢目标) → 重试 1 次: 死区扩到 retry_deadband(0.06) +
+    max_seconds 原基础上加 retry_extra_s(3s) — 底盘从当前位置续跑, 不回起点. 仍失败不阻塞.
     """
     from main.chassis import track_chassis  # 懒加载, 与 task1 一致
 
-    result = track_chassis(
-        track_cfg.get("target", "water"),
-        setpoint_cxcy=tuple(track_cfg.get("setpoint_cxcy", (0.0, 0.0))),
-        # 只控前后 (任务二规定), vy 恒 0, 到达只看 cx
-        vx_only=bool(track_cfg.get("vx_only", False)),
-        # 轴符号从配置来 (水塔场景方向实测与 cylinder 默认相反, 2026-08-03)
-        sign_vx=int(track_cfg.get("sign_vx", -1)),
-        sign_vy=int(track_cfg.get("sign_vy", 1)),
-        kp=track_cfg.get("kp", 0.50),
-        v_max=track_cfg.get("v_max", 0.25),
-        v_slew=track_cfg.get("v_slew", 0.02),  # 每帧速度变化限幅 (2026-08-03 实测太急 → 调缓)
-        hz=track_cfg.get("hz", 20.0),  # 2026-08-06: 控制频率 (yaml 可配, 默认 20)
-        deadband=track_cfg.get("deadband", 0.08),
-        hold_frames=track_cfg.get("hold_frames", 3),
-        max_lost_frames=track_cfg.get("max_lost_frames", 30),
-        max_seconds=track_cfg.get("max_seconds", 6.0),
-    )
+    def _run(deadband: float, max_seconds: float):
+        return track_chassis(
+            track_cfg.get("target", "water"),
+            setpoint_cxcy=tuple(track_cfg.get("setpoint_cxcy", (0.0, 0.0))),
+            # 只控前后 (任务二规定), vy 恒 0, 到达只看 cx
+            vx_only=bool(track_cfg.get("vx_only", False)),
+            # 轴符号从配置来 (水塔场景方向实测与 cylinder 默认相反, 2026-08-03)
+            sign_vx=int(track_cfg.get("sign_vx", -1)),
+            sign_vy=int(track_cfg.get("sign_vy", 1)),
+            kp=track_cfg.get("kp", 0.50),
+            v_max=track_cfg.get("v_max", 0.25),
+            v_slew=track_cfg.get("v_slew", 0.02),  # 每帧速度变化限幅 (2026-08-03 实测太急 → 调缓)
+            hz=track_cfg.get("hz", 20.0),  # 2026-08-06: 控制频率 (yaml 可配, 默认 20)
+            deadband=deadband,
+            hold_frames=track_cfg.get("hold_frames", 3),
+            max_lost_frames=track_cfg.get("max_lost_frames", 30),
+            max_seconds=max_seconds,
+        )
+
+    base_deadband = float(track_cfg.get("deadband", 0.08))
+    base_max_seconds = float(track_cfg.get("max_seconds", 6.0))
+    retry_deadband = float(track_cfg.get("retry_deadband", 0.06))
+    retry_extra_s = float(track_cfg.get("retry_extra_s", 3.0))
+
+    result = _run(base_deadband, base_max_seconds)
     logger.info("track_chassis result: arrived=%s reason=%s frames=%d",
                 result.arrived, result.reason, result.frames)
+    # 2026-08-10: 对齐未到位 → 扩死区 + 原基础上加时重试 1 次 (不回起点)
+    if not result.arrived:
+        logger.info("底盘对齐未到位 (reason=%s), 扩死区 %.3f→%.3f + 加时 %.0fs 重试 (从当前位置续跑)",
+                    result.reason, base_deadband, retry_deadband, retry_extra_s)
+        result = _run(retry_deadband, base_max_seconds + retry_extra_s)
+        logger.info("track_chassis 重试 result: arrived=%s reason=%s frames=%d",
+                    result.arrived, result.reason, result.frames)
     _stop_chassis(arm_client)
     return result
 
@@ -702,24 +720,35 @@ def _pick_cube_servo_local(
     # 2026-08-10 用户新规则: 超时不许失败 — 降死区 PICK_RETRY_DEADZONE(0.10) +
     # 加时 PICK_RETRY_EXTRA_S(4s) 重试; 重试仍超时且画面看得到 water
     # (trace_hits>0) → 再 +1s 类推第 3 次 (块1/2/3 最坏 5+4+1=10/6+4+1=11/7+4+1=12s).
+    # ⚠️ 重试是纯加时+扩死区, **不回起点**: 每次续跑前把 arm_start 更新为上一轮
+    # end_arm (run_arm_servo 每轮 arm_target 从 arm_start 起算, 不更新会把大臂
+    # 拉回初始 +90° 丢掉已转角度, 同 task1 抓苗重试语义)。
     # 仅 timeout 重试 (stopped=急停不重试); 画面看不到 water (trace_hits=0) 不类推.
     if (not result.get("settled")
             and result.get("reason") == "timeout"):
-        logger.info("视觉对齐超时, 降死区重试: deadzone %.3f→%.3f, servo_timeout +%.0fs",
-                    servo_kw["deadzone"], PICK_RETRY_DEADZONE, PICK_RETRY_EXTRA_S)
+        logger.info("视觉对齐超时, 降死区加时续跑: deadzone %.3f→%.3f, servo_timeout +%.0fs, "
+                    "arm_start %.1f→%s (不回起点)",
+                    servo_kw["deadzone"], PICK_RETRY_DEADZONE, PICK_RETRY_EXTRA_S,
+                    servo_kw["arm_start"],
+                    result.get("end_arm") if result.get("end_arm") is not None else "不变")
         servo_kw["deadzone"] = PICK_RETRY_DEADZONE
         servo_kw["servo_timeout"] = float(servo_kw["servo_timeout"]) + PICK_RETRY_EXTRA_S
+        if result.get("end_arm") is not None:
+            servo_kw["arm_start"] = float(result["end_arm"])  # 从当前大臂角度续跑
         result = _run_servo_once("重试", servo_kw)
-        # 第 3 次类推: 重试仍超时 + 画面看到 water → 再 +1s
+        # 第 3 次类推: 重试仍超时 + 画面看到 water → 再 +1s (同样从当前续)
         if (not result.get("settled")
                 and result.get("reason") == "timeout"
                 and int(result.get("trace_hits", 0) or 0) > 0):
-            logger.info("water 在画面但未锁上 (trace_hits>0), 再 +%.0fs 类推重试 "
-                        "(servo_timeout %.1fs→%.1fs)",
+            logger.info("water 在画面但未锁上 (trace_hits>0), 再 +%.0fs 类推续跑 "
+                        "(servo_timeout %.1fs→%.1fs, arm_start→%s)",
                         PICK_RETRY_ESCALATE_S,
                         float(servo_kw["servo_timeout"]),
-                        float(servo_kw["servo_timeout"]) + PICK_RETRY_ESCALATE_S)
+                        float(servo_kw["servo_timeout"]) + PICK_RETRY_ESCALATE_S,
+                        result.get("end_arm") if result.get("end_arm") is not None else "不变")
             servo_kw["servo_timeout"] = float(servo_kw["servo_timeout"]) + PICK_RETRY_ESCALATE_S
+            if result.get("end_arm") is not None:
+                servo_kw["arm_start"] = float(result["end_arm"])  # 类推也从当前续
             result = _run_servo_once("类推", servo_kw)
     if not result.get("settled"):
         raise RuntimeError(
