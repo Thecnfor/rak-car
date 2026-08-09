@@ -1,0 +1,5 @@
+# LedShow.srv — 点阵屏文本
+string text
+---
+bool ok
+string error

@@ -1,0 +1,15 @@
+# ArmExecuteTrajectory.action — 机械臂标准关节轨迹动作 (middle layer 2026-08-09).
+# 委托给 joint_trajectory_controller 的 FollowJointTrajectory。
+# status 同 ArmCartesianMove。
+
+# goal
+trajectory_msgs/JointTrajectory trajectory
+float32 timeout_sec
+---
+# result
+uint8 status
+string error
+---
+# feedback
+sensor_msgs/JointState joint_state
+float32 progress

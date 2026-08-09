@@ -1,0 +1,20 @@
+# ChassisNavigate.action — 底盘位姿/速度导航动作 (middle layer 2026-08-09).
+# use_pose=true: 向 target_pose(odom frame) 闭环; 否则按 target_velocity 持续控制。
+
+# goal
+msgs/Pose2D target_pose
+bool use_pose
+geometry_msgs/Twist target_velocity
+float32 linear_tolerance
+float32 angular_tolerance
+float32 timeout_sec
+---
+# result
+bool success
+string error
+float32 travelled_distance
+float32 duration_sec
+---
+# feedback
+msgs/Pose2D current_pose
+float32 remaining_distance

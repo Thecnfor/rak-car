@@ -1,0 +1,6 @@
+# SetDigitalOut.srv — 数字输出 (泵/阀/继电器)
+int32 port
+bool on
+---
+bool ok
+string error

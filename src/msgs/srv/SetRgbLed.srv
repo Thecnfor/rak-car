@@ -1,0 +1,8 @@
+# SetRgbLed.srv — RGB LED 设置
+int32 led_id
+int32 r
+int32 g
+int32 b
+---
+bool ok
+string error

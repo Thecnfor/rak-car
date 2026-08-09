@@ -1,0 +1,27 @@
+# ArmCartesianMove.action — 机械臂任务空间动作 (middle layer 2026-08-09).
+# 第一版 frame_id 仅 "arm_base"; x/z 单位 mm, yaw 单位 deg。
+# y_enabled=false → y 必须是固定工作平面(忽略); 非固定 y 返回 UNSUPPORTED_DIMENSION。
+# status: 0=REACHED 1=UNREACHABLE 2=TIMEOUT 3=HARDWARE_FAULT 4=CANCELLED
+#         5=PARTIAL 6=DEGRADED_NO_FEEDBACK 7=UNSUPPORTED_DIMENSION
+
+# goal
+string frame_id
+float32 x
+float32 z
+float32 yaw_deg
+bool y_enabled
+float32 y
+uint8 gripper_action
+float32 velocity_scale
+float32 position_tolerance
+float32 timeout_sec
+---
+# result
+uint8 status
+string error
+sensor_msgs/JointState final_joints
+---
+# feedback
+sensor_msgs/JointState joint_state
+geometry_msgs/Pose current_cartesian
+float32 progress

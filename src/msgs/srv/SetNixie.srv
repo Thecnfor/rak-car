@@ -1,0 +1,5 @@
+# SetNixie.srv — 数码管显示
+int32 value
+---
+bool ok
+string error

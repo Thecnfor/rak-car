@@ -1,0 +1,6 @@
+# SetBeep.srv — 蜂鸣器短操作
+int32 freq
+int32 duration_ms
+---
+bool ok
+string error
