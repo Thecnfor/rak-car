@@ -108,8 +108,8 @@ DEFAULT_MAX_CREEP_M: float = 0.58
 DEFAULT_MAX_SECONDS: float = 9999.0
 """任务总时长预算 (s) (距离优先模式下设为极大值, 实际不限制)。"""
 
-DEFAULT_CREEP_SPEED_MPS: float = 0.06
-"""creep 搜索前移速度 (m/s)。"""
+DEFAULT_CREEP_SPEED_MPS: float = 0.12
+"""creep 搜索前移速度 (m/s)。2026-08-09 用户: 翻倍 (0.06→0.12) 加快扫区。"""
 
 CREEP_POLL_HZ: float = 20.0
 """creep 期间 fetch_balls 轮询频率。"""
@@ -906,7 +906,7 @@ def step_target4(
         http_client: RuntimeApiClient (creep 速度下发 / fetch_balls / track_chassis 共用)。
         runner: ArmRunner (None 时自动建)。
         max_picks: 最多抓取数, 默认 8。
-        creep_speed_mps: creep 前移速度 (m/s), 默认 0.03。
+        creep_speed_mps: creep 前移速度 (m/s), 默认 0.12 (2026-08-09 翻倍)。
         max_creep_m: 累计前移距离预算 (m), 默认 0.8。耗尽无球 → 视作采区走完。
         max_seconds: 任务总时长预算 (s), 默认 180。
         track_max_seconds: 单球底盘伺服收敛预算 (s), 默认 12。
