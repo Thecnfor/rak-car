@@ -129,25 +129,26 @@ PICK_FINE_GAIN_X = 0.05
 PICK_FINE_GAIN_ARM = PICK_GAIN_ARM * 0.25   # 2026-08-08: 8.0*0.5=4.0 → 8.0*0.25=2.0 (大臂再慢, 原 0.5 倍)
 PICK_FINE_TIMEOUT_S = 6.0   # 2026-08-08: 4.0 → 6.0
 
-# 蔬菜布局 (2026-08-08 用户实测标定): 右列 4 行 (从上到下 1-4).
-# 每行: {x_mm, cx_ref, cy_ref} — 检测姿态 (大臂-90 Y-180) 下该行蔬菜框的 (cx,cy),
-# 只用来**匹配行号** (最近邻) → X 移到该行 x_mm → 精对齐.
+# 蔬菜布局 (2026-08-09 重标定): 右列 4 行 (物理底部第1行 X=-48 → 顶部第4行 X=-190).
+# 每行: {x_mm, cx_ref, cy_ref} — **检测姿态** (X=-160, 大臂-90, hand=-18, Y=-180) 下
+# 该行蔬菜框的 (cx,cy), 只用来**匹配行号** (最近邻) → X 移到该行 x_mm → 精对齐.
+# 画面与物理对应: 画面下方 (cy 负) = 物理底部 = 第1行, 画面上方 (cy 正) = 顶部 = 第4行.
 # 对齐 setpoint 是固定 PICK_SETPOINT_CXCY (0.168,-0.525), 不用每行 (cx,cy).
 PICK_RIGHT_CAL: Dict[int, Dict[str, float]] = {
-    1: dict(x_mm=-48.0,  cx=0.148, cy=-0.317),
-    2: dict(x_mm=-95.0,  cx=0.119, cy=-0.287),
-    3: dict(x_mm=-146.0, cx=0.113, cy=-0.302),
-    4: dict(x_mm=-190.0, cx=0.158, cy=-0.252),
+    1: dict(x_mm=-48.0,  cx=-0.08, cy=-0.62),   # 番茄 (底部)
+    2: dict(x_mm=-95.0,  cx=-0.05, cy=-0.28),   # 豆角
+    3: dict(x_mm=-146.0, cx=-0.02, cy=+0.12),   # 油菜
+    4: dict(x_mm=-190.0, cx=+0.01, cy=+0.42),   # 芹菜 (顶部)
 }
 PICK_LEFT_CAL: Dict[int, Dict[str, float]] = {
-    1: dict(x_mm=-48.0,  cx=0.148, cy=-0.317),   # 番茄 (最上)
-    2: dict(x_mm=-95.0,  cx=0.119, cy=-0.287),   # 豆角
-    3: dict(x_mm=-146.0, cx=0.113, cy=-0.302),   # 油菜
-    4: dict(x_mm=-190.0, cx=0.158, cy=-0.252),   # 金针菇 (最下)
+    1: dict(x_mm=-48.0,  cx=+0.03, cy=-0.61),   # 蘑菇 (底部)
+    2: dict(x_mm=-95.0,  cx=+0.07, cy=-0.26),   # 土豆
+    3: dict(x_mm=-146.0, cx=+0.10, cy=+0.15),   # 青椒
+    4: dict(x_mm=-190.0, cx=+0.15, cy=+0.42),   # 金针菇 (顶部)
 }
-# 2026-08-08: 左列 X 与右列同 (-48/-95/-146/-190 从上到下, 用户确认);
-#   左列 (cx,cy) 实测与右列相同 — 检测姿态下蔬菜框落点与货架列无关 (左右列靠底盘横移区分);
-#   行区分主要靠 cy (垂直), cx 每次停位略有漂移.
+# 2026-08-09: 旧表 (cx,cy) 不是检测姿态实测 (cy 全 -0.25~-0.32, 4 行挤在一起),
+#   最近邻分不开行 → 番茄被派到第3行 (X=-146, 实际第1行 X=-48) → 精对齐 0 hits 吸空.
+#   左列菜名实测 = 蘑菇/土豆/青椒/金针菇 (旧注释误写 番茄/豆角/油菜).
 # 列检测共同姿态 (2026-08-08)
 PICK_COL_ARM_DEG = -90.0
 PICK_COL_HAND_DEG = -18.0  # 2026-08-08: 0 → -18 (列检测姿态末端)
@@ -454,6 +455,67 @@ def _detect_column_stationary(
     return None
 
 
+def _align_4dof_phase_local(
+    runner: ArmRunner,
+    label: str,
+    *,
+    gain_x: float,
+    gain_arm: float,
+    max_vel: float,
+    timeout: float,
+    arm_start: float,
+    sx: float,
+    sy: float,
+) -> Tuple[bool, int]:
+    """本地视觉对齐 (2026-08-09 闭环下沉): runtime 进程内 run_arm_servo.
+
+    大臂控 cx + X 十字控 cy (与精对齐 x_error_source="dy" 同一映射, sign_x=-1/
+    sign_arm=+1 与 find_target_4dof 默认一致); y 十字锁 0, 末端不碰 (精对齐前已
+    composite_run 到 10°, run_arm_servo 不动 hand). main 只发一次目标参数, 无每帧
+    网络往返; 对齐收敛/超时由 runtime 判, 这里收结果判断成败.
+
+    Returns:
+        (settled, trace_hits) — 与 _align_4dof_phase 同构.
+    """
+    servo_kw = dict(
+        label=label,
+        hz=20.0,
+        gain_arm=float(gain_arm),
+        gain_x=float(gain_x),
+        deadzone=float(PICK_DEADZONE),
+        max_vel=float(max_vel),
+        arm_start=float(arm_start),
+        sign_arm=1.0,
+        sign_x=-1.0,
+        setpoint_x_norm=float(sx),
+        setpoint_y_norm=float(sy),
+        arm_min=float(PICK_ARM_MIN),
+        arm_max=float(PICK_ARM_MAX),
+        servo_timeout=float(timeout),
+        settle_hits=3,   # 与旧 find_target_4dof 的 3 连续帧收敛判定一致
+    )
+    logger.info(
+        "  本地视觉对齐: run_arm_servo(label=%s setpoint=(%.3f,%.3f) hz=20 "
+        "gain_arm=%s gain_x=%s deadzone=%s max_vel=%s arm=[%s,%s] settle=3 servo_timeout=%s)",
+        label, sx, sy, gain_arm, gain_x, PICK_DEADZONE, max_vel,
+        PICK_ARM_MIN, PICK_ARM_MAX, timeout,
+    )
+    job = runner.client.http.execute(
+        "car", "run_arm_servo", kwargs=servo_kw, sync=True,
+        timeout=float(timeout) + 15.0,
+    )
+    result = (job or {}).get("result") if isinstance(job, dict) else None
+    result = result if isinstance(result, dict) else {}
+    if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+        raise RuntimeError(
+            f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
+        )
+    logger.info("  本地视觉对齐结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                result.get("reason"), result.get("settled"),
+                result.get("trace_hits"), result.get("end_arm"))
+    return bool(result.get("settled")), int(result.get("trace_hits", 0))
+
+
 def _align_4dof_phase(
     runner: ArmRunner,
     label: str,
@@ -468,8 +530,13 @@ def _align_4dof_phase(
     hand_min: float = -90.0,
     hand_max: float = 0.0,
     setpoint_cxcy: Optional[Tuple[float, float]] = None,
+    local_servo: bool = False,
 ) -> Tuple[bool, int]:
     """跑一次 find_target_4dof (velocity 对齐). 返回 (settled, hits).
+
+    local_servo=True (2026-08-09 闭环下沉): 改走 runtime 进程内
+    _align_4dof_phase_local (run_arm_servo), main 只发一次目标, 无每帧网络.
+    arm_feed 生命周期由 run_arm_servo 内部自行管理, 不在这里 stop/start.
 
     gain_x>0 → X 十字也动; gain_hand>0 → 末端也动 (task6 只用精对齐, gain_hand=0).
     hand_min/hand_max (2026-08-08): 必须显式传 — find_target_4dof 默认 hand_max=0,
@@ -478,6 +545,13 @@ def _align_4dof_phase(
     PICK_SETPOINT_CXCY=(0.168,-0.525) (八个位置一致), 不再默认画面中心.
     """
     sx, sy = setpoint_cxcy if setpoint_cxcy is not None else PICK_SETPOINT_CXCY
+    if local_servo:
+        return _align_4dof_phase_local(
+            runner, label,
+            gain_x=gain_x, gain_arm=gain_arm,
+            max_vel=max_vel, timeout=timeout,
+            arm_start=arm_start, sx=sx, sy=sy,
+        )
     try:
         runner._set_arm_feed(stop=True)
         result = runner.client._make_vision_with_move().find_target_4dof(
@@ -512,12 +586,15 @@ def _pick_one_veggie_visual(
     label: str,
     place_pose: Dict[str, float],
     column: Optional[str] = None,
+    pick_vision: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """单棵蔬菜: 列姿态 → 匹配行(cx,cy) → X到该行 → 末端转10° → 精对齐 → 降+吸 → 放.
 
     2026-08-08: 只精对齐 (粗对齐已删). X 到匹配行后, 末端先显式转到 10°, 精对齐
     只动 X+大臂 (末端保持 10°), setpoint 固定 (0.168,-0.525) 八个位置一致, timeout 6s;
     每行 (cx,cy) 只用于匹配行号, 一列一列, 左右列各自标定.
+    pick_vision (2026-08-09): task6_config.yml pick_vision 段 — local_servo 开关
+    (true=本机闭环 / false=网络每帧) + timeout 覆盖精对齐超时.
 
     Returns:
         True=已抓取投放; False=检测不到/匹配不到行 (跳过).
@@ -553,14 +630,17 @@ def _pick_one_veggie_visual(
     #    setpoint 固定 (0.168,-0.525) (八个位置一致)
     runner.client.composite_run(hand=PICK_FINE_HAND_DEG, speed=100)
     logger.info("  [%s] 精对齐前末端→%.0f°", goods_name, PICK_FINE_HAND_DEG)
+    # 2026-08-09: local_servo 开关 — true=本机闭环 run_arm_servo, false=旧网络每帧
+    fine_timeout = float((pick_vision or {}).get("timeout", PICK_FINE_TIMEOUT_S))
     settled, hits = _align_4dof_phase(
         runner, label,
         gain_x=PICK_FINE_GAIN_X, gain_arm=PICK_FINE_GAIN_ARM,
         gain_hand=0.0,
-        max_vel=PICK_MAX_VEL, timeout=PICK_FINE_TIMEOUT_S,
+        max_vel=PICK_MAX_VEL, timeout=fine_timeout,
         arm_start=PICK_COL_ARM_DEG, hand_start=PICK_FINE_HAND_DEG,
         hand_min=PICK_FINE_HAND_MIN, hand_max=PICK_FINE_HAND_MAX,
         setpoint_cxcy=PICK_SETPOINT_CXCY,
+        local_servo=bool((pick_vision or {}).get("local_servo", False)),
     )
     logger.info("  [%s] 精对齐(X+大臂, 末端保持10): settled=%s hits=%d",
                 goods_name, settled, hits)
@@ -901,6 +981,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         }
     """
     cfg = _load_task6_config()
+    # 2026-08-09: 蔬菜视觉对齐开关 (local_servo=true 本机闭环 / false 网络每帧)
+    pick_vision = cfg.get("pick_vision") or {}
 
     if client is None:
         client = RuntimeApiClient()
@@ -1033,7 +1115,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 place = PICK_PLACE_1 if idx == 0 else PICK_PLACE_2
                 logger.info("  → 抓取 '%s' (label=%s, %s列, 订单%d)",
                             goods_name, label, col, idx + 1)
-                if _pick_one_veggie_visual(runner, goods_name, label, place, column=col):
+                if _pick_one_veggie_visual(runner, goods_name, label, place,
+                                           column=col, pick_vision=pick_vision):
                     picked_count += 1
                     picked_labels.add(label)
                     completed.append(f"picked_{picked_count}")

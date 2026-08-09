@@ -107,6 +107,8 @@ class FeedsMixin:
                         lateral_speed=None,
                         angular_speed=None,
                         distance=self.get_distance(),
+                        last_error=None,  # 2026-08-09: 成功必须清 last_error, 否则一次启动期
+                                          # 超时残留 → task3 move_along_lane 永久 fallback
                     )
             except Exception as exc:
                 wait_s = min(period * backoff, period * max_backoff)

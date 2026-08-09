@@ -188,6 +188,29 @@ def _classify_records(token, records, timeout, workers):
     return judged
 
 
+def judge_records(token, records, llm_timeout):
+    """逐张对已记录目标做 LLM 判定, 返回带 species/result/analysis 的 judged 列表.
+
+    从 recognize_phase 拆出 (2026-08-07): orchestrator 编排时判定放后台线程跑,
+    识别段存 pending json 后立即返回, 不阻塞车. 手动全流程仍在本进程同步判定.
+    """
+    judged = []
+    for record in records:
+        verdict = classify_target(token, record["image_path"], llm_timeout)
+        entry = dict(record)
+        entry.pop("detection", None)
+        entry.update({
+            "species": verdict["name"],
+            "classification": "pest" if verdict["result"] == 0 else "beneficial" if verdict["result"] == 1 else "unknown",
+            "result": verdict["result"],
+            "analysis": verdict["analysis"],
+        })
+        judged.append(entry)
+        print(f"  -> target #{entry['number']}: {entry['species']} / "
+              f"{entry['classification']} | {entry['analysis']}", flush=True)
+    return judged
+
+
 def read_traveled(client):
     """读取 odom 累计路径长 (m)，失败返回 None。"""
     try:
@@ -198,7 +221,8 @@ def read_traveled(client):
         return None
 
 
-def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir):
+def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
+                                defer_judge: bool = False):
     """首卡定位后按固定卡间距逐个记录，避免同一张卡重复计数。"""
     records = []
     period = max(args.poll_interval, 0.05)
@@ -481,6 +505,12 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir):
             safe_car_call(client, "stop", timeout=args.job_timeout)
 
     print(f"[recognition] driving complete; judging {len(records)} recorded targets")
+    if defer_judge:
+        # 2026-08-07: LLM 判定放后台, 识别段只存 raw 记录 (status=pending) 立即返回,
+        # 不阻塞车. task3_pest_scout 后台线程读到 pending json 后逐张判定并回写 done.
+        print(f"[recognition] driving complete; deferring LLM judging "
+              f"({len(records)} targets, status=pending)")
+        return records, traveled_now()
     judged = _classify_records(
         token, records, args.llm_timeout, args.classify_workers,
     )
@@ -490,20 +520,21 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir):
     return judged, traveled_now()
 
 
-def save_result(path_text, args, targets, traveled):
+def save_result(path_text, args, targets, traveled, *, status: str = "done"):
     path = Path(path_text)
     if not path.is_absolute():
         path = Path(__file__).resolve().parent / path
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": vars(args),
+        "status": status,
         "targets": targets,
-        "pest_numbers": [t["number"] for t in targets if t["result"] == 0],
-        "beneficial_numbers": [t["number"] for t in targets if t["result"] == 1],
+        "pest_numbers": [t["number"] for t in targets if t.get("result") == 0],
+        "beneficial_numbers": [t["number"] for t in targets if t.get("result") == 1],
         "traveled_m": round(traveled, 4),
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"[recognition] saved: {path}")
+    print(f"[recognition] saved: {path} (status={status})")
     return path
 
 
@@ -560,6 +591,11 @@ def main():
     parser.add_argument("--dry-run-steps", type=int, default=10,
                         help="safety limit used only with --dry-run")
     parser.add_argument("--no-pause", action="store_true", help="start shooting immediately after recognition")
+    parser.add_argument("--no-shoot", action="store_true",
+                        help="识别完成不射击 (编排模式: 射击由 task3_shoot waypoint 负责)")
+    parser.add_argument("--defer-judge", action="store_true",
+                        help="识别段不 LLM 判定: 存 raw targets (status=pending) 立即返回, "
+                             "判定由调用方后台线程 judge_records 回写 done")
     args = parser.parse_args()
 
     if (args.target_count < 1 or not 0 < args.creep_speed <= 0.2
@@ -568,10 +604,15 @@ def main():
             or args.classify_workers < 1
             or args.min_gap < 0):
         parser.error("target-count/creep-speed/dry-run-steps values are invalid")
-    token = load_token(args.token)
-    print(f"[ready] token={mask_token(token)}")
-    if not args.dry_run:
-        check_health(token, timeout=args.llm_timeout)
+    # --defer-judge: 识别段完全不碰 LLM (token/health 都省), 判定由后台线程做.
+    if args.defer_judge:
+        token = ""
+        print("[ready] --defer-judge: LLM 判定推迟到后台线程, 识别段不调 token/health")
+    else:
+        token = load_token(args.token)
+        print(f"[ready] token={mask_token(token)}")
+        if not args.dry_run:
+            check_health(token, timeout=args.llm_timeout)
     client = RuntimeApiClient()
     if not args.dry_run:
         client.wait_until_ready()
@@ -580,15 +621,18 @@ def main():
         return 1
     image_dir = Path(__file__).resolve().parent / "audit" / "task3_pipeline" / "targets"
     targets, traveled = recognize_phase_fixed_slots(
-        client, args, token, settings.streamer_url, image_dir
+        client, args, token, settings.streamer_url, image_dir,
+        defer_judge=args.defer_judge,
     )
-    result_path = save_result(args.save, args, targets, traveled)
-    pests = [t["number"] for t in targets if t["result"] == 0]
-    beneficial = [t["number"] for t in targets if t["result"] == 1]
+    status = "pending" if args.defer_judge else "done"
+    result_path = save_result(args.save, args, targets, traveled, status=status)
+    pests = [t["number"] for t in targets if t.get("result") == 0]
+    beneficial = [t["number"] for t in targets if t.get("result") == 1]
     print(f"[recognition] pests={pests or 'none'} beneficial={beneficial or 'none'}")
 
-    if not pests:
-        print("[shooting] no pests were confirmed; task 3 is complete")
+    if args.no_shoot:
+        print("[recognition] --no-shoot: recognition done, return to orchestrator "
+              "(shooting deferred to task3_shoot waypoint)", flush=True)
         return 0
     if not args.no_pause and not args.dry_run:
         input(

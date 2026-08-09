@@ -110,6 +110,15 @@ GROUP_BACKWARD_M: float = 0.33       # 8-06: tower 2 后向用 0.33 (不走 GROU
 PICK_VISION_LABEL: str = "water"
 PICK_VISION_SETPOINT_CXCY: List[float] = [0.063, -0.202]      # 8-06 重测 20 帧均值 (cx=0.063, cy=-0.202, 抖动 < 2px)
 PICK_VISION_TIMEOUT_S: float = 3.5
+# 2026-08-09: 每块视觉伺服单独超时 (None=用 yaml 默认 timeout).
+#   第2块(1): 6s — 用户规定 (默认 5s 不够稳, 第 2 块单独加到 6s)
+#   第3块(2): 7s — 高处堆叠抖动大收敛慢 (原 PICK_BLOCK3_TIMEOUT_S)
+PICK_BLOCK2_TIMEOUT_S: Optional[float] = 6.0
+PICK_BLOCK3_TIMEOUT_S: Optional[float] = 7.0
+# 2026-08-09 用户新规则: 视觉对齐超时**不许失败** — 降死区 + 加时重新对齐一次.
+#   默认死区 0.05 → 重试放宽到 0.07; 超时 +4s (块默认 5/6/7s → 重试 9/10/11s).
+PICK_RETRY_DEADZONE: float = 0.07
+PICK_RETRY_EXTRA_S: float = 4.0
 PICK_VISION_HZ: float = 25.0
 PICK_VISION_GAIN_ARM: float = 1.6
 PICK_VISION_GAIN_X: float = 0.35
@@ -160,11 +169,10 @@ def _chassis_move_for(
     SDK 串口 SerialEngine 统一调度 (CLAUDE.md §Runtime concurrency model),
     多线程并发安全.
 
-    2026-08-06 实车: 长距离前进 (tower_spacing 0.7m, group_forward 0.37m)
-    必须走 move_along_lane (沿车道线前进, vy=0 + ω 锁对齐), 否则 odom theta
-    漂移导致横向偏移, 第二座水塔识别不到.
-    use_lane_align=True 时改走 main.chassis.move_along_lane, use_lane_align=False
-    保留原 move_for (短距离后退 / detect_retry 用).
+    2026-08-09: 前进/后退统一走 move_for (SDK 4 轮等速, odom 自洽). 不再默认走
+    move_along_lane — 2026-08-06 曾因 odom theta 漂移改走车道线, 但 move_for 正用反用
+    各一次可抵消漂移 (见 CLAUDE.md "底盘平移一律 move_for" 规则).
+    use_lane_align=True 仍可强制 main.chassis.move_along_lane (特殊场景兜底).
 
     Args:
         arm_client: ArmClient (用来访问 runtime HTTP / chassis API).
@@ -183,7 +191,7 @@ def _chassis_move_for(
         )
         return {"ok": True, "mode": "lane_align", "dx_m": float(dx_m)}
 
-    # 短距离 / 后退 / detect_retry 用 SDK move_for (字节流 4 轮等速倒)
+    # 主路径: SDK move_for (字节流 4 轮等速, 正=前进 负=后退)
     job = arm_client.http.execute_car_action(
         "move_for", [dx_m, 0.0, 0.0],
         timeout=timeout, sync=False,
@@ -210,8 +218,8 @@ def _parallel_chassis_arm(
         arm_kwargs:  传 composite_run 的 kwargs (arm/x_mm/y_mm/hand/speed/timeout),
                      None/{} 跳过臂动作
         timeout:     两个动作的最大等待
-        use_lane_align: 覆盖底盘前进走法. None=默认 (前进→move_along_lane, 后退→move_for);
-                     False=强制 SDK move_for (4 轮等速); True=强制 move_along_lane.
+        use_lane_align: 覆盖底盘前进走法. None=默认 全部 move_for (4 轮等速, 2026-08-09 起
+                     前进不再走 move_along_lane); False=强制 move_for; True=强制 move_along_lane.
 
     2026-08-06 提速:
       - chassis 0.15m (~0.7s) 与臂切姿态 (~2-3s) 完全并发, 主循环零阻塞.
@@ -222,19 +230,22 @@ def _parallel_chassis_arm(
     task1_seeding.py:619-631 是同样的模式; SDK 串口 SerialEngine 单 io 线程
     调度 (CLAUDE.md §Runtime concurrency model), 多线程并发安全.
     """
-    # 2026-08-06: 底盘移动前也遵循大臂转动的安全区限制 (Y ∈ [-200,-90], X ∈ [-300,-200])
-    # 这保证底盘移动期间 X/Y 已在安全区, 与大臂 3 阶段共享同一约束.
-    # 若同时转大臂, 3 阶段 phase1 已是 no-op (X/Y 已就位).
-    if abs(target_dx_m) > 1e-3:
-        _ensure_xy_in_safe_zone(arm_client, runner, timeout=timeout)
-
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
-        # 底盘 move_along_lane (长距离用) 或 move_for (短距离/后退用) 与臂切姿态并发.
-        # 2026-08-06 实车: tower_spacing 0.7m + group_forward 0.37m 必须走 move_along_lane
-        # (沿车道线, 不偏); 后退 (d_back 负值) 走原 move_for (短距离, 已知位置).
+        # 2026-08-09: 底盘 move_for 与臂动作**从第一帧就并发** — 不再先串行调安全区.
+        # 转大臂时 _safe_arm_rotation_sequence 阶段 1 自己会调 X/Y 安全位, 与底盘移动
+        # 同时进行 (用户要求: 进入任务点就动 X, 底盘前进时臂同步; 机械臂内部顺序仍按
+        # 3 阶段). 省每块 ~2-4s 串行等待.
+        # ⚠️ 代价: 底盘移动期间 X/Y 正收回安全位 (非先收回再移动), 真机需确认无碰撞.
+        # 只有不转大臂 (arm_kwargs 无 arm) 时才先保证 X/Y 安全区 (无 3 阶段兜底).
+        if (arm_kwargs and arm_kwargs.get("arm") is None
+                and abs(target_dx_m) > 1e-3):
+            _ensure_xy_in_safe_zone(arm_client, runner, timeout=timeout)
+        # 前进/后退统一走 SDK move_for (4 轮等速, odom 自洽, 见 CLAUDE.md
+        # "底盘平移一律 move_for" 规则). 不再默认走 move_along_lane 车道线.
+        # use_lane_align=True 仍可强制 move_along_lane (特殊场景兜底).
         if abs(target_dx_m) > 1e-3:
-            use_lane = (target_dx_m > 0) if use_lane_align is None else use_lane_align
+            use_lane = False if use_lane_align is None else use_lane_align
             tasks.append(ex.submit(
                 _chassis_move_for, arm_client, target_dx_m, timeout,
                 use_lane_align=use_lane,
@@ -406,13 +417,13 @@ def _deliver_prepare(
     """
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
-        # 底盘回塔 (沿中心车道线, 跟前进一样用 move_along_lane, 不偏航).
+        # 底盘回塔: 统一 SDK move_for (2026-08-09, 前进/后退都走 move_for).
         # d_back 正值=Tower 2 抓完前进回塔, 负值=Tower 1 抓完后退回塔, _chassis_move_for
         # 自动按 dx_m 正负决定 vx 方向.
         if abs(target_dx_m) > 1e-3:
             tasks.append(ex.submit(
                 _chassis_move_for, arm_client, target_dx_m, timeout,
-                use_lane_align=True,
+                use_lane_align=False,
             ))
 
         # 臂步骤顺序 (一个 worker 内串行, 跟底盘并发; 2026-08-08 改: 不做 X/Y 并发)
@@ -465,7 +476,8 @@ def _ensure_xy_in_safe_zone(
     - 用 composite_run (无 client-side y_protected) 调 X/Y
 
     调用点:
-      1. _parallel_chassis_arm 入口 (底盘 move_for 前, 同步执行)
+      1. _parallel_chassis_arm 入口 — 仅当 arm_kwargs 无 arm (不转大臂, 无 3 阶段兜底)
+         且底盘移动时才同步执行 (2026-08-09 改: 转大臂的并发走 _safe_arm_rotation_sequence 阶段 1)
       2. _safe_arm_rotation_sequence 阶段 1 (大臂 3 阶段第 1 步)
     """
     try:
@@ -607,12 +619,16 @@ def _pick_cube_servo_local(
     pick: Dict[str, Any],
     sp_x: Optional[float],
     sp_y: Optional[float],
+    timeout_override: Optional[float] = None,
 ) -> Dict[str, Any]:
     """本地视觉伺服 (2026-08-09 闭环下沉): runtime 进程内闭环, main 只发一次目标.
 
     走 /v1/execute run_arm_servo —— runtime 内每帧读 task_feed 缓存 + 直调 arm
     (x_speed / set_arm_angle), 无网络往返. 对齐收敛 → y 降 grasp_y + hand 转
     descend_hand (并发) → 吸气 → 抬回 servo_y. 未收敛抛 RuntimeError.
+
+    timeout_override (2026-08-09): 覆盖 servo_timeout (每座塔第 3 块单独加时用).
+    None → 用 vision 配置的 timeout.
     """
     servo_kw = dict(
         label=vision.get("label", "water"),
@@ -628,7 +644,8 @@ def _pick_cube_servo_local(
         setpoint_y_norm=sp_y if sp_y is not None else 0.0,
         arm_min=float(vision["arm_min"]) if vision.get("arm_min") is not None else -150.0,
         arm_max=float(vision["arm_max"]) if vision.get("arm_max") is not None else 90.0,
-        servo_timeout=float(vision.get("timeout", 15.0)),
+        servo_timeout=float(timeout_override if timeout_override is not None
+                            else vision.get("timeout", 15.0)),
         settle_hits=int(vision.get("settle_hits", 3)),
     )
     logger.info(
@@ -653,6 +670,27 @@ def _pick_cube_servo_local(
     logger.info("cam2 本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
                 result.get("reason"), result.get("settled"),
                 result.get("trace_hits"), result.get("end_arm"))
+    # 2026-08-09 用户新规则: 超时不许失败 — 降死区 PICK_RETRY_DEADZONE(0.07) +
+    # 加时 PICK_RETRY_EXTRA_S(4s) 重新对齐一次. 仅 timeout 重试 (stopped=急停不重试).
+    if (not result.get("settled")
+            and result.get("reason") == "timeout"):
+        logger.info("视觉对齐超时, 降死区重试: deadzone %.3f→%.3f, servo_timeout +%.0fs",
+                    servo_kw["deadzone"], PICK_RETRY_DEADZONE, PICK_RETRY_EXTRA_S)
+        servo_kw["deadzone"] = PICK_RETRY_DEADZONE
+        servo_kw["servo_timeout"] = float(servo_kw["servo_timeout"]) + PICK_RETRY_EXTRA_S
+        job = arm_client.http.execute(
+            "car", "run_arm_servo", kwargs=servo_kw, sync=True,
+            timeout=float(servo_kw["servo_timeout"]) + 15.0,
+        )
+        result = (job or {}).get("result") if isinstance(job, dict) else None
+        result = result if isinstance(result, dict) else {}
+        if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+            raise RuntimeError(
+                f"run_arm_servo 重试任务失败: status={job.get('status')} error={job.get('error')}"
+            )
+        logger.info("cam2 本地视觉伺服重试结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                    result.get("reason"), result.get("settled"),
+                    result.get("trace_hits"), result.get("end_arm"))
     if not result.get("settled"):
         raise RuntimeError(
             f"cam2 本地视觉抓水立方失败 (reason={result.get('reason')}, "
@@ -701,6 +739,7 @@ def _pick_cube(
     runner: ArmRunner,
     cfg: Dict[str, Any],
     cube_x_mm: float,
+    vision_timeout_override: Optional[float] = None,
 ) -> None:
     """抓取单个水方块 (不含投放).
 
@@ -746,7 +785,8 @@ def _pick_cube(
     _t0 = _time.time()
     if vision.get("local_servo"):
         # 2026-08-09 闭环下沉: runtime 进程内视觉伺服 (main 只发一次目标, 无每帧网络)
-        result = _pick_cube_servo_local(arm_client, vision, pick, sp_x, sp_y)
+        result = _pick_cube_servo_local(arm_client, vision, pick, sp_x, sp_y,
+                                        timeout_override=vision_timeout_override)
     else:
         result = runner.track_velocity_pick(
             vision.get("label", "water"),
@@ -755,7 +795,8 @@ def _pick_cube(
             arm_start=float(pick["arm_angle_deg"]),
             hand_start=float(pick["hand_angle_deg"]),
             grasp_y_mm=float(vision.get("grasp_y_mm", pick["y_descend_mm"])),
-            timeout=float(vision.get("timeout", 15.0)),
+            timeout=float(vision_timeout_override if vision_timeout_override is not None
+                          else vision.get("timeout", 15.0)),
             hz=float(vision.get("hz", 20.0)),
             gain_arm=float(vision.get("gain_arm", 0.4)),
             gain_x=float(vision.get("gain_x", 0.08)),
@@ -860,15 +901,17 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     vision = cfg.get("pick_vision") or {}
 
     try:
-        # ===== 初始化: composite_run 4 轴并发到 detection 姿态 (transport Y=-150) =====
-        # 2026-08-06 提速: 原版 move_x → set_arm_angle → _wait_arm_angle_reached
-        #                 → set_hand_angle → time.sleep(0.5) 全串行 ~5s.
-        #                 改 composite_run 4 轴并发 ~2s, 省 3s.
-        logger.info("初始化: composite_run → detection 姿态 (X=%.0f Y=-150 arm=%s hand=%s)",
-                    x_target_mm, detection["arm_angle_deg"], detection["hand_angle_deg"])
+        # ===== 初始化: 进入任务点就动 X — 底盘回退 entry_back_off_m 与臂切 detection 姿态并发 =====
+        # 2026-08-09: orchestrator waypoint 的 back_off(0.2m) 挪进任务内, 底盘后退的同时
+        # 臂收 X/转大臂/切 detection 姿态 (进入任务点就开始先移动 X, 跟底盘移动一起进行).
+        # 臂内部仍是 3 阶段顺序 (安全位→转臂→到位), 只是跟底盘并发.
+        entry_back_off_m = float(cfg.get("entry_back_off_m", 0.0))
+        logger.info("初始化: 底盘回退 %.2fm + 切 detection 姿态 (X=%.0f Y=-150 arm=%s hand=%s) 并发",
+                    entry_back_off_m, x_target_mm,
+                    detection["arm_angle_deg"], detection["hand_angle_deg"])
         _parallel_chassis_arm(
             arm_client, runner,
-            target_dx_m=0.0,
+            target_dx_m=(-entry_back_off_m) if entry_back_off_m > 1e-3 else 0.0,
             arm_kwargs=dict(
                 arm=float(detection["arm_angle_deg"]),
                 x_mm=x_target_mm,
@@ -975,7 +1018,15 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     chassis_at_tower_m = target_offset
 
                     # 抓块 (含 vision servo + 自动抬回 transport Y)
-                    _pick_cube(arm_client, runner, cfg, pick_x)
+                    # 2026-08-09: 每块视觉伺服单独超时 — 第1块用 yaml 默认 5s;
+                    #   第2块 6s (PICK_BLOCK2_TIMEOUT_S), 第3块 7s (PICK_BLOCK3_TIMEOUT_S).
+                    _block_timeout = None
+                    if picked == 1:
+                        _block_timeout = PICK_BLOCK2_TIMEOUT_S
+                    elif picked == 2:
+                        _block_timeout = PICK_BLOCK3_TIMEOUT_S
+                    _pick_cube(arm_client, runner, cfg, pick_x,
+                               vision_timeout_override=_block_timeout)
 
                     # 准备 deliver: 底盘回塔 + 臂切 carry 姿态 (用户 2026-08-08 新规定)
                     #   顺序: X 收 -260 → 大臂转 → Y 直接降到投放深度 → X 伸到投放位
@@ -984,12 +1035,19 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                                          [-50.0, -65.0, -80.0])
                     deliver_y = deliver_ys[min(picked, len(deliver_ys) - 1)]
                     d_back = -chassis_at_tower_m
-                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收-260 → 大臂转%s° → Y降%.0f → X伸%s)",
-                                picked + 1, d_back, carry["arm_angle_deg"], deliver_y, carry["x_mm"])
+                    # 2026-08-09: 投放 X 分水塔 (carry_x_by_tower_mm[tower_idx], 缺省 carry.x_mm)
+                    carry_xs = cfg.get("carry_x_by_tower_mm") or []
+                    if carry_xs and tower_idx < len(carry_xs):
+                        carry_x_mm = float(carry_xs[tower_idx])
+                    else:
+                        carry_x_mm = float(carry["x_mm"])
+                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收-260 → 大臂转%s° → Y降%.0f → X伸%.0f [塔%d])",
+                                picked + 1, d_back, carry["arm_angle_deg"], deliver_y,
+                                carry_x_mm, tower_idx + 1)
                     _deliver_prepare(
                         arm_client, runner,
                         target_dx_m=d_back,
-                        carry_x_mm=float(carry["x_mm"]),
+                        carry_x_mm=carry_x_mm,
                         carry_arm_deg=float(carry["arm_angle_deg"]),
                         carry_hand_deg=float(deliver_hand),
                         deliver_y_mm=deliver_y,

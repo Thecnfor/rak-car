@@ -89,8 +89,12 @@ task_cfg:
     group_forward_m: 0.35        # 2026-08-06: 0.33 → 0.35 (tower 1 前向组间距); 2026-08-06: 0.35 → 0.37
     group_backward_m: 0.33       # 2026-08-06: tower 2 后向用 0.33 (3 块回退距离, 不走 0.35)
 
+    # 2026-08-09: 进入任务点的入口回退 — 原 orchestrator waypoint.back_off_m(0.2m) 挪到这里,
+    # 在 task2 init 里与臂切 detection 姿态**并发** (进入任务点就开始动 X, 跟底盘移动一起).
+    entry_back_off_m: 0.2
+
     # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前进 0.1m 再 cam2 检测)
-    detect_retry_step_m: 0.15    # 2026-08-08: 0.10 → 0.15 (cam2 未识别到等级标 → 底盘前移重试)
+    detect_retry_step_m: 0.10    # 2026-08-09: 0.15 → 0.10 (cam2 未识别到等级标 → 底盘前移重试)
     detect_retry_max: 2
 
     init_pose:
@@ -106,9 +110,9 @@ task_cfg:
       y_mm: -10                 # 2026-08-06: -20 → -10 (抬高 10mm, 看清等级标)
 
     first_cube_x_mm: -165
-    # 2026-08-04: 第二块 X 从 -265 改 -210 (用户实测摆放位置).
+    # 2026-08-09: 第二块 X 从 -210 改 -240 (用户实测摆放位置).
     # 识别/视觉对齐前姿态 X 由 cube_x_mm 决定, 见 _pick_cube.init_x_mm.
-    second_cube_x_mm: -210
+    second_cube_x_mm: -240
 
     # cam2 视觉闭环: 底盘对齐到水塔等级标 (track_chassis 参数)
     track_align:
@@ -133,13 +137,16 @@ task_cfg:
       deadband: 0.02                # 2026-08-09: 0.03 → 0.02 (水塔对齐死区再收紧)
       hold_frames: 6                # 2026-08-08: 4→6 (锁死帧数更严)
       max_lost_frames: 30
-      max_seconds: 6.0
+      max_seconds: 5.0          # 2026-08-09: 6.0 → 5.0 (底盘对齐时间)
 
     # 同一水塔内第 1/2/3 块的投放 Y 深度梯度 (避免堆叠碰撞)
     # 2026-08-06: -40/-60/-80 → -10/-55/-75 → 0/-50/-75 → 0/-45/-70 → -10/-45/-75 (用户新规定)
-    deliver_y_by_index: [-10, -45, -75]
-    # 同一水塔内第 1/2/3 块的投放手爪角度 (2026-08-09: -75/-80/-85 → -80/-85/-90 用户新规定)
-    deliver_hand_by_index: [-80, -85, -90]
+    # 2026-08-09: 第 3 块 Y -75 → -80, 手爪 -90 → -85 (用户新规定)
+    deliver_y_by_index: [-10, -45, -80]
+    deliver_hand_by_index: [-80, -85, -85]
+    # 2026-08-09: 投放 X 分水塔 (用户规定: 塔1=-80, 塔2=-90), 按 tower_idx 取值.
+    # 缺省回退 carry_pose.x_mm (-90).
+    carry_x_by_tower_mm: [-80, -90]
 
     pick_pose:
       # 2026-08-04: 抓取 init 姿态 (S 形态, 视觉伺服起点).
@@ -175,12 +182,12 @@ task_cfg:
       servo_y_mm: -150          # 视觉伺服起始 Y (与 pick_pose.y_transition_mm 对齐)
       grasp_y_mm: -50           # 吸附高度 (2026-08-04: -75 → -50, 抓时更贴方块)
       descend_hand_deg: 0       # 2026-08-04: 下降到位后手爪转 0° (吸嘴朝下贴方块顶面)
-      timeout: 4.0              # 2026-08-08: 3.5 → 4.0 (视觉对齐超时)
+      timeout: 5.0              # 2026-08-09: 4.0 → 5.0 (第 1 块默认; 第 2 块 override 6s, 第 3 块 override 7s)
       hz: 25.0                  # 2026-08-06: 20 → 25 (闭环频率↑, 同样帧数收敛更快)
       # 2026-08-06: 提速放宽标准 (对齐时间太久)
-      gain_arm: 0.6             # 2026-08-09: 0.8 → 0.6 (真机试跑仍偏快, 再降)
+      gain_arm: 0.3             # 2026-08-09: 0.8 → 0.6 → 0.3 (大臂增量过大 → 过冲振荡"左右晃", 减半再减半)
       gain_x: 0.25              # 2026-08-09: 0.35 → 0.25 (x 十字速度增益调缓, 防超调/抖动)
-      deadzone: 0.04            # 2026-08-09: 0.08 → 0.04 (测试是否真对齐, 收更紧)
+      deadzone: 0.05            # 2026-08-09: 0.04 → 0.05 (所有水立方统一放宽, 更容易锁上)
       max_vel: 0.03             # 2026-08-08: 0.05 → 0.03 (视觉对齐 x 十字速度, 30mm/s 上限)
       # sign_arm: 沿用 +1 (task1 标定), 但 task2 arm_start=+95° 与 task1 的 -90°
       # 几何相反, 若水立方在 cam2 里被推向画面边缘, 改 -1.
@@ -258,11 +265,11 @@ waypoints:
     dis_at_least_m: null           # 2026-08-06: 不在基地开始测, dis 不参与触发
     trigger_op: AND              # ir_ok AND True = 只看 IR
     # 2026-08-06: 出弯后沿中心车道线直行 2.0s (走 move_along_lane, vy=0 + ω 锁对齐; 08-08 1.5→2.0),
-    # 然后停 1s, 再沿车道后退 0.2m (弯道出口往回拉, 让 IR 重触发位置对齐工作位姿; 08-08 0.1→0.2).
+    # 2026-08-09: 后退 0.2m 挪进 task2 init 跟臂切 detection 姿态并发 (进入任务点就动 X).
     settle_forward_s: 2.0        # 沿车道直行 2.0s (替代旧 settle_before_pause_s 的 time.sleep; 2026-08-08 1.5→2.0)
     settle_forward_speed_mps: 0.15
-    back_off_delay_s: 1.0       # 停 1s (避免前后冲击, 底盘减速 + 车物理稳定)
-    back_off_m: 0.2              # 2026-08-08: 沿车道后退 0.2m (走 move_along_lane, 不偏; 0.1→0.2 改回)
+    back_off_delay_s: 0.0       # 2026-08-09: 后退已挪进 task2, 这里不再停
+    back_off_m: 0.0              # 2026-08-09: 0.2 → 0 (挪进 task2 init, 见 water_tower_task.entry_back_off_m)
     back_off_speed_mps: 0.10    # 后退速度
 
   # ----- task3_shoot (2026-08-06 拆分, 跟在 task2 后面, 读识别 json + 射击) -----
