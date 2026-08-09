@@ -60,7 +60,8 @@ class VisionOverlayNode(Node):
     def _on_image(self, msg: Image) -> None:
         try:
             row = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
-            frame = row[:, :msg.width * 3].reshape(msg.height, msg.width, 3).copy()
+            frame = row[:, :msg.width * 3].reshape(msg.height, msg.width, 3)
+            frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA).copy()
         except (ValueError, TypeError) as exc:
             self.get_logger().warning(f"overlay raw image decode failed: {exc}")
             return
@@ -98,8 +99,18 @@ class VisionOverlayNode(Node):
         if self._overlay_type == "lane":
             frame = draw_lane_overlay(frame, lane) if lane is not None else frame
         else:
-            frame = draw_detection_overlay(frame, detections) if detections is not None else frame
-        frame = cv2.resize(frame, (320, 240), interpolation=cv2.INTER_AREA)
+            if detections is not None:
+                scaled = DetectionArray()
+                scaled.model_id = detections.model_id
+                scaled.image_width = 320
+                scaled.image_height = 240
+                scaled.class_names = detections.class_names
+                scaled.scores = detections.scores
+                scaled.xs = [x * 0.5 for x in detections.xs]
+                scaled.ys = [y * 0.5 for y in detections.ys]
+                scaled.widths = [w * 0.5 for w in detections.widths]
+                scaled.heights = [h * 0.5 for h in detections.heights]
+                frame = draw_detection_overlay(frame, scaled)
         self._pub.publish(self._to_image(frame, stamp, frame_id))
 
 
