@@ -40,7 +40,7 @@ def generate_launch_description() -> LaunchDescription:
             description="Requested frame rate for both cameras."),
         DeclareLaunchArgument(
             "image_width",
-            default_value="680",
+            default_value="640",
             description="Requested camera width; driver may negotiate a supported mode."),
         DeclareLaunchArgument(
             "image_height",

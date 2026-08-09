@@ -36,6 +36,9 @@ def generate_launch_description():
         DeclareLaunchArgument("side_device", default_value="/dev/cam3"),
         DeclareLaunchArgument("image_rate_hz", default_value="30.0"),
         DeclareLaunchArgument("lane_rate_hz", default_value="30.0"),
+        DeclareLaunchArgument("image_width", default_value="640"),
+        DeclareLaunchArgument("image_height", default_value="480"),
+        DeclareLaunchArgument("pixel_format", default_value="YUYV"),
         DeclareLaunchArgument("detector_rate_hz", default_value="20.0"),
         DeclareLaunchArgument("overlay_rate_hz", default_value="10.0"),
         DeclareLaunchArgument(
@@ -58,6 +61,9 @@ def generate_launch_description():
             parameters=[{
                 "camera_id": "front",
                 "device": LaunchConfiguration("front_device"),
+                "image_width": LaunchConfiguration("image_width"),
+                "image_height": LaunchConfiguration("image_height"),
+                "pixel_format": LaunchConfiguration("pixel_format"),
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
                 "calibration_url": "package://bringup/params/camera_front.yaml",
             }],
@@ -68,6 +74,9 @@ def generate_launch_description():
             parameters=[{
                 "camera_id": "side",
                 "device": LaunchConfiguration("side_device"),
+                "image_width": LaunchConfiguration("image_width"),
+                "image_height": LaunchConfiguration("image_height"),
+                "pixel_format": LaunchConfiguration("pixel_format"),
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
                 "calibration_url": "package://bringup/params/camera_arm.yaml",
             }],

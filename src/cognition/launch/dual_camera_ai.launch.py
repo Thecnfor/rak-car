@@ -23,6 +23,9 @@ def generate_launch_description() -> LaunchDescription:
         DeclareLaunchArgument("front_device", default_value="/dev/cam4"),
         DeclareLaunchArgument("side_device", default_value="/dev/cam3"),
         DeclareLaunchArgument("image_rate_hz", default_value="30.0"),
+        DeclareLaunchArgument("image_width", default_value="640"),
+        DeclareLaunchArgument("image_height", default_value="480"),
+        DeclareLaunchArgument("pixel_format", default_value="YUYV"),
 
         # ---- front 相机(循线用)----
         Node(
@@ -31,6 +34,9 @@ def generate_launch_description() -> LaunchDescription:
             parameters=[{
                 "camera_id": "front",
                 "device": LaunchConfiguration("front_device"),
+                "image_width": LaunchConfiguration("image_width"),
+                "image_height": LaunchConfiguration("image_height"),
+                "pixel_format": LaunchConfiguration("pixel_format"),
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
             }],
         ),
@@ -41,6 +47,9 @@ def generate_launch_description() -> LaunchDescription:
             parameters=[{
                 "camera_id": "side",
                 "device": LaunchConfiguration("side_device"),
+                "image_width": LaunchConfiguration("image_width"),
+                "image_height": LaunchConfiguration("image_height"),
+                "pixel_format": LaunchConfiguration("pixel_format"),
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
             }],
         ),
