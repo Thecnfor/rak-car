@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+import yaml
 
 from main.api_client import RuntimeApiClient
 from main.task.task3.llm_ernie import call_vision, check_health, load_token, mask_token
@@ -40,6 +41,34 @@ Examples of pests: locust, aphid, caterpillar, beetle, snail, mite.
 Examples of beneficial animals: bee, ladybug, butterfly, earthworm, spider.
 If uncertain, still choose the most likely result and explain briefly.
 """
+
+
+def _load_pest_prompt() -> str:
+    """读 llm_config.yml 的 pest_detect.system_prompt (详细版) 替换简单硬编码提示词。
+
+    2026-08-09: 旧简单 prompt 没有"图里不是动物 → result=1"规则, LLM 把 YOLO 误检
+    (空图 / 蓝色结构物) 默认判成害虫 → 假 pest (#1/#2 实机案例)。详细版明确
+    "如果图片中不是动物或根本无法识别, 返回 result=1"。读不到/解析失败回退
+    RECOGNITION_PROMPT 保底。
+    """
+    try:
+        with open(Path(__file__).resolve().parent / "llm_config.yml",
+                  encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        prompt = (cfg.get("pest_detect") or {}).get("system_prompt")
+        if prompt and str(prompt).strip():
+            print(f"[ready] 害虫判定用 llm_config.yml 详细提示词 "
+                  f"({len(str(prompt))} 字符)", flush=True)
+            return str(prompt)
+        print("[warn] llm_config.yml 缺 pest_detect.system_prompt, 回退硬编码提示词",
+              file=sys.stderr)
+    except Exception as exc:
+        print(f"[warn] 读 llm_config.yml 失败, 回退硬编码提示词: {exc}",
+              file=sys.stderr)
+    return RECOGNITION_PROMPT
+
+
+PEST_PROMPT = _load_pest_prompt()
 
 DEFAULT_TARGET_COUNT = 4
 DEFAULT_CREEP_SPEED = 0.18          # m/s, 识别段 creep 速度 (2026-08-04 现场: 0.05→0.18)
@@ -142,7 +171,7 @@ def classify_target(token, image_path, timeout):
     except OSError:
         return {"name": "unknown", "result": None, "analysis": "target image unavailable"}
     image_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
-    verdict = call_vision(token, image_url, RECOGNITION_PROMPT, timeout=timeout)
+    verdict = call_vision(token, image_url, PEST_PROMPT, timeout=timeout)
     result = verdict.get("result")
     try:
         result = int(result) if result is not None else None
