@@ -41,7 +41,12 @@ namespace
 {
 
 constexpr char kActionName[] = "/rak/control/arm/cartesian_move";
-const std::vector<std::string> kArmJoints = {"arm_x", "arm_z", "arm_yaw", "arm_grip"};
+// Model joint order (must match ArmKinematicModel::make_default):
+//   index 0=arm_x  1=arm_z  2=arm_yaw  3=arm_grip
+// Default ROS joint names = URDF names (arm_horiz_joint etc.), overridable
+// via the `joint_names` parameter.
+const std::vector<std::string> kDefaultJointNames = {
+  "arm_horiz_joint", "arm_vert_joint", "arm_hand_rotate_joint", "arm_hand_grip_joint"};
 
 // ArmCartesianMove.action status values.
 constexpr uint8_t kStatusReached = 0;
@@ -65,6 +70,7 @@ public:
   explicit ArmCartesianMoveNode(const rclcpp::NodeOptions & options = rclcpp::NodeOptions())
   : Node("arm_cartesian_move_node", options)
   {
+    this->declare_parameter<std::vector<std::string>>("joint_names", kDefaultJointNames);
     this->declare_parameter<std::string>("traj_topic",
       "/joint_trajectory_controller/joint_trajectory");
     this->declare_parameter<std::string>("joint_state_topic", "/joint_states");
@@ -86,6 +92,7 @@ public:
 
     const std::string traj_topic = this->get_parameter("traj_topic").as_string();
     const std::string js_topic = this->get_parameter("joint_state_topic").as_string();
+    joint_names_ = this->get_parameter("joint_names").as_string_array();
     timeout_ = rclcpp::Duration::from_seconds(this->get_parameter("timeout_sec").as_double());
 
     planner_ = std::make_unique<ArmCartesianPlanner>(make_model(), grip_angle(), release_angle());
@@ -155,7 +162,7 @@ private:
   {
     std::lock_guard<std::mutex> lk(state_mutex_);
     std::vector<double> q;
-    for (const auto & n : kArmJoints) {
+    for (const auto & n : joint_names_) {
       auto it = latest_.find(n);
       q.push_back(it != latest_.end() ? it->second : 0.0);
     }
@@ -216,7 +223,7 @@ private:
     // Publish the joint-space target as a single-point trajectory.
     trajectory_msgs::msg::JointTrajectory traj;
     traj.header.stamp = this->now();
-    traj.joint_names = kArmJoints;
+    traj.joint_names = joint_names_;
     trajectory_msgs::msg::JointTrajectoryPoint pt;
     pt.positions = plan.q_target;
     pt.time_from_start = rclcpp::Duration::from_seconds(plan.duration_sec);
@@ -245,7 +252,7 @@ private:
       const auto q = current_q();
       const auto pose = planner_model().forward(q);
 
-      feedback->joint_state.name = kArmJoints;
+      feedback->joint_state.name = joint_names_;
       feedback->joint_state.position = q;
       feedback->current_cartesian.position.x = pose.x;
       feedback->current_cartesian.position.y = pose.y;
@@ -257,7 +264,7 @@ private:
 
       if (converged(q, plan.q_target, tolerance)) {
         result->status = kStatusReached;
-        result->final_joints.name = kArmJoints;
+        result->final_joints.name = joint_names_;
         result->final_joints.position = q;
         gh->succeed(result);
         return;
@@ -301,6 +308,7 @@ private:
 
   std::unique_ptr<ArmCartesianPlanner> planner_;
   rclcpp::Duration timeout_{0, 0};
+  std::vector<std::string> joint_names_;
 
   rclcpp::Publisher<trajectory_msgs::msg::JointTrajectory>::SharedPtr traj_pub_;
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr js_sub_;
