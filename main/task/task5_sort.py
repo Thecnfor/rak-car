@@ -133,7 +133,8 @@ GRASP_TIMEOUT_S: float = 10.0
 # Phase 1: 4机联动 + 模型识别高仓颜色
 # ============================================================
 
-def _phase1_detect_high_tower(client: ArmClient, runner: ArmRunner) -> Dict[str, Any]:
+def _phase1_detect_high_tower(client: ArmClient, runner: ArmRunner,
+                              phase1_pose_ready: bool = False) -> Dict[str, Any]:
     """Phase 1: 摆位 + 模型识别高仓色标。
 
     业务流程:
@@ -154,17 +155,23 @@ def _phase1_detect_high_tower(client: ArmClient, runner: ArmRunner) -> Dict[str,
           f"hand={PHASE1_HAND_DEG}° → 模型识别 (score_min={PHASE1_SCORE_MIN})")
 
     # [1/2] 4机联动 composite_run
-    print(f"  [1/2] composite_run: arm={PHASE1_ARM_DEG:+.0f}° x={PHASE1_X_MM:.0f}mm "
-          f"y={PHASE1_Y_MM:.0f}mm hand={PHASE1_HAND_DEG:+.0f}° "
-          f"speed={COMPOSITE_SPEED} timeout={COMPOSITE_TIMEOUT_S:.0f}s")
-    step1 = client.composite_run(
-        arm=PHASE1_ARM_DEG,
-        x_mm=PHASE1_X_MM,
-        y_mm=PHASE1_Y_MM,
-        hand=PHASE1_HAND_DEG,
-        speed=COMPOSITE_SPEED,
-        timeout=COMPOSITE_TIMEOUT_S,
-    )
+    if phase1_pose_ready:
+        print("  [1/2] ✅ 已由 task4→task5 handoff 完成 Phase 1 入场姿态，跳过重复 composite_run")
+        step1 = {"status": "succeeded", "result": {"ok": True, "steps": {
+            "arm": True, "x": True, "y": True, "hand": True,
+        }}, "handoff": True}
+    else:
+        print(f"  [1/2] composite_run: arm={PHASE1_ARM_DEG:+.0f}° x={PHASE1_X_MM:.0f}mm "
+              f"y={PHASE1_Y_MM:.0f}mm hand={PHASE1_HAND_DEG:+.0f}° "
+              f"speed={COMPOSITE_SPEED} timeout={COMPOSITE_TIMEOUT_S:.0f}s")
+        step1 = client.composite_run(
+            arm=PHASE1_ARM_DEG,
+            x_mm=PHASE1_X_MM,
+            y_mm=PHASE1_Y_MM,
+            hand=PHASE1_HAND_DEG,
+            speed=COMPOSITE_SPEED,
+            timeout=COMPOSITE_TIMEOUT_S,
+        )
     ok1 = (isinstance(step1, dict)
            and step1.get("status") == "succeeded"
            and isinstance(step1.get("result"), dict)
@@ -173,7 +180,10 @@ def _phase1_detect_high_tower(client: ArmClient, runner: ArmRunner) -> Dict[str,
         print(f"  [1/2] ❌ composite_run 失败: {step1}")
         raise RuntimeError(f"{LOG_PREFIX} Phase 1 composite_run 失败: {step1}")
     steps1 = step1["result"].get("steps", {}) if isinstance(step1.get("result"), dict) else {}
-    print(f"  [1/2] ✅ 4 轴并发到位  steps={steps1}")
+    if phase1_pose_ready:
+        print(f"  [1/2] ✅ handoff Phase 1 入场姿态已确认  steps={steps1}")
+    else:
+        print(f"  [1/2] ✅ 4 轴并发到位  steps={steps1}")
 
     # [2/2] 模型识别 label
     print(f"  [2/2] 调 client.http.request_vision_task (timeout={PHASE1_DETECT_TIMEOUT_S}s)")
@@ -534,7 +544,8 @@ def _retreat_166mm(client: ArmClient) -> Dict[str, Any]:
 # ============================================================
 
 def _run_pipeline(client: ArmClient, runner: ArmRunner,
-                  prev_ball_counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+                  prev_ball_counts: Optional[Dict[str, int]] = None,
+                  phase1_pose_ready: bool = False) -> Dict[str, Any]:
     """task5 端到端 4 阶段流水线 (内联实现)。
 
     Args:
@@ -558,7 +569,8 @@ def _run_pipeline(client: ArmClient, runner: ArmRunner,
     phase0_advance = _advance_315mm(client)
 
     # ========== Phase 1: 识别高仓颜色 ==========
-    phase1 = _phase1_detect_high_tower(client, runner)
+    phase1 = _phase1_detect_high_tower(client, runner,
+                                       phase1_pose_ready=phase1_pose_ready)
     high_color = phase1.get("label", "unknown")
     print(f"\n  ✅ Phase 1 完成  高仓颜色 = {high_color!r}")
     if high_color not in ("blue", "yellow"):
@@ -642,7 +654,8 @@ def _run_pipeline(client: ArmClient, runner: ArmRunner,
 # ============================================================
 
 def run(client: Optional[RuntimeApiClient] = None,
-        prev_ball_counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+        prev_ball_counts: Optional[Dict[str, int]] = None,
+        phase1_pose_ready: bool = False) -> Dict[str, Any]:
     """任务五主入口: 自包含实现 4 阶段流水线 (TASK_RUNNERS 兼容)。
 
     与 the_final/main.py 不同, 本函数**自包含**, 不调用 the_final.main,
@@ -652,7 +665,8 @@ def run(client: Optional[RuntimeApiClient] = None,
         client: 形式参数, 实际被忽略 (本函数内部自建 ArmClient / ArmRunner)。
         prev_ball_counts: task4 采集到的球色统计 {"blue": N, "yellow": M},
                            提供则跳过 Phase 2 全色识别。
-
+        phase1_pose_ready: task4→task5 巡航 handoff 已完成 Phase 1 入场姿态，
+                           True 时 Phase 1 仅识别高仓色标，不重复摆臂。
     Returns:
         Dict: {"ok": bool, "task": "task5_sort", "rc": 0/1, "detail": str}
     """
@@ -663,7 +677,8 @@ def run(client: Optional[RuntimeApiClient] = None,
 
     try:
         result = _run_pipeline(arm_client, runner,
-                               prev_ball_counts=prev_ball_counts)
+                               prev_ball_counts=prev_ball_counts,
+                               phase1_pose_ready=phase1_pose_ready)
         return {
             "ok": True,
             "task": "task5_sort",

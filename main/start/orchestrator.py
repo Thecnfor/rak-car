@@ -357,6 +357,7 @@ class Orchestrator:
         client = state["client"]
 
         completed: List[str] = []
+        task4_task5_handoff = None
         try:
             for wp in waypoints:
                 logger.info("=== navigating to %s ===", wp.name)
@@ -437,6 +438,17 @@ class Orchestrator:
                                   "ir_left": None, "ir_right": None,
                                   "state": "task"}
                     extra_kwargs: Dict[str, Any] = {}
+                    if wp.task_id == 4:
+                        # IR+odom 结束后，task4 的关仓和 task5 Phase 1 姿态
+                        # 在巡航期间后台执行；task4 自己不再抢占这段收尾。
+                        extra_kwargs["defer_task5_handoff"] = True
+                    if wp.task_id == 5 and task4_task5_handoff is not None:
+                        handoff_ok = self._wait_task4_task5_handoff(task4_task5_handoff)
+                        if not handoff_ok:
+                            logger.warning("[task4→task5] handoff failed; task5 will retry Phase 1 pose")
+                        else:
+                            extra_kwargs["phase1_pose_ready"] = True
+                        task4_task5_handoff = None
                     if wp.task_id == 5:
                         extra_kwargs["prev_ball_counts"] = dict(self._ball_counts)
                     task_result = self._run_task(client, wp, **extra_kwargs)
@@ -457,6 +469,10 @@ class Orchestrator:
                         self._ball_counts = counts
                         logger.info("[task4→task5] 采集统计: blue=%d yellow=%d",
                                     counts["blue"], counts["yellow"])
+                        detail_reason = detail.get("reason") if isinstance(detail, dict) else None
+                        if detail_reason == "ir_odom_exit":
+                            task4_task5_handoff = self._start_task4_task5_handoff(client)
+                            logger.info("[task4→task5] handoff 已启动，先恢复巡航")
                 time.sleep(wp.pause_after_s)
                 if wp.task_id == 1:
                     if post_task1 is not None:
@@ -483,15 +499,20 @@ class Orchestrator:
                         logger.warning("odom reset after task6 failed: %s", exc)
                     if post_task6 is not None:
                         self._post_task1_maneuver(api, post_task6)
-                # 2026-08-03: 每个任务结束后强制 reset 机械臂到 home 姿态
-                # (x=0, y=-150, arm=+90, hand=-90), 边重置边巡航 ——
-                # reset 在后台线程跑, 不阻塞 _resume_lane。
-                self._schedule_arm_home_reset()
+                # task4→task5 handoff 已在后台处理关仓 + Phase 1 姿态，
+                # 不能再启动通用 home reset 抢占同一条臂串口。
+                if not (wp.task_id == 4 and task4_task5_handoff is not None):
+                    self._schedule_arm_home_reset()
                 self._resume_lane(runner)
                 completed.append(wp.name)
         except KeyboardInterrupt:
             logger.info("interrupted by user")
         finally:
+            # task4→task5 handoff 若仍在跑（单任务/中断/未到 task5），必须在
+            # 清场前收尾，避免关仓/摆臂在 mission 结束后继续下发。
+            if task4_task5_handoff is not None and task4_task5_handoff.is_alive():
+                logger.info("[task4→task5] 收尾时 handoff 仍在跑, join 等它结束")
+                task4_task5_handoff.join()
             # 终止 runner（#1）：stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
             # join 等其 finally 块跑完（smoother 归零 + api.close()）。
             # 同时关掉 TUI + 下位机屏幕后台线程。
@@ -943,6 +964,108 @@ class Orchestrator:
         return False
 
     # ── 任务后机械臂归位 (2026-08-03) ───────────────────────────
+
+    @staticmethod
+    def _start_task4_task5_handoff(client: RuntimeApiClient):
+        """后台并行完成 task4 关仓 + task5 Phase 1 入场姿态。
+
+        线程立即启动，调用方可先恢复 lane 巡航；task5 waypoint 执行前再 join。
+        """
+        import threading
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from main.arm import ArmClient
+        from main.arm.each_task.task4.constants import (
+            STORAGE_CLOSE_ANGLE_DEG, STORAGE_OPEN_SPEED,
+        )
+        # 交接姿态以 task5 权威常量为准, 避免两处硬编码漂移。
+        from main.task.task5_sort import (
+            PHASE1_ARM_DEG, PHASE1_X_MM, PHASE1_Y_MM, PHASE1_HAND_DEG,
+        )
+
+        state = {"ok": False, "storage_ok": False, "pose_ok": False, "error": None}
+
+        def _run() -> None:
+            try:
+                arm = ArmClient(http=client)
+                logger.info("[task4→task5] handoff 开始: 关仓 + Phase 1 姿态")
+
+                def _close_storage():
+                    return arm.set_storage_angle(
+                        STORAGE_CLOSE_ANGLE_DEG,
+                        speed=STORAGE_OPEN_SPEED,
+                        timeout=10.0,
+                    )
+
+                def _move_phase1():
+                    return arm.composite_run(
+                        arm=PHASE1_ARM_DEG, x_mm=PHASE1_X_MM,
+                        y_mm=PHASE1_Y_MM, hand=PHASE1_HAND_DEG,
+                        speed=80, timeout=30.0,
+                    )
+
+                def _action_ok(result) -> bool:
+                    if not isinstance(result, dict):
+                        return False
+                    if result.get("ok"):
+                        return True
+                    return (
+                        result.get("status") == "succeeded"
+                        and isinstance(result.get("result"), dict)
+                        and bool(result["result"].get("ok", False))
+                    )
+
+                with ThreadPoolExecutor(max_workers=2,
+                                        thread_name_prefix="task4-task5-handoff") as pool:
+                    futures = {
+                        pool.submit(_close_storage): "storage",
+                        pool.submit(_move_phase1): "pose",
+                    }
+                    for future in as_completed(futures):
+                        name = futures[future]
+                        result = future.result()
+                        ok = _action_ok(result)
+                        state[f"{name}_ok"] = ok
+                        if not ok:
+                            raise RuntimeError(f"{name} failed: {result}")
+                logger.info("[task4→task5] handoff 完成: 关仓 + Phase 1 姿态已到位")
+            except Exception as exc:
+                state["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+                logger.warning("[task4→task5] handoff 失败: %s", state["error"])
+            finally:
+                try:
+                    # ⚠️ 不能用 client.call(..., sync=True) —— call() 把 sync 吞进
+                    # kwargs, execute() 走异步立即返回 status=queued。必须显式
+                    # execute(sync=True) 才会 wait_job 到 succeeded。
+                    start_res = client.execute(
+                        "car", "start_arm_feed",
+                        kwargs={"hz": 20.0}, timeout=5.0, sync=True,
+                    )
+                    state["arm_feed_started"] = bool(
+                        isinstance(start_res, dict)
+                        and start_res.get("status") == "succeeded"
+                    )
+                except Exception as exc:
+                    state["arm_feed_started"] = False
+                    logger.warning("[task4→task5] arm_feed 恢复失败: %s", exc)
+            # ok 必须包含 arm_feed 恢复成功 —— 否则 task5 会误信
+            # phase1_pose_ready 跳过自身 Phase 1 摆臂。
+            state["ok"] = bool(
+                state["storage_ok"] and state["pose_ok"]
+                and state.get("arm_feed_started", False)
+            )
+        thread = threading.Thread(target=_run, daemon=True,
+                                  name="task4-task5-handoff")
+        thread.handoff_state = state
+        thread.start()
+        return thread
+
+    @staticmethod
+    def _wait_task4_task5_handoff(thread) -> bool:
+        """task5 入场前等待真实 handoff 线程结束，不使用固定 sleep。"""
+        if thread is None:
+            return True
+        thread.join()
+        return bool(getattr(thread, "handoff_state", {}).get("ok", False))
 
     @staticmethod
     def _schedule_arm_home_reset() -> None:

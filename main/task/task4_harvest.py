@@ -82,6 +82,7 @@ def run(
     put_y_mm: float = Y_PUT_MM,
     bin_x_blue_mm: float = BIN_X_MM[COLOR_BLUE],
     bin_x_yellow_mm: float = BIN_X_MM[COLOR_YELLOW],
+    defer_task5_handoff: bool = False,
 ) -> Dict[str, Any]:
     """任务四主入口: 薄封装 step_target4, 参数全透传.
 
@@ -98,6 +99,8 @@ def run(
         do_prep: True 时开头跑 target1 准备位姿 (当前 target4 已删, 保留兼容).
         dry_run: True 不动硬件 (仍轮询视觉排练流程).
         debug_recognition: fetch_balls 打印每条检测的过滤原因.
+        defer_task5_handoff: 仅 orchestrator 调度时置 True —— IR+odom 正常结束后
+            关仓 + task5 Phase 1 姿态交给巡航后台线程; 独立运行保持 False 由本任务收尾.
 
     Returns:
         Dict: {
@@ -140,6 +143,7 @@ def run(
         put_y_mm=put_y_mm,
         bin_x_blue_mm=bin_x_blue_mm,
         bin_x_yellow_mm=bin_x_yellow_mm,
+        defer_task5_handoff=defer_task5_handoff,
     )
 
     ok = bool(detail.get("ok")) if isinstance(detail, dict) else bool(detail)

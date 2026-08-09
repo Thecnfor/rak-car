@@ -86,6 +86,16 @@ from main.chassis.loops.visual_track import TrackChassisResult  # noqa: E402
 
 LOG_PREFIX: str = LOG_PREFIX_TASK4 + "/target4"
 
+# 时间戳辅助: 距 task4 启动的秒数, 打在每个动作前定位每步延迟。
+_TASK4_T0: Optional[float] = None
+
+
+def _ts_str() -> str:
+    global _TASK4_T0
+    if _TASK4_T0 is None:
+        _TASK4_T0 = time.monotonic()
+    return f"t=+{time.monotonic() - _TASK4_T0:.1f}s"
+
 
 # ---- 默认参数 ----
 
@@ -103,6 +113,9 @@ DEFAULT_CREEP_SPEED_MPS: float = 0.06
 
 CREEP_POLL_HZ: float = 20.0
 """creep 期间 fetch_balls 轮询频率。"""
+
+CREEP_MAX_SECONDS_S: float = 30.0
+"""单次 creep 墙钟兜底上限 (s): 距离/IR/见球任一不满足也强制退出, 防 odom 卡死干等。"""
 
 DEFAULT_TRACK_MAX_SECONDS: float = 6.0
 """单球底盘视觉伺服收敛预算 (s)。"""
@@ -176,6 +189,11 @@ Y_FINAL_MM: float = -140.0
 BALL_LABELS = ["ball_blue", "ball_yellow"]
 """track_chassis 目标集 (PaddleDet 模型标签)。"""
 
+# IR 结束阈值: 左 IR **靠近** (< 此值) 视为抵达采区末端标记 → 再走 0.3m 收工。
+# 与 orchestrator 触发 task4 的极性一致 (ir_left < 0.7 = 到达起点, 现场实测 0.51);
+# 采区中途 IR 读 1.5m+ (空旷), 用 < 才不会全程误触发。现场可在此调灵敏度。
+IR_END_CLOSE_M: float = 0.6
+
 
 # ---- 后台保前移线程 (P 姿态 + creep 并发) ----
 
@@ -183,20 +201,29 @@ class _CreepThread:
     """后台线程保底盘前移 + 主线程摆臂。"""
 
     def __init__(self, http_client, *, speed_mps: float, max_distance_m: float,
-                 poll_hz: float = CREEP_POLL_HZ):
+                 poll_hz: float = CREEP_POLL_HZ, ir_exit_enabled: bool = True,
+                 max_seconds_s: float = 30.0):
         import threading
         self.http = http_client
         self.speed_mps = speed_mps
         self.max_distance_m = max_distance_m
         self.poll_hz = poll_hz
+        # IR+0.3m 结束条件只在任务进行中(至少第 2 球)启用 —— 第 1 球一开始
+        # 就触发会吞掉整段搜索 (现场实测 1.67m 起步即触发 → 0 球退出)。
+        self.ir_exit_enabled = bool(ir_exit_enabled)
+        # 墙钟兜底上限: 距离/IR/见球任一不满足时 (odom 卡死等) 也必须退出,
+        # 否则主线程 wait_for_ball 干等 (现场 球9 卡到 Ctrl+C)。
+        self.max_seconds_s = float(max_seconds_s)
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="task4-creep")
         self._stop_event = threading.Event()
-        self.ball_event = threading.Event()
+        self.completion_event = threading.Event()
         self.distance_m = 0.0
         self.elapsed_s = 0.0
         self.balls = None
         self.found_ball = False
+        # IR 触发后走满 0.3m 的终止锁存；必须唤醒 wait_for_ball。
+        self.finished_by_ir_odom = False
         self._t0 = 0.0
         self._odo_start_x = None
         self._odo_ir_trigger_x = None
@@ -242,38 +269,57 @@ class _CreepThread:
                     # 里程计不可用时回退到开环
                     self.distance_m += self.speed_mps * period
                 self.elapsed_s = time.monotonic() - t0
-                if self.distance_m >= self.max_distance_m:
+
+                # 墙钟兜底: odom 卡死/距离到不了预算时也必须退出, 不能无限蠕行。
+                if self.elapsed_s >= self.max_seconds_s:
+                    print(f"  [{LOG_PREFIX}] creep 超时 {self.max_seconds_s:.0f}s "
+                          f"(odom 可能卡死), 结束搜索")
                     break
 
-                # 左侧红外 > 0.4 触发：记录触发点里程计，后续走 0.3m 结束
-                if not self.ir_triggered and self.speed_mps > 0:
+                # 左 IR 靠近 (< IR_END_CLOSE_M) = 抵达采区末端标记, 锁存触发点
+                # 里程计, 后续只走 0.3m。ir_exit_enabled=False (第 1 球) 时不参与。
+                if not self.ir_triggered and self.speed_mps > 0 and self.ir_exit_enabled:
                     try:
                         ir_payload = self.http.get_ir_state() or {}
                         ir_data = ir_payload.get("ir_state") or {}
                         left_ir = ir_data.get("left")
-                        if left_ir is not None and float(left_ir) > 0.6:
+                        if left_ir is not None and float(left_ir) < IR_END_CLOSE_M:
                             self.ir_triggered = True
                             odo_payload = self.http.get_odom_state() or {}
                             odo_data = odo_payload.get("odom_state") or {}
                             self._odo_ir_trigger_x = odo_data.get("x")
-                            print(f"  [{LOG_PREFIX}] 左侧红外触发 > 0.4 "
+                            print(f"  [{LOG_PREFIX}] 左 IR 靠近 < {IR_END_CLOSE_M} "
                                   f"({float(left_ir):.2f}m), 里程计走 0.3m")
                     except Exception:
                         pass
 
-                if self.ir_triggered and self._odo_ir_trigger_x is not None:
-                    try:
-                        odo = self.http.get_odom_state() or {}
-                        odo_data = odo.get("odom_state") or {}
-                        current_x = odo_data.get("x", 0)
-                        if current_x is not None:
-                            extra = max(0.0, current_x - self._odo_ir_trigger_x)
-                            if extra >= 0.3:
-                                print(f"  [{LOG_PREFIX}] 里程计走完 0.3m "
-                                      f"({extra:.3f}m), 结束搜索")
-                                break
-                    except Exception:
-                        pass
+                # IR 触发后只走剩余 0.3m；不能再被视觉“见球”提前截断。
+                if self.ir_triggered:
+                    if self._odo_ir_trigger_x is not None:
+                        try:
+                            odo = self.http.get_odom_state() or {}
+                            odo_data = odo.get("odom_state") or {}
+                            current_x = odo_data.get("x")
+                            if current_x is not None:
+                                extra = max(0.0, current_x - self._odo_ir_trigger_x)
+                                if extra >= 0.3:
+                                    self.finished_by_ir_odom = True
+                                    print(f"  [{LOG_PREFIX}] IR 触发后里程计走满 "
+                                          f"0.3m ({extra:.3f}m), 结束搜索")
+                                    self._stop_event.set()
+                                    self.http.post(
+                                        "/v1/realtime/chassis-velocity",
+                                        {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                                        timeout=1.0,
+                                    )
+                                    self.completion_event.set()
+                                    break
+                        except Exception:
+                            pass
+                    continue
+
+                if self.distance_m >= self.max_distance_m:
+                    break
 
                 try:
                     balls = target2.fetch_balls(
@@ -283,7 +329,7 @@ class _CreepThread:
                            for b in balls):
                         self.balls = balls
                         self.found_ball = True
-                        self.ball_event.set()
+                        self.completion_event.set()
                         # 2026-08-06: 见球瞬间主动发 0 速, 不靠 track_chassis
                         # 第一帧 _set_vel 覆盖 —— 否则 50-150ms 窗口内底盘按
                         # creep 速度窜一下, 视觉上就是"track 开始瞬间底盘抖".
@@ -300,7 +346,7 @@ class _CreepThread:
                     pass
         finally:
             if not self.found_ball:
-                # 兜底: 没见球走完预算 / break 后主动停一次 0 速,
+                # 兜底: 没见球走完预算 / 超时 / break 后主动停一次 0 速,
                 # 见球路径已见球时上面自己发过, 这里不再发避免重复但保留
                 # 兜底安全 (极小概率 race: break 后另一线程 set 0 失败).
                 try:
@@ -311,12 +357,16 @@ class _CreepThread:
                     )
                 except Exception:
                     pass
+                # 关键: 非见球退出也必须唤醒 wait_for_ball, 否则主线程干等
+                # (现场 球9 卡到 Ctrl+C 的根因)。
+                self.completion_event.set()
 
     def wait_for_ball(self, timeout_s: float) -> dict:
         """阻塞等见球, 见球或超时返回。"""
-        got = self.ball_event.wait(timeout=timeout_s)
+        got = self.completion_event.wait(timeout=timeout_s)
         return {
-            "balls": self.balls if got else None,
+            "balls": self.balls if got and self.found_ball else None,
+            "finished_by_ir_odom": bool(self.finished_by_ir_odom),
             "distance_m": self.distance_m,
             "elapsed_s": self.elapsed_s,
         }
@@ -707,7 +757,7 @@ def _pick_and_store(
     bin_x = BIN_X_MM[color]
 
     # 0. 盲降前横移到 pick_x (待现场测; 短距, belt-slip 风险低)
-    print(f"  [{LOG_PREFIX}] [0/6] composite_run(x={pick_x_mm:+.0f})  盲降前横移到 {pick_x_mm}")
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [0/6] composite_run(x={pick_x_mm:+.0f})  盲降前横移到 {pick_x_mm}")
     try:
         arm_client.composite_run(x_mm=pick_x_mm, speed=80, timeout=30.0)
     except Exception as e:
@@ -717,7 +767,7 @@ def _pick_and_store(
                 "release_thread": None}
 
     # 1. 盲降到抓球位
-    print(f"  [{LOG_PREFIX}] [1/6] composite_run(y={pick_y_mm:+.0f})  盲降到抓球位")
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [1/6] composite_run(y={pick_y_mm:+.0f})  盲降到抓球位")
     try:
         arm_client.composite_run(y_mm=pick_y_mm, speed=80, timeout=10.0)
     except Exception as e:
@@ -727,7 +777,7 @@ def _pick_and_store(
                 "release_thread": None}
 
     # 2. grasp + 直接下一动作 (无 sleep, SDK 真空建立自闭环)
-    print(f"  [{LOG_PREFIX}] [2/6] grasp(True)  真空开 (无 sleep)")
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [2/6] grasp(True)  真空开 (无 sleep)")
     try:
         runner.grasp(True, timeout=5.0)
     except Exception as e:
@@ -736,7 +786,7 @@ def _pick_and_store(
                 "release_thread": None}
 
     # 3. 抬到中转位 (y=transit_y) ∥ 横移到中转位 x=transit_x (composite_run 并行)
-    print(f"  [{LOG_PREFIX}] [3/6] composite_run(y={transit_y_mm:+.0f}, x={transit_x_mm:+.0f})  "
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [3/6] composite_run(y={transit_y_mm:+.0f}, x={transit_x_mm:+.0f})  "
           f"抬升+横移到中转位")
     try:
         arm_client.composite_run(y_mm=transit_y_mm, x_mm=transit_x_mm,
@@ -748,7 +798,7 @@ def _pick_and_store(
                 "release_thread": None}
 
     # 4. 横移到 bin 上方 (中转 x=transit_x → bin_x)
-    print(f"  [{LOG_PREFIX}] [4/6] composite_run(x={bin_x:+.0f})  横移到 {color} bin 上方")
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [4/6] composite_run(x={bin_x:+.0f})  横移到 {color} bin 上方")
     try:
         arm_client.composite_run(x_mm=bin_x, speed=80, timeout=30.0)
     except Exception as e:
@@ -758,7 +808,7 @@ def _pick_and_store(
                 "release_thread": None}
 
     # 5. 降到放仓位 (中转 y=transit_y → bin y=bin_y_mm, 同时调整 hand=bin_hand_deg)
-    print(f"  [{LOG_PREFIX}] [5/6] composite_run(y={bin_y_mm:+.0f}, hand={bin_hand_deg:+.0f})  降到放仓位")
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [5/6] composite_run(y={bin_y_mm:+.0f}, hand={bin_hand_deg:+.0f})  降到放仓位")
     try:
         arm_client.composite_run(y_mm=bin_y_mm, hand=bin_hand_deg,
                                  speed=80, timeout=10.0)
@@ -769,7 +819,7 @@ def _pick_and_store(
                 "release_thread": None}
 
     # 6. 放气 (无 sleep, 直接让下一球 goto_pose_p 回 P 姿态)
-    print(f"  [{LOG_PREFIX}] [6/6] grasp(False)  放气 (无 sleep)")
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [6/6] grasp(False)  放气 (无 sleep)")
     try:
         runner.grasp(False, timeout=5.0)
     except Exception as e:
@@ -814,6 +864,7 @@ def step_target4(
     bin_y_yellow_mm: float = Y_PUT_MM,
     bin_hand_blue_deg: float = BIN_HAND_DEG.get(COLOR_BLUE, TASK4_POSE_P_HAND_DEG),
     bin_hand_yellow_deg: float = TASK4_POSE_P_HAND_DEG,
+    defer_task5_handoff: bool = False,
 ) -> dict:
     """慢速前移搜索 + 底盘视觉定位 (最左球) + 吸嘴中心抓取 + 放 bin。
 
@@ -831,16 +882,19 @@ def step_target4(
         pick_timeout_s: pick_by_vision 超时 (s), 默认 60。
         do_prep: True 开头跑 target1.step_target1 摆准备位姿。
         dry_run: True 不动硬件 (仍轮询视觉排练流程)。
-        debug_recognition: fetch_balls 打印每条检测的过滤原因。
+        debug_recognition: 是否打印每条 detection 的过滤原因。
+        defer_task5_handoff: task4 由 orchestrator 调度时，IR+odom 结束后将
+            关仓 + task5 Phase 1 姿态交给巡航线程并行执行；独立运行保持 False。
 
     Returns:
         dict:
-          - ok: bool (completed / zone_cleared / time_budget / keyboard_interrupt 为 True)
+          - ok: bool (completed / zone_cleared / time_budget / ir_odom_exit /
+                keyboard_interrupt 为 True)
           - picks / skips / pick_failures: 计数
           - total_creep_m: 累计前移距离
           - history: list[dict] 每球记录
           - reason: "completed" / "zone_cleared" / "time_budget" /
-                    "pick_error_exceeded" / "keyboard_interrupt"
+                    "ir_odom_exit" / "pick_error_exceeded" / "keyboard_interrupt"
           - elapsed_s: 总耗时
     """
     print(f"\n========== {LOG_PREFIX} step_target4 (底盘视觉伺服版) ==========")
@@ -869,6 +923,8 @@ def step_target4(
     total_creep_m = 0.0
     final_reason = "unknown"
     t_start = time.monotonic()
+    global _TASK4_T0
+    _TASK4_T0 = t_start
 
     try:
         # ---- 0. 停 arm_feed 守护线程 (2026-08-06 修):
@@ -973,27 +1029,33 @@ def step_target4(
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
             # 2.0 P 姿态 + creep 并发 (2026-08-08: 改回并发, 避免 composite_run 期间车子完全静止)
-            #    - release_thread.join (上一球放仓后台线程收尾)
-            #    - 启动 creep_thread (后台推 vx, 和 composite_run 并发)
-            #    - composite_run 回 P 姿态 (主线程同步)
-            #    注意: 并发时有 3 个风险:
+            #    2026-08-09 用户拍板: **只在任务刚触发 (第 1 球) 并发**, 之后每球
+            #    顺序执行 (先 P 姿态, 再 creep)。并发时 3 个风险:
             #      a) creep_thread 与 composite_run 同时跑 → 4 路臂命令 + 底盘 vx
             #         抢 SerialEngine, composite_run 内部 y 下降偶尔卡 200-500ms;
             #      b) 见球瞬间 creep 没主动发 0 速, 靠 track_chassis 第一帧覆盖,
             #         50-150ms 窗口内底盘按 creep 速度窜一下 → "track 开始瞬间抖";
             #      c) arm_feed 守护线程 20Hz 轮询 y/x/arm_angle 跟 composite_run
             #         4 路并发抢 share_key, 进一步加长 composite_run 时间.
-            #    如果出现以上问题, 可以改回顺序执行 (把 creep_thread 移到 composite_run 之后).
+            #    现场每球 creep 0.000m → 错过球, 这 3 个风险在并发下被放大。
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=15.0)
 
-            # 启动creep（和composite_run并发）
-            creep_thread = _CreepThread(
-                http_client, speed_mps=creep_speed_mps,
-                max_distance_m=remaining_m,
-                poll_hz=CREEP_POLL_HZ,
-            )
-            creep_thread.start()
+            # 首球 (任务刚触发): creep 和 P 姿态 composite_run 并发省时间;
+            # 后续球: 顺序 —— 先 P 姿态到位, 再启动 creep, 避免抢串口错过球。
+            # IR+0.3m 结束条件从第 2 球起才启用 (第 1 球 IR 起步即触发会吞掉搜索)。
+            concurrent_creep = (ball_idx == 1)
+            ir_exit_enabled = (ball_idx >= 2)
+            creep_thread = None
+            if concurrent_creep:
+                creep_thread = _CreepThread(
+                    http_client, speed_mps=creep_speed_mps,
+                    max_distance_m=remaining_m,
+                    poll_hz=CREEP_POLL_HZ,
+                    ir_exit_enabled=ir_exit_enabled,
+                    max_seconds_s=CREEP_MAX_SECONDS_S,
+                )
+                creep_thread.start()
 
             pose_ok = True
             if not dry_run:
@@ -1006,7 +1068,7 @@ def step_target4(
                     #     單獨用 200 速度快移, 其餘軸保持 100 不影響安全。
                     if last_color != COLOR_YELLOW:
                         # 藍色球 / 第一球: 需要恢復 hand, 先快速移 x 再恢復 arm+hand
-                        print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
+                        print(f"\n[{_ts_str()}] ========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
                               f"(x 快速橫移 → arm/hand) ==========")
                         arm_client.composite_run(
                             x_mm=pose_p_x_mm,
@@ -1021,7 +1083,7 @@ def step_target4(
                         )
                     else:
                         # 黃色球: hand 已在 10°, 只需恢復 arm + x (x 仍快速)
-                        print(f"\n========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
+                        print(f"\n[{_ts_str()}] ========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態 "
                               f"(x 快速橫移 → arm) ==========")
                         arm_client.composite_run(
                             x_mm=pose_p_x_mm,
@@ -1044,17 +1106,42 @@ def step_target4(
             if not pose_ok:
                 final_reason = "pick_error_exceeded"
                 print(f"  [{LOG_PREFIX}] ❌ P 姿態恢復失敗, 終止循环")
-                creep_thread.stop_and_join()
+                if creep_thread is not None:
+                    creep_thread.stop_and_join()
                 break
 
+            if creep_thread is None:
+                # 非首球: P 姿态到位后才启动 creep (顺序执行, 不抢串口)
+                creep_thread = _CreepThread(
+                    http_client, speed_mps=creep_speed_mps,
+                    max_distance_m=remaining_m,
+                    poll_hz=CREEP_POLL_HZ,
+                    ir_exit_enabled=ir_exit_enabled,
+                    max_seconds_s=CREEP_MAX_SECONDS_S,
+                )
+                creep_thread.start()
+
             # 2.0.b 等待 creep 后台见球 / 见球即停 + 累计前移记账
+            #    wait 上限必须有限: creep 线程自带墙钟兜底 (odom 卡死也会退出),
+            #    这里给个 buffer, 绝不 inherit max_seconds=9999 干等。
             creep_res = creep_thread.wait_for_ball(
-                timeout_s=max(1.0, max_seconds - elapsed))
+                timeout_s=min(max(1.0, max_seconds - elapsed),
+                              CREEP_MAX_SECONDS_S + 10.0))
             creep_thread.stop_and_join()
             total_creep_m += creep_res["distance_m"]
+            if creep_res.get("finished_by_ir_odom"):
+                creep_status = "IR+里程计完成"
+            elif creep_res["balls"] is not None:
+                creep_status = "见球"
+            else:
+                creep_status = "未见球"
             print(f"  [{LOG_PREFIX}] creep 结束: 前移 {creep_res['distance_m']:.3f}m "
-                  f"/ {creep_res['elapsed_s']:.1f}s → "
-                  f"{'见球' if creep_res['balls'] is not None else '未见球'}")
+                  f"/ {creep_res['elapsed_s']:.1f}s → {creep_status}")
+            if creep_res.get("finished_by_ir_odom"):
+                final_reason = "ir_odom_exit"
+                print(f"  [{LOG_PREFIX}] IR 触发后里程计走满 0.3m，"
+                      f"立即结束 task4 搜索")
+                break
             if creep_res["balls"] is None:
                 final_reason = "zone_cleared"
                 print(f"  [{LOG_PREFIX}] 🏁 前移预算内未见球, 视作采区走完")
@@ -1146,45 +1233,53 @@ def step_target4(
             #   cx_err 不收敛 → 满预算 timeout (不是 no_target); 若命令路径彻底
             #   断了, align 现在会 control_lost 快速退出 + stop_ok=False; 甚至
             #   arrived 但 motion_ok=False (发了命令编码器没动 = 200 但轮不转)。
-            #   旧代码只在 no_target 触发 rearm → 这些场景全漏 → 每球白烧
-            #   max_seconds 才计失败。统一: 对齐结果不可信 (未 arrived 或 arrived
-            #   但没物理位移) 且 (no_target / watchdog / control_lost / stop_ok=False
-            #   / motion_ok=False) → 重武装 + 重试 1 次。
+            # 2026-08-09 用户: "为什么老是底盘重武装".
+            #   根因 1: needs_rearm 把 no_target / watchdog 也算进去 —— 这俩是
+            #   视觉丢球 (task_feed 没球帧), 底盘响应正常; 重武装救不了视觉,
+            #   却让每球白烧 0.5s settle + 3s retry (现场连续失败 1/2 的元凶)。
+            #   根因 2: _chassis_rearm_if_stuck 在 track 已 finally 零速后采样
+            #   编码器 —— 车已停, 0.5s 内编码器必 < 1.0 → 永远判"底盘无响应"。
+            #   重武装只应在"命令路径确实失败"时触发: runtime 已在整个 track
+            #   窗口用真实编码器算好 motion_ok / stop_ok / control_lost, 直接信它。
             track_trusted = bool(track_res.arrived) and getattr(
                 track_res, "motion_ok", True)
             needs_rearm = (
                 not dry_run
                 and not track_trusted
                 and (
-                    track_res.reason in ("no_target", "watchdog", "control_lost")
+                    track_res.reason == "control_lost"
                     or not getattr(track_res, "stop_ok", True)
                     or not getattr(track_res, "motion_ok", True)
                 )
             )
             if needs_rearm:
-                rear = _chassis_rearm_if_stuck(http_client, settle_s=0.5)
-                if rear:
-                    print(f"  [{LOG_PREFIX}] [REARM] 检测到底盘无响应, 已重武装 "
-                          f"(reset-stop + 0 速下发), 重试一次 track")
-                    # 重试 1 次: 拿 3s 给一次集中机会, 若再失败就硬失败
-                    retry = track_chassis(
-                        target=BALL_LABELS,
-                        select_mode="leftmost",
-                        setpoint_cxcy=(0.0, 0.0),
-                        kp=0.10,
-                        v_max=0.08,
-                        hold_frames=3,
-                        v_slew=0.02,
-                        max_seconds=min(3.0, track_max_seconds),
-                        dry_run=dry_run,
-                    )
-                    if retry.arrived:
-                        track_res = retry
-                        print(f"  [{LOG_PREFIX}] [REARM] 重试 track 成功: "
-                              f"arrived=True reason={retry.reason}")
-                else:
-                    print(f"  [{LOG_PREFIX}] [REARM] 底盘有响应 (encoder 在动), "
-                          f"{track_res.reason} 是视觉真丢/车在滑, 不重武装")
+                # runtime 已判定命令路径假死 (control_lost / stop_ok=False /
+                # motion_ok=False) → 重武装: reset-stop + 0 速 + 直发轮速 IK,
+                # 重建 SerialEngine 命令缓存, 给下一拍 set_chassis_velocity
+                # 一次干净环境。motion_ok/stop_ok 已是整个 track 窗口的判定,
+                # 无需再采样 (stopped-sample 必 < 1.0)。
+                print(f"  [{LOG_PREFIX}] [REARM] 底盘命令路径异常 "
+                      f"(reason={track_res.reason} stop_ok="
+                      f"{getattr(track_res, 'stop_ok', True)} motion_ok="
+                      f"{getattr(track_res, 'motion_ok', True)}), "
+                      f"重武装后重试一次 track")
+                _chassis_rearm_if_stuck(http_client, settle_s=0.5)
+                # 重试 1 次: 拿 3s 给一次集中机会, 若再失败就硬失败
+                retry = track_chassis(
+                    target=BALL_LABELS,
+                    select_mode="leftmost",
+                    setpoint_cxcy=(0.0, 0.0),
+                    kp=0.10,
+                    v_max=0.08,
+                    hold_frames=3,
+                    v_slew=0.02,
+                    max_seconds=min(3.0, track_max_seconds),
+                    dry_run=dry_run,
+                )
+                if retry.arrived:
+                    track_res = retry
+                    print(f"  [{LOG_PREFIX}] [REARM] 重试 track 成功: "
+                          f"arrived=True reason={retry.reason}")
 
             # 2026-08-06: track 失败要计入 n_consecutive_failures, 否则
             # 永不触发 max_consecutive_pick_failures 退出 —— 这是 task4
@@ -1295,58 +1390,70 @@ def step_target4(
             # 最后一球的放仓线程收尾, 再关仓 (防臂还在动就关舵机)
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=2.0)
+            # task4→task5 正常交接时关仓/P 姿态/arm_feed 都由 orchestrator 的
+            # 巡航后台线程负责; 异常/独立运行仍由本 finally 收尾。
+            handoff_deferred = defer_task5_handoff and final_reason == "ir_odom_exit"
             # ---- 关闭存储仓 (task4 结束关仓) ----
-            try:
-                print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")
-                arm_client.set_storage_angle(
-                    STORAGE_CLOSE_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
-            except Exception as e:
-                print(f"  [{LOG_PREFIX}] ⚠️ 关仓失败 ({type(e).__name__}: {str(e)[:80]})")
-            # ---- 结束回到 bin/P 姿态 (后台线程, 不阻塞导航) ----
-            try:
-                import threading as _th
-                def _return_to_pose_p():
-                    try:
-                        print(f"  [{LOG_PREFIX}] 后台回到 P 姿态 "
-                              f"(x={pose_p_x_mm} y={pose_p_y_mm} "
-                              f"arm={pose_p_arm_deg} hand={pose_p_hand_deg})")
-                        arm_client.composite_run(
-                            arm=pose_p_arm_deg,
-                            x_mm=pose_p_x_mm,
-                            y_mm=pose_p_y_mm,
-                            hand=pose_p_hand_deg,
-                            speed=80,
-                            timeout=30.0,
-                        )
-                    except Exception as e:
-                        print(f"  [{LOG_PREFIX}] ⚠️ 回 P 姿态失败 "
-                              f"({type(e).__name__}: {str(e)[:80]})")
-                _th.Thread(target=_return_to_pose_p, daemon=True).start()
-            except Exception:
-                pass
+            if not handoff_deferred:
+                try:
+                    print(f"  [{LOG_PREFIX}] 关闭存储仓 (angle={STORAGE_CLOSE_ANGLE_DEG}°)")
+                    arm_client.set_storage_angle(
+                        STORAGE_CLOSE_ANGLE_DEG, speed=STORAGE_OPEN_SPEED, timeout=10.0)
+                except Exception as e:
+                    print(f"  [{LOG_PREFIX}] ⚠️ 关仓失败 ({type(e).__name__}: {str(e)[:80]})")
+            else:
+                print(f"  [{LOG_PREFIX}] task4→task5 交接: 关仓交给巡航后台线程")
+            # ---- 结束回到 bin/P 姿态 ----
+            # 正常 task4→task5 交接由 orchestrator 后台送到 task5 Phase 1，
+            # 不再启动旧的 daemon P 归位，避免和交接动作抢串口。
+            if not handoff_deferred:
+                try:
+                    import threading as _th
+                    def _return_to_pose_p():
+                        try:
+                            print(f"  [{LOG_PREFIX}] 后台回到 P 姿态 "
+                                  f"(x={pose_p_x_mm} y={pose_p_y_mm} "
+                                  f"arm={pose_p_arm_deg} hand={pose_p_hand_deg})")
+                            arm_client.composite_run(
+                                arm=pose_p_arm_deg,
+                                x_mm=pose_p_x_mm,
+                                y_mm=pose_p_y_mm,
+                                hand=pose_p_hand_deg,
+                                speed=80,
+                                timeout=30.0,
+                            )
+                        except Exception as e:
+                            print(f"  [{LOG_PREFIX}] ⚠️ 回 P 姿态失败 "
+                                  f"({type(e).__name__}: {str(e)[:80]})")
+                    _th.Thread(target=_return_to_pose_p, daemon=True).start()
+                except Exception:
+                    pass
             # ---- 恢复 arm_feed (2026-08-06 修) ----
             #    start_arm_feed 幂等, 任务前 stop 后 start 不丢状态.
             #    没在任务前 stop 的场景 (force=False 静默 noop, 或本来就没启)
             #    start 也无害 (同 hz 的 already_running fast-path).
             #    sync 路径返回结构: {"ok": bool, "job": {"status":..., "result":...}}
             #    (见 runtime/api/routers/_helpers.py:242), 不是 {"result": ...} 直接外层.
-            try:
-                start_res = http_client.call(
-                    "car", "start_arm_feed", hz=20.0, timeout=5.0, sync=True,
-                )
-                start_job = (
-                    (start_res or {}).get("job", {})
-                    if isinstance(start_res, dict) else {}
-                )
-                start_result = start_job.get("result") or {}
-                if not isinstance(start_result, dict):
-                    start_result = {}
-                started = start_result.get("started", None)
-                print(f"  [{LOG_PREFIX}] ▶️ start_arm_feed(hz=20) started={started} "
-                      f"ok={(start_res or {}).get('ok') if isinstance(start_res, dict) else None}")
-            except Exception as e:
-                print(f"  [{LOG_PREFIX}] ⚠️ start_arm_feed 失败 "
-                      f"({type(e).__name__}: {str(e)[:80]})")
+            if not handoff_deferred:
+                try:
+                    start_res = http_client.call(
+                        "car", "start_arm_feed", hz=20.0, timeout=5.0, sync=True,
+                    )
+                    start_job = (
+                        (start_res or {}).get("job", {})
+                        if isinstance(start_res, dict) else {}
+                    )
+                    start_result = start_job.get("result") or {}
+                    if not isinstance(start_result, dict):
+                        start_result = {}
+                    started = start_result.get("started", None)
+                    print(f"  [{LOG_PREFIX}] ▶️ start_arm_feed(hz=20) started={started} "
+                          f"ok={(start_res or {}).get('ok') if isinstance(start_res, dict) else None}")
+                except Exception as e:
+                    print(f"  [{LOG_PREFIX}] ⚠️ start_arm_feed 失败 "
+                          f"({type(e).__name__}: {str(e)[:80]})")
+            else:
+                print(f"  [{LOG_PREFIX}] task4→task5 交接: arm_feed 由 handoff 完成后恢复")
 
     elapsed = time.monotonic() - t_start
     print(f"\n========== {LOG_PREFIX} 完成 ==========")
@@ -1357,6 +1464,7 @@ def step_target4(
     return {
         "ok": final_reason in (
             "completed", "zone_cleared", "time_budget", "keyboard_interrupt",
+            "ir_odom_exit",
         ),
         "picks": n_picks,
         "skips": n_skips,
