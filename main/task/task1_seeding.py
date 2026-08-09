@@ -74,10 +74,10 @@ TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
 }
 
 # ── 视觉伺服参数 (track_velocity_pick) ─────────────────────────────────────
-PICK_SERVO_GAIN_ARM = 0.7     # 2026-08-10: 1.0 → 0.7 (用户: 大臂增量调缓, 每帧 +1.0×dx → +0.7×dx)
+PICK_SERVO_GAIN_ARM = 0.5     # 2026-08-10: 0.7 → 0.5 (用户: 大臂增量再调缓, 每帧 +0.7×dx → +0.5×dx)
 PICK_SERVO_GAIN_X = 0.30
-PICK_SERVO_DEADZONE = 0.06
-PICK_SERVO_MAX_VEL = 0.5
+PICK_SERVO_DEADZONE = 0.05    # 2026-08-10: 0.06 → 0.05 (第一次死区收紧)
+PICK_SERVO_MAX_VEL = 0.3      # 2026-08-10: 0.5 → 0.3 (x十字速度上限收紧)
 PICK_SERVO_SETTLE_HITS = 3
 PICK_SERVO_HOLD_S = 0.05
 PICK_SERVO_LIFT_BACK = True
@@ -87,7 +87,7 @@ PICK_SERVO_HZ = 20.0
 PICK_SERVO_TIMEOUT_S_DEFAULT = 4.0
 # ── 对齐失败重试 (2026-08-09 用户): 失败但看得到目标 → 加时 3s + 死区调大 ──
 PICK_SERVO_RETRY_TIMEOUT_EXTRA_S = 3.0   # 重试超时在原超时上加 3s
-PICK_SERVO_RETRY_DEADZONE = 0.10         # 重试死区调大 (默认 0.06 → 0.10), 更容易锁上
+PICK_SERVO_RETRY_DEADZONE = 0.10         # 重试死区调大 (第一次 0.05 → 0.10), 更容易锁上
 
 # ── 抓取起始 hand 角度 ─────────────────────────────────────────────────────
 PICK_START_HAND_DEG = -15.0   # 2026-08-06: S 姿态 hand 固定 -15°
@@ -107,10 +107,10 @@ PLACE_X_MM_FALLBACK = -235.0 # 唯一依据，禁止从 cfg / overrides 覆盖
 # 用户改为 place_x=-235 起步, 见 task_config.yml place_align 段).
 PLACE_ALIGN_X_MM = -235.0
 PLACE_ALIGN_LABEL = "cylinder_set"
-PLACE_ALIGN_SETPOINT_CXCY = (0.042, -0.359)  # 2026-08-10 用户标定 (对准时画面坐标)
+PLACE_ALIGN_SETPOINT_CXCY = (0.072, -0.331)  # 2026-08-10 用户标定 (0.042,-0.359) → (0.072,-0.331)
 PLACE_ALIGN_TIMEOUT_S = 5.0
 PLACE_ALIGN_SERVO_ARM_MIN = 30.0  # 起始 +90, 允许向下微调到 +30
-PLACE_ALIGN_SERVO_ARM_MAX = 90.0
+PLACE_ALIGN_SERVO_ARM_MAX = 150.0  # 2026-08-10: 90 → 150 (clamp 放宽, 与 yaml arm_max 对齐)
 PLACE_ALIGN_SERVO_SIGN_ARM = 1.0  # ⚠️ 沿用抓苗标定; 若"越对越偏"取反 (task2 同规则)
 PLACE_ALIGN_SERVO_SIGN_X = -1.0   # ⚠️ 同上
 

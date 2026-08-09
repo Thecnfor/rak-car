@@ -360,7 +360,7 @@ class TestRun(unittest.TestCase):
         cfg = CFG.copy()
         cfg["place_align"] = {
             "enabled": True, "label": "cylinder_set",
-            "setpoint_cxcy": [0.042, -0.359],
+            "setpoint_cxcy": [0.072, -0.331],
             "init_x_mm": -235, "init_arm_deg": 90, "init_hand_deg": 0,
             "timeout": 0.01,
         }
@@ -398,8 +398,8 @@ class TestRun(unittest.TestCase):
         # 第 1 次参数: setpoint + 起始姿态来自 yaml place_align 段
         # (execute 调用是 kwargs=kw, 所以 kw 在 recorded.kwargs["kwargs"] 里)
         kw0 = servo_calls[0].kwargs["kwargs"]
-        self.assertEqual(kw0["setpoint_x_norm"], 0.042)
-        self.assertEqual(kw0["setpoint_y_norm"], -0.359)
+        self.assertEqual(kw0["setpoint_x_norm"], 0.072)
+        self.assertEqual(kw0["setpoint_y_norm"], -0.331)
         self.assertEqual(kw0["arm_start"], 90)
         self.assertEqual(kw0["label"], "cylinder_set")
         # 放苗用记住的姿态 (arm=88, x=-232mm), 不是写死 -235/+90
@@ -419,7 +419,7 @@ class TestRun(unittest.TestCase):
         cfg = CFG.copy()
         cfg["place_align"] = {
             "enabled": True, "label": "cylinder_set",
-            "setpoint_cxcy": [0.042, -0.359],
+            "setpoint_cxcy": [0.072, -0.331],
             "init_x_mm": -235, "init_arm_deg": 90, "init_hand_deg": 0,
             "timeout": 0.01,
         }
