@@ -520,12 +520,24 @@ class Orchestrator:
                         from main.task.task3.arm_poses import RECOGNITION_ARM
                         self._schedule_arm_pose(RECOGNITION_ARM, "recognition",
                                                 target_task_id=3)
+                    elif wp.task_id == 3:
+                        # 2026-08-09 用户: task3 识别结束后, 前往 task2 水塔区的
+                        # 巡线途中后台摆好 task2 detection 姿态 (省 task2 init 摆臂).
+                        from main.task.task3.arm_poses import TASK2_DETECTION_ARM
+                        self._schedule_arm_pose(TASK2_DETECTION_ARM, "detection",
+                                                target_task_id=2)
                     elif wp.task_id == 2:
                         # 2026-08-09 用户: task2 结束后, 前往 task3 射击区的
                         # 巡线途中后台摆好射击姿态.
                         from main.task.task3.arm_poses import SHOOTING_ARM
                         self._schedule_arm_pose(SHOOTING_ARM, "shooting",
                                                 target_task_id=8)
+                    elif wp.task_id == 8:
+                        # 2026-08-09 用户: task3 射击结束后, 前往 task4 收割区的
+                        # 巡线途中后台摆好 task4 P 姿态 (省 task4 初始 P 恢复).
+                        from main.task.task3.arm_poses import TASK4_P_ARM
+                        self._schedule_arm_pose(TASK4_P_ARM, "p_pose",
+                                                target_task_id=4)
                     else:
                         self._schedule_arm_home_reset()
                 self._resume_lane(runner)

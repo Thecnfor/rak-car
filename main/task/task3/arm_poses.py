@@ -1,20 +1,27 @@
 ﻿#!/usr/bin/python3
 # -*- coding: utf-8 -*-
-"""task3 识别/射击机械臂姿态常量 (arm_seq_v9 CLI 参数, orchestrator 与 task3 共用).
+"""跨任务机械臂姿态常量 (arm_seq_v9 CLI 参数, orchestrator 与 task3 共用).
 
 参数顺序与 main/task/task3/arm_seq_v9.py 的 CLI 一致:
     (y1 中间位, y2 最终位, x, arm_angle, hand_angle)
-- RECOGNITION_ARM: 识别段 (cam2 看卡片) —— y2=-40mm, x=-270mm, 大臂+90°, 手爪-70°
-- SHOOTING_ARM:    射击段 (cam2 看目标卡) —— y2=-150mm, x=-200mm, 大臂+90°, 手爪-90°
+- RECOGNITION_ARM:      task3 识别段 (cam2 看卡片) —— y2=-40mm, x=-270mm, 大臂+90°, 手爪-70°
+- SHOOTING_ARM:         task3 射击段 (cam2 看目标卡) —— y2=-150mm, x=-200mm, 大臂+90°, 手爪-90°
+- TASK2_DETECTION_ARM:  task2 检测姿态 (识别水塔等级标) —— y2=-10mm, x=-200mm, 大臂-96°, 手爪-60°
+- TASK4_P_ARM:          task4 P 姿态 (收割准备/回位) —— y2=-160mm, x=-295mm, 大臂+90°, 手爪+10°
 
-orchestrator 在 task1→识别区 / task2→射击区的巡线途中用这些姿态后台摆臂,
-task3_pipeline / task3_shoot 在任务点再确认一次 (已在位则跳过)。
+orchestrator 在上一任务结束后的巡线途中用这些姿态后台摆臂 (先做者),
+task3_pipeline / task3_shoot 在任务点再用 arm_at_pose 确认 (已在位则跳过).
 """
 from __future__ import annotations
 
 
 RECOGNITION_ARM = ("-0.100", "-0.040", "-0.270", "90", "-70")
 SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
+# task2 检测姿态 (对齐 task_config.yml water_tower_task.detection_pose:
+# x=-200 y=-10 arm=-96 hand=-60; y1=-100 中间安全位 → y2=-10 最终检测位)
+TASK2_DETECTION_ARM = ("-0.100", "-0.010", "-0.200", "-96", "-60")
+# task4 P 姿态 (对齐 target4 POSE_P: x=-295 y=-160 arm=+90 hand=+10)
+TASK4_P_ARM = ("-0.100", "-0.160", "-0.295", "90", "10")
 
 
 def arm_at_pose(client, pose, tol_m: float = 0.020, tol_deg: float = 12.0) -> bool:
@@ -42,4 +49,5 @@ def arm_at_pose(client, pose, tol_m: float = 0.020, tol_deg: float = 12.0) -> bo
         return False
 
 
-__all__ = ["RECOGNITION_ARM", "SHOOTING_ARM", "arm_at_pose"]
+__all__ = ["RECOGNITION_ARM", "SHOOTING_ARM",
+           "TASK2_DETECTION_ARM", "TASK4_P_ARM", "arm_at_pose"]
