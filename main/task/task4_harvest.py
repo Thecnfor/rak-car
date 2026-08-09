@@ -24,12 +24,12 @@ def run(client: Optional[RuntimeApiClient] = None, **kwargs: Any) -> Dict[str, A
 
     from main.arm.each_task.task4.target4 import step_target4
     # step_target4 的预算参数已于 2026-08-10 冻结为 constants 默认值, 不再接收
-    # max_picks/creep_speed_mps/max_creep_m/max_seconds/return_x_mm; 透传时必须
+    # max_picks/creep_speed_mps/max_creep_m/max_seconds; 透传时必须
     # 过滤掉这些键 (CLI --max-picks 等已是 no-op), 否则全量 **kwargs 会 TypeError。
     _ALLOWED = {
-        "defer_task5_handoff", "dry_run", "debug_recognition",
+        "defer_task5_handoff", "dry_run",
         "pose_p_y_mm", "pose_p_x_mm", "pose_p_arm_deg", "pose_p_hand_deg",
-        "pick_x_mm", "pick_y_mm", "transit_y_mm", "transit_x_mm", "put_y_mm",
+        "pick_y_mm", "transit_x_mm",
         "bin_x_blue_mm", "bin_x_yellow_mm", "bin_y_blue_mm", "bin_y_yellow_mm",
         "bin_hand_blue_deg", "bin_hand_yellow_deg",
     }
@@ -59,18 +59,11 @@ def _build_parser() -> argparse.ArgumentParser:
                    help="任务总时长预算 (s)")
     p.add_argument("--dry-run", action="store_true",
                    help="dry-run 模式 (只打印不动硬件)")
-    p.add_argument("--no-return", action="store_true",
-                   help="放 bin 后 x 不回位")
-    p.add_argument("--debug-recognition", action="store_true",
-                   help="fetch_balls 打印每条检测的过滤原因")
     return p
 
 
 def main(argv=None) -> int:
     args = _build_parser().parse_args(argv)
-
-    from main.arm.each_task.task4.target4 import DEFAULT_RETURN_X_MM
-    return_x_mm: Optional[float] = None if args.no_return else DEFAULT_RETURN_X_MM
 
     t0 = time.monotonic()
     result = run(
@@ -79,8 +72,6 @@ def main(argv=None) -> int:
         max_creep_m=args.max_creep_m,
         max_seconds=args.max_seconds,
         dry_run=args.dry_run,
-        debug_recognition=args.debug_recognition,
-        return_x_mm=return_x_mm,
     )
     elapsed = time.monotonic() - t0
 

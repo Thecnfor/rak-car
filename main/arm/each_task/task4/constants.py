@@ -8,41 +8,13 @@
 """
 from __future__ import annotations
 
-# ---------- Bin 坐标 ----------
-BLUE_BIN_X_MM: float = 0.0
-YELLOW_BIN_X_MM: float = -45.0
-
 # ---------- Y 位置 ----------
-SAFE_Y_TRANSIT_MM: float = -190.0
-"""持球转移 + idle 时的安全 y。必须出 y 保护区 [0, -80]。"""
-
 BIN_OPEN_Y_MM: float = -150.0
 """开仓 y gate 上界（STORAGE_OPEN_Y_MAX_MM, 闭区间 inclusive）。
 下界 -205. 在区间 [-205, -145] 内放过，区间外→raise。
 
 ⚠️ 实际下界比上界更优 (更远离触底，门位余量更大)，但当前物理位置实测
     y=-150 命中上界已可。开仓见 ARMClient.set_storage_angle 75° 的 Round 13/15 gate。
-"""
-
-PICK_Y_MM: float = -160.0
-"""球心对应 y (4cm 球, 任务模型顶面)。
-⚠️ **待现场校准** —— 见 plan §风险 1；plan 建议在 b2 加 move_y 试探循环
-   从 -30 起每次 -5mm 找到命中点。先默认值 -160, 校准后改这里。
-"""
-
-# ---------- 姿态角度 ----------
-ARM_INIT_DEG: float = 90.0
-"""大臂 MID / 复位位 (+90°，2026-07-27 后 reset_position 默认角度；业务硬限上界 +150°，2026-08-05 放宽)。"""
-
-HAND_DOWN_DEG: float = 0.0
-"""手爪朝下（朝地板）。set 时需要先 arm ≤ -30° 出联动保护区（api.py:583）。"""
-
-HAND_INIT_DEG: float = -75.0
-"""手爪"正前方" init 姿态。
-
-⚠️ **实测偏差**：ARM_API.md §1.1 写 -90° 是 init, 但用户实测舵机实际识别角度是 -75°
-（2026-07-22）。原因猜测: 舵机出厂标定与 SDK 写值差 15°。业务层用本常量, 不要再写 -90°.
-ARMClient.set_hand_angle 业务硬限仍然是 [-90, 0]°, -75° 在范围内合法.
 """
 
 # ---------- 舵机 ----------
@@ -79,51 +51,23 @@ COLOR_UNKNOWN: str = "unknown"
 # w~0.424, h~0.605, score~0.937, area~0.257)。旧值 0.5/0.6/0.003/0.60 太松,
 # 噪声框都能过; 收紧到基于实测 ± 安全余量。
 TARGET_SCORE_MIN: float = 0.6
-"""最低置信度 (2026-08-05 用户: 0.85→0.72→0.6。
-实测真球 0.85, 鬼影 0.62, 留 ~0.1 边际。creep 段前移运动模糊 score 进一步下降,
-0.85 边缘卡阈值; 0.6 落在真球/鬼影中间, 推进留余量, track_chassis 按 label 独立选目标不受影响。"""
+"""最低置信度。实测真球 0.85 / 鬼影 0.62, 留 ~0.1 边际; creep 运动模糊再降分,
+用 0.6 保推进余量。"""
 
 TARGET_ASPECT_TOL: float = 0.8
 """宽高比容差 (实测 w/h = 0.42/0.60 = 0.70, 留 ±0.10 容差)。
 |aspect - 1.0| ≤ TARGET_ASPECT_TOL 即合格, 适配球比场景里略宽/略高的形变。"""
 
 TARGET_AREA_MIN: float = 0.15
-"""最小归一化面积。
-- 历史 baseline 0.246-0.265 是 target1 y=-150 校准的, 留 0.04 buffer
-- 2026-07-30: 现场 1↔2 球间歇, 小球 (被切边/压扁) area=0.158~0.183
-  ↓ 0.20 会拒; 放宽到 0.15 (留 0.008-0.033 buffer)
-- 0.15 已接近帧噪声框范围, 现场如有误检再考虑 aspect_tol 收紧
-"""
+"""最小归一化面积。小球 (被切边/压扁) 实测 0.158~0.183, 放宽到 0.15 防误拒;
+已接近帧噪声框范围, 现场误检时再收紧 aspect_tol。"""
 
 TARGET_AREA_MAX: float = 0.60
-"""最大归一化面积。
-- 2026-07-29 之前 0.50 → 2026-07-30 退到 0.30 → 现场拒大球 → 改回 0.50
-- 历史 baseline 0.246-0.265 是 target1 y=-150 校准的, 留 0.04 buffer
-- 2026-07-30: 现场 2 球实测, 右球 area=0.457 完全可见, 0.30 会拒掉右球
-  → 放宽到 0.50 (留 0.043 buffer 兼容近/远)
-- 2026-08-03 P 姿态 (y=-100/x=-270) 实测: 球框 area=0.529, 0.50 拒掉
-  → 放宽到 0.60 (留 0.07 buffer 兼容 P 姿态下的大球)
-- 0.60 已接近帧噪声框范围, 现场如有误检再考虑 aspect_tol 收紧
+"""最大归一化面积。P 姿态实测球框 area=0.529, 0.50 会拒掉 → 放宽到 0.60。
 
-⚠️ 2026-08-02 取消 BALL_VERIFIED_* 7 项位置验证 (用户要求 "识别到球就抓, 不用在
-最佳抓取位置"): TARGET_* 4 项基础过滤 (score / aspect / area) 仍生效, 但
-target2.fetch_balls 不再调用 _verify_ball_in_target1_pose。球检测只要过
-TARGET_* 4 项 + color 是蓝/黄就视为有效候选。
+⚠️ 2026-08-02 取消 BALL_VERIFIED_* 7 项位置验证 (用户要求 "识别到球就抓"):
+球检测只要过 TARGET_* (score/aspect/area) + color 是蓝/黄即视为有效候选。
 """
-
-# ---------- 检测 / 选择策略 ----------
-TARGET_DEDUP_NORM_MIN: float = 0.05
-"""选 next 时, 跳过 cx_norm 距 0 < 此值的球 (上次画面中心已采的去重)。"""
-
-TARGET_POLL_S: float = 0.2
-"""b1 侧摄轮询 task_feed 间隔 (10Hz 守护线程)。"""
-
-# ---------- belt-slip 兜底 ----------
-X_SPEED_SAFETY_V_FALLBACK_MMS: float = 30.0
-"""b2/b3 belt-slip fallback 用 x_speed_with_safety 的速度 (mm/s)。"""
-
-X_SPEED_SAFETY_STALE_S: float = 2.0
-"""x_speed_with_safety watchdog 超时 (s), 见 ARM_API §10。"""
 
 # ---------- 任务总控 ----------
 DEFAULT_MAX_ROUNDS: int = 8
@@ -211,7 +155,7 @@ Y_PUT_MM: float = -140.0
 """放球 y (再深 10mm 防脱落)。"""
 
 BIN_X_MM = {COLOR_BLUE: 0.0, COLOR_YELLOW: -60.0}
-"""蓝 bin x=0, 黄 bin x=-70。"""
+"""蓝 bin x=0, 黄 bin x=-60。"""
 
 BIN_Y_MM = {COLOR_BLUE: -140.0}
 """蓝 bin y=-135; 黄沿用 Y_PUT_MM。"""
@@ -220,11 +164,65 @@ BIN_HAND_DEG = {COLOR_BLUE: 10.0}
 """蓝 bin hand=-30°; 黄沿用 P 姿态 hand=10°。"""
 
 # ---- 其他 ----
-Y_FINAL_MM: float = -140.0
-"""最终 y (识别位姿, 历史值)。"""
-
 BALL_LABELS = ["ball_blue", "ball_yellow"]
-"""track_chassis 目标集 (PaddleDet 模型标签)。"""
+"""臂伺服目标集 (PaddleDet 模型标签)。"""
+
+# ============================================================================
+# 机械臂智能抓取对齐 (2026-08-10, 替换底盘对齐 —— 底盘打滑不准)
+# ============================================================================
+# 方案 (用户拍板 2026-08-10):
+#   - 对齐自由度: **大臂 + x 十字, y 锁 0** (走 track_velocity_pick /
+#     find_target_arm_cross: dx=cx-setpoint_x → arm, dy=cy-setpoint_y → x 十字)。
+#   - setpoint: **硬编码到本文件** (用户标记 cam2 侧摄画面里吸嘴的像素)。
+#   - 抓取降序: **高位伺服 → 最后盲降** (伺服时臂抬在 y 高位, 收敛后 y 盲降到
+#     Y_PICK_MM 吸气), 规避侧摄近地丢球 (见 memory task4-pick-servo-high-then-descend)。
+#   - 两种球同尺寸 → 蓝/黄共用一份 setpoint。
+
+# ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户标定, 2026-08-10)。
+#    手爪智能抓取目标 = (cx, cy) = (-0.03, -0.74), 两种球同尺寸共用一份。
+TASK4_SETPOINT_X_NORM: float = -0.03
+TASK4_SETPOINT_Y_NORM: float = -0.74
+
+TASK4_SERVO_Y_START_MM: float = TASK4_POSE_P_Y_MM
+"""臂伺服起始/抬回 y (高位, 球全程可见)。cam2 侧摄固定, y 只影响吸嘴高度,
+不影响检测; 抬在安全高位即可, 最后盲降抓球。"""
+
+TASK4_SERVO_GAIN_ARM: float = 0.4
+"""大臂控 cx 增益 (dx → d_arm)。⚠️ 现场标定。"""
+
+TASK4_SERVO_GAIN_X: float = 0.08
+"""x 十字控 cy 增益 (dy → x_vel)。⚠️ 现场标定。"""
+
+TASK4_SERVO_DEADZONE: float = 0.02
+"""收敛死区 (|dx|,|dy| < 此值视为已对准)。"""
+
+TASK4_SERVO_MAX_VEL: float = 0.15
+"""x 十字最大速度 (m/s)。"""
+
+TASK4_SERVO_HZ: float = 20.0
+"""臂伺服循环频率 (Hz)。"""
+
+TASK4_SERVO_SETTLE_HITS: int = 3
+"""收敛判定: 末段连续 settle_hits 帧命中且 |dx|,|dy| < deadzone。"""
+
+TASK4_SERVO_TIMEOUT_S: float = 30.0
+"""单球臂伺服总超时 (s)。"""
+
+TASK4_SERVO_ARM_MIN: float = -150.0
+"""大臂 clamp 下界 (°)。P 姿态 arm=+90°, 留足旋转余量。"""
+
+TASK4_SERVO_ARM_MAX: float = 150.0
+"""大臂 clamp 上界 (°)。"""
+
+TASK4_SERVO_SIGN_ARM: float = 1.0
+"""大臂方向符号 (dx>0 → d_arm)。⚠️ 现场标定 (task1 S 姿态实机 = +1)。"""
+
+TASK4_SERVO_SIGN_X: float = -1.0
+"""x 十字方向符号 (dy>0 → x_vel)。⚠️ 现场标定 (task1 S 姿态实机 = -1)。"""
+
+TASK4_SERVO_DESCEND_HAND_DEG = None
+"""盲降时手爪角度; None = 保持 P 姿态 hand 不动 (吸嘴朝下即可)。"""
+
 
 # ---- IR 生命周期 ----
 # task4 任务点由 orchestrator 的左 IR < 0.70m 触发。

@@ -1,28 +1,30 @@
 #!/usr/bin/python3
-"""task4 / target4 —— 编排门面: 慢速前移搜索 + 底盘视觉定位 (最左球) + 吸嘴中心抓取。
+"""task4 / target4 —— 编排门面: 慢速前移搜索 + 机械臂智能抓取对齐 + 放 bin。
 
 2026-08-10 拆分: 原 1599 行单文件按职责拆成 4 个单向依赖模块, 本文件保留
 **编排骨架** (`step_target4` 主循环 + 预算/清场 + CLI), 业务实现下沉:
   - ``creep_thread.py``   后台保前移线程 + 跨球 IR 生命周期 + 底盘速度 helper
                           (`_CreepThread` / `_Task4SearchState` / `_set_chassis_vel`)
-  - ``track_align.py``    底盘视觉对齐最左球 + 卡死重武装
-                          (`_track_leftmost_ball` / `_chassis_rearm_if_stuck`)
-  - ``pick_store.py``     选球判色 + 盲降抓取放 bin
-                          (`_pick_and_store` / `_color_from_track` / `_pick_best_ball`)
-  - ``constants.py``      所有位姿/预算/IR/蠕动常量 + 时间戳辅助 (校准表面)
+  - ``pick_store.py``     选球判色 + 机械臂智能抓取 + 放 bin
+                          (`_pick_by_arm_servo` / `_pick_and_store` / `_pick_best_ball`)
+  - ``constants.py``      所有位姿/预算/IR/蠕动/臂伺服常量 + 时间戳辅助 (校准表面)
 
-对外符号全部 re-export 于此 (step_target4 / DEFAULT_RETURN_X_MM / _CreepThread /
-_Task4SearchState / _track_leftmost_ball), 外部 import 无需改动。
+对外符号全部 re-export 于此 (step_target4 / _CreepThread /
+_Task4SearchState), 外部 import 无需改动。
 
-流程 (2026-08-03 二次重写, 用户指定 "新方法"):
-  - 到任务点后持续慢速前移扫球; 见到球即用底盘视觉伺服把画面最左球拉到画面
-    中心 (track_chassis); 然后盲降抓取 (吸嘴中心) → 吸气 → 按颜色放 bin。
+流程 (2026-08-10 起用机械臂智能抓取, 替换底盘对齐):
+  - 到任务点后持续慢速前移扫球 (creep, cam2 侧摄); 见到球即用**机械臂智能抓取**
+    对齐 (track_velocity_pick: 大臂控 cx + x 十字控 cy, y 锁 0, 用户标定 setpoint),
+    高位伺服收敛后 y 盲降 → 吸气 → 按颜色放 bin。
+  - 用户拍板 (2026-08-10): 底盘对齐打滑不准 → 改臂伺服; setpoint 硬编码到
+    constants.TASK4_SETPOINT_*; 两种球同尺寸共用一份; 高位伺服→最后盲降。
   - 预算式收尾: IR 丢失+0.3m 是主终止; 累计前移距离 / 总时长 / 最大抓取数兜底。
   - 终止条件 (任一): IR 离开区后走满 0.3m / 前移 ≥ max_creep_m / picks ≥ max_picks /
     总耗时 ≥ max_seconds / 连续 pick 失败 ≥ max_consecutive_pick_failures / Ctrl-C。
 
-⚠️ 底盘通道: /v1/realtime/chassis-velocity (realtime 门, 免 job_queue, 与
-   track_chassis 同通道); orchestrator 派发 task4 前已暂停 lane 外环, 不冲突。
+⚠️ 底盘通道: 仅 creep 用 /v1/realtime/chassis-velocity (realtime 门); 对齐在臂上
+   (velocity 模式 /v1/realtime/arm-velocity), 底盘不打滑。orchestrator 派发
+   task4 前已暂停 lane 外环, 不冲突。
 ⚠️ 视觉伺服前置: 跑本脚本前必须先停 arm_feed (20Hz 轮询会饿 arm_queue); 跑完恢复。
 
 CLI 跑法:
@@ -47,9 +49,7 @@ from main.arm.each_task.task4.constants import (  # noqa: E402
     # 预算 / 终止
     DEFAULT_MAX_PICKS, DEFAULT_MAX_CREEP_M, DEFAULT_MAX_SECONDS,
     DEFAULT_CREEP_SPEED_MPS, DEFAULT_TRACK_MAX_SECONDS,
-    DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES, DEFAULT_PICK_TIMEOUT_S,
-    DEFAULT_RETURN_X_MM,
-    DEFAULT_TRACK_SOFT_DEADBAND, DEFAULT_TRACK_WIDE_DEADBAND,
+    DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
     CREEP_POLL_HZ, CREEP_MAX_SECONDS_S,
     # 姿态 / 放仓
     COLOR_BLUE, COLOR_YELLOW, BIN_X_MM, BIN_Y_MM, BIN_HAND_DEG,
@@ -63,11 +63,8 @@ from main.arm.each_task.task4.constants import (  # noqa: E402
 from main.arm.each_task.task4.creep_thread import (  # noqa: E402
     _Task4SearchState, _CreepThread, _set_chassis_vel,
 )
-from main.arm.each_task.task4.track_align import (  # noqa: E402
-    _track_leftmost_ball, _chassis_rearm_if_stuck,
-)
 from main.arm.each_task.task4.pick_store import (  # noqa: E402
-    _color_from_track, _pick_best_ball, _pick_and_store,
+    _pick_best_ball, _pick_and_store,
 )
 
 
@@ -83,17 +80,13 @@ def step_target4(
     runner: Optional[ArmRunner] = None,
     defer_task5_handoff: bool = False,
     dry_run: bool = False,
-    debug_recognition: bool = False,
     # ---- 姿态参数 (默认值在 constants.py, 可由外部覆盖) ----
     pose_p_y_mm: float = TASK4_POSE_P_Y_MM,
     pose_p_x_mm: float = TASK4_POSE_P_X_MM,
     pose_p_arm_deg: float = TASK4_POSE_P_ARM_DEG,
     pose_p_hand_deg: float = TASK4_POSE_P_HAND_DEG,
-    pick_x_mm: float = X_PICK_MM,
-    pick_y_mm: float = Y_PICK_MM,
-    transit_y_mm: float = Y_TRANSIT_MM,
+    pick_y_mm: float = Y_PICK_MM,  # 盲降抓球目标 y (臂伺服 grasp_y)
     transit_x_mm: float = X_TRANSIT_MM,
-    put_y_mm: float = Y_PUT_MM,
     bin_x_blue_mm: float = BIN_X_MM[COLOR_BLUE],
     bin_x_yellow_mm: float = BIN_X_MM[COLOR_YELLOW],
     bin_y_blue_mm: float = BIN_Y_MM.get(COLOR_BLUE, Y_PUT_MM),
@@ -101,11 +94,11 @@ def step_target4(
     bin_hand_blue_deg: float = BIN_HAND_DEG.get(COLOR_BLUE, TASK4_POSE_P_HAND_DEG),
     bin_hand_yellow_deg: float = TASK4_POSE_P_HAND_DEG,
 ) -> dict:
-    """慢速前移搜索 + 底盘视觉定位 (最左球) + 吸嘴中心抓取 + 放 bin。
+    """慢速前移搜索 + 机械臂智能抓取 + 放 bin。
 
     Args:
         arm_client: ArmClient 实例。
-        http_client: RuntimeApiClient (creep 速度下发 / fetch_balls / track_chassis 共用)。
+        http_client: RuntimeApiClient (creep 速度下发 / fetch_balls 共用)。
         runner: ArmRunner (None 时自动建)。
         defer_task5_handoff: task4 由 orchestrator 调度时，IR+odom 结束后将
             关仓 + task5 Phase 1 姿态交给巡航线程并行执行；独立运行保持 False。
@@ -130,17 +123,12 @@ def step_target4(
     creep_speed_mps = DEFAULT_CREEP_SPEED_MPS
     track_max_seconds = DEFAULT_TRACK_MAX_SECONDS
     max_consecutive_pick_failures = DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES
-    return_x_mm = DEFAULT_RETURN_X_MM
-    pick_timeout_s = DEFAULT_PICK_TIMEOUT_S
-    do_prep = False
-    print(f"\n========== {LOG_PREFIX} step_target4 (底盘视觉伺服版) ==========")
+    print(f"\n========== {LOG_PREFIX} step_target4 (机械臂智能抓取版) ==========")
     print(f"  模式: {'DRY-RUN (不动硬件)' if dry_run else 'EXECUTE (动硬件)'}")
     print(f"  预算: 前移 ≤{max_creep_m:.2f}m @ {creep_speed_mps:.2f}m/s | "
           f"picks ≤{max_picks} | 总时 ≤{max_seconds:.0f}s")
-    print(f"  单球底盘伺服预算: {track_max_seconds:.0f}s | 连续失败容忍: "
+    print(f"  单球臂伺服预算: {track_max_seconds:.0f}s | 连续失败容忍: "
           f"{max_consecutive_pick_failures}")
-    print(f"  放 bin 后 x 回: {return_x_mm} mm | 准备位姿: "
-          f"{'跑 target1' if do_prep and not dry_run else '跳过'}")
 
     for name, val in (("max_picks", max_picks), ("max_seconds", max_seconds),
                       ("max_creep_m", max_creep_m), ("creep_speed_mps", creep_speed_mps),
@@ -252,7 +240,6 @@ def step_target4(
         #      c) 再恢复 P 姿态 + creep 继续, 循环到 max_picks
         #      d) 失败一次就退出, 不死循环
         ball_idx = 0
-        last_color = None  # 上一球颜色 (用于优化 P 姿态恢复)
         release_thread = None  # 上一球放仓后台线程, 回 P 前需 join
         while n_picks < max_picks:
             elapsed = time.monotonic() - t_start
@@ -270,35 +257,12 @@ def step_target4(
                   f"(t={elapsed:.1f}s, 已采 {n_picks}, "
                   f"剩余前移 {remaining_m:.2f}m) ==========")
 
-            # 2.0 P 姿态 + creep 并发 (2026-08-08: 改回并发, 避免 composite_run 期间车子完全静止)
-            #    2026-08-09 用户拍板: **只在任务刚触发 (第 1 球) 并发**, 之后每球
-            #    顺序执行 (先 P 姿态, 再 creep)。并发时 3 个风险:
-            #      a) creep_thread 与 composite_run 同时跑 → 4 路臂命令 + 底盘 vx
-            #         抢 SerialEngine, composite_run 内部 y 下降偶尔卡 200-500ms;
-            #      b) 见球瞬间 creep 没主动发 0 速, 靠 track_chassis 第一帧覆盖,
-            #         50-150ms 窗口内底盘按 creep 速度窜一下 → "track 开始瞬间抖";
-            #      c) arm_feed 守护线程 20Hz 轮询 y/x/arm_angle 跟 composite_run
-            #         4 路并发抢 share_key, 进一步加长 composite_run 时间.
-            #    现场每球 creep 0.000m → 错过球, 这 3 个风险在并发下被放大。
+            # 上一球放仓线程收尾 (防 composite_run 期间臂还在动)
             if release_thread is not None and release_thread.is_alive():
                 release_thread.join(timeout=15.0)
 
-            # 首球 (任务刚触发): creep 和 P 姿态 composite_run 并发省时间;
-            # 后续球: 顺序 —— 先 P 姿态到位, 再启动 creep, 避免抢串口错过球。
-            # IR 状态跨球共享，首球也参与远端确认；任务触发时已是近 IR。
-            # 先完成 P 姿态，再开始前移；否则首球在摆臂期间就可能丢 IR，
-            # 直接消耗完离开区的 0.3m 预算，还没进入视觉搜索。
-            concurrent_creep = False
+            # 每球先恢复 P 姿态, 再启动 creep (顺序执行; 曾试过并发, 抢串口会错过球)。
             creep_thread = None
-            if concurrent_creep:
-                creep_thread = _CreepThread(
-                    http_client, state=search_state,
-                    speed_mps=creep_speed_mps,
-                    max_distance_m=remaining_m,
-                    poll_hz=CREEP_POLL_HZ,
-                    max_seconds_s=CREEP_MAX_SECONDS_S,
-                )
-                creep_thread.start()
 
             pose_ok = True
             if not dry_run:
@@ -370,167 +334,13 @@ def step_target4(
                 print(f"  [{LOG_PREFIX}] 🏁 前移预算内未见球, 视作采区走完")
                 break
 
-            # 2.2 底盘视觉定位 (最左球 → 畫面中心)
-            #    只用底盤對齊 (track_chassis), 跳過臂側 find_target /
-            #    move_to_vision_target —— 假設底盤對齊後吸嘴已在球正上方,
-            #    直接 composite_run(y_bin高位) → y 下 → grasp 即可。
-            #    2026-08-08: track 段也計入里程計預算, 避免過沖。
-            odo_before = None
-            if not dry_run:
-                try:
-                    odo_before = http_client.call(
-                        "car", "get_odometry", timeout=5.0)
-                except Exception:
-                    pass
-            print(f"  [{LOG_PREFIX}] 🎯 track_chassis(leftmost, "
-                  f"≤{track_max_seconds:.0f}s) — 僅底盤對齊, 跳過臂視覺伺服")
-            track_res = _track_leftmost_ball(
-                max_seconds=track_max_seconds, dry_run=dry_run,
-            )
-            if not dry_run and odo_before is not None:
-                try:
-                    odo_after = http_client.call(
-                        "car", "get_odometry", timeout=5.0)
-                    if (isinstance(odo_before, dict) and isinstance(odo_after, dict)
-                            and odo_before.get("status") == "succeeded"
-                            and odo_after.get("status") == "succeeded"):
-                        x_before = (odo_before.get("result") or {}).get("x", 0)
-                        x_after = (odo_after.get("result") or {}).get("x", 0)
-                        track_dist = max(0.0, x_after - x_before)
-                        if track_dist > 0:
-                            total_creep_m += track_dist
-                            print(f"  [{LOG_PREFIX}] 📏 track 段前移 "
-                                  f"{track_dist:.3f}m (里程計差值), "
-                                  f"累計前移 {total_creep_m:.3f}m")
-                except Exception:
-                    pass
-            print(f"  [{LOG_PREFIX}] track 結束: arrived={track_res.arrived} "
-                  f"reason={track_res.reason}")
-            # 2026-08-09: 下沉后 align 返回 stop_ok / motion_ok —— finally 零速是否
-            # 到达轮子 / 期间轮子是否物理位移 (真实编码器反馈)。stop_ok=False =
-            # 命令路径断了 (串口/下位机异常) 或车仍在滑行; motion_ok=False = 发了
-            # 命令但编码器没动 ("200 但轮不转" 假死)。两者任一 → 先显式停稳,
-            # 再决定是否重武装 (旧代码只 trust track_chassis 内部 finally)。
-            if not dry_run and (
-                not getattr(track_res, "stop_ok", True)
-                or not getattr(track_res, "motion_ok", True)
-            ):
-                print(f"  [{LOG_PREFIX}] ⚠️ track 命令/位移异常 "
-                      f"(stop_ok={getattr(track_res, 'stop_ok', True)} "
-                      f"motion_ok={getattr(track_res, 'motion_ok', True)}), 显式停稳...")
-                try:
-                    http_client.post(
-                        f"{http_client.api_prefix}/realtime/chassis-velocity",
-                        {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
-                except Exception:
-                    pass
-                try:
-                    http_client.wait_wheels_stopped(settle_s=0.15, timeout_s=1.0)
-                except Exception:
-                    pass
-            # 2026-08-06 软成功 / 宽成 提示. arrived=True 但 reason 是 near_arrived_*
-            # 表示 timeout 内没硬停但 final_frame 落入软/宽死区, 视为对齐.
-            if track_res.arrived and track_res.reason in (
-                "near_arrived_soft", "near_arrived_soft_retry", "near_arrived_wide",
-            ):
-                ff = track_res.final_frame
-                if ff is not None:
-                    th = (DEFAULT_TRACK_WIDE_DEADBAND
-                          if track_res.reason == "near_arrived_wide"
-                          else DEFAULT_TRACK_SOFT_DEADBAND)
-                    print(f"  [{LOG_PREFIX}] ✨ 软成功对齐 ({track_res.reason}): "
-                          f"label={ff.label} "
-                          f"|cx_err|={abs(ff.cx_err or 0):.3f} "
-                          f"|cy_err|={abs(ff.cy_err or 0):.3f} "
-                          f"(< 阈值 {th:.2f})")
-
-            # 2026-08-06 第 6 次迭代: no_target 现场反馈 "看到之后动都不动".
-            #   这是 CLAUDE.md 顶部提的 OPEN chassis realtime-velocity no-motion bug
-            #   的一种表现: track_chassis 期间 _set_vel 多次成功 (没抛), 但轮速
-            #   实际没下发 (SerialEngine 队列 / _stop_flag / 串口抢锁各种原因).
-            #   lost_frames++ 是因为 "球在视野里没动 → cx_err 不收敛 → 选取失败"
-            #   而不是 "球真的消失". 救治思路: 在 no_target 退出后, 主动检查
-            #   encoder 是否真没动, 若没动 → 一次 reset-stop + 强制 0 速重下发
-            #   ("重武装"), 给下一拍 set_chassis_velocity 一次干净的环境.
-            # 2026-08-09: 下沉后 reason 集合变了 — 串口掉线但视觉仍活时车不动,
-            #   cx_err 不收敛 → 满预算 timeout (不是 no_target); 若命令路径彻底
-            #   断了, align 现在会 control_lost 快速退出 + stop_ok=False; 甚至
-            #   arrived 但 motion_ok=False (发了命令编码器没动 = 200 但轮不转)。
-            # 2026-08-09 用户: "为什么老是底盘重武装".
-            #   根因 1: needs_rearm 把 no_target / watchdog 也算进去 —— 这俩是
-            #   视觉丢球 (task_feed 没球帧), 底盘响应正常; 重武装救不了视觉,
-            #   却让每球白烧 0.5s settle + 3s retry (现场连续失败 1/2 的元凶)。
-            #   根因 2: _chassis_rearm_if_stuck 在 track 已 finally 零速后采样
-            #   编码器 —— 车已停, 0.5s 内编码器必 < 1.0 → 永远判"底盘无响应"。
-            #   重武装只应在"命令路径确实失败"时触发: runtime 已在整个 track
-            #   窗口用真实编码器算好 motion_ok / stop_ok / control_lost, 直接信它。
-            # 2026-08-10: motion_ok=False 在"软成功/近对齐"(near_arrived_*) 下常是
-            # 假阳性 —— 球本来就接近画面中心, 底盘几乎没动, runtime 便判
-            # "发了命令编码器没动"。对一个**已 arrived** 的 track 再重武装纯属浪费
-            # (0.5s settle + 重试)。重武装只在 track **没到位** 且命令路径确实异常
-            # (control_lost / stop_ok=False / motion_ok=False) 时触发。
-            needs_rearm = (
-                not dry_run
-                and not bool(track_res.arrived)
-                and (
-                    track_res.reason == "control_lost"
-                    or not getattr(track_res, "stop_ok", True)
-                    or not getattr(track_res, "motion_ok", True)
-                )
-            )
-            if needs_rearm:
-                # runtime 已判定命令路径假死 (control_lost / stop_ok=False /
-                # motion_ok=False) → 重武装: reset-stop + 0 速 + 直发轮速 IK,
-                # 重建 SerialEngine 命令缓存, 给下一拍 set_chassis_velocity
-                # 一次干净环境。motion_ok/stop_ok 已是整个 track 窗口的判定,
-                # 无需再采样 (stopped-sample 必 < 1.0)。
-                print(f"  [{LOG_PREFIX}] [REARM] 底盘命令路径异常 "
-                      f"(reason={track_res.reason} stop_ok="
-                      f"{getattr(track_res, 'stop_ok', True)} motion_ok="
-                      f"{getattr(track_res, 'motion_ok', True)}), "
-                      f"重武装后重试一次 track")
-                _chassis_rearm_if_stuck(http_client, settle_s=0.5)
-                # 重试 1 次: 拿 3s 给一次集中机会, **直接用大 kp** (0.20) 走完整
-                # 5 段式成功判据 (2026-08-10 用户拍板"直接默认用大kp"), 若再失败就硬失败。
-                retry = _track_leftmost_ball(
-                    max_seconds=min(3.0, track_max_seconds),
-                    dry_run=dry_run,
-                )
-                if retry.arrived:
-                    track_res = retry
-                    print(f"  [{LOG_PREFIX}] [REARM] 重试 track 成功: "
-                          f"arrived=True reason={retry.reason}")
-
-            # 2026-08-06: track 失败要计入 n_consecutive_failures, 否则
-            # 永不触发 max_consecutive_pick_failures 退出 —— 这是 task4
-            # "卡住 + 跳过"的隐性根因之一. reason ∈ {arrived} 视为成功,
-            # 其他 {timeout, no_target, watchdog, stopped, control_lost} 全算失败.
-            track_ok = bool(track_res.arrived)
-            if not track_ok and not dry_run:
-                n_consecutive_failures += 1
-                n_pick_failures += 1
-                history.append({
-                    "ball": ball_idx, "action": "track_failed",
-                    "color": None,
-                    "error": f"track reason={track_res.reason}",
-                })
-                print(f"  [{LOG_PREFIX}] ❌ track 失败 (reason={track_res.reason}); "
-                      f"连续失败 {n_consecutive_failures}/{max_consecutive_pick_failures}")
-                if n_consecutive_failures >= max_consecutive_pick_failures:
-                    final_reason = "pick_error_exceeded"
-                    print(f"  [{LOG_PREFIX}] ❌ 连续失败达到 "
-                          f"{max_consecutive_pick_failures}, 退出循环")
-                    break
-                # 兜底: track 失败本轮不再走 pick, 直接下一轮 (creep 继续搜)
-                continue
-
-            # 2.3 定颜色:
-            #    creep 阶段已经把当前帧 balls 拿到 (creep_res['balls']),
-            #    直接复用 — 不再 track 完再 fetch_balls 一次, 省 1 个 HTTP RTT。
-            #    优先用 creep 看到的 balls; track label 兜底; 都没有就 skip。
-            color = _color_from_track(track_res)
-            if color is None and not dry_run:
-                best = _pick_best_ball(creep_res["balls"] or [])
+            # 2.2 定颜色 (机械臂智能抓取, 2026-08-10 移除底盘对齐)
+            #    creep 阶段已把当前帧 balls 拿到 (creep_res['balls']), 直接复用判色,
+            #    不再 track_chassis (底盘打滑不准) → 不 track 完再 fetch_balls。
+            #    颜色锁定后, 由 _pick_and_store 内的臂伺服 (大臂+x轴) 智能抓取。
+            color = None
+            if creep_res.get("balls"):
+                best = _pick_best_ball(creep_res["balls"])
                 color = best["color"] if best else None
             if dry_run and color is None:
                 color = COLOR_BLUE  # dry-run 无视觉时的占位, 走通流程
@@ -541,11 +351,11 @@ def step_target4(
                                 "color": None, "error": None})
                 print(f"  [{LOG_PREFIX}] ❌ 无法确定球色, 跳过继续搜索")
                 continue
-            print(f"  [{LOG_PREFIX}] ✓ 锁定 {color} 球, 直接进入抓手姿态")
+            print(f"  [{LOG_PREFIX}] ✓ 锁定 {color} 球, 机械臂智能抓取 (大臂+x轴)")
 
-            # 2.4 抓取 + 放 bin
+            # 2.3 抓取 + 放 bin (臂伺服 pick + store)
             if dry_run:
-                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 pick_by_vision + 放 bin "
+                print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过臂伺服抓取 + 放 bin "
                       f"(would pick {color}, bin x={BIN_X_MM[color]})")
                 history.append({"ball": ball_idx, "action": "dry_run",
                                 "color": color, "error": None})
@@ -556,16 +366,16 @@ def step_target4(
             res = _pick_and_store(
                 arm_client, runner,
                 color=color,
-                return_x_mm=return_x_mm,
-                pick_timeout_s=pick_timeout_s,
-                pick_x_mm=pick_x_mm,
                 pick_y_mm=pick_y_mm,
-                transit_y_mm=transit_y_mm,
                 transit_x_mm=transit_x_mm,
-                put_y_mm=put_y_mm,
                 bin_x_mm=bin_x_blue_mm if color == COLOR_BLUE else bin_x_yellow_mm,
                 bin_y_mm=bin_y_blue_mm if color == COLOR_BLUE else bin_y_yellow_mm,
                 bin_hand_deg=bin_hand_blue_deg if color == COLOR_BLUE else bin_hand_yellow_deg,
+                # 臂伺服 pick 起始位姿 = P 姿态 (主循环已 composite_run 到位)
+                servo_x_start_mm=pose_p_x_mm,
+                servo_y_start_mm=pose_p_y_mm,
+                servo_arm_start_deg=pose_p_arm_deg,
+                servo_hand_start_deg=pose_p_hand_deg,
             )
             release_thread = res.get("release_thread")  # 记录放仓线程, 下轮回P前 join
             history.append({"ball": ball_idx,
@@ -574,7 +384,6 @@ def step_target4(
             if res["ok"]:
                 n_picks += 1
                 n_consecutive_failures = 0
-                last_color = color  # 记录上一球颜色, 供 P 姿态恢复优化
                 print(f"  [{LOG_PREFIX}] ✅ {color} 球完成 (累计 {n_picks})")
             else:
                 n_pick_failures += 1
@@ -597,7 +406,7 @@ def step_target4(
         final_reason = "keyboard_interrupt"
         print(f"\n  [{LOG_PREFIX}] Ctrl-C 中断")
     finally:
-        # 兜底清场: 速度清零 + stop_wheel_speeds (track_chassis 自己会停, 这是保险)
+        # 兜底清场: 速度清零 + stop_wheel_speeds (creep/臂伺服内已停, 这是保险)
         try:
             _set_chassis_vel(http_client, 0.0)
         except Exception:
@@ -700,14 +509,12 @@ def step_target4(
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="task4 target4: 慢速前移搜索 + 底盘视觉定位 (最左球) + "
-                    "吸嘴中心抓取 (--dry-run 只打印)",
+        description="task4 target4: 慢速前移搜索 + 机械臂智能抓取 + 放 bin "
+                    "(--dry-run 只打印)",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--dry-run", action="store_true",
                    help="dry-run 模式 (默认 execute, 真动硬件)")
-    p.add_argument("--debug-recognition", action="store_true",
-                   help="fetch_balls 打印每条 detection 过滤原因")
     p.add_argument("--pose-x", type=float, default=TASK4_POSE_P_X_MM,
                    help=f"P 姿态 x (mm), 默认 {TASK4_POSE_P_X_MM}")
     p.add_argument("--pose-y", type=float, default=TASK4_POSE_P_Y_MM,
@@ -731,7 +538,6 @@ def main(argv=None) -> int:
         arm, http,
         runner=runner,
         dry_run=args.dry_run,
-        debug_recognition=args.debug_recognition,
         pose_p_x_mm=args.pose_x,
         pose_p_y_mm=args.pose_y,
         pose_p_arm_deg=args.pose_arm,
