@@ -88,10 +88,14 @@ PICK_POSE_HAND_DEG: float = -10.0
 FIRST_CUBE_X_MM: float = -165.0
 SECOND_CUBE_X_MM: float = -210.0
 
-# 每座水塔第 1 块转动大臂时的安全 X (2026-08-10 用户: 通用安全区 [-300,-200] 的 clamp 值
-# -200 → -185)。实际生效读 yaml water_tower_task.first_cube_safe_x_mm, 这里仅兜底默认。
-# ⚠️ 只影响第 1 块的转臂阶段 (safe_x_mm 覆盖), 第 2/3 块仍走通用安全区。
-FIRST_CUBE_SAFE_X_MM: float = -185.0
+# 转动大臂时的安全 X (所有块通用; 2026-08-10 用户: -185 → -200 改回通用安全区边界,
+# 且不再只限第 1 块)。实际生效读 yaml water_tower_task.first_cube_safe_x_mm, 这里仅兜底默认.
+FIRST_CUBE_SAFE_X_MM: float = -200.0
+
+# 放块前 X 收回距离 (_deliver_prepare 第 1 步, 远离水塔给大臂转动留空间).
+# 2026-08-10 用户: 每座塔第 1 块 → -235 (更贴近投放位), 第 2/3 块仍 -260.
+DELIVER_RETRACT_X_MM: float = -260.0
+FIRST_DELIVER_RETRACT_X_MM: float = -235.0
 
 # carry 姿态 (从方块到水塔的运输/投放位姿)
 # 2026-08-06: arm 改为 -92° (对标 detection_pose.arm_angle_deg)
@@ -121,10 +125,13 @@ PICK_VISION_TIMEOUT_S: float = 3.5
 #   第3块(2): 7s — 高处堆叠抖动大收敛慢 (原 PICK_BLOCK3_TIMEOUT_S)
 PICK_BLOCK2_TIMEOUT_S: Optional[float] = 6.0
 PICK_BLOCK3_TIMEOUT_S: Optional[float] = 7.0
-# 2026-08-09 用户新规则: 视觉对齐超时**不许失败** — 降死区 + 加时重新对齐一次.
-#   默认死区 0.05 → 重试放宽到 0.07; 超时 +4s (块默认 5/6/7s → 重试 9/10/11s).
-PICK_RETRY_DEADZONE: float = 0.07
+# 2026-08-10 用户新规则: 视觉对齐超时**不许失败** — 降死区 + 加时重新对齐.
+#   初试死区 0.05 → 重试放宽到 0.10; 重试超时 +4s (块默认 5/6/7s → 9/10/11s);
+#   重试仍超时**且画面看得到 water** (trace_hits>0) → 再 +1s 类推第 3 次
+#   (块1/2/3 最坏 = 5+4+1=10s / 6+4+1=11s / 7+4+1=12s).
+PICK_RETRY_DEADZONE: float = 0.10
 PICK_RETRY_EXTRA_S: float = 4.0
+PICK_RETRY_ESCALATE_S: float = 1.0
 PICK_VISION_HZ: float = 25.0
 # ⚠️ dead 常量: run() 实际读 yaml water_tower_task.pick_vision.* (现 gain_arm=0.15).
 #    这里的 PICK_VISION_* 值只作参考, 调参改 task_config.yml 才生效.
@@ -418,12 +425,14 @@ def _deliver_prepare(
     carry_arm_deg: float,
     carry_hand_deg: float,
     deliver_y_mm: float,
+    retract_x_mm: float = DELIVER_RETRACT_X_MM,
     timeout: float = 10.0,
 ) -> None:
     """carry 切姿态 (用户 2026-08-08 新规定, 顺序: 收X → 大臂转 → Y降投放深度 → X伸出).
 
     抓取后到投放位 (与旧版 "阶段3 X/Y 并发 + 先到 -75 transit" 不同):
-      1) X 收到 -260 (更收回, 远离水塔, 给大臂转动留空间)
+      1) X 收到 retract_x_mm (默认 -260, 更收回远离水塔给大臂转动留空间;
+         每座塔第 1 块用户改 -235, 更贴近投放位)
       2) _safe_arm_rotation_sequence: 只转 arm + hand (X/Y 冻结在安全位, 不做阶段3 X/Y)
       3) Y 直接降到投放深度 deliver_y_mm (不再去 -75 transit; 必须在大臂之后)
       4) X 伸出到 carry_x_mm (必须在 Y 之后)
@@ -443,10 +452,10 @@ def _deliver_prepare(
 
         # 臂步骤顺序 (一个 worker 内串行, 跟底盘并发; 2026-08-08 改: 不做 X/Y 并发)
         def _arm_prep():
-            # 1) X 收到 -260 (更收回)
+            # 1) X 收到 retract_x_mm (默认 -260; 每座塔第 1 块 -235)
             _safe_composite_run(
                 arm_client, arm=None,
-                x_mm=-260.0, y_mm=None,
+                x_mm=retract_x_mm, y_mm=None,
                 hand=None, speed=100, timeout=5.0,
             )
             # 2) 大臂 + 手爪转 (X/Y 冻结在安全位, 不做阶段3 X/Y)
@@ -672,40 +681,46 @@ def _pick_cube_servo_local(
         servo_kw["arm_min"], servo_kw["arm_max"],
         servo_kw["settle_hits"], servo_kw["servo_timeout"],
     )
-    job = arm_client.http.execute(
-        "car", "run_arm_servo", kwargs=servo_kw, sync=True,
-        timeout=float(servo_kw["servo_timeout"]) + 15.0,
-    )
-    result = (job or {}).get("result") if isinstance(job, dict) else None
-    result = result if isinstance(result, dict) else {}
-    if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
-        raise RuntimeError(
-            f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
+    def _run_servo_once(tag: str, kw: Dict[str, Any]) -> Dict[str, Any]:
+        """跑一轮 run_arm_servo 并解析 result (status 失败 raise)。tag 用于日志区分."""
+        job = arm_client.http.execute(
+            "car", "run_arm_servo", kwargs=kw, sync=True,
+            timeout=float(kw["servo_timeout"]) + 15.0,
         )
-    logger.info("cam2 本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
-                result.get("reason"), result.get("settled"),
-                result.get("trace_hits"), result.get("end_arm"))
-    # 2026-08-09 用户新规则: 超时不许失败 — 降死区 PICK_RETRY_DEADZONE(0.07) +
-    # 加时 PICK_RETRY_EXTRA_S(4s) 重新对齐一次. 仅 timeout 重试 (stopped=急停不重试).
+        result = (job or {}).get("result") if isinstance(job, dict) else None
+        result = result if isinstance(result, dict) else {}
+        if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+            raise RuntimeError(
+                f"run_arm_servo {tag} 任务失败: status={job.get('status')} error={job.get('error')}"
+            )
+        logger.info("cam2 本地视觉伺服%s结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                    tag, result.get("reason"), result.get("settled"),
+                    result.get("trace_hits"), result.get("end_arm"))
+        return result
+
+    result = _run_servo_once("", servo_kw)
+    # 2026-08-10 用户新规则: 超时不许失败 — 降死区 PICK_RETRY_DEADZONE(0.10) +
+    # 加时 PICK_RETRY_EXTRA_S(4s) 重试; 重试仍超时且画面看得到 water
+    # (trace_hits>0) → 再 +1s 类推第 3 次 (块1/2/3 最坏 5+4+1=10/6+4+1=11/7+4+1=12s).
+    # 仅 timeout 重试 (stopped=急停不重试); 画面看不到 water (trace_hits=0) 不类推.
     if (not result.get("settled")
             and result.get("reason") == "timeout"):
         logger.info("视觉对齐超时, 降死区重试: deadzone %.3f→%.3f, servo_timeout +%.0fs",
                     servo_kw["deadzone"], PICK_RETRY_DEADZONE, PICK_RETRY_EXTRA_S)
         servo_kw["deadzone"] = PICK_RETRY_DEADZONE
         servo_kw["servo_timeout"] = float(servo_kw["servo_timeout"]) + PICK_RETRY_EXTRA_S
-        job = arm_client.http.execute(
-            "car", "run_arm_servo", kwargs=servo_kw, sync=True,
-            timeout=float(servo_kw["servo_timeout"]) + 15.0,
-        )
-        result = (job or {}).get("result") if isinstance(job, dict) else None
-        result = result if isinstance(result, dict) else {}
-        if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
-            raise RuntimeError(
-                f"run_arm_servo 重试任务失败: status={job.get('status')} error={job.get('error')}"
-            )
-        logger.info("cam2 本地视觉伺服重试结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
-                    result.get("reason"), result.get("settled"),
-                    result.get("trace_hits"), result.get("end_arm"))
+        result = _run_servo_once("重试", servo_kw)
+        # 第 3 次类推: 重试仍超时 + 画面看到 water → 再 +1s
+        if (not result.get("settled")
+                and result.get("reason") == "timeout"
+                and int(result.get("trace_hits", 0) or 0) > 0):
+            logger.info("water 在画面但未锁上 (trace_hits>0), 再 +%.0fs 类推重试 "
+                        "(servo_timeout %.1fs→%.1fs)",
+                        PICK_RETRY_ESCALATE_S,
+                        float(servo_kw["servo_timeout"]),
+                        float(servo_kw["servo_timeout"]) + PICK_RETRY_ESCALATE_S)
+            servo_kw["servo_timeout"] = float(servo_kw["servo_timeout"]) + PICK_RETRY_ESCALATE_S
+            result = _run_servo_once("类推", servo_kw)
     if not result.get("settled"):
         raise RuntimeError(
             f"cam2 本地视觉抓水立方失败 (reason={result.get('reason')}, "
@@ -1042,8 +1057,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                             hand=float(pick["hand_angle_deg"]),      # -10
                             speed=100,
                             timeout=10.0,
-                            # 2026-08-10: 每座塔第 1 块转动大臂用安全 X=-185 (其余块走通用安全区)
-                            safe_x_mm=first_cube_safe_x_mm if picked == 0 else None,
+                            # 2026-08-10: 转动大臂安全 X 所有块通用 (=yaml first_cube_safe_x_mm, 现 -200)
+                            safe_x_mm=first_cube_safe_x_mm,
                         ),
                     )
                     chassis_at_tower_m = target_offset
@@ -1072,8 +1087,11 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                         carry_x_mm = float(carry_xs[tower_idx])
                     else:
                         carry_x_mm = float(carry["x_mm"])
-                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收-260 → 大臂转%s° → Y降%.0f → X伸%.0f [塔%d])",
-                                picked + 1, d_back, carry["arm_angle_deg"], deliver_y,
+                    # 每座塔第 1 块放块前 X 收到 -235, 其余 -260 (2026-08-10 用户)
+                    retract_x = (FIRST_DELIVER_RETRACT_X_MM if picked == 0
+                                 else DELIVER_RETRACT_X_MM)
+                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收%.0f → 大臂转%s° → Y降%.0f → X伸%.0f [塔%d])",
+                                picked + 1, d_back, retract_x, carry["arm_angle_deg"], deliver_y,
                                 carry_x_mm, tower_idx + 1)
                     _deliver_prepare(
                         arm_client, runner,
@@ -1082,6 +1100,7 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                         carry_arm_deg=float(carry["arm_angle_deg"]),
                         carry_hand_deg=float(deliver_hand),
                         deliver_y_mm=deliver_y,
+                        retract_x_mm=retract_x,
                         timeout=10.0,
                     )
                     chassis_at_tower_m = 0.0

@@ -155,9 +155,9 @@ task_cfg:
     # 2026-08-09: 第二块 X 从 -210 改 -240 (用户实测摆放位置).
     # 识别/视觉对齐前姿态 X 由 cube_x_mm 决定, 见 _pick_cube.init_x_mm.
     second_cube_x_mm: -240
-    # 2026-08-10: 每座塔第 1 块转动大臂时的安全 X (通用安全区 [-300,-200] 的 clamp 值
-    # -200 → -185)。仅影响第 1 块转臂阶段, 抓取 X 仍走 first_cube_x_mm。
-    first_cube_safe_x_mm: -185
+    # 2026-08-10: 转动大臂时的安全 X (所有块通用, 不再只第 1 块)。
+    # -185 → -200 (改回通用安全区边界)。抓取 X 仍走 first_cube_x_mm。
+    first_cube_safe_x_mm: -200
 
     # cam2 视觉闭环: 底盘对齐到水塔等级标 (track_chassis 参数)
     track_align:
