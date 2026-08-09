@@ -73,7 +73,7 @@ TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
 }
 
 # ── 视觉伺服参数 (track_velocity_pick) ─────────────────────────────────────
-PICK_SERVO_GAIN_ARM = 1.0
+PICK_SERVO_GAIN_ARM = 0.7     # 2026-08-10: 1.0 → 0.7 (用户: 大臂增量调缓, 每帧 +1.0×dx → +0.7×dx)
 PICK_SERVO_GAIN_X = 0.30
 PICK_SERVO_DEADZONE = 0.06
 PICK_SERVO_MAX_VEL = 0.5

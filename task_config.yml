@@ -37,7 +37,7 @@ task_cfg:
 
     arm_pick_pose:
       x_mm: -70            # 2026-08-09: -80 → -70 (S 姿态 x 前移, 与 S_POSE_X_MM 一致)
-      arm_angle_deg: -90
+      arm_angle_deg: -95   # 2026-08-10: -90 → -95 (用户: S 姿态/视觉对齐起始大臂角)
       y_mm: 0              # 2026-08-02: 吸取动作位置 (吸嘴触底)
       hand_angle_deg: 0    # 吸取时末端向下
 
