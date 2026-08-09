@@ -16,7 +16,7 @@ from main.arm import ArmRunner  # noqa: E402
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
     TASK4_POSE_P_HAND_DEG,
-    X_PICK_MM, Y_PICK_MM, X_TRANSIT_MM, Y_PUT_MM,
+    X_PICK_MM, Y_PICK_MM, X_TRANSIT_MM, Y_TRANSIT_MM, Y_PUT_MM,
     BIN_X_MM,
     # 机械臂智能抓取 (2026-08-10)
     TASK4_SETPOINT_X_NORM, TASK4_SETPOINT_Y_NORM,
@@ -55,7 +55,8 @@ def _pick_by_arm_servo(
     走 runner.track_velocity_pick (velocity 模式, 免 arm_queue):
       - find_target_arm_cross: dx=cx-setpoint_x → 大臂, dy=cy-setpoint_y → x 十字
         (y 十字锁 0, hand 固定) —— 用户拍板"大臂 + x 轴, y 不动"。
-      - 高位伺服 (y=servo_y_start) 收敛后 → y 盲降 grasp_y_mm → 吸气 → 抬回。
+      - 高位伺服 (y=servo_y_start) 收敛后 → y 盲降 grasp_y_mm → 吸气。
+        (lift_back=False 不抬回; 抬高交给中转同步 composite_run)
       - setpoint 硬编码 (TASK4_SETPOINT_*), 两种球同尺寸共用一份。
 
     Returns:
@@ -89,8 +90,12 @@ def _pick_by_arm_servo(
         sign_x=TASK4_SERVO_SIGN_X,
         mode="pick",
         lock_first=True,
-        # target4 主循环已先 composite_run 到 P 姿态, 跳过重复摆位 (省 ~2-3s)。
-        skip_pose_align=True,
+        # 抓取后不自动抬回 y_start 高位: 由 _pick_and_store 的中转同步 composite_run
+        # (x=transit_x, y=transit_y) 一步抬高到中转位 (用户拍板 2026-08-10)。
+        lift_back=False,
+        # P 姿态 x=-295mm 靠近 runtime 下限 -300mm，负向 x_vel 会被限幅为 0。
+        # 进入视觉循环前先摆到 X_PICK_MM=-240mm，给 x 轴双向调节余量。
+        skip_pose_align=False,
     )
     if not result.get("ok"):
         return {"ok": False,
@@ -108,6 +113,7 @@ def _pick_and_store(
     color: str,
     pick_y_mm: float = Y_PICK_MM,  # 盲降抓球目标 y (臂伺服 grasp_y)
     transit_x_mm: float = X_TRANSIT_MM,
+    transit_y_mm: float = Y_TRANSIT_MM,  # 中转 y (与中转 x 同步抬高, 用户拍板 -130)
     bin_x_mm: Optional[float] = None,  # None → 按 color 查 BIN_X_MM
     bin_y_mm: float = Y_PUT_MM,
     bin_hand_deg: float = TASK4_POSE_P_HAND_DEG,
@@ -122,11 +128,11 @@ def _pick_and_store(
     """机械臂智能抓取 + 同步放 bin。
 
     流程 (同步, 无 sleep):
-      0. 臂伺服智能抓取: 大臂+x 轴对齐 → 高位收敛 → y 盲降 pick_y → 吸气 → 抬回高位
-      1. composite_run x=transit_x              中转 x (belt-slip 分段)
-      2. composite_run x=bin_x                  横移到 bin 上方
-      3. composite_run y=bin_y, hand=bin_hand   降到放仓位
-      4. grasp(False)                           放气
+      0. 臂伺服智能抓取: 大臂+x 轴对齐 → 高位收敛 → y 盲降 pick_y → 吸气 (不抬回)
+      1. composite_run x=transit_x, y=transit_y  中转同步抬高+横移 (用户拍板)
+      2. composite_run x=bin_x                   横移到 bin 上方
+      3. composite_run y=bin_y, hand=bin_hand    降到放仓位
+      4. grasp(False)                            放气
 
     Returns:
         {"ok": bool, "error": str|None, "release_thread": None}
@@ -149,14 +155,16 @@ def _pick_and_store(
     if not pick["ok"]:
         return {"ok": False, "error": pick["error"], "release_thread": None}
 
-    # 1. 中转 x (servo 抬回高位后, 先到中转位, 分两段防 belt-slip)
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [1/4] composite_run(x={transit_x_mm:+.0f})  "
-          f"横移到中转位 {transit_x_mm}")
+    # 1. 中转 (x+y 同步: 抬高到 transit_y + 横移到 transit_x, 一次 composite_run。
+    #    用户拍板 2026-08-10: 抓取后不抬回高位, 中转即抬高, 同步走)
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [1/4] composite_run(x={transit_x_mm:+.0f}, "
+          f"y={transit_y_mm:+.0f})  中转同步抬高+横移")
     try:
-        arm_client.composite_run(x_mm=transit_x_mm, speed=80, timeout=30.0)
+        arm_client.composite_run(x_mm=transit_x_mm, y_mm=transit_y_mm,
+                                 speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
-                "error": f"composite_run(x={transit_x_mm}) 中转横移失败: "
+                "error": f"composite_run(x={transit_x_mm}, y={transit_y_mm}) 中转失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 

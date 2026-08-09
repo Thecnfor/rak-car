@@ -371,8 +371,9 @@ def step_target4(
                 bin_x_mm=bin_x_blue_mm if color == COLOR_BLUE else bin_x_yellow_mm,
                 bin_y_mm=bin_y_blue_mm if color == COLOR_BLUE else bin_y_yellow_mm,
                 bin_hand_deg=bin_hand_blue_deg if color == COLOR_BLUE else bin_hand_yellow_deg,
-                # 臂伺服 pick 起始位姿 = P 姿态 (主循环已 composite_run 到位)
-                servo_x_start_mm=pose_p_x_mm,
+                # 视觉伺服起始 x 用抓取位，不用 P 位 -295mm（贴近 x 下限）。
+                # track_velocity_pick 会先摆到 X_PICK_MM，再开始实时 x_vel 闭环。
+                servo_x_start_mm=X_PICK_MM,
                 servo_y_start_mm=pose_p_y_mm,
                 servo_arm_start_deg=pose_p_arm_deg,
                 servo_hand_start_deg=pose_p_hand_deg,

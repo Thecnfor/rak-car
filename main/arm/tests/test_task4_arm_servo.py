@@ -15,6 +15,10 @@ from main.arm.each_task.task4 import constants as C
 
 
 class TestPickByArmServo(unittest.TestCase):
+    def test_latest_shared_setpoint(self):
+        self.assertEqual(C.TASK4_SETPOINT_X_NORM, 0.08)
+        self.assertEqual(C.TASK4_SETPOINT_Y_NORM, -0.70)
+
     def _runner(self, ok=True, reason=None):
         r = Mock()
         r.track_velocity_pick.return_value = {
@@ -43,7 +47,9 @@ class TestPickByArmServo(unittest.TestCase):
         self.assertEqual(kw["arm_start"], 90.0)
         self.assertEqual(kw["sign_arm"], C.TASK4_SERVO_SIGN_ARM)
         self.assertEqual(kw["sign_x"], C.TASK4_SERVO_SIGN_X)
-        self.assertTrue(kw["skip_pose_align"])           # 主循环已摆到 P 姿态
+        self.assertEqual(kw["x_start"], -295.0)
+        self.assertFalse(kw["skip_pose_align"])          # 先离开 P 位 x 下限，再闭环
+        self.assertFalse(kw["lift_back"])                # 抓取后不抬回高位，中转同步抬高
         # 两种球同尺寸 → 黄球同一 setpoint
         r2 = self._runner(ok=True)
         _pick_by_arm_servo(r2, color="yellow", servo_x_start_mm=-295.0)
@@ -85,11 +91,16 @@ class TestPickAndStore(unittest.TestCase):
         self.assertTrue(res["ok"])
         # 臂伺服被调用 (label=ball_blue)
         self.assertEqual(runner.track_velocity_pick.call_args.args[0], "ball_blue")
-        # 放 bin: 中转 x → bin_x → 降 → 放气
+        # 放 bin: 中转(同步 x+y) → bin_x → 降 → 放气
         xs = [c.kwargs.get("x_mm") for c in arm.composite_run.call_args_list]
         self.assertIn(C.BIN_X_MM["blue"], xs)  # 蓝 bin x=0 必现
         self.assertTrue(any(c.kwargs.get("y_mm") is not None
                             for c in arm.composite_run.call_args_list))
+        # 中转同步: 同一次 composite_run 同时含 transit_x 和 transit_y
+        transit = [c for c in arm.composite_run.call_args_list
+                   if c.kwargs.get("x_mm") == C.X_TRANSIT_MM]
+        self.assertTrue(transit, "中转 x 必现")
+        self.assertEqual(transit[0].kwargs.get("y_mm"), C.Y_TRANSIT_MM)
         runner.grasp.assert_called_with(False, timeout=5.0)
 
     def test_yellow_bin_column(self):

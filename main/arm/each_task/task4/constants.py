@@ -141,14 +141,14 @@ TASK4_POSE_P_HAND_DEG: float = 10.0
 X_PICK_MM: float = -240.0
 """盲降前横移 x (mm)。"""
 
-Y_PICK_MM: float = -55.0
-"""抓球 y (吸盘贴近球面)。"""
+Y_PICK_MM: float = -65.0
+"""抓球 y (对准后直接下降到此高度, 吸住后保持到中转/bin)。"""
 
-Y_TRANSIT_MM: float = -140.0
-"""中转 y (放仓位之前的过渡位)。"""
+Y_TRANSIT_MM: float = -130.0
+"""中转 y (用户拍板 2026-08-10: 抓取后抬高到此高度, 与中转 x 同步 composite_run)。"""
 
 X_TRANSIT_MM: float = -220.0
-"""中转 x (车体中线附近, 两次小位移降低 belt-slip 风险)。"""
+"""中转 x (车体中线附近; 与中转 y 同步 composite_run 一次到位, 降 belt-slip 风险)。"""
 
 # ---- 放 bin 参数 ----
 Y_PUT_MM: float = -140.0
@@ -178,10 +178,10 @@ BALL_LABELS = ["ball_blue", "ball_yellow"]
 #     Y_PICK_MM 吸气), 规避侧摄近地丢球 (见 memory task4-pick-servo-high-then-descend)。
 #   - 两种球同尺寸 → 蓝/黄共用一份 setpoint。
 
-# ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户标定, 2026-08-10)。
-#    手爪智能抓取目标 = (cx, cy) = (-0.03, -0.74), 两种球同尺寸共用一份。
-TASK4_SETPOINT_X_NORM: float = -0.03
-TASK4_SETPOINT_Y_NORM: float = -0.74
+# ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户最新标定, 2026-08-10)。
+#    手爪智能抓取目标 = (cx, cy) = (0.08, -0.70), 两种球同尺寸共用一份。
+TASK4_SETPOINT_X_NORM: float = 0.08
+TASK4_SETPOINT_Y_NORM: float = -0.70
 
 TASK4_SERVO_Y_START_MM: float = TASK4_POSE_P_Y_MM
 """臂伺服起始/抬回 y (高位, 球全程可见)。cam2 侧摄固定, y 只影响吸嘴高度,
