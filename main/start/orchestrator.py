@@ -359,7 +359,7 @@ class Orchestrator:
         completed: List[str] = []
         task4_task5_handoff = None
         try:
-            for wp in waypoints:
+            for waypoint_index, wp in enumerate(waypoints):
                 logger.info("=== navigating to %s ===", wp.name)
                 self._wait_until_triggered(wp, api, dis_buf, tui_buf,
                                            interval_s=self.ir_interval_s)
@@ -433,14 +433,19 @@ class Orchestrator:
                         logger.info("odometry reset at task3 trigger: distance from 0")
                     except Exception as exc:
                         logger.warning("odom reset at task3 trigger failed: %s", exc)
+                defer_task5_handoff = False
                 if wp.task_module:
                     tui_buf[0] = {"wp": wp.name, "dis": dis_buf[0],
                                   "ir_left": None, "ir_right": None,
                                   "state": "task"}
                     extra_kwargs: Dict[str, Any] = {}
-                    if wp.task_id == 4:
-                        # IR+odom 结束后，task4 的关仓和 task5 Phase 1 姿态
-                        # 在巡航期间后台执行；task4 自己不再抢占这段收尾。
+                    defer_task5_handoff = self._should_defer_task4_handoff(
+                        waypoints, waypoint_index,
+                    )
+                    if defer_task5_handoff:
+                        # 仅当当前选中的 waypoint 后面紧跟 task5 时，
+                        # 才把 task4 收尾交给后台 handoff；单任务 --task 4
+                        # 必须走 task4 自己的 finally，避免引入 task5 线程池。
                         extra_kwargs["defer_task5_handoff"] = True
                     if wp.task_id == 5 and task4_task5_handoff is not None:
                         handoff_ok = self._wait_task4_task5_handoff(task4_task5_handoff)
@@ -470,7 +475,8 @@ class Orchestrator:
                         logger.info("[task4→task5] 采集统计: blue=%d yellow=%d",
                                     counts["blue"], counts["yellow"])
                         detail_reason = detail.get("reason") if isinstance(detail, dict) else None
-                        if detail_reason == "ir_odom_exit":
+                        if (detail_reason == "ir_odom_exit"
+                                and defer_task5_handoff):
                             task4_task5_handoff = self._start_task4_task5_handoff(client)
                             logger.info("[task4→task5] handoff 已启动，先恢复巡航")
                 time.sleep(wp.pause_after_s)
@@ -501,14 +507,14 @@ class Orchestrator:
                         self._post_task1_maneuver(api, post_task6)
                 # task4→task5 handoff 已在后台处理关仓 + Phase 1 姿态，
                 # 不能再启动通用 home reset 抢占同一条臂串口。
-                if not (wp.task_id == 4 and task4_task5_handoff is not None):
+                if task4_task5_handoff is None:
                     self._schedule_arm_home_reset()
                 self._resume_lane(runner)
                 completed.append(wp.name)
         except KeyboardInterrupt:
             logger.info("interrupted by user")
         finally:
-            # task4→task5 handoff 若仍在跑（单任务/中断/未到 task5），必须在
+            # task4→task5 handoff 若仍在跑（中断/未到 task5），必须在
             # 清场前收尾，避免关仓/摆臂在 mission 结束后继续下发。
             if task4_task5_handoff is not None and task4_task5_handoff.is_alive():
                 logger.info("[task4→task5] 收尾时 handoff 仍在跑, join 等它结束")
@@ -964,6 +970,17 @@ class Orchestrator:
         return False
 
     # ── 任务后机械臂归位 (2026-08-03) ───────────────────────────
+
+    @staticmethod
+    def _should_defer_task4_handoff(
+        waypoints: List[Waypoint], index: int,
+    ) -> bool:
+        """仅在当前选中序列紧接 task5 时启用 task4→task5 交接。"""
+        if index < 0 or index >= len(waypoints):
+            return False
+        if waypoints[index].task_id != 4 or index + 1 >= len(waypoints):
+            return False
+        return waypoints[index + 1].task_id == 5
 
     @staticmethod
     def _start_task4_task5_handoff(client: RuntimeApiClient):

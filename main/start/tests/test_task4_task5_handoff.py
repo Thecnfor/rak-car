@@ -1,10 +1,23 @@
 import unittest
 from unittest.mock import MagicMock, patch
 
-from main.start.orchestrator import Orchestrator
+from main.start.orchestrator import Orchestrator, Waypoint
 
 
 class TestTask4Task5Handoff(unittest.TestCase):
+    def test_single_task4_does_not_defer_handoff(self):
+        waypoints = [
+            Waypoint("task4", task_id=4, task_module="task4"),
+        ]
+        self.assertFalse(Orchestrator._should_defer_task4_handoff(waypoints, 0))
+
+    def test_adjacent_task4_task5_defers_handoff(self):
+        waypoints = [
+            Waypoint("task4", task_id=4, task_module="task4"),
+            Waypoint("task5", task_id=5, task_module="task5"),
+        ]
+        self.assertTrue(Orchestrator._should_defer_task4_handoff(waypoints, 0))
+
     @patch("main.arm.ArmClient")
     def test_handoff_closes_storage_moves_phase1_and_restarts_feed(self, arm_cls):
         arm = arm_cls.return_value
