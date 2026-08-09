@@ -28,7 +28,7 @@ class DetectorNode(Node):
         self.declare_parameter("labels_file", "/home/xrak/models/ppyoloe_plus_crn_s_80e_coco/labels.txt")
         self.declare_parameter("model_id", "ppyoloe")
         self.declare_parameter("publish_rate_hz", 20.0)
-        self.declare_parameter("score_threshold", 0.3)
+        self.declare_parameter("score_threshold", 0.5)
         self.declare_parameter("input_scale", 1.0)
         self.declare_parameter("bgr_to_rgb", False)
 

@@ -76,7 +76,7 @@ def generate_launch_description() -> LaunchDescription:
                 "labels_file": "/home/xrak/models/ppyoloe_plus_crn_s_80e_coco/labels.txt",
                 "model_id": "task",
                 "publish_rate_hz": 20.0,
-                "score_threshold": 0.3,
+                "score_threshold": 0.5,
             }],
         ),
 

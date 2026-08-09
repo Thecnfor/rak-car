@@ -53,7 +53,7 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "detector_labels",
             default_value="/home/xrak/models/ppyoloe_plus_crn_s_80e_coco/labels.txt"),
-        DeclareLaunchArgument("score_threshold", default_value="0.3"),
+        DeclareLaunchArgument("score_threshold", default_value="0.5"),
 
         Node(
             package="hardware", executable="camera_node",
