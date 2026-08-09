@@ -382,6 +382,14 @@ class TestRun(unittest.TestCase):
         self.assertTrue(result["chassis_aligned"])
         self.assertEqual(tc.call_count, 2)
         self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
+        for call_item in tc.call_args_list:
+            kwargs = call_item.kwargs
+            self.assertFalse(kwargs["decouple_xy"])
+            self.assertEqual(kwargs["kp"], 0.20)
+            self.assertEqual(kwargs["v_max"], 0.12)
+            self.assertEqual(kwargs["v_slew"], 0.04)
+            self.assertEqual(kwargs["deadband"], 0.05)
+            self.assertEqual(kwargs["hold_frames"], 3)
 
     def test_align_failure_after_two_tries_still_proceeds(self):
         """2026-08-06: 重试后仍失败 → ERROR 告警 + 放行; chassis_aligned=False, ok=True (比赛完赛优先)。"""

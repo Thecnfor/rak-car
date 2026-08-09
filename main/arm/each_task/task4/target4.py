@@ -108,8 +108,8 @@ DEFAULT_MAX_CREEP_M: float = 0.58
 DEFAULT_MAX_SECONDS: float = 9999.0
 """任务总时长预算 (s) (距离优先模式下设为极大值, 实际不限制)。"""
 
-DEFAULT_CREEP_SPEED_MPS: float = 0.06
-"""creep 搜索前移速度 (m/s)。"""
+DEFAULT_CREEP_SPEED_MPS: float = 0.12
+"""creep 搜索前移速度 (m/s)。2026-08-09 用户: 翻倍 (0.06→0.12) 加快扫区。"""
 
 CREEP_POLL_HZ: float = 20.0
 """creep 期间 fetch_balls 轮询频率。"""
@@ -189,14 +189,62 @@ Y_FINAL_MM: float = -140.0
 BALL_LABELS = ["ball_blue", "ball_yellow"]
 """track_chassis 目标集 (PaddleDet 模型标签)。"""
 
-# IR 结束阈值: 左 IR **靠近** (< 此值) 视为抵达采区末端标记 → 再走 0.3m 收工。
-# 与 orchestrator 触发 task4 的极性一致 (ir_left < 0.7 = 到达起点, 现场实测 0.51);
-# 采区中途 IR 读 1.5m+ (空旷), 用 < 才不会全程误触发。现场可在此调灵敏度。
-IR_END_CLOSE_M: float = 0.6
+# task4 任务点由 orchestrator 的左 IR < 0.70m 触发。
+# 任务运行期间 IR 回到 > 0.70m, 连续确认后视为离开任务区, 再前进 0.30m 收工。
+IR_FAR_THRESHOLD_M: float = 0.70
+IR_FAR_CONFIRM_FRAMES: int = 2
+POST_IR_LOSS_DISTANCE_M: float = 0.30
 
-# IR 触发后走 0.3m 的时间兜底: 0.3m@0.06m/s≈5s, +3s 裕量。odom 冻结时
-# (现场整场冻结) 靠它收尾, 不再等 30s 墙钟或手动 Ctrl+C。
-IR_TRIGGERED_MAX_S: float = 8.0
+
+class _Task4SearchState:
+    """跨每一球保存 task4 的 IR 生命周期和末端 0.3m 记账。"""
+
+    def __init__(self, *, ir_started: bool = True,
+                 far_threshold_m: float = IR_FAR_THRESHOLD_M,
+                 far_confirm_frames: int = IR_FAR_CONFIRM_FRAMES):
+        import threading
+        self.ir_started = bool(ir_started)
+        self.far_threshold_m = float(far_threshold_m)
+        self.far_confirm_frames = max(1, int(far_confirm_frames))
+        self.ir_lost = False
+        self.far_streak = 0
+        self.post_loss_distance_m = 0.0
+        self._pending_far_distance_m = 0.0
+        self.finished_by_ir_odom = False
+        self._lock = threading.Lock()
+
+    def update_ir(self, left_ir, *, distance_m: float = 0.0) -> bool:
+        """更新左 IR；连续远读数锁存为 IR 丢失并吸收确认期间位移。"""
+        with self._lock:
+            if self.ir_lost or not self.ir_started:
+                return self.ir_lost
+            try:
+                far = float(left_ir) > self.far_threshold_m
+            except (TypeError, ValueError):
+                far = False
+            if far:
+                self.far_streak += 1
+                self._pending_far_distance_m += max(0.0, float(distance_m))
+                if self.far_streak >= self.far_confirm_frames:
+                    self.ir_lost = True
+                    self.post_loss_distance_m += self._pending_far_distance_m
+                    self._pending_far_distance_m = 0.0
+                    if self.post_loss_distance_m >= POST_IR_LOSS_DISTANCE_M:
+                        self.finished_by_ir_odom = True
+            else:
+                self.far_streak = 0
+                self._pending_far_distance_m = 0.0
+            return self.ir_lost
+
+    def add_post_loss_distance(self, delta_m: float) -> bool:
+        """累计 IR 丢失后的位移，并返回是否达到 0.30m。"""
+        with self._lock:
+            if not self.ir_lost or self.finished_by_ir_odom:
+                return self.finished_by_ir_odom
+            self.post_loss_distance_m += max(0.0, float(delta_m))
+            if self.post_loss_distance_m >= POST_IR_LOSS_DISTANCE_M:
+                self.finished_by_ir_odom = True
+            return self.finished_by_ir_odom
 
 
 # ---- 后台保前移线程 (P 姿态 + creep 并发) ----
@@ -204,24 +252,18 @@ IR_TRIGGERED_MAX_S: float = 8.0
 class _CreepThread:
     """后台线程保底盘前移 + 主线程摆臂。"""
 
-    def __init__(self, http_client, *, speed_mps: float, max_distance_m: float,
-                 poll_hz: float = CREEP_POLL_HZ, ir_exit_enabled: bool = True,
-                 max_seconds_s: float = 30.0,
-                 ir_max_seconds_s: float = IR_TRIGGERED_MAX_S):
+    def __init__(self, http_client, *, state: Optional[_Task4SearchState] = None,
+                 speed_mps: float, max_distance_m: float,
+                 poll_hz: float = CREEP_POLL_HZ,
+                 max_seconds_s: float = CREEP_MAX_SECONDS_S):
         import threading
         self.http = http_client
+        self.state = state or _Task4SearchState()
         self.speed_mps = speed_mps
         self.max_distance_m = max_distance_m
         self.poll_hz = poll_hz
-        # IR+0.3m 结束条件只在任务进行中(至少第 2 球)启用 —— 第 1 球一开始
-        # 就触发会吞掉整段搜索 (现场实测 1.67m 起步即触发 → 0 球退出)。
-        self.ir_exit_enabled = bool(ir_exit_enabled)
-        # 墙钟兜底上限: 距离/IR/见球任一不满足时 (odom 卡死等) 也必须退出,
-        # 否则主线程 wait_for_ball 干等 (现场 球9 卡到 Ctrl+C)。
+        # 墙钟上限只是单次 worker 的安全兜底；正常 task4 收尾由 IR 丢失+0.3m 决定。
         self.max_seconds_s = float(max_seconds_s)
-        # IR 触发后的时间兜底: 0.3m 靠 odom 增量, odom 冻结时靠它收尾
-        # (现场 全场 odom 冻结 → IR+0.3m 永不完成 → 手动 Ctrl+C)。
-        self.ir_max_seconds_s = float(ir_max_seconds_s)
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="task4-creep")
         self._stop_event = threading.Event()
@@ -230,20 +272,14 @@ class _CreepThread:
         self.elapsed_s = 0.0
         self.balls = None
         self.found_ball = False
-        # IR 触发后走满 0.3m 的终止锁存；必须唤醒 wait_for_ball。
         self.finished_by_ir_odom = False
-        self._t0 = 0.0
+        self.timed_out = False
         self._odo_start_x = None
-        self._odo_ir_trigger_x = None
-        self._ir_triggered_at = None
-        # odom 冻结检测: x 长时间不变化 → 距离记账退回开环。
         self._last_odom_x = None
         self._odom_stall_s = 0.0
-        self.ir_triggered = False
 
     def start(self) -> None:
-        self._t0 = time.monotonic()
-        # 记录启动时里程计 x，后续闭环累加
+        # 记录启动时里程计 x，后续闭环累加。
         try:
             odo = self.http.get_odom_state() or {}
             odo_data = odo.get("odom_state") or {}
@@ -257,6 +293,10 @@ class _CreepThread:
         t0 = time.monotonic()
         try:
             while not self._stop_event.is_set():
+                if self.state.finished_by_ir_odom:
+                    self.finished_by_ir_odom = True
+                    break
+
                 try:
                     self.http.post(
                         "/v1/realtime/chassis-velocity",
@@ -267,7 +307,9 @@ class _CreepThread:
                     pass
                 time.sleep(period)
 
-                # 里程计闭环累加（替换原开环 speed*time）
+                # 优先使用 odom 的本轮增量；读不到或冻结时保留开环兜底。
+                old_distance_m = self.distance_m
+                odom_delta_available = False
                 if self._odo_start_x is not None:
                     try:
                         odo = self.http.get_odom_state() or {}
@@ -275,10 +317,8 @@ class _CreepThread:
                         current_x = odo_data.get("x")
                         if current_x is not None:
                             odom_dist = max(0.0, current_x - self._odo_start_x)
-                            # odom 冻结检测: x 连续不变 ≥1s → 距离退回开环记账,
-                            # 否则距离预算永不触发 (现场 全场 odom 冻结 → 0.000m)。
-                            if self._last_odom_x is not None and \
-                                    abs(current_x - self._last_odom_x) < 1e-9:
+                            if (self._last_odom_x is not None
+                                    and abs(current_x - self._last_odom_x) < 1e-9):
                                 self._odom_stall_s += period
                             else:
                                 self._odom_stall_s = 0.0
@@ -286,72 +326,45 @@ class _CreepThread:
                             if self._odom_stall_s >= 1.0:
                                 self.distance_m += self.speed_mps * period
                             else:
-                                self.distance_m = odom_dist
+                                self.distance_m = max(self.distance_m, odom_dist)
+                            odom_delta_available = self.distance_m > old_distance_m
                     except Exception:
-                        pass
+                        self.distance_m += self.speed_mps * period
                 else:
-                    # 里程计不可用时回退到开环
                     self.distance_m += self.speed_mps * period
+                movement_delta_m = max(0.0, self.distance_m - old_distance_m)
                 self.elapsed_s = time.monotonic() - t0
 
-                # 墙钟兜底: odom 卡死/距离到不了预算时也必须退出, 不能无限蠕行。
-                if self.elapsed_s >= self.max_seconds_s:
-                    print(f"  [{LOG_PREFIX}] creep 超时 {self.max_seconds_s:.0f}s "
-                          f"(odom 可能卡死), 结束搜索")
-                    break
-
-                # 左 IR 靠近 (< IR_END_CLOSE_M) = 抵达采区末端标记, 锁存触发点
-                # 里程计, 后续只走 0.3m。ir_exit_enabled=False (第 1 球) 时不参与。
-                if not self.ir_triggered and self.speed_mps > 0 and self.ir_exit_enabled:
-                    try:
-                        ir_payload = self.http.get_ir_state() or {}
-                        ir_data = ir_payload.get("ir_state") or {}
-                        left_ir = ir_data.get("left")
-                        if left_ir is not None and float(left_ir) < IR_END_CLOSE_M:
-                            self.ir_triggered = True
-                            self._ir_triggered_at = time.monotonic()
-                            odo_payload = self.http.get_odom_state() or {}
-                            odo_data = odo_payload.get("odom_state") or {}
-                            self._odo_ir_trigger_x = odo_data.get("x")
-                            print(f"  [{LOG_PREFIX}] 左 IR 靠近 < {IR_END_CLOSE_M} "
-                                  f"({float(left_ir):.2f}m), 里程计走 0.3m")
-                    except Exception:
-                        pass
-
-                # IR 触发后只走剩余 0.3m；不能再被视觉“见球”提前截断。
-                if self.ir_triggered:
-                    if self._odo_ir_trigger_x is not None:
-                        try:
-                            odo = self.http.get_odom_state() or {}
-                            odo_data = odo.get("odom_state") or {}
-                            current_x = odo_data.get("x")
-                            if current_x is not None:
-                                extra = max(0.0, current_x - self._odo_ir_trigger_x)
-                            else:
-                                extra = -1.0
-                        except Exception:
-                            extra = -1.0
-                        # 0.3m 到位 或 触发后满 ir_max_seconds_s (odom 冻结兜底)
-                        ir_elapsed = time.monotonic() - (self._ir_triggered_at or 0.0)
-                        if extra >= 0.3 or ir_elapsed >= self.ir_max_seconds_s:
-                            self.finished_by_ir_odom = True
-                            if extra >= 0.3:
-                                print(f"  [{LOG_PREFIX}] IR 触发后里程计走满 "
-                                      f"0.3m ({extra:.3f}m), 结束搜索")
-                            else:
-                                print(f"  [{LOG_PREFIX}] IR 触发后时间兜底 "
-                                      f"{ir_elapsed:.1f}s (odom 冻结), 结束搜索")
-                            self._stop_event.set()
-                            self.http.post(
-                                "/v1/realtime/chassis-velocity",
-                                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                                timeout=1.0,
-                            )
-                            self.completion_event.set()
-                            break
+                try:
+                    ir_payload = self.http.get_ir_state() or {}
+                    ir_data = ir_payload.get("ir_state") or {}
+                    left_ir = ir_data.get("left")
+                except Exception:
+                    left_ir = None
+                was_ir_lost = self.state.ir_lost
+                ir_lost = self.state.update_ir(
+                    left_ir, distance_m=movement_delta_m,
+                )
+                if ir_lost:
+                    # IR 丢失阶段禁止再拿新球；确认帧已计入的位移不重复累加。
+                    if was_ir_lost and not odom_delta_available:
+                        movement_delta_m = self.speed_mps * period
+                        self.distance_m += movement_delta_m
+                    if was_ir_lost:
+                        finished = self.state.add_post_loss_distance(movement_delta_m)
+                    else:
+                        finished = self.state.finished_by_ir_odom
+                    if finished:
+                        self.finished_by_ir_odom = True
+                        print(f"  [{LOG_PREFIX}] IR 丢失后继续前进 "
+                              f"{self.state.post_loss_distance_m:.3f}m, 结束搜索")
+                        self._stop_event.set()
+                        break
                     continue
 
-                if self.distance_m >= self.max_distance_m:
+                if self.elapsed_s >= self.max_seconds_s:
+                    self.timed_out = True
+                    print(f"  [{LOG_PREFIX}] creep 单次超时 {self.max_seconds_s:.0f}s, 结束搜索")
                     break
 
                 try:
@@ -362,10 +375,6 @@ class _CreepThread:
                            for b in balls):
                         self.balls = balls
                         self.found_ball = True
-                        self.completion_event.set()
-                        # 2026-08-06: 见球瞬间主动发 0 速, 不靠 track_chassis
-                        # 第一帧 _set_vel 覆盖 —— 否则 50-150ms 窗口内底盘按
-                        # creep 速度窜一下, 视觉上就是"track 开始瞬间底盘抖".
                         try:
                             self.http.post(
                                 "/v1/realtime/chassis-velocity",
@@ -378,21 +387,15 @@ class _CreepThread:
                 except Exception:
                     pass
         finally:
-            if not self.found_ball:
-                # 兜底: 没见球走完预算 / 超时 / break 后主动停一次 0 速,
-                # 见球路径已见球时上面自己发过, 这里不再发避免重复但保留
-                # 兜底安全 (极小概率 race: break 后另一线程 set 0 失败).
-                try:
-                    self.http.post(
-                        "/v1/realtime/chassis-velocity",
-                        {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                        timeout=1.0,
-                    )
-                except Exception:
-                    pass
-                # 关键: 非见球退出也必须唤醒 wait_for_ball, 否则主线程干等
-                # (现场 球9 卡到 Ctrl+C 的根因)。
-                self.completion_event.set()
+            try:
+                self.http.post(
+                    "/v1/realtime/chassis-velocity",
+                    {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                    timeout=1.0,
+                )
+            except Exception:
+                pass
+            self.completion_event.set()
 
     def wait_for_ball(self, timeout_s: float) -> dict:
         """阻塞等见球, 见球或超时返回。"""
@@ -526,10 +529,12 @@ def _track_leftmost_ball(
         target=BALL_LABELS,
         select_mode="leftmost",
         setpoint_cxcy=(0.0, 0.0),
-        kp=0.10,
-        v_max=0.08,
+        kp=0.20,
+        v_max=0.12,
+        deadband=0.05,
         hold_frames=3,
-        v_slew=0.02,
+        v_slew=0.04,
+        decouple_xy=False,
         max_seconds=max_seconds,
         dry_run=dry_run,
     )
@@ -570,10 +575,12 @@ def _track_leftmost_ball(
                 target=BALL_LABELS,
                 select_mode="leftmost",
                 setpoint_cxcy=(0.0, 0.0),
-                kp=0.18,         # 2x 默认 kp, 但仍走 v_max/v_slew 限幅
-                v_max=0.08,
+                kp=0.20,
+                v_max=0.12,
+                deadband=0.05,
                 hold_frames=3,
-                v_slew=0.02,
+                v_slew=0.04,
+                decouple_xy=False,
                 max_seconds=retry_seconds,
                 dry_run=dry_run,
             )
@@ -906,7 +913,7 @@ def step_target4(
         http_client: RuntimeApiClient (creep 速度下发 / fetch_balls / track_chassis 共用)。
         runner: ArmRunner (None 时自动建)。
         max_picks: 最多抓取数, 默认 8。
-        creep_speed_mps: creep 前移速度 (m/s), 默认 0.03。
+        creep_speed_mps: creep 前移速度 (m/s), 默认 0.12 (2026-08-09 翻倍)。
         max_creep_m: 累计前移距离预算 (m), 默认 0.8。耗尽无球 → 视作采区走完。
         max_seconds: 任务总时长预算 (s), 默认 180。
         track_max_seconds: 单球底盘伺服收敛预算 (s), 默认 12。
@@ -955,6 +962,8 @@ def step_target4(
     n_consecutive_failures = 0
     total_creep_m = 0.0
     final_reason = "unknown"
+    # orchestrator 已经用左 IR 触发 task4；该状态跨每一球 creep worker 保留。
+    search_state = _Task4SearchState(ir_started=True)
     t_start = time.monotonic()
     global _TASK4_T0
     _TASK4_T0 = t_start
@@ -1050,11 +1059,7 @@ def step_target4(
                 break
 
             remaining_m = max_creep_m - total_creep_m
-            if remaining_m <= 0.02:
-                final_reason = "zone_cleared"
-                print(f"\n  [{LOG_PREFIX}] 🏁 前移预算 {max_creep_m:.2f}m 耗尽, "
-                      f"视作采区走完")
-                break
+            # max_creep_m 仅保留为日志/安全参数；正常收尾由 IR 丢失+0.3m 决定。
 
             ball_idx += 1
             print(f"\n========== [{LOG_PREFIX}] 第 {ball_idx} 球 "
@@ -1076,16 +1081,15 @@ def step_target4(
 
             # 首球 (任务刚触发): creep 和 P 姿态 composite_run 并发省时间;
             # 后续球: 顺序 —— 先 P 姿态到位, 再启动 creep, 避免抢串口错过球。
-            # IR+0.3m 结束条件从第 2 球起才启用 (第 1 球 IR 起步即触发会吞掉搜索)。
+            # IR 状态跨球共享，首球也参与远端确认；任务触发时已是近 IR。
             concurrent_creep = (ball_idx == 1)
-            ir_exit_enabled = (ball_idx >= 2)
             creep_thread = None
             if concurrent_creep:
                 creep_thread = _CreepThread(
-                    http_client, speed_mps=creep_speed_mps,
+                    http_client, state=search_state,
+                    speed_mps=creep_speed_mps,
                     max_distance_m=remaining_m,
                     poll_hz=CREEP_POLL_HZ,
-                    ir_exit_enabled=ir_exit_enabled,
                     max_seconds_s=CREEP_MAX_SECONDS_S,
                 )
                 creep_thread.start()
@@ -1146,10 +1150,10 @@ def step_target4(
             if creep_thread is None:
                 # 非首球: P 姿态到位后才启动 creep (顺序执行, 不抢串口)
                 creep_thread = _CreepThread(
-                    http_client, speed_mps=creep_speed_mps,
+                    http_client, state=search_state,
+                    speed_mps=creep_speed_mps,
                     max_distance_m=remaining_m,
                     poll_hz=CREEP_POLL_HZ,
-                    ir_exit_enabled=ir_exit_enabled,
                     max_seconds_s=CREEP_MAX_SECONDS_S,
                 )
                 creep_thread.start()
