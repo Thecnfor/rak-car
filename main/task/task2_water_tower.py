@@ -952,8 +952,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     # 2026-08-06: 第二座塔 3 块时回退距离单独配置 (不走 0.35, 用 0.33)
     group_backward_m = cfg.get("group_backward_m", group_forward_m)
     tower_spacing_m = cfg.get("tower_spacing_m", 0.65)
-    detect_retry_step_m = cfg.get("detect_retry_step_m", 0.2)
-    detect_retry_max = cfg.get("detect_retry_max", 1)
+    # 2026-08-10: detect_retry_step_m/max 已删除 — 识别逻辑改为"先对齐再识别",
+    # 不再前移重试 (见水塔循环内 _align_to_tower → _detect_tower_count 顺序)
     x_target_mm = float(detection["x_mm"])
     # 2026-08-10: 每座塔第 1 块转动大臂安全 X (yaml 可配, 默认 -185)
     first_cube_safe_x_mm = float(cfg.get("first_cube_safe_x_mm", FIRST_CUBE_SAFE_X_MM))
@@ -1028,27 +1028,21 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 logger.warning("Y 下降失败, 跳过水塔 %s", tower_label)
                 continue
 
-            # 识别需几块; 未识别到等级标 → 底盘前移 detect_retry_step_m 再检测
-            # (2026-08-03 用户规定: cam2 没看到第一个水塔等级标 → 前进 0.1m 再 cam2)
+            # 2026-08-10 用户新逻辑: 先对齐再识别 (不要先识别再对齐).
+            #   1. track_chassis 先对齐水塔等级标 (含超时重试: 死区 0.06 + 加时 3s)
+            #   2. 对齐后再识别需几块 — 对齐失败也以此刻识别到的为准
+            #   3. 全程没识别到: 第一座塔默认 1 块; 第二座塔从摆姿势到对齐都没看到
+            #      水塔标识 → 不拿 (跳过整座塔)
+            _align_to_tower(arm_client, track_cfg)
             needed = _detect_tower_count(client)
-            retry = 0
-            while needed is None and retry < detect_retry_max:
-                retry += 1
-                logger.info("cam2 未识别到水塔 %s 等级标, 底盘前移 %.2f m 再检测 (第 %d/%d 次)",
-                            tower_label, detect_retry_step_m, retry, detect_retry_max)
-                # 2026-08-06 提速: 直接 execute_car_action, 跳过 ChassisClient.connect/close
-                _chassis_move_for(arm_client, detect_retry_step_m, timeout=timeout)
-                needed = _detect_tower_count(client)
             if needed is None:
-                logger.warning("水塔 %s 重试后仍未识别到等级标, 兜底取 1 块", tower_label)
+                if tower_idx > 0:
+                    logger.warning("水塔 %s 从摆姿势到对齐都没看到水塔标识, 不拿 (跳过整座塔)",
+                                   tower_label)
+                    continue
+                logger.warning("水塔 %s 未识别到等级标, 默认取 1 块", tower_label)
                 needed = 1
             logger.info("水塔 %s 需投放 %d 块水方块", tower_label, needed)
-
-            # cam2 视觉闭环: 把底盘对齐到水塔等级标居中
-            # 2026-08-06 实测: 第 2 座塔也必须对齐 (move_for 0.7m 期间 odom theta
-            # 漂移, 横向位置变化, cam2 看到的等级标不在第一座标定的 setpoint).
-            # 每座水塔都做一次 track_chassis (~7s).
-            _align_to_tower(arm_client, track_cfg)
 
             # 对齐后的底盘位置视为水塔原点
             chassis_at_tower_m = 0.0  # 底盘相对水塔原点的偏移 (m): >0 前进, <0 后退

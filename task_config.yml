@@ -135,9 +135,10 @@ task_cfg:
     # 在 task2 init 里与臂切 detection 姿态**并发** (进入任务点就开始动 X, 跟底盘移动一起).
     entry_back_off_m: 0.2
 
-    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前进 0.1m 再 cam2 检测)
-    detect_retry_step_m: 0.10    # 2026-08-09: 0.15 → 0.10 (cam2 未识别到等级标 → 底盘前移重试)
-    detect_retry_max: 2
+    # 2026-08-10: detect_retry_step_m/max 作废 — 识别逻辑改"先对齐再识别" (代码已不读).
+    # 原: cam2 未识别到等级标 → 底盘前移重试; 现: 对齐后识别, 未识别到第一座默认1块/第二座不拿.
+    # detect_retry_step_m: 0.10
+    # detect_retry_max: 2
 
     init_pose:
       y_mm: -150
