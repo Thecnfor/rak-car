@@ -68,12 +68,39 @@ task_cfg:
 
     # 2026-08-02: pick 前视觉对齐底盘 (用户自己写 _chassis_align_by_area,
     # 用 set_chassis_velocity 经 IK, 不像 VisualAlignRunner 那样旋转).
+    # 2026-08-10: 放苗侧 cylinder_set 改用机械臂对齐 (place_align), 本底盘对齐段作废
+    # (代码已不读 chassis_align, 保留做历史参考).
     chassis_align:
-      enabled: false        # 2026-08-10: 底盘对齐临时注释掉 (改 yaml 即可恢复 true)
-      ref_area: 1.10        # 2026-08-02 实测 PLACE 姿态 / x=-270 / 距离 T 列约 30cm: cylinder_set bbox area ≈ 1.12
-      label: null           # auto
+      enabled: false        # 作废 — 被 place_align 替代
+      ref_area: 1.10
+      label: null
       v_max: 0.20
-      max_seconds: 5.0      # 2026-08-09: 8.0 → 5.0 (对齐超时收紧, 最坏等待 2×5+1.2s)
+      max_seconds: 5.0
+
+    # 2026-08-10: 放苗侧 cylinder_set 机械臂视觉对齐 (替代原底盘对齐).
+    # 初始姿态 = 现 place 姿态 (arm=+90, x=-235, y=-100, hand=0);
+    # 收敛后记住 (arm, x) → 本次运行放苗直接开到这个姿态 (不再用写死 -235/+90),
+    # 单次运行内恒定, 跨运行重新对齐重记. 未收敛 → 回落写死 place 姿态.
+    # ⚠️ 方向: sign_arm/sign_x 沿用 task1 抓苗标定 (+1/-1); place 在 arm=+90
+    # 与抓苗 -90 几何相反, 若"越对越偏"分别取反 (task2 同规则).
+    place_align:
+      enabled: true
+      label: "cylinder_set"
+      setpoint_cxcy: [0.042, -0.359]   # 2026-08-10 用户标定 (对准时画面坐标)
+      init_x_mm: -235
+      init_arm_deg: 90
+      init_hand_deg: 0
+      timeout: 5.0
+      hz: 20.0
+      gain_arm: 0.7
+      gain_x: 0.30
+      deadzone: 0.06
+      max_vel: 0.5
+      settle_hits: 3
+      sign_arm: 1
+      sign_x: -1
+      arm_min: 30
+      arm_max: 90
 
     # 2026-08-09: 任务点触发后 step0 — lane follow 前移 0.1m @ 0.1m/s,
     # 与机械臂切 PLACE 姿态 (arm=+90 x=-300 y=-100 hand=0) 并发 (进入任务点就动臂).
