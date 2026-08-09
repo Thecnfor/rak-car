@@ -252,7 +252,7 @@ waypoints:
     ir_threshold_m: 1.05
     ir_side: left
     dis_at_least_m: 0.93
-    trigger_op: AND
+    trigger_op: OR
 
   # ----- task2 -----
   - name: task2_water_tower

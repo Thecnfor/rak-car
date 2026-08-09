@@ -29,6 +29,22 @@ DEFAULT_MANIFEST = (
 # 兜底等 max_wait_s (4 张 × 15s timeout 的最坏上界).
 MAX_JUDGE_WAIT_S = 90.0
 
+# 射击姿态 (y1 y2 x arm_angle hand_angle) —— 与 task3_pipeline.SHOOTING_ARM 一致.
+# cam2 随臂动: 编排/单任务模式 task3_shoot 直接拉 shoot_target (它不动臂),
+# 臂停在上一任务姿态 → cam2 看不到卡片. 必须在拉 subprocess 前摆好 (2026-08-09).
+SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
+
+
+def _set_shooting_pose() -> int:
+    """摆射击姿态, 复用 task3_pipeline.run_arm_pose 的 subprocess 调 arm_seq_v9 做法."""
+    command = [
+        sys.executable, "-m", "main.task.task3.arm_seq_v9",
+        "--y1", SHOOTING_ARM[0], "--y2", SHOOTING_ARM[1], "--x", SHOOTING_ARM[2],
+        "--arm-angle", SHOOTING_ARM[3], "--hand-angle", SHOOTING_ARM[4],
+    ]
+    print(f"[task3_shoot] shooting pose: {' '.join(command)}", flush=True)
+    return subprocess.run(command, check=False).returncode
+
 
 def _load_done_manifest(timeout: float = MAX_JUDGE_WAIT_S) -> Dict[str, Any]:
     """读识别 json, 直到 status=done (后台判定完成) 或超时返回当前内容.
@@ -73,6 +89,12 @@ def run(
     if not pests:
         print("[task3_shoot] 无确认害虫, 跳过射击", flush=True)
         return {"ok": True, "status": "ok", "exit_code": 0, "pest_numbers": []}
+
+    # 2026-08-09: 编排/单任务模式补 SHOOTING_ARM 摆臂 —— 手动全流程由 task3_pipeline
+    # 在射前摆臂, task3_shoot 直接拉 shoot_target 时臂停在上一任务姿态, cam2 看不到卡片.
+    if _set_shooting_pose() != 0:
+        print("[task3_shoot] 摆射击姿态失败, 放弃射击", file=sys.stderr)
+        return {"ok": False, "status": "failed", "exit_code": 1, "pest_numbers": pests}
 
     cmd = [
         sys.executable, "-m", "main.task.task3.shoot_target",
