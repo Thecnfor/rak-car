@@ -72,12 +72,11 @@ PEST_PROMPT = _load_pest_prompt()
 
 DEFAULT_TARGET_COUNT = 4
 DEFAULT_CREEP_SPEED = 0.18          # m/s, 识别段 creep 速度 (2026-08-04 现场: 0.05→0.18)
-DEFAULT_FIRST_CARD_VX = 0.04        # m/s, 首卡搜索连续 lane-follow 速度 (2026-08-09: 0.08→0.04)
 DEFAULT_MIN_SCORE = 0.40
 DEFAULT_CENTER_TOL = 0.15
 DEFAULT_MIN_GAP = 0.16          # 卡片中心距 16cm → 去重窗口需覆盖一张卡的间距
 DEFAULT_CLASSIFY_WORKERS = 2
-DEFAULT_TARGET_SPACING_M = 0.15       # 卡片中心距 15cm (2026-08-09: 16→15; 补录推进 + 超程保护都用它)
+DEFAULT_TARGET_SPACING_M = 0.16       # 卡片中心距 16cm (2026-08-09: 改回 16; 补录推进 + 超程保护都用它)
 DEFAULT_TARGET_SETTLE_S = 0.15
 RECOGNITION_ARM = ("-0.100", "-0.040", "-0.270", "90", "-70")
 SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
@@ -469,37 +468,41 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
             search_distance = 0.0
             best_det = None
             best_abs_x = None
+            best_distance = 0.0
             initial = make_latch(first_window, required_samples=1)
             first_det = wait_for_target(initial, min(args.slot_wait_s, 0.5))
-            if first_det is None:
-                # 2026-08-09: 首卡搜索改连续 lane-follow @0.08 m/s (不用 4cm 小步)
+            while first_det is None and search_distance < args.max_travel:
+                search_step = min(0.04, args.max_travel - search_distance)
                 first_latch = make_latch(first_window, required_samples=1,
                                          sample_period=0.05)
-
-                def _search_tick(*_args):
-                    # 连续行驶期间每 tick (~20ms) 采样锁存器 + 记录离中心最近的一张
-                    ready = first_latch[1]()
-                    nearest = centered(1.0)
-                    if nearest is not None:
-                        nearest_abs_x = abs(animal_center(nearest))
-                        nonlocal best_det, best_abs_x
-                        if best_abs_x is None or nearest_abs_x < best_abs_x:
-                            best_det = dict(nearest)
-                            best_abs_x = nearest_abs_x
-                    return ready
-
-                print(f"  [search] 连续 lane-follow {DEFAULT_FIRST_CARD_VX} m/s "
-                      f"前进 {args.max_travel:.2f}m 找首卡 "
-                      f"(锁到中心即停)...", flush=True)
-                actual = move_along_lane(args.max_travel, stop_when=_search_tick,
-                                         stopped=lambda: first_latch[0]["ready"],
-                                         vx=DEFAULT_FIRST_CARD_VX)
-                # 用实际里程 (锁到卡会提前停), 别按满程算 —— 否则补录段被 1.5m 上限误拦
-                search_distance = min(args.max_travel, actual)
-                if first_latch[0]["ready"]:
+                move_along_lane(search_step,
+                                stop_when=lambda *_: first_latch[1](),
+                                stopped=lambda: first_latch[0]["ready"])
+                search_distance += search_step
+                time.sleep(max(period, 0.10))
+                first_confirm = make_latch(first_window, required_samples=1)
+                first_det = wait_for_target(first_confirm, min(args.slot_wait_s, 0.5))
+                if first_det is None and first_latch[0]["ready"]:
                     first_det = first_latch[0]["det"]
-                    print(f"  [search] 锁到首卡 xc="
-                          f"{animal_center(first_det):+.3f}", flush=True)
+                nearest = centered(1.0)
+                if nearest is not None:
+                    nearest_abs_x = abs(animal_center(nearest))
+                    print(f"  [search] nearest xc={animal_center(nearest):+.3f}",
+                          flush=True)
+                    if best_abs_x is None or nearest_abs_x < best_abs_x:
+                        best_det = dict(nearest)
+                        best_abs_x = nearest_abs_x
+                        best_distance = search_distance
+                    elif (best_abs_x < nearest_abs_x
+                          and search_distance > best_distance
+                          and best_abs_x <= first_window):
+                        backoff = min(search_step, search_distance - best_distance)
+                        move_forward_fallback(-backoff)
+                        search_distance -= backoff
+                        first_det = best_det
+                if first_det is None:
+                    print(f"  [search] checked {search_distance:.2f}m, "
+                          "首卡尚未进入中心", flush=True)
             nominal_travel = max(nominal_travel, search_distance)
         if first_det is None:
             if best_det is not None:
