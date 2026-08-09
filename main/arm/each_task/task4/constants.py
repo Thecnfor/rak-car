@@ -92,6 +92,10 @@ DEFAULT_MAX_PICKS: int = 1000
 """最多抓取数 (距离优先模式下设为极大值, 实际不限制)。"""
 
 DEFAULT_MAX_CREEP_M: float = 0.58
+"""累计前移距离预算 (m): 实际退出由 CREEP_EXIT_DISTANCE_M 决定, 此值仅作兜底。"""
+
+CREEP_EXIT_DISTANCE_M: float = 0.8
+"""从任务触发开始累计行走满此距离即退出 creep (用户拍板 2026-08-10)。"""
 """累计前移距离预算 (m, 开环 速度×时间 记账)。唯一实际生效的终止条件。"""
 
 DEFAULT_MAX_SECONDS: float = 9999.0
@@ -236,12 +240,9 @@ TASK4_SERVO_DESCEND_HAND_DEG = None
 """盲降时手爪角度; None = 保持 P 姿态 hand 不动 (吸嘴朝下即可)。"""
 
 
-# ---- IR 生命周期 ----
-# task4 任务点由 orchestrator 的左 IR < 1.0m 触发。
-# 任务运行期间 IR 连续 > 1.0m 满 IR_FAR_CONFIRM_SECONDS(5s) → 视为离开任务区收工
-# (用户拍板 2026-08-10: creep 时 IR 连续 5s > 1m 即退出, 取代旧的"丢失后走 0.3m")。
-IR_FAR_THRESHOLD_M: float = 1.0
-IR_FAR_CONFIRM_SECONDS: float = 5.0
+# ---- 行走距离退出 (用户拍板 2026-08-10) ----
+# 任务触发后累计 odom 行走距离，满此值即退出 creep，IR 判定废除。
+CREEP_EXIT_DISTANCE_M: float = 0.8
 
 # ---- 时间戳辅助 (跨 target4 各子模块共享) ----
 import time as _time  # noqa: E402

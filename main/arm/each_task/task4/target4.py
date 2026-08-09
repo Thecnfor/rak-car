@@ -50,7 +50,7 @@ from main.arm.each_task.task4.constants import (  # noqa: E402
     DEFAULT_MAX_PICKS, DEFAULT_MAX_CREEP_M, DEFAULT_MAX_SECONDS,
     DEFAULT_CREEP_SPEED_MPS, DEFAULT_TRACK_MAX_SECONDS,
     DEFAULT_MAX_CONSECUTIVE_PICK_FAILURES,
-    CREEP_POLL_HZ, CREEP_MAX_SECONDS_S,
+    CREEP_POLL_HZ, CREEP_MAX_SECONDS_S, CREEP_EXIT_DISTANCE_M,
     # 姿态 / 放仓
     COLOR_BLUE, COLOR_YELLOW, BIN_X_MM, BIN_Y_MM, BIN_HAND_DEG,
     TASK4_POSE_P_Y_MM, TASK4_POSE_P_X_MM, TASK4_POSE_P_ARM_DEG, TASK4_POSE_P_HAND_DEG,
@@ -107,13 +107,13 @@ def step_target4(
 
     Returns:
         dict:
-          - ok: bool (completed / zone_cleared / time_budget / ir_odom_exit /
+          - ok: bool (completed / zone_cleared / time_budget / distance_exit /
                 keyboard_interrupt 为 True)
           - picks / skips / pick_failures: 计数
           - total_creep_m: 累计前移距离
           - history: list[dict] 每球记录
           - reason: "completed" / "zone_cleared" / "time_budget" /
-                    "ir_odom_exit" / "pick_error_exceeded" / "keyboard_interrupt"
+                    "distance_exit" / "pick_error_exceeded" / "keyboard_interrupt"
           - elapsed_s: 总耗时
     """
     # 预算 / 动作参数全部走 constants 模块默认值，只保留姿态可调 (2026-08-10 冻结)。
@@ -338,10 +338,9 @@ def step_target4(
                 creep_status = "未见球"
             print(f"  [{LOG_PREFIX}] creep 结束: 前移 {creep_res['distance_m']:.3f}m "
                   f"/ {creep_res['elapsed_s']:.1f}s → {creep_status}")
-            if creep_res.get("finished_by_ir_odom"):
-                final_reason = "ir_odom_exit"
-                print(f"  [{LOG_PREFIX}] IR 触发后里程计走满 0.3m，"
-                      f"立即结束 task4 搜索")
+            if total_creep_m >= CREEP_EXIT_DISTANCE_M:
+                final_reason = "distance_exit"
+                print(f"  [{LOG_PREFIX}] 累计行走 {total_creep_m:.2f}m >= {CREEP_EXIT_DISTANCE_M}m，退出")
                 break
             if creep_res["balls"] is None:
                 final_reason = "zone_cleared"
@@ -436,7 +435,7 @@ def step_target4(
                 release_thread.join(timeout=2.0)
             # task4→task5 正常交接时关仓/P 姿态/arm_feed 都由 orchestrator 的
             # 巡航后台线程负责; 异常/独立运行仍由本 finally 收尾。
-            handoff_deferred = defer_task5_handoff and final_reason == "ir_odom_exit"
+            handoff_deferred = defer_task5_handoff and final_reason == "distance_exit"
             # ---- 关闭存储仓 (task4 结束关仓) ----
             if not handoff_deferred:
                 try:
@@ -508,7 +507,7 @@ def step_target4(
     return {
         "ok": final_reason in (
             "completed", "zone_cleared", "time_budget", "keyboard_interrupt",
-            "ir_odom_exit",
+            "distance_exit",
         ),
         "picks": n_picks,
         "skips": n_skips,

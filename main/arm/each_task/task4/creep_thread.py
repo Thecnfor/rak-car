@@ -15,7 +15,6 @@ from . import target2  # noqa: E402
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
     CREEP_POLL_HZ, CREEP_MAX_SECONDS_S, CREEP_STOP_CX_MAX,
-    IR_FAR_THRESHOLD_M, IR_FAR_CONFIRM_SECONDS,
     LOG_PREFIX_TARGET4 as LOG_PREFIX,
 )
 
@@ -34,71 +33,19 @@ def _left_half_balls(balls: list[dict]) -> list[dict]:
     ]
 
 
-class _Task4SearchState:
-    """跨每一球保存 task4 的 IR 生命周期和末端 0.3m 记账。"""
-
-    def __init__(self, *, ir_started: bool = True,
-                 far_threshold_m: float = IR_FAR_THRESHOLD_M,
-                 far_confirm_seconds: float = IR_FAR_CONFIRM_SECONDS):
-        import threading
-        self.ir_started = bool(ir_started)
-        self.far_threshold_m = float(far_threshold_m)
-        self.far_confirm_seconds = float(far_confirm_seconds)
-        self.ir_lost = False
-        # orchestrator 已用左 IR < 1.0m 触发任务，进入 task4 即视为已进入任务区。
-        self.ir_seen_near = True
-        # 连续 far 读数起始时刻 (monotonic); None = 当前不在连续 far 窗口内。
-        self._far_since = None
-        self.finished_by_ir_odom = False
-        self._lock = threading.Lock()
-
-    def update_ir(self, left_ir, *, distance_m: float = 0.0) -> bool:
-        """更新左 IR；IR 连续 >far_threshold_m 满 far_confirm_seconds(5s) → 离区退出。
-
-        用户拍板 2026-08-10: creep 时 IR 连续 5s > 1m 即视为离开任务区收工,
-        取代旧的"丢失后走 0.3m"。
-        """
-        with self._lock:
-            if self.finished_by_ir_odom or not self.ir_started:
-                return self.finished_by_ir_odom
-            # None/非法值表示传感器暂时没有新样本，不能当作“远离”。
-            # (否则 task4 刚暂停 orchestrator 的 ir_feed 后连续收到 --- 会被误判离区)
-            try:
-                ir_value = float(left_ir)
-            except (TypeError, ValueError):
-                self._far_since = None
-                return False
-            near = ir_value <= self.far_threshold_m
-            if near:
-                self.ir_seen_near = True
-                self._far_since = None
-                return False
-            if not self.ir_seen_near:
-                return False
-            # 只有 task4 触发后实际读到远 IR (>1m)，才进入连续 far 时间窗。
-            now = time.monotonic()
-            if self._far_since is None:
-                self._far_since = now
-            elif now - self._far_since >= self.far_confirm_seconds:
-                self.ir_lost = True
-                self.finished_by_ir_odom = True
-            return self.ir_lost
-
-
 class _CreepThread:
     """后台线程保底盘前移 + 主线程摆臂。"""
 
-    def __init__(self, http_client, *, state: Optional[_Task4SearchState] = None,
+    def __init__(self, http_client, *,
                  speed_mps: float, max_distance_m: float,
                  poll_hz: float = CREEP_POLL_HZ,
                  max_seconds_s: float = CREEP_MAX_SECONDS_S):
         import threading
         self.http = http_client
-        self.state = state or _Task4SearchState()
         self.speed_mps = speed_mps
         self.max_distance_m = max_distance_m
         self.poll_hz = poll_hz
-        # 墙钟上限只是单次 worker 的安全兜底；正常 task4 收尾由 IR 丢失+0.3m 决定。
+        # 墙钟上限只是单次 worker 的安全兜底；task4 主循环累计 creep 总距离控制退出。
         self.max_seconds_s = float(max_seconds_s)
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="task4-creep")
@@ -108,7 +55,6 @@ class _CreepThread:
         self.elapsed_s = 0.0
         self.balls = None
         self.found_ball = False
-        self.finished_by_ir_odom = False
         self.timed_out = False
         self._odo_start_x = None
         self._last_odom_x = None
@@ -130,10 +76,6 @@ class _CreepThread:
         t0 = time.monotonic()
         try:
             while not self._stop_event.is_set():
-                if self.state.finished_by_ir_odom:
-                    self.finished_by_ir_odom = True
-                    break
-
                 _set_chassis_vel(self.http, self.speed_mps)
                 time.sleep(period)
 
@@ -198,13 +140,6 @@ class _CreepThread:
                         self.found_ball = True
                         _set_chassis_vel(self.http, 0.0)
                         break
-                    # IR 连续 >1m 满 5s → 离区收工 (用户拍板, 取代旧的"走 0.3m")。
-                    if self.state.finished_by_ir_odom:
-                        self.finished_by_ir_odom = True
-                        print(f"  [{LOG_PREFIX}] IR 连续 {self.state.far_confirm_seconds:.0f}s "
-                              f"> {self.state.far_threshold_m:.0f}m, 结束搜索")
-                        self._stop_event.set()
-                        break
                     continue
 
                 if self.elapsed_s >= self.max_seconds_s:
@@ -243,7 +178,6 @@ class _CreepThread:
         got = self.completion_event.wait(timeout=timeout_s)
         return {
             "balls": self.balls if got and self.found_ball else None,
-            "finished_by_ir_odom": bool(self.finished_by_ir_odom),
             "distance_m": self.distance_m,
             "elapsed_s": self.elapsed_s,
         }
