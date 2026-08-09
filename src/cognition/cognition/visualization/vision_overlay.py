@@ -11,7 +11,7 @@ from msgs.msg import DetectionArray, LaneResult
 from rclpy.node import Node
 from sensor_msgs.msg import CompressedImage, Image
 
-from .overlay_helpers import draw_detection_overlay, draw_lane_overlay
+from .overlay_helpers import draw_detection_overlay, draw_lane_overlay, image_data_sequence
 
 Frame = Tuple[np.ndarray, object, str]
 
@@ -91,7 +91,7 @@ class VisionOverlayNode(Node):
         msg.encoding = "bgr8"
         msg.is_bigendian = False
         msg.step = msg.width * 3
-        msg.data = frame.tobytes()
+        msg.data = image_data_sequence(frame)
         return msg
 
     def _publish(self) -> None:

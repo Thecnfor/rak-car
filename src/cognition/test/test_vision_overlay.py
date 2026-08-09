@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from cognition.visualization.overlay_helpers import (
     draw_detection_overlay,
     draw_lane_overlay,
+    image_data_sequence,
 )
 
 
@@ -29,3 +30,8 @@ def test_draw_detection_overlay_draws_bbox_and_class():
     out = draw_detection_overlay(frame, detections)
     assert out.shape == frame.shape
     assert not np.array_equal(out, frame)
+
+
+def test_image_data_sequence_converts_frame_to_ros_byte_values():
+    frame = np.zeros((2, 3, 3), dtype=np.uint8)
+    assert image_data_sequence(frame) == [0] * 18

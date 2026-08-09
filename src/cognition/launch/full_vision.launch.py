@@ -59,7 +59,7 @@ def generate_launch_description():
                 "camera_id": "front",
                 "device": LaunchConfiguration("front_device"),
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
-                "calibration_url": camera_front_yaml,
+                "calibration_url": "package://bringup/params/camera_front.yaml",
             }],
         ),
         Node(
@@ -69,7 +69,7 @@ def generate_launch_description():
                 "camera_id": "side",
                 "device": LaunchConfiguration("side_device"),
                 "rate_hz": LaunchConfiguration("image_rate_hz"),
-                "calibration_url": camera_side_yaml,
+                "calibration_url": "package://bringup/params/camera_arm.yaml",
             }],
         ),
 
