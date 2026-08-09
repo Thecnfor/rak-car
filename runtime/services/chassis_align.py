@@ -252,6 +252,8 @@ class ChassisAlignController:
         # task 每球白烧 max_seconds。连续失败 max_control_fail_frames 帧 (默认 10 ≈ 0.5s
         # @20Hz) → reason=control_lost 提前退出, 任务层可立即重武装而不是干等。
         self._max_control_fail_frames = int(max(1, max_control_fail_frames))
+        # decouple_xy 轴滞回状态 (2026-08-09): 记录上次驱动的轴, |cx|≈|cy| 不换轴。
+        self._last_axis = None
         # Kalman 平滑（默认开, 2026-08-09 用户决定; kalman=False 显式关保持原始
         # 检测）: 有检测帧时平滑 cx/cy 抑制 bbox 抖动。filterpy 未安装 → 自动禁用。
         self._kalman = None
@@ -432,9 +434,11 @@ class ChassisAlignController:
                 if not frm.target_found:
                     lost_frames += 1
                     in_band = 0
-                    if (lost_frames == 1 and self._recover_after_lost
+                    # 连丢 2 帧才反向回拉 (0.25 倍) —— 单帧闪烁只停不反向,
+                    # 否则 "正向(找到)↔反向(丢帧)" 交替 = 来回晃 (2026-08-09 现场)。
+                    if (lost_frames == 2 and self._recover_after_lost
                             and (last_vx != 0.0 or last_vy != 0.0)):
-                        vx, vy = -last_vx * 0.5, -last_vy * 0.5
+                        vx, vy = -last_vx * 0.25, -last_vy * 0.25
                     else:
                         vx, vy = 0.0, 0.0
                     if not _send(vx, vy):
@@ -457,7 +461,15 @@ class ChassisAlignController:
                 elif self._decouple_xy:
                     # 4 轮一起平移 (2026-08-09): 每帧只驱动误差较大的单轴, 另一轴 0。
                     # 同时驱动 vx+vy 且 |vx|≈|vy| 时 IK 置零一对对角轮 → 打滑。
-                    if abs(cx_err) >= abs(cy_err):
+                    # 轴滞回 (2026-08-09): |cx|≈|cy| 时避免每帧换轴 → 对角来回晃。
+                    # 已选轴保持, 除非另一轴误差 > 1.2x 才切换。
+                    if self._last_axis == "x" and abs(cy_err) > abs(cx_err) * 1.2:
+                        self._last_axis = "y"
+                    elif self._last_axis == "y" and abs(cx_err) > abs(cy_err) * 1.2:
+                        self._last_axis = "x"
+                    elif self._last_axis not in ("x", "y"):
+                        self._last_axis = "x" if abs(cx_err) >= abs(cy_err) else "y"
+                    if self._last_axis == "x":
                         vx = float(self._sign_vx) * float(self._kp) * float(cx_err)
                         vy = 0.0
                     else:

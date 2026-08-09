@@ -250,7 +250,7 @@ class TestChassisAlignController(unittest.TestCase):
             self.assertEqual(vy, 0.0)
 
     def test_recover_after_lost_reverses(self):
-        """第一帧有目标（产生非零 last_vx），第二帧丢帧 → 反向小搜。"""
+        """丢帧回拉: 连丢 2 帧才反向 (0.25 倍), 单帧闪烁只停不反向 (2026-08-09 治来回晃)."""
         dets = [_d(cx=0.3)]  # frame 1: 有目标
         call_count = [0]
         svc = _make_service_with_detections(dets)
@@ -265,16 +265,18 @@ class TestChassisAlignController(unittest.TestCase):
         svc.get_task_state = _alternating
         # v_slew=None 关掉限幅，露出原始 P 控制律：
         #   frame1: vx = sign_vx * kp * cx_err = -1 * 0.2 * (-0.3) = +0.06
-        #   frame2 (lost): recover = -last_vx * 0.5 = -0.03
+        #   frame2 (lost #1): 闪烁只停 → 0.0
+        #   frame3 (lost #2): recover = -last_vx * 0.25 = -0.015
         ctrl = _make_controller(svc, kp=0.20, recover_after_lost=True,
                                 v_slew=None,
                                 max_lost_frames=200, hz=50, max_seconds=3.0)
         result = _fast_run(ctrl)
         calls = svc.set_chassis_velocity_calls
-        self.assertTrue(len(calls) >= 2,
-                        f"Expected >=2 calls, got {len(calls)}: {calls}")
+        self.assertTrue(len(calls) >= 3,
+                        f"Expected >=3 calls, got {len(calls)}: {calls}")
         self.assertAlmostEqual(calls[0][0], 0.06, places=4)
-        self.assertAlmostEqual(calls[1][0], -0.03, places=4)
+        self.assertAlmostEqual(calls[1][0], 0.0, places=4)
+        self.assertAlmostEqual(calls[2][0], -0.015, places=4)
 
     def test_no_recover_after_lost_stops(self):
         """recover_after_lost=False → 丢帧后直接停。"""
@@ -471,6 +473,22 @@ class TestChassisAlignController(unittest.TestCase):
         diag = [(vx, vy) for vx, vy, _ in svc.set_chassis_velocity_calls[:-1]]
         self.assertTrue(any(abs(vx) > 1e-6 and abs(vy) > 1e-6 for vx, vy in diag),
                         f"decouple_xy=False 应同时动两轴, got {diag[:3]}")
+
+    def test_decouple_xy_axis_hysteresis_locks(self):
+        """轴滞回: |cx|≈|cy| (每帧互换大小但都在 1.2x 内) → 轴锁定不换, 治对角来回晃。"""
+        # 每帧 cx/cy 互换大小: 0.25↔0.22。无滞回会每帧 x↔y 交替。
+        altern = [_d(cx=0.25, cy=0.22), _d(cx=0.22, cy=0.25)] * 50
+        svc = _make_service_with_detections(altern)
+        ctrl = _make_controller(svc, kp=0.20, v_slew=0.10,
+                                deadband=0.01, hold_frames=100,
+                                hz=50, max_seconds=3.0, max_lost_frames=200)
+        _fast_run(ctrl)
+        calls = [(vx, vy) for vx, vy, _ in svc.set_chassis_velocity_calls[:-1]]
+        driven_x = [c for c in calls if abs(c[0]) > 1e-6]
+        driven_y = [c for c in calls if abs(c[1]) > 1e-6]
+        # 首次选中 x 后, 1.2x 阈值内不切 y → 只能有单轴持续驱动。
+        self.assertTrue(driven_x and not driven_y,
+                        f"轴滞回应锁定单轴 (x), got x={driven_x[:3]} y={driven_y[:3]}")
 
 
 # ===== Kalman 平滑（filterpy，2026-08-09）=====

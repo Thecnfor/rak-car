@@ -325,6 +325,7 @@ def _track_chassis_client_loop(
     in_band = 0
     last_vx = 0.0
     last_vy = 0.0
+    _last_axis = None  # decouple_xy 轴滞回状态 (与 runtime 同构)
     lost_frames = 0
     final_frame: Optional[TrackFrame] = None
     arrived = False
@@ -359,8 +360,10 @@ def _track_chassis_client_loop(
             if not frm.target_found:
                 lost_frames += 1
                 in_band = 0
-                if lost_frames == 1 and recover_after_lost and (last_vx != 0.0 or last_vy != 0.0):
-                    vx, vy = -last_vx * 0.5, -last_vy * 0.5
+                # 连丢 2 帧才反向回拉 (0.25 倍), 单帧闪烁只停不反向 (与 runtime 同构,
+                # 否则 正向↔反向 交替 = 来回晃, 2026-08-09 现场)。
+                if lost_frames == 2 and recover_after_lost and (last_vx != 0.0 or last_vy != 0.0):
+                    vx, vy = -last_vx * 0.25, -last_vy * 0.25
                 else:
                     vx, vy = 0.0, 0.0
                 _set_vel(vx, vy)
@@ -387,7 +390,14 @@ def _track_chassis_client_loop(
                 # 4 轮一起平移 (2026-08-09, 与 runtime 同构): 每帧只驱动误差
                 # 较大的单轴, 另一轴 0 → 纯 x/纯 y 平移 4 轮全动, 避免 |vx|≈|vy|
                 # 时 IK 置零一对对角轮导致打滑。
-                if abs(cx_err) >= abs(cy_err):
+                # 轴滞回: |cx|≈|cy| 不换轴 (否则每帧 x↔y 交替 → 对角来回晃)。
+                if _last_axis == "x" and abs(cy_err) > abs(cx_err) * 1.2:
+                    _last_axis = "y"
+                elif _last_axis == "y" and abs(cx_err) > abs(cy_err) * 1.2:
+                    _last_axis = "x"
+                elif _last_axis not in ("x", "y"):
+                    _last_axis = "x" if abs(cx_err) >= abs(cy_err) else "y"
+                if _last_axis == "x":
                     vx = float(sign_vx) * float(kp) * float(cx_err)
                     vy = 0.0
                 else:
