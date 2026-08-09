@@ -84,7 +84,6 @@ def _pick_by_arm_servo(
         max_vel=TASK4_SERVO_MAX_VEL,
         hz=TASK4_SERVO_HZ,
         settle_hits=TASK4_SERVO_SETTLE_HITS,
-        settle_tol=TASK4_SERVO_DEADZONE,  # 对齐 task1: settle_tol=deadzone(0.05), 不卡临界抖动
         timeout=TASK4_SERVO_TIMEOUT_S,
         arm_min=TASK4_SERVO_ARM_MIN,
         arm_max=TASK4_SERVO_ARM_MAX,
