@@ -223,7 +223,13 @@ target_link_libraries(chassis_navigate_node PUBLIC
 
 # Optional ros2_control hardware interface plugin
 if(hardware_interface_FOUND AND pluginlib_FOUND)
-  add_library(_hardware_plugin SHARED src/mc602_hardware_interface.cpp)
+  # bridge_transport.cpp must be compiled INTO the plugin — a shared library
+  # tolerates undefined symbols at link time, but controller_manager would
+  # fail to dlopen the plugin at runtime without them.
+  add_library(_hardware_plugin SHARED
+    src/mc602_hardware_interface.cpp
+    src/bridge_transport.cpp
+  )
   target_include_directories(_hardware_plugin PUBLIC include)
   target_link_libraries(_hardware_plugin PUBLIC
     rclcpp::rclcpp
@@ -236,6 +242,25 @@ if(hardware_interface_FOUND AND pluginlib_FOUND)
     RUNTIME DESTINATION lib/${PROJECT_NAME}
     LIBRARY DESTINATION lib/${PROJECT_NAME}
   )
+
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gmock REQUIRED)
+    ament_add_gmock(test_mc602_hardware_interface
+      test/test_mc602_hardware_interface.cpp
+      src/mc602_hardware_interface.cpp
+      src/mc602_adapter.cpp
+      src/mc602_protocol.cpp
+      src/serial_transport.cpp
+      src/serial_port.cpp
+      src/bridge_transport.cpp
+    )
+    target_include_directories(test_mc602_hardware_interface PUBLIC include)
+    target_link_libraries(test_mc602_hardware_interface
+      rclcpp::rclcpp
+      hardware_interface::hardware_interface
+      msgs::msgs
+    )
+  endif()
 endif()
 
 if(CAMERA_INFO_MANAGER_FOUND)
@@ -339,6 +364,15 @@ if(BUILD_TESTING)
     src/serial_port.cpp
   )
   target_include_directories(test_serial_port PUBLIC include)
+
+  # BridgeTransport — executor-safety regression (P0, spec §7.1)
+  ament_add_gmock(test_bridge_transport
+    test/test_bridge_transport.cpp
+    src/bridge_transport.cpp
+  )
+  target_include_directories(test_bridge_transport PUBLIC include)
+  # plain signature (ament_add_gmock uses plain target_link_libraries internally)
+  target_link_libraries(test_bridge_transport rclcpp::rclcpp msgs::msgs)
 
   ament_add_gmock(test_mecanum_chassis
     test/test_mecanum_chassis.cpp
