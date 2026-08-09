@@ -11,6 +11,8 @@
 import numpy as np
 import tensorrt as trt
 
+from .detector_decode import decode_detection_rows
+
 try:
     import pycuda.driver as cuda
     import pycuda.autoinit  # noqa: F401  初始化 CUDA 上下文
@@ -117,7 +119,8 @@ class Detector:
         cuda.memcpy_dtoh_async(boxes, self._output_alloc.mem, self.stream)
         cuda.memcpy_dtoh_async(self._num_dets, self._d_num_dets, self.stream)
         self.stream.synchronize()
-        return boxes, int(self._num_dets[0])
+        decoded = decode_detection_rows(boxes, int(self._num_dets[0]), 23)
+        return decoded, decoded.shape[0]
 
     def close(self):
         if self._output_alloc is not None:
