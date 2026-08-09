@@ -88,6 +88,11 @@ PICK_POSE_HAND_DEG: float = -10.0
 FIRST_CUBE_X_MM: float = -165.0
 SECOND_CUBE_X_MM: float = -210.0
 
+# 每座水塔第 1 块转动大臂时的安全 X (2026-08-10 用户: 通用安全区 [-300,-200] 的 clamp 值
+# -200 → -185)。实际生效读 yaml water_tower_task.first_cube_safe_x_mm, 这里仅兜底默认。
+# ⚠️ 只影响第 1 块的转臂阶段 (safe_x_mm 覆盖), 第 2/3 块仍走通用安全区。
+FIRST_CUBE_SAFE_X_MM: float = -185.0
+
 # carry 姿态 (从方块到水塔的运输/投放位姿)
 # 2026-08-06: arm 改为 -92° (对标 detection_pose.arm_angle_deg)
 CARRY_POSE_X_MM: float = -115.0
@@ -121,7 +126,9 @@ PICK_BLOCK3_TIMEOUT_S: Optional[float] = 7.0
 PICK_RETRY_DEADZONE: float = 0.07
 PICK_RETRY_EXTRA_S: float = 4.0
 PICK_VISION_HZ: float = 25.0
-PICK_VISION_GAIN_ARM: float = 1.6
+# ⚠️ dead 常量: run() 实际读 yaml water_tower_task.pick_vision.* (现 gain_arm=0.15).
+#    这里的 PICK_VISION_* 值只作参考, 调参改 task_config.yml 才生效.
+PICK_VISION_GAIN_ARM: float = 0.15
 PICK_VISION_GAIN_X: float = 0.35
 PICK_VISION_DEADZONE: float = 0.15
 PICK_VISION_MAX_VEL: float = 0.05
@@ -302,6 +309,8 @@ def _safe_arm_rotation_sequence(
     target_x = arm_kwargs.get("x_mm")
     target_arm = arm_kwargs.get("arm")
     target_hand = arm_kwargs.get("hand")
+    # 2026-08-10: 每座塔第 1 块允许在通用安全区外转大臂 — arm_kwargs 带 safe_x_mm 时覆盖安全 X.
+    safe_x_override = arm_kwargs.get("safe_x_mm")
 
     try:
         state = arm_client.get_state()
@@ -322,6 +331,8 @@ def _safe_arm_rotation_sequence(
 
     safe_y = cur_y if y_in else max(Y_LO, min(Y_HI, cur_y))
     safe_x = cur_x if x_in else max(X_LO, min(X_HI, cur_x))
+    if safe_x_override is not None:
+        safe_x = float(safe_x_override)   # 首个水立方: 安全 X 在通用区外 (用户标定 -185)
 
     logger.info(
         "大臂 3 阶段: 当前 Y=%.1f X=%.1f → 安全位 Y=%.1f X=%.1f → 目标 Y=%s X=%s arm=%s hand=%s",
@@ -900,6 +911,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     detect_retry_step_m = cfg.get("detect_retry_step_m", 0.2)
     detect_retry_max = cfg.get("detect_retry_max", 1)
     x_target_mm = float(detection["x_mm"])
+    # 2026-08-10: 每座塔第 1 块转动大臂安全 X (yaml 可配, 默认 -185)
+    first_cube_safe_x_mm = float(cfg.get("first_cube_safe_x_mm", FIRST_CUBE_SAFE_X_MM))
     pick = cfg["pick_pose"]
     carry = cfg["carry_pose"]
     vision = cfg.get("pick_vision") or {}
@@ -1029,6 +1042,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                             hand=float(pick["hand_angle_deg"]),      # -10
                             speed=100,
                             timeout=10.0,
+                            # 2026-08-10: 每座塔第 1 块转动大臂用安全 X=-185 (其余块走通用安全区)
+                            safe_x_mm=first_cube_safe_x_mm if picked == 0 else None,
                         ),
                     )
                     chassis_at_tower_m = target_offset
