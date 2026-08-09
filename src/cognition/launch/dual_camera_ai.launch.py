@@ -20,8 +20,8 @@ from launch_ros.actions import Node
 
 def generate_launch_description() -> LaunchDescription:
     return LaunchDescription([
-        DeclareLaunchArgument("front_device", default_value="/dev/video0"),
-        DeclareLaunchArgument("side_device", default_value="/dev/video2"),
+        DeclareLaunchArgument("front_device", default_value="/dev/cam4"),
+        DeclareLaunchArgument("side_device", default_value="/dev/cam3"),
         DeclareLaunchArgument("image_rate_hz", default_value="30.0"),
 
         # ---- front 相机(循线用)----
@@ -68,6 +68,19 @@ def generate_launch_description() -> LaunchDescription:
                 "model_id": "task",
                 "publish_rate_hz": 20.0,
                 "score_threshold": 0.3,
+            }],
+        ),
+
+        # ---- 输出 overlay，供 RViz2 直接显示识别结果 ----
+        Node(
+            package="cognition", executable="vision-overlay",
+            name="vision_overlay", output="screen",
+            parameters=[{
+                "front_image_topic": "/rak/sensors/camera/front/image_compressed",
+                "side_image_topic": "/rak/sensors/camera/side/image_compressed",
+                "lane_topic": "/rak/perception/lane",
+                "detection_topic": "/rak/perception/detections/task",
+                "publish_rate_hz": 10.0,
             }],
         ),
     ])

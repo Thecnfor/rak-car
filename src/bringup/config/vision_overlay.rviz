@@ -1,0 +1,76 @@
+Panels:
+  - Class: rviz_common/Displays
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /front_overlay1
+        - /side_overlay1
+        - /front_raw1
+        - /side_raw1
+      Splitter Ratio: 0.5
+    Tree Height: 800
+  - Class: rviz_common/Views
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz_common/Time
+    Name: Time
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz_default_plugins/TF
+      Enabled: true
+      Name: TF
+      Show Arrows: true
+      Show Axes: false
+      Show Names: false
+      Update Interval: 0
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: front_overlay
+      Topic: /rak/visualization/front_overlay
+      Transport Hint: raw
+      Queue Size: 2
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: true
+      Name: side_overlay
+      Topic: /rak/visualization/side_overlay
+      Transport Hint: raw
+      Queue Size: 2
+      Value: true
+    - Class: rviz_default_plugins/Image
+      Enabled: false
+      Name: front_raw
+      Topic: /rak/sensors/camera/front/image_compressed
+      Transport Hint: compressed
+      Queue Size: 2
+      Value: false
+    - Class: rviz_default_plugins/Image
+      Enabled: false
+      Name: side_raw
+      Topic: /rak/sensors/camera/side/image_compressed
+      Transport Hint: compressed
+      Queue Size: 2
+      Value: false
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Fixed Frame: base_link
+    Frame Rate: 30
+  Name: root
+  Tools:
+    - Class: rviz_default_plugins/Interact
+    - Class: rviz_default_plugins/MoveCamera
+    - Class: rviz_default_plugins/Select
+  Value: true
+  Views:
+    Current:
+      Class: rviz_default_plugins/TopDownOrtho
+      Name: Current View
+      Value: TopDownOrtho (rviz)
+Window Geometry:
+  Height: 900
+  Width: 1400
+  X: 80
+  Y: 80

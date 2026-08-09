@@ -26,6 +26,7 @@ setup(
             "inference-bridge = cognition.inference.bridge:main",
             "lane-follower = cognition.lane.lane_follower:main",
             "detector-node = cognition.detector.detector_node:main",
+            "vision-overlay = cognition.visualization.vision_overlay:main",
         ],
     },
 )
