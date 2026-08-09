@@ -94,6 +94,29 @@ class TestTask4IrOdomExit(unittest.TestCase):
         finally:
             creep.stop_and_join()
 
+    def test_ir_exit_time_fallback_when_odom_frozen(self):
+        """odom 冻结 (0.000m): IR 触发后靠时间兜底收尾, 不再挂死等手动停. (现场整场 odom 冻结)"""
+        class _FrozenOdomHttp(_FakeHttp):
+            def __init__(self):
+                super().__init__(ir_left=0.4)
+            def get_odom_state(self):
+                return {"odom_state": {"x": 0.0}}  # 永远 0, odom 冻结
+
+        import time as _t
+        http = _FrozenOdomHttp()
+        creep = _CreepThread(http, speed_mps=0.06, max_distance_m=0.8,
+                             poll_hz=100.0, ir_max_seconds_s=0.2)
+        creep.start()
+        try:
+            t0 = _t.monotonic()
+            result = creep.wait_for_ball(timeout_s=1.0)
+            elapsed = _t.monotonic() - t0
+            # 触发后 ~0.2s 时间兜底即收尾, 不应等到 1s
+            self.assertLess(elapsed, 0.8)
+            self.assertTrue(result["finished_by_ir_odom"])
+        finally:
+            creep.stop_and_join()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -194,6 +194,10 @@ BALL_LABELS = ["ball_blue", "ball_yellow"]
 # 采区中途 IR 读 1.5m+ (空旷), 用 < 才不会全程误触发。现场可在此调灵敏度。
 IR_END_CLOSE_M: float = 0.6
 
+# IR 触发后走 0.3m 的时间兜底: 0.3m@0.06m/s≈5s, +3s 裕量。odom 冻结时
+# (现场整场冻结) 靠它收尾, 不再等 30s 墙钟或手动 Ctrl+C。
+IR_TRIGGERED_MAX_S: float = 8.0
+
 
 # ---- 后台保前移线程 (P 姿态 + creep 并发) ----
 
@@ -202,7 +206,8 @@ class _CreepThread:
 
     def __init__(self, http_client, *, speed_mps: float, max_distance_m: float,
                  poll_hz: float = CREEP_POLL_HZ, ir_exit_enabled: bool = True,
-                 max_seconds_s: float = 30.0):
+                 max_seconds_s: float = 30.0,
+                 ir_max_seconds_s: float = IR_TRIGGERED_MAX_S):
         import threading
         self.http = http_client
         self.speed_mps = speed_mps
@@ -214,6 +219,9 @@ class _CreepThread:
         # 墙钟兜底上限: 距离/IR/见球任一不满足时 (odom 卡死等) 也必须退出,
         # 否则主线程 wait_for_ball 干等 (现场 球9 卡到 Ctrl+C)。
         self.max_seconds_s = float(max_seconds_s)
+        # IR 触发后的时间兜底: 0.3m 靠 odom 增量, odom 冻结时靠它收尾
+        # (现场 全场 odom 冻结 → IR+0.3m 永不完成 → 手动 Ctrl+C)。
+        self.ir_max_seconds_s = float(ir_max_seconds_s)
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="task4-creep")
         self._stop_event = threading.Event()
@@ -227,6 +235,10 @@ class _CreepThread:
         self._t0 = 0.0
         self._odo_start_x = None
         self._odo_ir_trigger_x = None
+        self._ir_triggered_at = None
+        # odom 冻结检测: x 长时间不变化 → 距离记账退回开环。
+        self._last_odom_x = None
+        self._odom_stall_s = 0.0
         self.ir_triggered = False
 
     def start(self) -> None:
@@ -262,7 +274,19 @@ class _CreepThread:
                         odo_data = odo.get("odom_state") or {}
                         current_x = odo_data.get("x")
                         if current_x is not None:
-                            self.distance_m = max(0.0, current_x - self._odo_start_x)
+                            odom_dist = max(0.0, current_x - self._odo_start_x)
+                            # odom 冻结检测: x 连续不变 ≥1s → 距离退回开环记账,
+                            # 否则距离预算永不触发 (现场 全场 odom 冻结 → 0.000m)。
+                            if self._last_odom_x is not None and \
+                                    abs(current_x - self._last_odom_x) < 1e-9:
+                                self._odom_stall_s += period
+                            else:
+                                self._odom_stall_s = 0.0
+                            self._last_odom_x = current_x
+                            if self._odom_stall_s >= 1.0:
+                                self.distance_m += self.speed_mps * period
+                            else:
+                                self.distance_m = odom_dist
                     except Exception:
                         pass
                 else:
@@ -285,6 +309,7 @@ class _CreepThread:
                         left_ir = ir_data.get("left")
                         if left_ir is not None and float(left_ir) < IR_END_CLOSE_M:
                             self.ir_triggered = True
+                            self._ir_triggered_at = time.monotonic()
                             odo_payload = self.http.get_odom_state() or {}
                             odo_data = odo_payload.get("odom_state") or {}
                             self._odo_ir_trigger_x = odo_data.get("x")
@@ -302,20 +327,28 @@ class _CreepThread:
                             current_x = odo_data.get("x")
                             if current_x is not None:
                                 extra = max(0.0, current_x - self._odo_ir_trigger_x)
-                                if extra >= 0.3:
-                                    self.finished_by_ir_odom = True
-                                    print(f"  [{LOG_PREFIX}] IR 触发后里程计走满 "
-                                          f"0.3m ({extra:.3f}m), 结束搜索")
-                                    self._stop_event.set()
-                                    self.http.post(
-                                        "/v1/realtime/chassis-velocity",
-                                        {"vx": 0.0, "vy": 0.0, "wz": 0.0},
-                                        timeout=1.0,
-                                    )
-                                    self.completion_event.set()
-                                    break
+                            else:
+                                extra = -1.0
                         except Exception:
-                            pass
+                            extra = -1.0
+                        # 0.3m 到位 或 触发后满 ir_max_seconds_s (odom 冻结兜底)
+                        ir_elapsed = time.monotonic() - (self._ir_triggered_at or 0.0)
+                        if extra >= 0.3 or ir_elapsed >= self.ir_max_seconds_s:
+                            self.finished_by_ir_odom = True
+                            if extra >= 0.3:
+                                print(f"  [{LOG_PREFIX}] IR 触发后里程计走满 "
+                                      f"0.3m ({extra:.3f}m), 结束搜索")
+                            else:
+                                print(f"  [{LOG_PREFIX}] IR 触发后时间兜底 "
+                                      f"{ir_elapsed:.1f}s (odom 冻结), 结束搜索")
+                            self._stop_event.set()
+                            self.http.post(
+                                "/v1/realtime/chassis-velocity",
+                                {"vx": 0.0, "vy": 0.0, "wz": 0.0},
+                                timeout=1.0,
+                            )
+                            self.completion_event.set()
+                            break
                     continue
 
                 if self.distance_m >= self.max_distance_m:
