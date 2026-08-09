@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Optional
 
 import requests
+import yaml
 
 from main.api_client import RuntimeApiClient
 from main.task.task3.llm_ernie import call_vision, check_health, load_token, mask_token
@@ -41,13 +42,41 @@ Examples of beneficial animals: bee, ladybug, butterfly, earthworm, spider.
 If uncertain, still choose the most likely result and explain briefly.
 """
 
+
+def _load_pest_prompt() -> str:
+    """读 llm_config.yml 的 pest_detect.system_prompt (详细版) 替换简单硬编码提示词。
+
+    2026-08-09: 旧简单 prompt 没有"图里不是动物 → result=1"规则, LLM 把 YOLO 误检
+    (空图 / 蓝色结构物) 默认判成害虫 → 假 pest (#1/#2 实机案例)。详细版明确
+    "如果图片中不是动物或根本无法识别, 返回 result=1"。读不到/解析失败回退
+    RECOGNITION_PROMPT 保底。
+    """
+    try:
+        with open(Path(__file__).resolve().parent / "llm_config.yml",
+                  encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+        prompt = (cfg.get("pest_detect") or {}).get("system_prompt")
+        if prompt and str(prompt).strip():
+            print(f"[ready] 害虫判定用 llm_config.yml 详细提示词 "
+                  f"({len(str(prompt))} 字符)", flush=True)
+            return str(prompt)
+        print("[warn] llm_config.yml 缺 pest_detect.system_prompt, 回退硬编码提示词",
+              file=sys.stderr)
+    except Exception as exc:
+        print(f"[warn] 读 llm_config.yml 失败, 回退硬编码提示词: {exc}",
+              file=sys.stderr)
+    return RECOGNITION_PROMPT
+
+
+PEST_PROMPT = _load_pest_prompt()
+
 DEFAULT_TARGET_COUNT = 4
 DEFAULT_CREEP_SPEED = 0.18          # m/s, 识别段 creep 速度 (2026-08-04 现场: 0.05→0.18)
 DEFAULT_MIN_SCORE = 0.40
 DEFAULT_CENTER_TOL = 0.15
 DEFAULT_MIN_GAP = 0.16          # 卡片中心距 16cm → 去重窗口需覆盖一张卡的间距
 DEFAULT_CLASSIFY_WORKERS = 2
-DEFAULT_TARGET_SPACING_M = 0.16       # 卡片 8cm + 间隔 8cm = 中心距 16cm
+DEFAULT_TARGET_SPACING_M = 0.16       # 卡片中心距 16cm (2026-08-09: 改回 16; 补录推进 + 超程保护都用它)
 DEFAULT_TARGET_SETTLE_S = 0.15
 RECOGNITION_ARM = ("-0.100", "-0.040", "-0.270", "90", "-70")
 SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
@@ -141,7 +170,7 @@ def classify_target(token, image_path, timeout):
     except OSError:
         return {"name": "unknown", "result": None, "analysis": "target image unavailable"}
     image_url = "data:image/jpeg;base64," + base64.b64encode(image_bytes).decode("ascii")
-    verdict = call_vision(token, image_url, RECOGNITION_PROMPT, timeout=timeout)
+    verdict = call_vision(token, image_url, PEST_PROMPT, timeout=timeout)
     result = verdict.get("result")
     try:
         result = int(result) if result is not None else None
@@ -226,7 +255,10 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
     """首卡定位后按固定卡间距逐个记录，避免同一张卡重复计数。"""
     records = []
     period = max(args.poll_interval, 0.05)
-    min_samples = max(2, int(args.target_settle_s / period) + 1)
+    # 后续卡锁存器要求的最小稳定帧数: 2→4 (2026-08-09 用户要求, 卡要连续 4 帧稳定)
+    # 公式含义: settle 秒内能采到的样本数; max(4, ...) 保证至少 4 帧, settle 调大可更多.
+    # (首卡不受影响 —— 显式 required_samples=1, 车在前进卡可能只在中心出现一帧)
+    min_samples = max(4, int(args.target_settle_s / period) + 1)
     first_window = max(args.center_tol, 0.30)
     slot_window = max(args.center_tol * 2.0, 0.35)
     start_odom = read_traveled(client)
@@ -367,12 +399,15 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
         if done.get("status") != "succeeded":
             raise RuntimeError(f"car.move_for failed: {done.get('error')}")
 
-    def move_along_lane(distance, stop_when=None, stopped=None):
+    def move_along_lane(distance, stop_when=None, stopped=None, vx=None):
+        """沿车道推进 distance 米; 返回实际里程增量 (m, odom 不可用按请求距离估算)."""
         if args.dry_run:
-            return
+            return distance
         from main.chassis.config import LANE_FOLLOW
         from main.chassis.controllers import move_along_lane as lane_move
-        print(f"  [drive] move_along_lane +{distance:.2f}m", flush=True)
+        eff_vx = vx if vx is not None else args.creep_speed
+        print(f"  [drive] move_along_lane +{distance:.2f}m @{eff_vx:.2f} m/s",
+              flush=True)
         before = read_traveled(client)
         try:
             lane_state = client.get("/v1/vision/lane/state") or {}
@@ -383,24 +418,29 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
             print(f"  [warn] lane feed unavailable: {lane_error}",
                   file=sys.stderr, flush=True)
             move_forward_fallback(distance)
-            return
-        lane_move(
-            vx=args.creep_speed,
-            distance_m=distance,
-            profile=LANE_FOLLOW.tuned(watchdog_ms=None),
-            max_seconds=max(
-                5.0,
-                distance / max(args.creep_speed, 0.05) * 3.0 + 2.0,
-            ),
-            stop_when=stop_when,
-        )
-        after = read_traveled(client)
-        moved = (after is not None and before is not None
-                 and after >= before + max(0.02, distance * 0.25))
-        if not moved and not (stopped and stopped()):
-            print("  [warn] move_along_lane 无里程变化，切换 move_for",
-                  file=sys.stderr, flush=True)
-            move_forward_fallback(distance)
+            after = read_traveled(client)
+        else:
+            lane_move(
+                vx=eff_vx,
+                distance_m=distance,
+                profile=LANE_FOLLOW.tuned(watchdog_ms=None),
+                max_seconds=max(
+                    5.0,
+                    distance / max(eff_vx, 0.05) * 3.0 + 2.0,
+                ),
+                stop_when=stop_when,
+            )
+            after = read_traveled(client)
+            moved = (after is not None and before is not None
+                     and after >= before + max(0.02, distance * 0.25))
+            if not moved and not (stopped and stopped()):
+                print("  [warn] move_along_lane 无里程变化，切换 move_for",
+                      file=sys.stderr, flush=True)
+                move_forward_fallback(distance)
+                after = read_traveled(client)
+        if before is not None and after is not None:
+            return max(0.0, float(after) - float(before))
+        return distance
 
     def wait_for_target(latch, timeout):
         deadline = time.monotonic() + timeout
@@ -482,9 +522,15 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
                 print("[warn] 已达到识别区最大行程，停止补录", file=sys.stderr)
                 break
             nominal_travel += args.target_spacing
-            print(f"[recognition] slot {next_number}: move_along_lane "
-                  f"+{args.target_spacing:.2f}m", flush=True)
-            move_along_lane(args.target_spacing)
+            if next_number == args.target_count:
+                # 2026-08-09: 最后一次 16cm (补录最后一张卡前) 改 move_for 直线
+                print(f"[recognition] slot {next_number}: move_for "
+                      f"+{args.target_spacing:.2f}m (最后一次)", flush=True)
+                move_forward_fallback(args.target_spacing)
+            else:
+                print(f"[recognition] slot {next_number}: move_along_lane "
+                      f"+{args.target_spacing:.2f}m", flush=True)
+                move_along_lane(args.target_spacing)
             latch = make_latch(slot_window)
             det = wait_for_target(latch, args.slot_wait_s)
             if det is None:
@@ -579,7 +625,7 @@ def main():
     parser.add_argument("--poll-interval", type=float, default=0.15)
     parser.add_argument("--target-spacing", "--straight-step", dest="target_spacing",
                         type=float, default=DEFAULT_TARGET_SPACING_M,
-                        help="center-to-center distance between target cards (default 0.16m)")
+                        help="center-to-center distance between target cards (default 0.15m)")
     parser.add_argument("--slot-wait-s", type=float, default=1.0,
                         help="seconds to wait for a centered target after each fixed move")
     parser.add_argument("--target-settle-s", type=float, default=DEFAULT_TARGET_SETTLE_S,

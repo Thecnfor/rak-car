@@ -2,12 +2,10 @@
 # -*- coding: utf-8 -*-
 r"""main/task/task3/arm_seq_v9.py - sequenced arm motion v9
 
-动作序列(每步独立,失败抛错停):
-  1. arm.move_y_position(y1)             -> 先到中间 y 位(如 -100mm = -0.100m)
-  2. arm.set_hand_angle(hand, speed)     -> 在 y1 处调整手爪舵机角度
-  3. arm.set_arm_angle(arm, speed)       -> 在 y1 处调整机械臂(大臂)角度
-  4. arm.move_x_position(x)              -> 在 y1 处调整 x 位置
-  5. arm.move_y_position(y2)             -> 最后走到目标 y 位(如 -40mm = -0.040m)
+动作序列(2026-08-09: 四轴并发 + 最后 y 收尾):
+  1. composite_run 并发 (y / hand / arm / x) -> 4 轴同一路 job 内
+     ThreadPoolExecutor 并行: y→y1(中间位) + 手爪 + 大臂 + x 十字同时动
+  2. arm.move_y_position(y2)                -> 最后走到目标 y 位(如 -40mm)
 
 每步后读 arm_state 打印。
 
@@ -98,44 +96,24 @@ def main():
           f"arm_angle={b.get('arm_angle')} "
           f"hand_angle={b.get('hand_angle')}", flush=True)
 
-    # 1) y -> 中间位(如 -100mm;速度限制 0.1 m/s;y SDK 默认就是 0.1,见 _slow_arm_y)
-    print(f"\n[1/5] move_y_position({args.y1}) 速度={args.speed} m/s ...",
+    # 1) y/hand/arm/x 四轴并发 (composite_run, 同一路 job 内 ThreadPoolExecutor)
+    #    speed=angle_speed(默认100) 管手爪/大臂角度速度, x_v_max_mms=100 管 x 0.1 m/s,
+    #    y 走 move_y_position 默认 PID 0.1 m/s
+    print(f"\n[1/2] composite_run 四轴并发: y={args.y1}m "
+          f"hand={args.hand_angle}° arm={args.arm_angle}° x={args.x}m ...",
           flush=True)
-    _slow_arm_y(client, args.y1, timeout=args.timeout)
-    time.sleep(args.settle)
-    s = read_arm(client)
-    print(f"       -> y_m={s.get('y_m')} x_m={s.get('x_m')}", flush=True)
-
-    # 2) 手爪舵机角度(在 y1 中间位调整)
-    print(f"\n[2/5] set_hand_angle({args.hand_angle}, {args.angle_speed}) ...",
-          flush=True)
-    arm_call(client, "set_hand_angle", args.hand_angle, args.angle_speed,
+    arm_call(client, "composite_run",
+             y=args.y1, arm=args.arm_angle, x=args.x, hand=args.hand_angle,
+             speed=args.angle_speed, x_v_max_mms=args.speed * 1000.0,
              timeout=args.timeout)
     time.sleep(args.settle)
     s = read_arm(client)
-    print(f"       -> hand_angle={s.get('hand_angle')} "
-          f"arm_angle={s.get('arm_angle')}", flush=True)
-
-    # 3) 机械臂(大臂)角度(在 y1 中间位调整)
-    print(f"\n[3/5] set_arm_angle({args.arm_angle}, {args.angle_speed}) ...",
+    print(f"       -> y_m={s.get('y_m')} x_m={s.get('x_m')} "
+          f"arm_angle={s.get('arm_angle')} hand_angle={s.get('hand_angle')}",
           flush=True)
-    arm_call(client, "set_arm_angle", args.arm_angle, args.angle_speed,
-             timeout=args.timeout)
-    time.sleep(args.settle)
-    s = read_arm(client)
-    print(f"       -> arm_angle={s.get('arm_angle')} "
-          f"hand_angle={s.get('hand_angle')}", flush=True)
 
-    # 4) x 位置(在 y1 中间位调整;速度限制 0.1 m/s)
-    print(f"\n[4/5] move_x_position({args.x}) 速度={args.speed} m/s ...",
-          flush=True)
-    _slow_arm_x(client, args.x, timeout=args.timeout)
-    time.sleep(args.settle)
-    s = read_arm(client)
-    print(f"       -> y_m={s.get('y_m')} x_m={s.get('x_m')}", flush=True)
-
-    # 5) y -> 目标位(如 -40mm)
-    print(f"\n[5/5] move_y_position({args.y2}) 速度={args.speed} m/s ...",
+    # 2) y -> 目标位(如 -40mm)
+    print(f"\n[2/2] move_y_position({args.y2}) 速度={args.speed} m/s ...",
           flush=True)
     _slow_arm_y(client, args.y2, timeout=args.timeout)
     time.sleep(args.settle)

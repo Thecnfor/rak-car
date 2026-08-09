@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
@@ -158,7 +159,7 @@ def _chassis_move_for(
     timeout: float,
     *,
     use_lane_align: bool = False,
-    speed_mps: float = 0.15,
+    speed_mps: float = 0.10,
 ) -> dict:
     """底盘纵向 move_for — 仿 task1_seeding 范式: sync=False + wait_job.
 
@@ -179,7 +180,8 @@ def _chassis_move_for(
         dx_m: 位移 (m), 正=前进, 负=后退. lane_align 模式下取绝对值当 distance_m.
         timeout: 单次最大等待 (s).
         use_lane_align: True=走 move_along_lane (沿车道线, 不偏), False=走 move_for (SDK 4 轮等速).
-        speed_mps: lane_align 模式下的前进速度 (m/s), 默认 0.15.
+        speed_mps: 底盘移动速度上限 (m/s), 默认 0.10 (2026-08-09: 0.15/0.2 → 0.10).
+                  move_along_lane 用它当 vx; move_for 用它当 max_velocities[0/1] (前后都限).
     """
     if use_lane_align and abs(dx_m) > 1e-3:
         # 沿中心车道线走 (vy=0 + ω 锁对齐, 弯道不偏)
@@ -192,9 +194,11 @@ def _chassis_move_for(
         return {"ok": True, "mode": "lane_align", "dx_m": float(dx_m)}
 
     # 主路径: SDK move_for (字节流 4 轮等速, 正=前进 负=后退)
+    # 2026-08-09: 显式传 max_velocities 控速 (默认 0.2 太快), 前后都限 speed_mps.
     job = arm_client.http.execute_car_action(
         "move_for", [dx_m, 0.0, 0.0],
         timeout=timeout, sync=False,
+        max_velocities=[float(speed_mps), float(speed_mps), math.pi / 3.0],
     )
     jid = job.get("id") if isinstance(job, dict) else None
     if jid:

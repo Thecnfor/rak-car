@@ -367,7 +367,14 @@ def estimate_common_xc_shift(reference_xcs, current_xcs, excluded_index=None):
                 if (best is None
                         or candidate[0] > best[0]
                         or (candidate[0] == best[0]
-                            and candidate[1] < best[1])):
+                            and candidate[1] < best[1])
+                        or (candidate[0] == best[0]
+                            and candidate[1] == best[1]
+                            and abs(candidate[2]) < abs(best[2]))):
+                    # 2026-08-09 修复: 平局(count/residual 相同)时优先选位移更小的配对。
+                    # 旧逻辑先到先得 → excluded_index 只留 1 个参考板时, 会把 0.70 错配到
+                    # 0.46 (shift=-0.24), 导致射后确认 expected_xc 偏一个板距, 目标"找不到"
+                    # → 卡还站着却被判"完全消失" (假阳性 HIT)。
                     best = candidate
         if best is not None and best[0] == count:
             break
@@ -409,6 +416,18 @@ def select_confirmation_target(animals, reference_xcs, target_index,
         a for a in animals
         if abs(bbox_xc(a) - expected_xc) <= identity_tol
     ]
+    if not candidates and anchor_xc is not None:
+        # 2026-08-09 防御: 预测位置找不到时, 回退检查实际射击位置 anchor 附近。
+        # 射后 0.45s 车没被命令移动, 卡若还在应仍在 anchor 附近;
+        # 用紧容差(板距 ~0.25 > 0.12)避免抓到相邻板 → 防止"卡还在却判 hit"假阳性。
+        fallback_tol = max(CONFIRM_IDENTITY_MIN_TOL, 0.12)
+        candidates = [
+            a for a in animals
+            if abs(bbox_xc(a) - anchor_xc) <= fallback_tol
+        ]
+        if candidates:
+            expected_xc = anchor_xc
+            identity_tol = fallback_tol
     if not candidates:
         return None
     return min(candidates, key=lambda a: abs(bbox_xc(a) - expected_xc))
