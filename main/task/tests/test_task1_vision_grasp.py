@@ -384,12 +384,12 @@ class TestRun(unittest.TestCase):
         self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
         for call_item in tc.call_args_list:
             kwargs = call_item.kwargs
-            self.assertFalse(kwargs["decouple_xy"])
-            self.assertEqual(kwargs["kp"], 0.20)
-            self.assertEqual(kwargs["v_max"], 0.12)
+            self.assertTrue(kwargs["decouple_xy"])  # 2026-08-09: task1 开解耦治对角打滑
+            self.assertEqual(kwargs["kp"], 0.2)
+            self.assertEqual(kwargs["v_max"], 0.2)
             self.assertEqual(kwargs["v_slew"], 0.04)
             self.assertEqual(kwargs["deadband"], 0.05)
-            self.assertEqual(kwargs["hold_frames"], 3)
+            self.assertEqual(kwargs["hold_frames"], 4)
 
     def test_align_failure_after_two_tries_still_proceeds(self):
         """2026-08-06: 重试后仍失败 → ERROR 告警 + 放行; chassis_aligned=False, ok=True (比赛完赛优先)。"""
@@ -533,6 +533,65 @@ class TestRun(unittest.TestCase):
             if c.args and c.args[0] == "move_for"
         )
         self.assertAlmostEqual(cumulative_dx, 0.30, places=6)
+
+
+class TestStep0TriggerLaneArm(unittest.TestCase):
+    """2026-08-09: step0 — 触发后 lane follow 并发臂切 PLACE."""
+
+    def _call(self, cfg_override=None):
+        import main.task.task1_seeding as m
+        cfg = {
+            "trigger_settle": {
+                "enabled": True, "lane_follow_m": 0.1, "lane_speed_mps": 0.1,
+            },
+        }
+        if cfg_override:
+            cfg.update(cfg_override)
+        arm = MagicMock()
+        arm.get_state.return_value = MagicMock(y_mm=-100)
+        return m._init_step0_trigger_lane_arm(arm, cfg), arm
+
+    def test_lane_and_arm_run_concurrently(self):
+        """move_along_lane(vx=0.1, distance_m=0.1) 与 composite_run(PLACE) 并发. """
+        import main.task.task1_seeding as m
+        with patch("main.chassis.move_along_lane") as mal:
+            ok, arm = self._call()
+        self.assertTrue(ok)
+        mal.assert_called_once_with(vx=0.1, distance_m=0.1)
+        arm.composite_run.assert_called_once()
+        kw = arm.composite_run.call_args.kwargs
+        self.assertEqual(kw["arm"], m.PLACE_ARM_DEG)
+        self.assertEqual(kw["x_mm"], m.PLACE_ALIGN_X_MM)
+        self.assertEqual(kw["y_mm"], m.PLACE_Y_MM)
+        self.assertEqual(kw["hand"], m.PLACE_HAND_DEG)
+
+    def test_disabled_skips(self):
+        """enabled=False → 直接返回 True, 不碰底盘/臂. """
+        with patch("main.chassis.move_along_lane") as mal:
+            ok, arm = self._call({"trigger_settle": {"enabled": False}})
+        self.assertTrue(ok)
+        mal.assert_not_called()
+        arm.composite_run.assert_not_called()
+
+    def test_y_low_raises_before_concurrent(self):
+        """y > -50 先串行抬到 PLACE_Y_MM 再并发 (防撞). """
+        import main.task.task1_seeding as m
+        arm = MagicMock()
+        arm.get_state.return_value = MagicMock(y_mm=0)
+        with patch("main.chassis.move_along_lane"):
+            m._init_step0_trigger_lane_arm(arm, {
+                "trigger_settle": {"enabled": True,
+                                   "lane_follow_m": 0.1, "lane_speed_mps": 0.1},
+            })
+        arm.move_y.assert_called_once_with(m.PLACE_Y_MM, timeout=5.0)
+
+    def test_lane_failure_continues(self):
+        """lane follow 抛错 → 记 warning 返回 False 不阻塞. """
+        def _boom(*a, **kw):
+            raise RuntimeError("lane 断")
+        with patch("main.chassis.move_along_lane", side_effect=_boom):
+            ok, _ = self._call()
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

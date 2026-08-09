@@ -73,17 +73,17 @@ TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
 }
 
 # ── 视觉伺服参数 (track_velocity_pick) ─────────────────────────────────────
-PICK_SERVO_GAIN_ARM = 2.5
-PICK_SERVO_GAIN_X = 0.55
+PICK_SERVO_GAIN_ARM = 1.0
+PICK_SERVO_GAIN_X = 0.30
 PICK_SERVO_DEADZONE = 0.06
-PICK_SERVO_MAX_VEL = 0.70
-PICK_SERVO_SETTLE_HITS = 1
+PICK_SERVO_MAX_VEL = 0.5
+PICK_SERVO_SETTLE_HITS = 3
 PICK_SERVO_HOLD_S = 0.05
 PICK_SERVO_LIFT_BACK = True
 PICK_SERVO_SKIP_POSE_ALIGN = True
 PICK_SERVO_HZ = 20.0
 # pick_track_timeout_s 优先从 cfg 读, 此处为缺省值
-PICK_SERVO_TIMEOUT_S_DEFAULT = 2.0
+PICK_SERVO_TIMEOUT_S_DEFAULT = 4.0
 
 # ── 抓取起始 hand 角度 ─────────────────────────────────────────────────────
 PICK_START_HAND_DEG = -15.0   # 2026-08-06: S 姿态 hand 固定 -15°
@@ -91,7 +91,7 @@ PICK_START_HAND_DEG = -15.0   # 2026-08-06: S 姿态 hand 固定 -15°
 # ── S 姿态 (track_velocity_pick 起始位 / 循环切 S 用) ──────────────────────
 # arm_angle_deg 优先从 cfg["arm_pick_pose"] 读; x/y/hand 在此写死
 S_POSE_Y_MM = -100.0    # 安全抬升高度 (mm)
-S_POSE_X_MM = -80.0     # 主循环切 S 用 x (mm)
+S_POSE_X_MM = -70.0     # 主循环切 S 用 x (mm)
 S_POSE_HAND_DEG = 0.0   # 主循环切 S 用 hand (deg)
 
 # ── PLACE 姿态 (释放工作平面) ──────────────────────────────────────────────
@@ -113,6 +113,10 @@ CHASSIS_CONCURRENT_Y_THRESHOLD_MM = -30.0
 # ── composite_run 公共参数 ─────────────────────────────────────────────────
 COMPOSITE_SPEED_DEFAULT = 100
 COMPOSITE_TIMEOUT_S_DEFAULT = 5.0
+
+# ── step0: 任务点触发后 lane follow 并发臂切 PLACE (2026-08-09 用户) ──────
+TRIGGER_SETTLE_LANE_M = 0.1    # lane follow 前移距离 (m), 速度 0.1m/s
+TRIGGER_SETTLE_LANE_VX = 0.1   # lane follow 速度 (m/s)
 
 
 # ── 视觉读取（cam2 task_feed 缓存） ─────────────────────────────────────────
@@ -475,6 +479,75 @@ def _init_step1_reset_x(arm_client: ArmClient, timeout: float = 30.0) -> None:
     arm_client.reset_x(direction="right", timeout=timeout)
 
 
+def _init_step0_trigger_lane_arm(
+    arm_client: ArmClient,
+    cfg: Dict[str, Any],
+) -> bool:
+    """2026-08-09: 任务点触发后 step0 — lane follow 前移 与 臂切 PLACE 并发.
+
+    编排层 waypoint 触发 (右侧 IR<阈值 AND 里程≥阈值) 后、step1 视觉对齐前:
+      1. 底盘 move_along_lane(vx, distance_m) 沿车道线前进 (拉近 marker, 不偏航)
+      2. 机械臂并发 composite_run 切 PLACE 对齐姿态 (arm=+90, x=-300, y=-100,
+         hand=0) — "进入任务点就动臂" (task2 同款并发范式, task1_seeding 原本
+         step1 也要切 PLACE, 提前并发省串行等待).
+
+    参数走 task_config.yml trigger_settle 段 (enabled / lane_follow_m /
+    lane_speed_mps). 关闭或 lane_m<=0 → 原样返回.
+
+    安全: 当前 y > -50 (臂偏低) 先串行抬到 PLACE_Y_MM 再并发, 防底盘前进撞臂
+    (与 _switch_to_place_pose 同规则). lane follow 需要 lane_feed 存活
+    (orchestrator 触发后只 pause 外环 runner, feed 仍跑, 与 settle_forward 同理).
+
+    失败不阻塞任务: lane follow 或臂切失败只记 warning, 继续 step1.
+    Returns: lane follow 且 臂切 是否都完成.
+    """
+    settle = cfg.get("trigger_settle") or {}
+    if not settle.get("enabled", False):
+        return True
+    lane_m = float(settle.get("lane_follow_m", TRIGGER_SETTLE_LANE_M))
+    lane_vx = float(settle.get("lane_speed_mps", TRIGGER_SETTLE_LANE_VX))
+    if lane_m <= 0:
+        return True
+
+    # 安全: y 偏低先抬 (串行 ~0.5s), 否则底盘前进时臂还低着会撞
+    try:
+        st = arm_client.get_state()
+        if st.y_mm > -50:
+            logger.info("step0: 当前 y=%.1f 偏低, 先抬到 %s 再并发", st.y_mm, PLACE_Y_MM)
+            arm_client.move_y(PLACE_Y_MM, timeout=5.0)
+    except Exception as exc:
+        logger.warning("step0: 检查/抬升 y 失败 (%s), 继续", exc)
+
+    from concurrent.futures import ThreadPoolExecutor
+    from main.chassis import move_along_lane
+
+    logger.info("step0: lane follow %.2fm @ %.2fm/s 并发臂切 PLACE "
+                "(arm=%s° x=%s y=%s hand=%s°)",
+                lane_m, lane_vx, PLACE_ARM_DEG, PLACE_ALIGN_X_MM,
+                PLACE_Y_MM, PLACE_HAND_DEG)
+    lane_done = True
+    arm_ok = False
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_lane = ex.submit(move_along_lane, vx=lane_vx, distance_m=lane_m)
+        f_arm = ex.submit(
+            arm_client.composite_run,
+            arm=PLACE_ARM_DEG, x_mm=PLACE_ALIGN_X_MM, y_mm=PLACE_Y_MM,
+            hand=PLACE_HAND_DEG, speed=COMPOSITE_SPEED_DEFAULT, timeout=20.0,
+        )
+        try:
+            f_lane.result()
+        except Exception as exc:
+            lane_done = False
+            logger.warning("step0: lane follow 失败 (%s), 继续 step1", exc)
+        try:
+            arm_ok = bool(f_arm.result())
+        except Exception as exc:
+            logger.warning("step0: 臂切 PLACE 失败 (%s), 继续 step1", exc)
+    if not lane_done:
+        logger.warning("step0: lane follow 未完成, step1 对齐从当前位置开始")
+    return lane_done and arm_ok
+
+
 def _init_step1_place_align(
     arm_client: ArmClient,
     cfg: Dict[str, Any],
@@ -513,12 +586,13 @@ def _init_step1_place_align(
         result = track_chassis(
             marker_label,
             setpoint_cxcy=(0.0, 0.0),
-            kp=0.20,
-            v_max=0.12,
+            kp=0.2,
+            v_max=0.2,
             deadband=0.05,
-            hold_frames=3,
+            hold_frames=4,
             v_slew=0.04,
-            decouple_xy=False,
+            # 2026-08-09: task1 单独开解耦 (单轴驱动) 治对角双轴打滑; task4 保留 False 场测对比.
+            decouple_xy=True,
             dry_run=False,
             max_seconds=align_max_s,
         )
@@ -657,6 +731,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     init_y_mm = cfg.get("init_y_mm", -180)
 
     try:
+        # ===== 初始化步骤 0 (2026-08-09 用户): 任务点触发后 lane follow 0.1m
+        #     并发臂切 PLACE (进入任务点就动臂, 拉近 marker 再视觉对齐) =====
+        _init_step0_trigger_lane_arm(arm_client, cfg)
         # ===== 初始化步骤 1 (用户 20:53): PLACE 视觉对齐 — 一次性 step 1 =====
         # 用户: "开始place对齐（x=-320，只在任务第一次触发时定位0在哪）"
         # 1. 切 PLACE 姿态 (arm=+90, x=-320, y=-100, hand=0) — x=-320 是用户标定的

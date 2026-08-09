@@ -36,7 +36,7 @@ task_cfg:
     spacing_along_row_m: 0.15
 
     arm_pick_pose:
-      x_mm: -80            # 2026-08-02 21:36 用户: pick 和 S 姿态 x 都是 -80
+      x_mm: -70            # 2026-08-09: -80 → -70 (S 姿态 x 前移, 与 S_POSE_X_MM 一致)
       arm_angle_deg: -90
       y_mm: 0              # 2026-08-02: 吸取动作位置 (吸嘴触底)
       hand_angle_deg: 0    # 吸取时末端向下
@@ -73,7 +73,14 @@ task_cfg:
       ref_area: 1.10        # 2026-08-02 实测 PLACE 姿态 / x=-270 / 距离 T 列约 30cm: cylinder_set bbox area ≈ 1.12
       label: null           # auto
       v_max: 0.20
-      max_seconds: 12.0
+      max_seconds: 8.0
+
+    # 2026-08-09: 任务点触发后 step0 — lane follow 前移 0.1m @ 0.1m/s,
+    # 与机械臂切 PLACE 姿态 (arm=+90 x=-300 y=-100 hand=0) 并发 (进入任务点就动臂).
+    trigger_settle:
+      enabled: true
+      lane_follow_m: 0.1
+      lane_speed_mps: 0.1
 
     # 2026-08-09: 抓苗视觉伺服传输开关 (同 task2/task6 pick_vision):
     #   local_servo=true  → 新传输 (runtime 进程内 run_arm_servo, main 只发一次目标)
@@ -81,7 +88,7 @@ task_cfg:
     #   增益/死区/速度等仍走 task1_seeding.py 的 PICK_SERVO_* 常量, 这里只放开关+超时.
     pick_vision:
       local_servo: true
-      timeout: 2.0          # 视觉对齐超时秒 (→ run_arm_servo servo_timeout, 同 pick_track_timeout_s 默认)
+      timeout: 4.0          # 视觉对齐超时秒 (→ run_arm_servo servo_timeout, 同 pick_track_timeout_s 默认)
 
   water_tower_task:
     _doc: |
@@ -248,9 +255,9 @@ waypoints:
   - name: task1_seeding
     task_id: 1
     task_module: main.task.task1_seeding
-    ir_threshold_m: 0.7
+    ir_threshold_m: 1.2
     ir_side: right
-    dis_at_least_m: 0.89
+    dis_at_least_m: 0.5
     trigger_op: AND
 
   # ----- task3 (TODO) -----
