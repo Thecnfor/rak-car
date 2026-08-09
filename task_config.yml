@@ -75,6 +75,14 @@ task_cfg:
       v_max: 0.20
       max_seconds: 12.0
 
+    # 2026-08-09: 抓苗视觉伺服传输开关 (同 task2/task6 pick_vision):
+    #   local_servo=true  → 新传输 (runtime 进程内 run_arm_servo, main 只发一次目标)
+    #   local_servo=false → 旧方式 (网络每帧 track_velocity_pick)
+    #   增益/死区/速度等仍走 task1_seeding.py 的 PICK_SERVO_* 常量, 这里只放开关+超时.
+    pick_vision:
+      local_servo: true
+      timeout: 2.0          # 视觉对齐超时秒 (→ run_arm_servo servo_timeout, 同 pick_track_timeout_s 默认)
+
   water_tower_task:
     _doc: |
       任务二：水塔取水
@@ -252,7 +260,7 @@ waypoints:
     ir_threshold_m: 1.05
     ir_side: left
     dis_at_least_m: 0.93
-    trigger_op: OR
+    trigger_op: AND
 
   # ----- task2 -----
   - name: task2_water_tower

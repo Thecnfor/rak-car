@@ -230,6 +230,101 @@ def _scan_marker_present(
 
 # ── 底盘纵向移动 ─────────────────────────────────────────────────────────
 
+def _pick_cylinder_servo_local(
+    arm_client: ArmClient,
+    runner: ArmRunner,
+    cfg: Dict[str, Any],
+    label: str,
+    setpoint_xy: Tuple[float, float],
+    init_y_mm: float,
+    pick_arm_start: float,
+) -> Dict[str, Any]:
+    """本地视觉伺服抓苗 (2026-08-09 闭环下沉): runtime 进程内 run_arm_servo.
+
+    mirror task1 的 track_velocity_pick: 对齐收敛 → y 降 0 (grasp_y) → grasp →
+    抬回 init_y_mm (fire-and-forget). main 只发一次目标参数, 无每帧网络往返.
+    控制律 (arm 控 cx + x 十字控 cy) 与 find_target_arm_cross 同构, 方向符号沿用
+    task1 标定: sign_arm=+1, sign_x=-1.
+
+    Returns: run_arm_servo 结果 dict (含 ok/settled/trace_hits/end_arm).
+    未收敛抛 RuntimeError (主循环跳过该列, 与旧路径一致).
+    """
+    vision = cfg.get("pick_vision") or {}
+    servo_timeout = float(vision.get(
+        "timeout", cfg.get("pick_track_timeout_s", PICK_SERVO_TIMEOUT_S_DEFAULT)))
+    servo_kw = dict(
+        label=label,
+        hz=PICK_SERVO_HZ,
+        gain_arm=PICK_SERVO_GAIN_ARM,
+        gain_x=PICK_SERVO_GAIN_X,
+        deadzone=PICK_SERVO_DEADZONE,
+        max_vel=PICK_SERVO_MAX_VEL,
+        arm_start=float(pick_arm_start),
+        sign_arm=1.0,
+        sign_x=-1.0,
+        setpoint_x_norm=float(setpoint_xy[0]),
+        setpoint_y_norm=float(setpoint_xy[1]),
+        arm_min=-150.0,
+        arm_max=90.0,
+        servo_timeout=servo_timeout,
+        settle_hits=int(PICK_SERVO_SETTLE_HITS),
+    )
+    logger.info(
+        "本地视觉伺服: run_arm_servo(label=%s setpoint=(%.3f,%.3f) hz=%s "
+        "gain_arm=%s gain_x=%s deadzone=%s max_vel=%s arm_start=%s settle=%s servo_timeout=%s)",
+        label, servo_kw["setpoint_x_norm"], servo_kw["setpoint_y_norm"],
+        servo_kw["hz"], servo_kw["gain_arm"], servo_kw["gain_x"],
+        servo_kw["deadzone"], servo_kw["max_vel"], servo_kw["arm_start"],
+        servo_kw["settle_hits"], servo_kw["servo_timeout"],
+    )
+    job = arm_client.http.execute(
+        "car", "run_arm_servo", kwargs=servo_kw, sync=True,
+        timeout=float(servo_kw["servo_timeout"]) + 15.0,
+    )
+    result = (job or {}).get("result") if isinstance(job, dict) else None
+    result = result if isinstance(result, dict) else {}
+    if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+        raise RuntimeError(
+            f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
+        )
+    logger.info("本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                result.get("reason"), result.get("settled"),
+                result.get("trace_hits"), result.get("end_arm"))
+    if not result.get("settled"):
+        raise RuntimeError(
+            f"S 视觉抓苗未收敛 (reason={result.get('reason')}, "
+            f"trace_hits={result.get('trace_hits')}, end_arm={result.get('end_arm')})"
+        )
+    # 对齐完成 → y 降 0 → grasp → 抬回 init_y (mirror track_velocity_pick grasp 段)
+    try:
+        job_down = arm_client.http.execute(
+            "arm", "composite_run",
+            kwargs=dict(arm=None, x=None, y=0.0, hand=None, speed=100, timeout=5.0),
+            sync=False,
+        )
+        jid = job_down.get("id") if isinstance(job_down, dict) else None
+        if jid:
+            arm_client.http.wait_job(jid, timeout=5.0)
+        arm_client.http.execute("arm", "grasp", kwargs=dict(value=True), sync=False)
+        # 抬回 init_y fire-and-forget (下游 move 并发)
+        arm_client.http.execute(
+            "arm", "composite_run",
+            kwargs=dict(arm=None, x=None, y=float(init_y_mm) / 1000.0, hand=None,
+                        speed=100, timeout=5.0),
+            sync=False,
+        )
+    except Exception as exc:
+        try:
+            arm_client.http.execute(
+                "arm", "move_y_position",
+                kwargs=dict(target=float(init_y_mm) / 1000.0, timeout=5.0), sync=False,
+            )
+        except Exception:
+            pass
+        raise RuntimeError(f"本地视觉抓苗 grasp 段失败: {exc}") from exc
+    return result
+
+
 def _pick_at_source(
     runner: ArmRunner,
     arm_client: ArmClient,
@@ -290,21 +385,29 @@ def _pick_at_source(
     state = arm_client.get_state()
     init_y_mm = float(cfg.get("init_y_mm", -100.0))
     pick_arm_start = float(cfg.get("arm_pick_pose", {}).get("arm_angle_deg", -90.0))
-    result = runner.track_velocity_pick(
-        label,
-        x_start=state.x_mm, y_start=init_y_mm,
-        arm_start=pick_arm_start, hand_start=PICK_START_HAND_DEG,
-        setpoint_x_norm=TASK1_NOZZLE_OFFSET_MAP[label][0],
-        setpoint_y_norm=TASK1_NOZZLE_OFFSET_MAP[label][1],
-        timeout=cfg.get("pick_track_timeout_s", PICK_SERVO_TIMEOUT_S_DEFAULT),
-        hz=PICK_SERVO_HZ,
-        gain_arm=PICK_SERVO_GAIN_ARM, gain_x=PICK_SERVO_GAIN_X,
-        deadzone=PICK_SERVO_DEADZONE, max_vel=PICK_SERVO_MAX_VEL,
-        settle_hits=PICK_SERVO_SETTLE_HITS,
-        hold_s=PICK_SERVO_HOLD_S,
-        lift_back=PICK_SERVO_LIFT_BACK,
-        skip_pose_align=PICK_SERVO_SKIP_POSE_ALIGN,
-    )
+    # 2026-08-09: local_servo 开关 — true=本机闭环 run_arm_servo, false=旧网络每帧
+    if (cfg.get("pick_vision") or {}).get("local_servo"):
+        result = _pick_cylinder_servo_local(
+            arm_client, runner, cfg, label,
+            setpoint_xy=TASK1_NOZZLE_OFFSET_MAP[label],
+            init_y_mm=init_y_mm, pick_arm_start=pick_arm_start,
+        )
+    else:
+        result = runner.track_velocity_pick(
+            label,
+            x_start=state.x_mm, y_start=init_y_mm,
+            arm_start=pick_arm_start, hand_start=PICK_START_HAND_DEG,
+            setpoint_x_norm=TASK1_NOZZLE_OFFSET_MAP[label][0],
+            setpoint_y_norm=TASK1_NOZZLE_OFFSET_MAP[label][1],
+            timeout=cfg.get("pick_track_timeout_s", PICK_SERVO_TIMEOUT_S_DEFAULT),
+            hz=PICK_SERVO_HZ,
+            gain_arm=PICK_SERVO_GAIN_ARM, gain_x=PICK_SERVO_GAIN_X,
+            deadzone=PICK_SERVO_DEADZONE, max_vel=PICK_SERVO_MAX_VEL,
+            settle_hits=PICK_SERVO_SETTLE_HITS,
+            hold_s=PICK_SERVO_HOLD_S,
+            lift_back=PICK_SERVO_LIFT_BACK,
+            skip_pose_align=PICK_SERVO_SKIP_POSE_ALIGN,
+        )
     if not result.get("ok"):
         # 用户 00:19: 不要 fallback! 太慢! 直接 raise, 主循环跳过该列
         raise RuntimeError(
