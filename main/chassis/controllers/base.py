@@ -16,6 +16,59 @@ from typing import List, Optional
 from ..state import LaneState
 
 
+def _apply_traction_bias(
+    base: List[float],
+    vx: float,
+    vy: float,
+    omega: float,
+    r: float,
+) -> List[float]:
+    """沿麦轮零空间调整轮速，保持三自由度车体速度不变。"""
+    if (
+        abs(vx) < 0.01
+        or abs(vy) < 0.01
+        or abs(omega) > 0.02
+    ):
+        return base
+    motion_scale = max(abs(vx), abs(vy), 0.02)
+    base_min = min(abs(v) for v in base)
+    if base_min >= max(0.01, 0.15 * motion_scale):
+        return base
+    limit = min(0.08, 0.25 * motion_scale)
+    if limit <= 0.0:
+        return base
+
+    null = (1.0, -1.0, 1.0, -1.0)
+    candidates = [-limit, 0.0, limit]
+    for i in range(4):
+        candidates.append(-base[i] / null[i])
+    for i in range(4):
+        for j in range(i + 1, 4):
+            for sign in (-1.0, 1.0):
+                denominator = null[i] - sign * null[j]
+                if abs(denominator) > 1e-12:
+                    candidates.append(
+                        (sign * base[j] - base[i]) / denominator
+                    )
+
+    valid = [a for a in candidates if -limit <= a <= limit]
+    if not valid:
+        return base
+
+    def score(alpha):
+        candidate = [base[i] + alpha * null[i] for i in range(4)]
+        return (
+            min(abs(v) for v in candidate),
+            -sum((candidate[i] - base[i]) ** 2 for i in range(4)),
+        )
+
+    alpha = max(valid, key=score)
+    adjusted = [base[i] + alpha * null[i] for i in range(4)]
+    if min(abs(v) for v in adjusted) <= base_min + 1e-9:
+        return base
+    return adjusted
+
+
 def mecanum_inverse(vx: float, vy: float, omega: float, r: float) -> List[float]:
     """按 vehicle_to_wheel_matrix = [[1,-1,-1,1],[t,t,-t,-t],[r,r,r,r]] 推，
     与 SDK ``calculate_wheel_velocities`` 的输出轮序**完全一致**。
@@ -32,12 +85,13 @@ def mecanum_inverse(vx: float, vy: float, omega: float, r: float) -> List[float]
     r 即 SDK 的 ``half_track·tan(roller) + half_wheel_base``。
     """
     r_eff = max(r, 1e-6)
-    return [
+    base = [
         vx + vy + r_eff * omega,
         -vx + vy + r_eff * omega,
         -vx - vy + r_eff * omega,
         vx - vy + r_eff * omega,
     ]
+    return _apply_traction_bias(base, vx, vy, omega, r_eff)
 
 
 class WheelSmoother:

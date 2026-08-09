@@ -22,6 +22,8 @@ import time
 import sys
 import logging
 
+from .mecanum_traction import apply_traction_bias
+
 logger = logging.getLogger(__name__)
 
 
@@ -280,9 +282,15 @@ class MecanumChassis:
         返回:
             numpy.ndarray: 轮子线速度向量
         """
-        # 计算小车每个轮子的线速度
+        # 计算小车每个轮子的线速度，并在组合平移时增加四轮牵引
         wheel_velocities = self.inverse_kinematics(np.array([x, y, z]))
-        return wheel_velocities
+        return apply_traction_bias(
+            wheel_velocities,
+            self.wheel_to_vehicle_matrix,
+            x,
+            y,
+            z,
+        )
 
     def update_odometry(self, wheel_displacements: np.ndarray):
         """
