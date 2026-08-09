@@ -226,19 +226,19 @@ if(hardware_interface_FOUND AND pluginlib_FOUND)
   # bridge_transport.cpp must be compiled INTO the plugin — a shared library
   # tolerates undefined symbols at link time, but controller_manager would
   # fail to dlopen the plugin at runtime without them.
-  add_library(_hardware_plugin SHARED
+  add_library(hardware SHARED
     src/mc602_hardware_interface.cpp
     src/bridge_transport.cpp
   )
-  target_include_directories(_hardware_plugin PUBLIC include)
-  target_link_libraries(_hardware_plugin PUBLIC
+  target_include_directories(hardware PUBLIC include)
+  target_link_libraries(hardware PUBLIC
     rclcpp::rclcpp
     hardware_interface::hardware_interface
     pluginlib::pluginlib
     msgs::msgs
   )
   pluginlib_export_plugin_description_file(hardware_interface plugin.xml)
-  install(TARGETS _hardware_plugin
+  install(TARGETS hardware
     RUNTIME DESTINATION lib/${PROJECT_NAME}
     LIBRARY DESTINATION lib/${PROJECT_NAME}
   )
