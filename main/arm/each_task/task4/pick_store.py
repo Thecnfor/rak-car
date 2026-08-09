@@ -15,7 +15,7 @@ from main.arm import ArmRunner  # noqa: E402
 
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
-    TASK4_POSE_P_HAND_DEG,
+    TASK4_POSE_P_ARM_DEG, TASK4_POSE_P_HAND_DEG,
     X_PICK_MM, Y_PICK_MM, X_TRANSIT_MM, Y_TRANSIT_MM, Y_PUT_MM,
     BIN_X_MM,
     # 机械臂智能抓取 (2026-08-10)
@@ -129,10 +129,10 @@ def _pick_and_store(
 
     流程 (同步, 无 sleep):
       0. 臂伺服智能抓取: 大臂+x 轴对齐 → 高位收敛 → y 盲降 pick_y → 吸气 (不抬回)
-      1. composite_run x=transit_x, y=transit_y  中转同步抬高+横移 (用户拍板)
-      2. composite_run x=bin_x                   横移到 bin 上方
-      3. composite_run y=bin_y, hand=bin_hand    降到放仓位
-      4. grasp(False)                            放气
+      1. composite_run x=transit_x, y=transit_y   中转同步抬高+横移 (用户拍板)
+      2. composite_run x=bin_x, arm=+90           横移到 bin 上方 (显式锁大臂)
+      3. composite_run y=bin_y, hand=bin_hand, arm=+90  降到放仓位 (显式锁大臂)
+      4. grasp(False)                             放气
 
     Returns:
         {"ok": bool, "error": str|None, "release_thread": None}
@@ -168,22 +168,24 @@ def _pick_and_store(
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
-    # 2. 横移到 bin 上方 (中转 x=transit_x → bin_x_mm)
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [2/4] composite_run(x={bin_x_mm:+.0f})  "
-          f"横移到 {color} bin 上方")
+    # 2. 横移到 bin 上方 (中转 x=transit_x → bin_x_mm; 显式 arm=+90 锁定大臂)
+    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [2/4] composite_run(x={bin_x_mm:+.0f}, "
+          f"arm={TASK4_POSE_P_ARM_DEG:+.0f})  横移到 {color} bin 上方")
     try:
-        arm_client.composite_run(x_mm=bin_x_mm, speed=80, timeout=30.0)
+        arm_client.composite_run(x_mm=bin_x_mm, arm=TASK4_POSE_P_ARM_DEG,
+                                 speed=80, timeout=30.0)
     except Exception as e:
         return {"ok": False,
                 "error": f"composite_run(x={bin_x_mm}) 横移失败: "
                          f"{type(e).__name__}: {str(e)[:120]}",
                 "release_thread": None}
 
-    # 3. 降到放仓位 (y=bin_y_mm, hand=bin_hand_deg)
+    # 3. 降到放仓位 (y=bin_y_mm, hand=bin_hand_deg; 显式 arm=+90 锁定大臂)
     print(f"  [{LOG_PREFIX}] [{_ts_str()}] [3/4] composite_run(y={bin_y_mm:+.0f}, "
-          f"hand={bin_hand_deg:+.0f})  降到放仓位")
+          f"hand={bin_hand_deg:+.0f}, arm={TASK4_POSE_P_ARM_DEG:+.0f})  降到放仓位")
     try:
         arm_client.composite_run(y_mm=bin_y_mm, hand=bin_hand_deg,
+                                 arm=TASK4_POSE_P_ARM_DEG,
                                  speed=80, timeout=10.0)
     except Exception as e:
         return {"ok": False,

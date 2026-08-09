@@ -187,14 +187,16 @@ TASK4_SERVO_Y_START_MM: float = TASK4_POSE_P_Y_MM
 """臂伺服起始/抬回 y (高位, 球全程可见)。cam2 侧摄固定, y 只影响吸嘴高度,
 不影响检测; 抬在安全高位即可, 最后盲降抓球。"""
 
-TASK4_SERVO_GAIN_ARM: float = 0.4
-"""大臂控 cx 增益 (dx → d_arm)。⚠️ 现场标定。"""
+TASK4_SERVO_GAIN_ARM: float = 0.5
+"""大臂控 cx 增益 (dx → d_arm)。⚠️ 现场标定。2026-08-10: 0.4→0.5
+(与 task1 PICK_SERVO_GAIN_ARM=0.5 一致, 加快大臂收敛)。"""
 
 TASK4_SERVO_GAIN_X: float = 0.08
 """x 十字控 cy 增益 (dy → x_vel)。⚠️ 现场标定。"""
 
-TASK4_SERVO_DEADZONE: float = 0.02
-"""收敛死区 (|dx|,|dy| < 此值视为已对准)。"""
+TASK4_SERVO_DEADZONE: float = 0.05
+"""收敛死区 (|dx|,|dy| < 此值视为已对准)。⚠️ 现场标定。
+2026-08-10: 0.02→0.05 (与 task1 PICK_SERVO_DEADZONE=0.05 一致, 放宽判定加快 settle)。"""
 
 TASK4_SERVO_MAX_VEL: float = 0.15
 """x 十字最大速度 (m/s)。"""
