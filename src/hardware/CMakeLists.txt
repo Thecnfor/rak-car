@@ -183,6 +183,7 @@ if(hardware_interface_FOUND AND pluginlib_FOUND)
     rclcpp::rclcpp
     hardware_interface::hardware_interface
     pluginlib::pluginlib
+    msgs::msgs
   )
   pluginlib_export_plugin_description_file(hardware_interface plugin.xml)
   install(TARGETS _hardware_plugin
