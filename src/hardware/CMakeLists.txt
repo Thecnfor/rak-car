@@ -299,6 +299,13 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_mecanum_chassis PUBLIC include)
 
+  # ArmKinematicModel — pure serial-chain FK + analytic task-space IK
+  ament_add_gmock(test_arm_kinematic_model
+    test/test_arm_kinematic_model.cpp
+    src/arm_kinematic_model.cpp
+  )
+  target_include_directories(test_arm_kinematic_model PUBLIC include)
+
   ament_add_gmock(test_base_controller_iface
     test/test_base_controller_iface.cpp
   )
