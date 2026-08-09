@@ -128,11 +128,11 @@ TEST(Mc602HardwareInterfaceTest, ExportsWheelVelocityAndArmPositionCommands)
 
   bool saw_wheel_vel = false, saw_arm_pos = false;
   for (const auto & ci : cmds) {
-    if (ci.get_name() == "wheel_m1_joint" &&
+    if (ci.get_prefix_name() == "wheel_m1_joint" &&
         ci.get_interface_name() == hardware_interface::HW_IF_VELOCITY) {
       saw_wheel_vel = true;
     }
-    if (ci.get_name() == "arm_horiz_joint" &&
+    if (ci.get_prefix_name() == "arm_horiz_joint" &&
         ci.get_interface_name() == hardware_interface::HW_IF_POSITION) {
       saw_arm_pos = true;
     }
@@ -168,12 +168,12 @@ TEST(Mc602HardwareInterfaceTest, ReadPopulatesWheelStatesFromEncoder4)
   auto states = h.hw.export_state_interfaces();
   double fl = -1.0, rr = -1.0;
   for (const auto & si : states) {
-    if (si.get_name() == "wheel_m1_joint" &&
+    if (si.get_prefix_name() == "wheel_m1_joint" &&
         si.get_interface_name() == hardware_interface::HW_IF_POSITION) {
       // M1 = front-right = encoder index 1 = 2 counts.
       fl = si.get_value();
     }
-    if (si.get_name() == "wheel_m4_joint" &&
+    if (si.get_prefix_name() == "wheel_m4_joint" &&
         si.get_interface_name() == hardware_interface::HW_IF_POSITION) {
       // M4 = rear-right = encoder index 3 = 4 counts.
       rr = si.get_value();
@@ -189,7 +189,7 @@ TEST(Mc602HardwareInterfaceTest, ArmPositionCommandDispatchesMotorFrame)
   Harness h;
   auto cmds = h.hw.export_command_interfaces();
   for (auto & ci : cmds) {
-    if (ci.get_name() == "arm_horiz_joint" &&
+    if (ci.get_prefix_name() == "arm_horiz_joint" &&
         ci.get_interface_name() == hardware_interface::HW_IF_POSITION) {
       ci.set_value(0.1);  // 0.1 m target
     }
