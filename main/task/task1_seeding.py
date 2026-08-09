@@ -409,6 +409,13 @@ def _init_step1_place_align(
         # 逐帧轨迹改为 runtime result 的 frames/elapsed_s 摘要。
         result = track_chassis(
             marker_label,
+            setpoint_cxcy=(0.0, 0.0),
+            kp=0.20,
+            v_max=0.12,
+            deadband=0.05,
+            hold_frames=3,
+            v_slew=0.04,
+            decouple_xy=False,
             dry_run=False,
             max_seconds=align_max_s,
         )

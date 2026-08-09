@@ -40,6 +40,19 @@ class TestTask4TrackStopOk(unittest.TestCase):
             res = _track_leftmost_ball(max_seconds=12.0, dry_run=False)
         self.assertTrue(res.stop_ok)
 
+    def test_track_requests_dual_axis_tuned_parameters(self):
+        """task4 首轮对齐必须显式使用双轴和现场调好的速度参数。"""
+        with patch("main.arm.each_task.task4.target4.track_chassis",
+                   return_value=_res(reason="control_lost", arrived=False)) as track:
+            _track_leftmost_ball(max_seconds=12.0, dry_run=False)
+        kwargs = track.call_args.kwargs
+        self.assertFalse(kwargs["decouple_xy"])
+        self.assertEqual(kwargs["kp"], 0.20)
+        self.assertEqual(kwargs["v_max"], 0.12)
+        self.assertEqual(kwargs["v_slew"], 0.04)
+        self.assertEqual(kwargs["deadband"], 0.05)
+        self.assertEqual(kwargs["hold_frames"], 3)
+
     def test_control_lost_returned_as_is(self):
         """control_lost → 5 段式不参与, 原样返回 (reason 非 timeout)."""
         with patch("main.arm.each_task.task4.target4.track_chassis",
