@@ -48,6 +48,7 @@ find_package(camera_info_manager QUIET)   # camera_node loads YAML calibration (
 find_package(hardware_interface QUIET)
 find_package(pluginlib QUIET)
 find_package(rcpputils REQUIRED)
+find_package(nav2_msgs QUIET)             # optional: nav2 FollowWaypoints behavior backend
 
 # Track whether camera_info_manager is available.
 set(CAMERA_INFO_MANAGER_FOUND ${camera_info_manager_FOUND})
@@ -292,6 +293,7 @@ target_link_libraries(seeding_task PUBLIC
   rclcpp::rclcpp
   geometry_msgs::geometry_msgs
   std_msgs::std_msgs
+  behavior_client
 )
 target_link_libraries(mission_runner_node PUBLIC
   "-Wl,--no-as-needed"
@@ -310,6 +312,26 @@ target_link_libraries(task_registry PUBLIC
 )
 target_link_libraries(mission_runner_node PUBLIC task_registry)
 install(TARGETS task_registry
+  LIBRARY DESTINATION lib/${PROJECT_NAME}
+)
+
+# BehaviorClient — task-facing adapters over the rak action contract.
+# nav2_msgs is optional: when present the FollowWaypoints backend is compiled
+# in (RAK_HAVE_NAV2); otherwise chassis falls back to the local ChassisNavigate
+# P-loop. Same optional-dependency pattern as ros2_control above.
+add_library(behavior_client SHARED src/behavior_client.cpp)
+target_include_directories(behavior_client PUBLIC include)
+target_link_libraries(behavior_client PUBLIC
+  rclcpp::rclcpp
+  rclcpp_action::rclcpp_action
+  std_msgs::std_msgs
+  msgs::msgs
+)
+if(nav2_msgs_FOUND)
+  target_compile_definitions(behavior_client PUBLIC RAK_HAVE_NAV2)
+  target_link_libraries(behavior_client PUBLIC nav2_msgs::nav2_msgs)
+endif()
+install(TARGETS behavior_client
   LIBRARY DESTINATION lib/${PROJECT_NAME}
 )
 
@@ -436,6 +458,18 @@ if(BUILD_TESTING)
     src/mission_runner.cpp
   )
   target_include_directories(test_mission_runner PUBLIC include)
+
+  # BehaviorClient — end-to-end vs an in-process ChassisNavigate action server
+  ament_add_gmock(test_behavior_client
+    test/test_behavior_client.cpp
+    src/behavior_client.cpp
+  )
+  target_include_directories(test_behavior_client PUBLIC include)
+  target_link_libraries(test_behavior_client rclcpp::rclcpp rclcpp_action::rclcpp_action msgs::msgs)
+  if(nav2_msgs_FOUND)
+    target_compile_definitions(test_behavior_client PUBLIC RAK_HAVE_NAV2)
+    target_link_libraries(test_behavior_client nav2_msgs::nav2_msgs)
+  endif()
 endif()
 
 ament_package()
