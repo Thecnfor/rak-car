@@ -764,7 +764,11 @@ class ArmRunner:
                 arm_start=arm_start,
                 sign_arm=sign_arm, sign_x=sign_x,
                 setpoint_x_norm=sx, setpoint_y_norm=sy,
-                selector=selector, **cross_kw)
+                selector=selector,
+                # 2026-08-10: 传 settle_frames 让 find_target_arm_cross 在连续
+                # settle_hits 帧收敛时提前退出, 不再跑满 timeout (对齐慢的根因)。
+                settle_frames=settle_hits,
+                **cross_kw)
         finally:
             self._set_arm_feed(stop=False)
 

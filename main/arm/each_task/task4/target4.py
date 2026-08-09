@@ -282,6 +282,20 @@ def step_target4(
                     )
                     if isinstance(pose_result, dict) and not pose_result.get("ok", True):
                         raise RuntimeError(f"P 姿態 composite_run 未全部完成: {pose_result}")
+                    # x 到位校验 (2026-08-10 修复): composite_run 并发的 x 有时只走一半
+                    # (停在 -200 而非目标)。用 arm_feed 编码器 (唯一可信源, SDK
+                    # x_get_position 撞墙后锁死) 校验, 未到位单轴补走, 最多 3 次。
+                    for _ in range(3):
+                        actual_x = None
+                        try:
+                            actual_x = arm_client._read_x_mm_realtime()
+                        except Exception:
+                            actual_x = None
+                        if actual_x is None or abs(actual_x - pose_p_x_mm) < 15.0:
+                            break
+                        print(f"  [{_ts_str()}] ⚠️ x 未到位: 实际={actual_x:.0f}mm "
+                              f"目标={pose_p_x_mm:.0f}mm, 单轴补走...")
+                        arm_client.composite_run(x_mm=pose_p_x_mm, speed=100, timeout=30.0)
                     print(f"========== {LOG_PREFIX}/球{ball_idx} 恢复 P 姿態完成 ==========\n")
                 except Exception as e:
                     print(f"  [{LOG_PREFIX}] ❌ 恢复 P 姿態失敗: "

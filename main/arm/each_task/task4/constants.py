@@ -235,11 +235,11 @@ TASK4_SERVO_DESCEND_HAND_DEG = None
 
 
 # ---- IR 生命周期 ----
-# task4 任务点由 orchestrator 的左 IR < 0.70m 触发。
-# 任务运行期间 IR 回到 > 0.70m, 连续确认后视为离开任务区, 再前进 0.30m 收工。
-IR_FAR_THRESHOLD_M: float = 0.70
-IR_FAR_CONFIRM_FRAMES: int = 2
-POST_IR_LOSS_DISTANCE_M: float = 0.30
+# task4 任务点由 orchestrator 的左 IR < 1.0m 触发。
+# 任务运行期间 IR 连续 > 1.0m 满 IR_FAR_CONFIRM_SECONDS(5s) → 视为离开任务区收工
+# (用户拍板 2026-08-10: creep 时 IR 连续 5s > 1m 即退出, 取代旧的"丢失后走 0.3m")。
+IR_FAR_THRESHOLD_M: float = 1.0
+IR_FAR_CONFIRM_SECONDS: float = 5.0
 
 # ---- 时间戳辅助 (跨 target4 各子模块共享) ----
 import time as _time  # noqa: E402

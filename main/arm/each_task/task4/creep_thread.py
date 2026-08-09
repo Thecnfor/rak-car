@@ -15,7 +15,7 @@ from . import target2  # noqa: E402
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
     CREEP_POLL_HZ, CREEP_MAX_SECONDS_S, CREEP_STOP_CX_MAX,
-    IR_FAR_THRESHOLD_M, IR_FAR_CONFIRM_FRAMES, POST_IR_LOSS_DISTANCE_M,
+    IR_FAR_THRESHOLD_M, IR_FAR_CONFIRM_SECONDS,
     LOG_PREFIX_TARGET4 as LOG_PREFIX,
 )
 
@@ -39,67 +39,50 @@ class _Task4SearchState:
 
     def __init__(self, *, ir_started: bool = True,
                  far_threshold_m: float = IR_FAR_THRESHOLD_M,
-                 far_confirm_frames: int = IR_FAR_CONFIRM_FRAMES):
+                 far_confirm_seconds: float = IR_FAR_CONFIRM_SECONDS):
         import threading
         self.ir_started = bool(ir_started)
         self.far_threshold_m = float(far_threshold_m)
-        self.far_confirm_frames = max(1, int(far_confirm_frames))
+        self.far_confirm_seconds = float(far_confirm_seconds)
         self.ir_lost = False
-        # orchestrator 已用左 IR < 0.7m 触发任务，进入 task4 即视为已进入任务区。
+        # orchestrator 已用左 IR < 1.0m 触发任务，进入 task4 即视为已进入任务区。
         self.ir_seen_near = True
-        self.far_streak = 0
-        self.post_loss_distance_m = 0.0
-        self._pending_far_distance_m = 0.0
+        # 连续 far 读数起始时刻 (monotonic); None = 当前不在连续 far 窗口内。
+        self._far_since = None
         self.finished_by_ir_odom = False
         self._lock = threading.Lock()
 
     def update_ir(self, left_ir, *, distance_m: float = 0.0) -> bool:
-        """更新左 IR；连续远读数锁存为 IR 丢失并吸收确认期间位移。"""
+        """更新左 IR；IR 连续 >far_threshold_m 满 far_confirm_seconds(5s) → 离区退出。
+
+        用户拍板 2026-08-10: creep 时 IR 连续 5s > 1m 即视为离开任务区收工,
+        取代旧的"丢失后走 0.3m"。
+        """
         with self._lock:
-            if self.ir_lost or not self.ir_started:
-                return self.ir_lost
+            if self.finished_by_ir_odom or not self.ir_started:
+                return self.finished_by_ir_odom
             # None/非法值表示传感器暂时没有新样本，不能当作“远离”。
-            # 否则 task4 刚暂停 orchestrator 的 ir_feed 后会连续收到 ---，
-            # 两帧就被误判离区并提前走完 0.3m。
+            # (否则 task4 刚暂停 orchestrator 的 ir_feed 后连续收到 --- 会被误判离区)
             try:
                 ir_value = float(left_ir)
             except (TypeError, ValueError):
-                self.far_streak = 0
-                self._pending_far_distance_m = 0.0
+                self._far_since = None
                 return False
             near = ir_value <= self.far_threshold_m
             if near:
                 self.ir_seen_near = True
-                self.far_streak = 0
-                self._pending_far_distance_m = 0.0
+                self._far_since = None
                 return False
             if not self.ir_seen_near:
                 return False
-            # 只有 task4 触发后实际读到远 IR，才进入离开确认。
-            far = ir_value > self.far_threshold_m
-            if far:
-                self.far_streak += 1
-                self._pending_far_distance_m += max(0.0, float(distance_m))
-                if self.far_streak >= self.far_confirm_frames:
-                    self.ir_lost = True
-                    self.post_loss_distance_m += self._pending_far_distance_m
-                    self._pending_far_distance_m = 0.0
-                    if self.post_loss_distance_m >= POST_IR_LOSS_DISTANCE_M:
-                        self.finished_by_ir_odom = True
-            else:
-                self.far_streak = 0
-                self._pending_far_distance_m = 0.0
-            return self.ir_lost
-
-    def add_post_loss_distance(self, delta_m: float) -> bool:
-        """累计 IR 丢失后的位移，并返回是否达到 0.30m。"""
-        with self._lock:
-            if not self.ir_lost or self.finished_by_ir_odom:
-                return self.finished_by_ir_odom
-            self.post_loss_distance_m += max(0.0, float(delta_m))
-            if self.post_loss_distance_m >= POST_IR_LOSS_DISTANCE_M:
+            # 只有 task4 触发后实际读到远 IR (>1m)，才进入连续 far 时间窗。
+            now = time.monotonic()
+            if self._far_since is None:
+                self._far_since = now
+            elif now - self._far_since >= self.far_confirm_seconds:
+                self.ir_lost = True
                 self.finished_by_ir_odom = True
-            return self.finished_by_ir_odom
+            return self.ir_lost
 
 
 class _CreepThread:
@@ -215,18 +198,11 @@ class _CreepThread:
                         self.found_ball = True
                         _set_chassis_vel(self.http, 0.0)
                         break
-                    # IR 丢失阶段禁止再拿新球；确认帧已计入的位移不重复累加。
-                    if was_ir_lost and not odom_delta_available:
-                        movement_delta_m = self.speed_mps * period
-                        self.distance_m += movement_delta_m
-                    if was_ir_lost:
-                        finished = self.state.add_post_loss_distance(movement_delta_m)
-                    else:
-                        finished = self.state.finished_by_ir_odom
-                    if finished:
+                    # IR 连续 >1m 满 5s → 离区收工 (用户拍板, 取代旧的"走 0.3m")。
+                    if self.state.finished_by_ir_odom:
                         self.finished_by_ir_odom = True
-                        print(f"  [{LOG_PREFIX}] IR 丢失后继续前进 "
-                              f"{self.state.post_loss_distance_m:.3f}m, 结束搜索")
+                        print(f"  [{LOG_PREFIX}] IR 连续 {self.state.far_confirm_seconds:.0f}s "
+                              f"> {self.state.far_threshold_m:.0f}m, 结束搜索")
                         self._stop_event.set()
                         break
                     continue
