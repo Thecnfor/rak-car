@@ -686,7 +686,8 @@ class ArmRunner:
                             hold_s: float = 0.5,
                             lift_back: bool = True,
                             no_reset: bool = False,
-                            skip_pose_align: bool = False) -> dict:
+                            skip_pose_align: bool = False,
+                            grasp_x_offset_mm: float = 0.0) -> dict:
         """智能定位抓取 (arm 控 cx + x 十字控 cy + 吸嘴 setpoint, 2026-08-02).
 
         2026-08-03 优化: skip_pose_align=True 跳过入口处的 composite_run ——
@@ -821,10 +822,22 @@ class ArmRunner:
             logger.info("track_velocity_pick: 开始 grasp 段, mode=%s hand+y 并发 (move_y=%.0fmm=%.4fm)",
                         mode, grasp_y_mm, target_m)
             hand_param = float(descend_hand_deg) if descend_hand_deg is not None else None
+            # 盲降 x 后缩 (grasp_x_offset_mm>0): 读当前 x + 偏移, 与 y 下降并发。
+            # 用户 2026-08-10 task4: setpoint=(0,0) 时吸嘴对齐画面中心, 盲降前 x 缩回。
+            x_grasp_m = None
+            if grasp_x_offset_mm:
+                try:
+                    cur_x_mm = self.client._read_x_mm_realtime()
+                except Exception:
+                    cur_x_mm = None
+                if cur_x_mm is not None:
+                    x_grasp_m = (float(cur_x_mm) + float(grasp_x_offset_mm)) / 1000.0
+                    logger.info("  盲降 x 后缩: cur_x=%.1fmm + offset=%.1fmm -> x=%.4fm",
+                                cur_x_mm, grasp_x_offset_mm, x_grasp_m)
             job_y_down = self.client.http.execute(
                 "arm", "composite_run",
                 kwargs=dict(
-                    arm=None, x=None,
+                    arm=None, x=x_grasp_m,
                     y=target_m,
                     hand=hand_param,
                     speed=100, timeout=5.0,

@@ -16,7 +16,8 @@ from main.arm import ArmRunner  # noqa: E402
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
     TASK4_POSE_P_ARM_DEG, TASK4_POSE_P_HAND_DEG,
-    X_PICK_MM, Y_PICK_MM, X_TRANSIT_MM, Y_TRANSIT_MM, Y_PUT_MM,
+    X_PICK_MM, Y_PICK_MM, TASK4_GRASP_X_OFFSET_MM,
+    X_TRANSIT_MM, Y_TRANSIT_MM, Y_PUT_MM,
     BIN_X_MM,
     # 机械臂智能抓取 (2026-08-10)
     TASK4_SETPOINT_X_NORM, TASK4_SETPOINT_Y_NORM,
@@ -93,6 +94,8 @@ def _pick_by_arm_servo(
         # 抓取后不自动抬回 y_start 高位: 由 _pick_and_store 的中转同步 composite_run
         # (x=transit_x, y=transit_y) 一步抬高到中转位 (用户拍板 2026-08-10)。
         lift_back=False,
+        # 盲降抓球时 x 后缩 +30mm (setpoint=(0,0) 对齐画面中心后补偿球位置)。
+        grasp_x_offset_mm=TASK4_GRASP_X_OFFSET_MM,
         # P 姿态 x=-295mm 靠近 runtime 下限 -300mm，负向 x_vel 会被限幅为 0。
         # 进入视觉循环前先摆到 X_PICK_MM=-240mm，给 x 轴双向调节余量。
         skip_pose_align=False,

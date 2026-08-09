@@ -148,6 +148,10 @@ X_PICK_MM: float = -240.0
 Y_PICK_MM: float = -65.0
 """抓球 y (对准后直接下降到此高度, 吸住后保持到中转/bin)。"""
 
+TASK4_GRASP_X_OFFSET_MM: float = 30.0
+"""盲降抓球时 x 后缩量 (mm, 正=往正方向缩回, 远离下限)。
+用户 2026-08-10: setpoint=(0,0) 对齐画面中心后, 盲降前 x 缩 30mm 补偿球实际位置。"""
+
 Y_TRANSIT_MM: float = -130.0
 """中转 y (用户拍板 2026-08-10: 抓取后抬高到此高度, 与中转 x 同步 composite_run)。"""
 
@@ -182,10 +186,10 @@ BALL_LABELS = ["ball_blue", "ball_yellow"]
 #     Y_PICK_MM 吸气), 规避侧摄近地丢球 (见 memory task4-pick-servo-high-then-descend)。
 #   - 两种球同尺寸 → 蓝/黄共用一份 setpoint。
 
-# ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户最新标定, 2026-08-10)。
-#    手爪智能抓取目标 = (cx, cy) = (0.00, -0.70), 两种球同尺寸共用一份。
+# ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户拍板 2026-08-10: 直接 (0,0))。
+#    对齐目标 = 画面中心; 盲降时 x 后缩 TASK4_GRASP_X_OFFSET_MM 补偿球实际位置。
 TASK4_SETPOINT_X_NORM: float = 0.0
-TASK4_SETPOINT_Y_NORM: float = -0.70
+TASK4_SETPOINT_Y_NORM: float = 0.0
 
 TASK4_SERVO_Y_START_MM: float = TASK4_POSE_P_Y_MM
 """臂伺服起始/抬回 y (高位, 球全程可见)。cam2 侧摄固定, y 只影响吸嘴高度,
