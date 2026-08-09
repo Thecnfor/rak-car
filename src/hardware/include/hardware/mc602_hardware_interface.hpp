@@ -127,7 +127,13 @@ private:
   double arm_x_gain_{4.0};               // position servo kp [1/s]
   double arm_x_counts_per_rev_{2015.13}; // M6 encoder (must verify)
   double arm_z_steps_per_meter_{2015.13 / 0.008};  // stepper3 encoder/rev ÷ perimeter
-  int32_t arm_z_velocity_{50};           // raw stepper velocity (arm_node default)
+  double arm_z_max_speed_mps_{0.04};
+  double arm_z_min_m_{0.0};
+  double arm_z_max_m_{0.3};
+  uint8_t arm_z_limit_port_{5};
+  uint16_t arm_z_limit_threshold_{1000};
+  bool arm_z_zeroed_{false};
+  int32_t arm_z_velocity_{50};           // fallback raw stepper velocity
   double arm_yaw_deg_min_{-93.0};        // S3 angle range
   double arm_yaw_deg_max_{93.0};
   double arm_grip_deg_min_{-45.0};       // S7 angle range

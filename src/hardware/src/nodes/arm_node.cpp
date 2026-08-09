@@ -62,13 +62,13 @@ constexpr double M6_PERIMETER = 0.032;
 // Max horizontal speed: ±0.2 m/s.
 constexpr double HORIZ_MAX_SPEED_MPS = 0.2;
 
-// S3 rotation servo angle map (from arm_base.py).
-// {-1: -93°, 0: 0°, 1: +93°}
-constexpr double S3_ANGLE_MAP[3] = {-93.0, 0.0, 93.0};
+// Continuous servo command limits. The MC602 conversion helpers map these
+// physical angles into each servo's raw command range.
+constexpr double SERVO_ANGLE_MIN_DEG = -150.0;
+constexpr double SERVO_ANGLE_MAX_DEG = 150.0;
 
-// S7 hand servo angle map (from arm_base.py, 270° mode).
-// {-1: -45°, 1: +46°}
-constexpr double S7_ANGLE_MAP[3] = {-45.0, 0.0, 46.0};
+// Analog P5 magnetic bottom limit: raw value > 1000 means z = 0.0 m.
+constexpr uint8_t VERT_LIMIT_PORT = 5;
 
 // Vacuum pump: ON = 1 (suck), OFF = 0.
 constexpr uint8_t PUMP_ON  = 2;  // MC602 DOUT connect
@@ -194,43 +194,56 @@ private:
         "M6 motor write failed: %s", e.what());
     }
 
-    // --- Joint 1: Stepper 3 vertical (position → raw steps) ---
-    // Driver speaks (velocity, position); business decides both values.
-    // Position = steps for the target height; velocity = default 50.
-    const double vert_pos_m = std::clamp(positions[J_VERT], 0.0, 0.3);  // 0~0.3m range
+    // --- Joint 1: Stepper 3 vertical (position + configurable velocity) ---
+    const double vert_pos_m = std::clamp(positions[J_VERT], 0.0, 0.3);
+    double vert_speed_mps = VERT_MAX_SPEED_MPS;
+    if (point.velocities.size() > J_VERT && std::isfinite(point.velocities[J_VERT])) {
+      vert_speed_mps = std::clamp(std::abs(point.velocities[J_VERT]), 0.0,
+                                  VERT_MAX_SPEED_MPS);
+    }
+    const bool moving_down = vert_pos_m < last_positions_[J_VERT];
+    try {
+      const uint16_t p5 = adapter_->read_analog(VERT_LIMIT_PORT);
+      if (p5 > VERT_LIMIT_THRESHOLD) {
+        vert_zeroed_ = true;
+        last_positions_[J_VERT] = 0.0;
+        if (moving_down) {
+          vert_speed_mps = 0.0;
+        }
+      }
+    } catch (const std::exception & e) {
+      RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "P5 magnetic limit read failed: %s", e.what());
+    }
+    const int32_t vert_velocity = static_cast<int32_t>(
+      std::round(vert_speed_mps * stepper3_steps_per_meter()));
     const int32_t vert_steps = static_cast<int32_t>(
       std::round(vert_pos_m * stepper3_steps_per_meter()));
 
     try {
-      adapter_->set_stepper(3, /*velocity=*/50, vert_steps);
+      adapter_->set_stepper(3, vert_velocity, vert_steps);
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "Stepper3 write failed: %s", e.what());
     }
 
-    // --- Joint 2: S3 rotation servo (raw bus-servo angle byte) ---
-    // Position is -1 / 0 / +1 → mapped to -93° / 0° / +93° (fits signed byte).
-    double s3_angle = 0.0;
-    const int side_idx = static_cast<int>(std::round(positions[J_ROTATE]));
-    if (side_idx >= -1 && side_idx <= 1) {
-      s3_angle = S3_ANGLE_MAP[side_idx + 1];
-    }
+    // --- Joint 2: S3 rotation servo (continuous physical angle) ---
+    const double s3_angle = std::clamp(positions[J_ROTATE],
+      SERVO_ANGLE_MIN_DEG, SERVO_ANGLE_MAX_DEG);
     try {
-      adapter_->set_servo_bus(3, static_cast<int>(s3_angle));
+      adapter_->set_servo_bus(3, vw::MC602Adapter::deg_to_servo_bus(
+        s3_angle, SERVO_ANGLE_MIN_DEG, SERVO_ANGLE_MAX_DEG));
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "S3 servo write failed: %s", e.what());
     }
 
-    // --- Joint 3: S7 hand servo (raw pwm angle) ---
-    // Position is -1 / 0 / +1 → mapped to -45° / 0° / +46°.
-    double s7_angle = 0.0;
-    const int grip_idx = static_cast<int>(std::round(positions[J_GRIP]));
-    if (grip_idx >= -1 && grip_idx <= 1) {
-      s7_angle = S7_ANGLE_MAP[grip_idx + 1];
-    }
+    // --- Joint 3: S7 hand servo (continuous physical angle) ---
+    const double s7_angle = std::clamp(positions[J_GRIP],
+      SERVO_ANGLE_MIN_DEG, SERVO_ANGLE_MAX_DEG);
     try {
-      adapter_->set_servo_pwm(7, static_cast<int>(s7_angle));
+      adapter_->set_servo_pwm(7, vw::MC602Adapter::deg_to_servo_pwm(
+        s7_angle, SERVO_ANGLE_MIN_DEG, SERVO_ANGLE_MAX_DEG));
     } catch (const std::exception & e) {
       RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "S7 servo write failed: %s", e.what());
@@ -260,8 +273,12 @@ private:
         "burst commit failed: %s", e.what());
     }
 
-    // Store last commanded positions for state publishing.
     last_positions_ = positions;
+    last_positions_[J_VERT] = vert_pos_m;
+    last_velocities_ = std::vector<double>(NUM_JOINTS, 0.0);
+    if (point.velocities.size() > J_VERT) {
+      last_velocities_[J_VERT] = vert_speed_mps;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -272,16 +289,18 @@ private:
   void publish_state()
   {
     std::vector<double> positions;
+    std::vector<double> velocities;
     {
       std::lock_guard<std::mutex> lock(state_mutex_);
       positions = last_positions_;
+      velocities = last_velocities_;
     }
 
     auto msg = std::make_unique<sensor_msgs::msg::JointState>();
     msg->header.stamp = this->now();
     msg->name = joint_names_;
     msg->position = positions;
-    msg->velocity.assign(NUM_JOINTS, 0.0);
+    msg->velocity = velocities;
     msg->effort.assign(NUM_JOINTS, 0.0);
 
     state_pub_->publish(std::move(msg));
@@ -291,6 +310,8 @@ private:
   std::string arm_id_;
   std::vector<std::string> joint_names_;
   std::vector<double> last_positions_{NUM_JOINTS, 0.0};
+  std::vector<double> last_velocities_{NUM_JOINTS, 0.0};
+  bool vert_zeroed_{false};
 
   std::mutex state_mutex_;
 
@@ -308,11 +329,15 @@ private:
 int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
+  // Keep the node alive for the entire executor lifetime. Executor stores
+  // node references weakly; a temporary shared_ptr would destroy the node
+  // immediately after add_node(), leaving a spinning but empty process.
+  auto node = std::make_shared<ArmNode>();
   // Multi-threaded: bridge mode blocks the callback on a service round-trip;
   // extra threads keep subscriptions/timers serviced while it waits.
   rclcpp::executors::MultiThreadedExecutor executor(
     rclcpp::ExecutorOptions(), 4);
-  executor.add_node(std::make_shared<ArmNode>());
+  executor.add_node(node);
   executor.spin();
   rclcpp::shutdown();
   return 0;

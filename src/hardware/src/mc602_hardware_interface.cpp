@@ -127,11 +127,17 @@ hardware_interface::CallbackReturn MC602HardwareInterface::parse_hardware_params
   arm_x_gain_ = get_d("arm_x_gain", arm_x_gain_);
   arm_x_counts_per_rev_ = get_d("arm_x_counts_per_rev", arm_x_counts_per_rev_);
   arm_z_steps_per_meter_ = get_d("arm_z_steps_per_meter", arm_z_steps_per_meter_);
+  arm_z_max_speed_mps_ = get_d("arm_z_max_speed_mps", arm_z_max_speed_mps_);
+  arm_z_min_m_ = get_d("arm_z_min_m", arm_z_min_m_);
+  arm_z_max_m_ = get_d("arm_z_max_m", arm_z_max_m_);
+  arm_z_limit_port_ = get_u8("arm_z_limit_port", arm_z_limit_port_);
+  arm_z_limit_threshold_ = static_cast<uint16_t>(
+    get_d("arm_z_limit_threshold", arm_z_limit_threshold_));
   arm_z_velocity_ = static_cast<int32_t>(get_d("arm_z_velocity", arm_z_velocity_));
-  arm_yaw_deg_min_ = get_d("arm_yaw_deg_min", arm_yaw_deg_min_);
-  arm_yaw_deg_max_ = get_d("arm_yaw_deg_max", arm_yaw_deg_max_);
-  arm_grip_deg_min_ = get_d("arm_grip_deg_min", arm_grip_deg_min_);
-  arm_grip_deg_max_ = get_d("arm_grip_deg_max", arm_grip_deg_max_);
+  arm_yaw_deg_min_ = get_d("arm_yaw_deg_min", -150.0);
+  arm_yaw_deg_max_ = get_d("arm_yaw_deg_max", 150.0);
+  arm_grip_deg_min_ = get_d("arm_grip_deg_min", -150.0);
+  arm_grip_deg_max_ = get_d("arm_grip_deg_max", 150.0);
 
   return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -367,10 +373,25 @@ void MC602HardwareInterface::write_arm_x(const JointConfig & j)
 
 void MC602HardwareInterface::write_arm_z(const JointConfig & j)
 {
-  // Stepper3 takes absolute (velocity, position-in-steps).
+  const double target_m = std::clamp(j.cmd, arm_z_min_m_, arm_z_max_m_);
+  double speed_mps = arm_z_max_speed_mps_;
+  // A ros2_control position interface has no velocity companion here; use the
+  // configured safe default. Trajectory users should use arm_node velocities[1].
+  int32_t velocity = static_cast<int32_t>(std::round(speed_mps * arm_z_steps_per_meter_));
+  try {
+    const uint16_t p5 = adapter_->read_analog(arm_z_limit_port_);
+    if (p5 > arm_z_limit_threshold_) {
+      arm_z_zeroed_ = true;
+      if (target_m <= arm_z_min_m_) {
+        velocity = 0;
+      }
+    }
+  } catch (const std::exception & e) {
+    log_throttled(std::string("P5 limit read failed: ") + e.what());
+  }
   const int32_t steps = static_cast<int32_t>(
-    std::round(j.cmd * arm_z_steps_per_meter_));
-  adapter_->set_stepper(j.port, arm_z_velocity_, steps);
+    std::round((target_m - (arm_z_zeroed_ ? arm_z_min_m_ : 0.0)) * arm_z_steps_per_meter_));
+  adapter_->set_stepper(j.port, velocity, steps);
 }
 
 void MC602HardwareInterface::log_throttled(const std::string & msg)
