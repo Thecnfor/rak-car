@@ -5,8 +5,6 @@
 **编排骨架** (`step_target4` 主循环 + 预算/清场 + CLI), 业务实现下沉:
   - ``creep_thread.py``   后台保前移线程 + 跨球 IR 生命周期 + 底盘速度 helper
                           (`_CreepThread` / `_Task4SearchState` / `_set_chassis_vel`)
-  - ``track_align.py``    底盘视觉对齐 (2026-08-10 起主流程不再调用, 保留兼容)
-                          (`_track_leftmost_ball` / `_chassis_rearm_if_stuck`)
   - ``pick_store.py``     选球判色 + 机械臂智能抓取 + 放 bin
                           (`_pick_by_arm_servo` / `_pick_and_store` / `_pick_best_ball`)
   - ``constants.py``      所有位姿/预算/IR/蠕动/臂伺服常量 + 时间戳辅助 (校准表面)
