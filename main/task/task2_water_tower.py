@@ -110,8 +110,10 @@ GROUP_BACKWARD_M: float = 0.33       # 8-06: tower 2 后向用 0.33 (不走 GROU
 PICK_VISION_LABEL: str = "water"
 PICK_VISION_SETPOINT_CXCY: List[float] = [0.063, -0.202]      # 8-06 重测 20 帧均值 (cx=0.063, cy=-0.202, 抖动 < 2px)
 PICK_VISION_TIMEOUT_S: float = 3.5
-# 2026-08-09: 每座水塔第 3 块 (如有, needed>=3) 视觉伺服单独加时 — 第 3 块吸嘴/方块
-# 常因高度/堆叠抖动更慢收敛, 给 7s 代替默认 timeout 4s. None=不加时 (用默认).
+# 2026-08-09: 每块视觉伺服单独超时 (None=用 yaml 默认 timeout).
+#   第2块(1): 6s — 用户规定 (默认 5s 不够稳, 第 2 块单独加到 6s)
+#   第3块(2): 7s — 高处堆叠抖动大收敛慢 (原 PICK_BLOCK3_TIMEOUT_S)
+PICK_BLOCK2_TIMEOUT_S: Optional[float] = 6.0
 PICK_BLOCK3_TIMEOUT_S: Optional[float] = 7.0
 PICK_VISION_HZ: float = 25.0
 PICK_VISION_GAIN_ARM: float = 1.6
@@ -985,11 +987,15 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                     chassis_at_tower_m = target_offset
 
                     # 抓块 (含 vision servo + 自动抬回 transport Y)
-                    # 2026-08-09: 每座塔第 3 块 (如有, needed>=3) 单独加视觉对齐超时
-                    # (PICK_BLOCK3_TIMEOUT_S=7s, 替代默认 timeout 4s — 高处堆叠抖动大收敛慢)
-                    block3_timeout = (PICK_BLOCK3_TIMEOUT_S if picked == 2 else None)
+                    # 2026-08-09: 每块视觉伺服单独超时 — 第1块用 yaml 默认 5s;
+                    #   第2块 6s (PICK_BLOCK2_TIMEOUT_S), 第3块 7s (PICK_BLOCK3_TIMEOUT_S).
+                    _block_timeout = None
+                    if picked == 1:
+                        _block_timeout = PICK_BLOCK2_TIMEOUT_S
+                    elif picked == 2:
+                        _block_timeout = PICK_BLOCK3_TIMEOUT_S
                     _pick_cube(arm_client, runner, cfg, pick_x,
-                               vision_timeout_override=block3_timeout)
+                               vision_timeout_override=_block_timeout)
 
                     # 准备 deliver: 底盘回塔 + 臂切 carry 姿态 (用户 2026-08-08 新规定)
                     #   顺序: X 收 -260 → 大臂转 → Y 直接降到投放深度 → X 伸到投放位
