@@ -230,7 +230,7 @@ ReachedFeedback:
 
 - 禁止在 controller/hardware 回调内 `spin_until_future_complete`
 - 方案 A（推荐）：hardware 插件侧独立 client node + 专用线程；等待在阻塞线程，不重入主 executor
-- 方案 B/C 备选（§4.1）
+- 备选：B. 回调式异步（`async_send_request` + response 队列，控制周期轮询）；C. 插件在 `on_activate` 起专用 executor/线程持有 client。三者都遵守“回调内不递归 spin”
 
 ### 7.2 MC602HardwareInterface
 
