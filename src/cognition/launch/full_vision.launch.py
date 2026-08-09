@@ -104,8 +104,8 @@ def generate_launch_description():
             package="cognition", executable="vision-overlay",
             name="vision_overlay", output="screen",
             parameters=[{
-                "front_image_topic": "/rak/sensors/camera/front/image_compressed",
-                "side_image_topic": "/rak/sensors/camera/side/image_compressed",
+                "front_image_topic": "/rak/sensors/camera/front/image_raw",
+                "side_image_topic": "/rak/sensors/camera/side/image_raw",
                 "lane_topic": "/rak/perception/lane",
                 "detection_topic": "/rak/perception/detections/task",
                 "publish_rate_hz": LaunchConfiguration("overlay_rate_hz"),

@@ -34,11 +34,11 @@ class VisionOverlayNode(Node):
         self._detections: Optional[DetectionArray] = None
         qos = 5
         self._front_sub = self.create_subscription(
-            CompressedImage, self.get_parameter("front_image_topic").value,
-            self._on_front, qos)
+            Image, self.get_parameter("front_image_topic").value,
+            self._on_front_raw, qos)
         self._side_sub = self.create_subscription(
-            CompressedImage, self.get_parameter("side_image_topic").value,
-            self._on_side, qos)
+            Image, self.get_parameter("side_image_topic").value,
+            self._on_side_raw, qos)
         self._lane_sub = self.create_subscription(
             LaneResult, self.get_parameter("lane_topic").value,
             self._on_lane, qos)
@@ -54,20 +54,17 @@ class VisionOverlayNode(Node):
         self.get_logger().info(
             "VisionOverlay up: front/side images + lane/detections -> RViz overlay topics")
 
-    @staticmethod
-    def _decode(data: bytes) -> Optional[np.ndarray]:
-        try:
-            return cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
-        except Exception:
-            return None
-
-    def _on_front(self, msg: CompressedImage) -> None:
+    def _on_front_raw(self, msg: Image) -> None:
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            (msg.height, msg.width, 3)).copy()
         with self._lock:
-            self._front = (bytes(msg.data), msg.header.stamp, msg.header.frame_id)
+            self._front = (frame, msg.header.stamp, msg.header.frame_id)
 
-    def _on_side(self, msg: CompressedImage) -> None:
+    def _on_side_raw(self, msg: Image) -> None:
+        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
+            (msg.height, msg.width, 3)).copy()
         with self._lock:
-            self._side = (bytes(msg.data), msg.header.stamp, msg.header.frame_id)
+            self._side = (frame, msg.header.stamp, msg.header.frame_id)
 
     def _on_lane(self, msg: LaneResult) -> None:
         with self._lock:
@@ -92,9 +89,9 @@ class VisionOverlayNode(Node):
     def _publish(self) -> None:
         with self._lock:
             front = None if self._front is None else (
-                self._decode(self._front[0]), self._front[1], self._front[2])
+                self._front[0].copy(), self._front[1], self._front[2])
             side = None if self._side is None else (
-                self._decode(self._side[0]), self._side[1], self._side[2])
+                self._side[0].copy(), self._side[1], self._side[2])
             lane = self._lane
             detections = self._detections
         if front is not None:
