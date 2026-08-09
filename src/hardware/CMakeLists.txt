@@ -65,7 +65,10 @@ set(CAMERA_INFO_MANAGER_FOUND ${camera_info_manager_FOUND})
 # Node entry points (main) live in src/nodes/; core logic (adapters, chassis,
 # state machines) stays in src/. See CLAUDE.md layout conventions.
 if(CAMERA_INFO_MANAGER_FOUND)
-add_executable(camera_node src/nodes/camera_node.cpp)
+add_executable(camera_node
+  src/nodes/camera_node.cpp
+  src/camera_capture_config.cpp
+)
 target_include_directories(camera_node PUBLIC include)
 target_link_libraries(camera_node PUBLIC
   rclcpp::rclcpp
@@ -326,6 +329,13 @@ install(
 # -----------------------------------------------------------------------------
 if(BUILD_TESTING)
   find_package(ament_cmake_gmock REQUIRED)
+
+  ament_add_gmock(test_camera_capture_config
+    test/test_camera_capture_config.cpp
+    src/camera_capture_config.cpp
+  )
+  target_include_directories(test_camera_capture_config PUBLIC include)
+  target_link_libraries(test_camera_capture_config opencv_videoio)
 
   ament_add_gmock(test_mc602_adapter
     test/test_mc602_adapter.cpp

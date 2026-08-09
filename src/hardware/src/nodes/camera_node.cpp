@@ -30,6 +30,8 @@
 // keeps trying — it does NOT crash, so OS-level tooling (udev, cable) can
 // heal it without process supervision.
 
+#include "hardware/camera_capture_config.hpp"
+
 #include <rclcpp/rclcpp.hpp>
 #include <sensor_msgs/msg/image.hpp>
 #include <sensor_msgs/msg/compressed_image.hpp>
@@ -79,6 +81,17 @@ inline rclcpp::QoS status_qos() { return rclcpp::QoS(10).reliable(); }
 // USB hiccup, short enough that operators don't wait long when the
 // cable is broken.
 constexpr int kReopenAfterFailStreak = 5;
+
+std::string fourcc_text(int fourcc)
+{
+  std::string text(4, ' ');
+  text[0] = static_cast<char>(fourcc & 0xff);
+  text[1] = static_cast<char>((fourcc >> 8) & 0xff);
+  text[2] = static_cast<char>((fourcc >> 16) & 0xff);
+  text[3] = static_cast<char>((fourcc >> 24) & 0xff);
+  return text;
+}
+
 }  // namespace vwpc_cam
 
 class CameraNode : public rclcpp::Node
@@ -90,6 +103,7 @@ public:
     // ---- Parameters (all knobs overridable; nothing hardcoded) ----
     this->declare_parameter<std::string>("camera_id", "front");
     this->declare_parameter<std::string>("device", "/dev/cam2");
+    this->declare_parameter<std::string>("pixel_format", "MJPG");
     this->declare_parameter<int>("image_width", 640);
     this->declare_parameter<int>("image_height", 480);
     this->declare_parameter<double>("rate_hz", 30.0);
@@ -110,6 +124,7 @@ public:
     height_requested_ = this->get_parameter("image_height").as_int();
     rate_hz_ = this->get_parameter("rate_hz").as_double();
     jpeg_q_ = this->get_parameter("jpeg_quality").as_int();
+    pixel_format_ = this->get_parameter("pixel_format").as_string();
     calibration_url_ = this->get_parameter("calibration_url").as_string();
 
     tf_parent_frame_ = this->get_parameter("tf_parent_frame").as_string();
@@ -175,11 +190,16 @@ public:
 
     RCLCPP_INFO(
       this->get_logger(),
-      "CameraNode[%s] up: device=%s, %dx%d@%.1fHz, jpeg q=%d, "
+      "CameraNode[%s] up: device=%s, requested=%s %dx%d@%.1fHz, "
+      "actual=%s %dx%d@%.1fHz, jpeg q=%d, "
       "calibration='%s', frame_id='%s' under %s",
-      camera_id_.c_str(), device_.c_str(), actual_width_, actual_height_,
-      rate_hz_, jpeg_q_, calibration_url_.c_str(), frame_id_.c_str(),
-      ns_.c_str());
+      camera_id_.c_str(), device_.c_str(), pixel_format_.c_str(),
+      width_requested_, height_requested_, rate_hz_,
+      vwpc_cam::fourcc_text(static_cast<int>(
+        cap_ ? cap_->get(cv::CAP_PROP_FOURCC) : 0)).c_str(),
+      actual_width_, actual_height_,
+      cap_ ? cap_->get(cv::CAP_PROP_FPS) : 0.0, jpeg_q_,
+      calibration_url_.c_str(), frame_id_.c_str(), ns_.c_str());
   }
 
   ~CameraNode() override
@@ -196,22 +216,19 @@ private:
   void open_capture()
   {
     cap_ = std::make_unique<cv::VideoCapture>();
-    const int mjpg = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
-    if (!cap_->open(device_, cv::CAP_V4L2)) {
+    const auto config = hardware::make_camera_capture_config(
+      pixel_format_, width_requested_, height_requested_, rate_hz_);
+    const std::vector<int> open_params = {
+      cv::CAP_PROP_FOURCC, config.fourcc,
+      cv::CAP_PROP_FRAME_WIDTH, config.width,
+      cv::CAP_PROP_FRAME_HEIGHT, config.height,
+      cv::CAP_PROP_FPS, static_cast<int>(config.rate_hz)};
+    if (!cap_->open(device_, cv::CAP_V4L2, open_params)) {
       throw std::runtime_error(
         "CameraNode[" + camera_id_ + "]: cannot open V4L2 '" + device_ +
         "'. Real hardware is required — refusing to publish synthetic frames. "
         "Check USB cable + udev rules + the device launch arg.");
     }
-    cap_->set(cv::CAP_PROP_FOURCC, static_cast<double>(mjpg));
-    cap_->set(cv::CAP_PROP_FRAME_WIDTH, static_cast<double>(width_requested_));
-    cap_->set(cv::CAP_PROP_FRAME_HEIGHT, static_cast<double>(height_requested_));
-    // FPS: ask the device explicitly. Default without this call is
-    // driver-dependent — Aveo SP2812 defaults to ~10 fps when not
-    // requested, even though --list-formats-ext advertises 30. We
-    // request the rate_hz launch arg (clamped to what the device
-    // supports; cap_->set tolerates unsupported values by ignoring).
-    cap_->set(cv::CAP_PROP_FPS, rate_hz_);
     cap_->set(cv::CAP_PROP_CONVERT_RGB, 1.0);
 
     // V4L2_CID_EXPOSURE_AUTO = aperture-priority (3) WITHOUT the dynamic-
@@ -548,6 +565,7 @@ private:
   // ============================================================
   std::string camera_id_;
   std::string device_;
+  std::string pixel_format_;
   std::string frame_id_;
   std::string ns_;
   std::string tf_parent_frame_;
