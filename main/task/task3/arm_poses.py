@@ -29,13 +29,25 @@ def arm_at_pose(client, pose, tol_m: float = 0.020, tol_deg: float = 12.0) -> bo
 
     pose 顺序同 RECOGNITION_ARM: (y1, y2, x, arm_angle, hand_angle), 只比较最终位 y2。
     读不到状态 / 值缺失 → 返回 False (调用方会重新摆臂, 保底)。
+
+    兼容两种客户端:
+      - RuntimeApiClient (task3_pipeline/task3_shoot): get_arm_state() → {"arm_state": {y_m,x_m,...}}
+      - main.arm.ArmClient (task2/task4): get_state() → ArmState (x_mm/y_mm 单位 mm)
     """
+    y_m = x_m = arm_angle = hand_angle = None
     try:
-        state = (client.get_arm_state() or {}).get("arm_state") or {}
-        y_m = state.get("y_m")
-        x_m = state.get("x_m")
-        arm_angle = state.get("arm_angle")
-        hand_angle = state.get("hand_angle")
+        if hasattr(client, "get_arm_state"):
+            state = (client.get_arm_state() or {}).get("arm_state") or {}
+            y_m = state.get("y_m")
+            x_m = state.get("x_m")
+            arm_angle = state.get("arm_angle")
+            hand_angle = state.get("hand_angle")
+        else:
+            st = client.get_state()
+            y_m = None if st.y_mm is None else float(st.y_mm) / 1000.0
+            x_m = None if st.x_mm is None else float(st.x_mm) / 1000.0
+            arm_angle = getattr(st, "arm_angle", None)
+            hand_angle = getattr(st, "hand_angle", None)
     except Exception:
         return False
     if any(v is None for v in (y_m, x_m, arm_angle, hand_angle)):

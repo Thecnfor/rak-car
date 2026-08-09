@@ -1019,20 +1019,29 @@ def step_target4(
 
         # ---- 0.c 初始 P 姿态恢复 (task4 开始前确保臂在 P 姿态) ----
         #    主循环第一球也会恢复 P 姿态, 但此处提前一次确保起始位姿正确。
+        #    2026-08-09: orchestrator 已在 task3 射击结束后巡线途中预摆 TASK4_P_ARM
+        #    → 已在位则跳过, 省重复摆臂 (~2s).
         if not dry_run:
             try:
-                print(f"  [{LOG_PREFIX}] 初始 P 姿态恢复 "
-                      f"(arm={pose_p_arm_deg}° x={pose_p_x_mm}mm "
-                      f"y={pose_p_y_mm}mm hand={pose_p_hand_deg}°)")
-                arm_client.composite_run(
-                    arm=pose_p_arm_deg,
-                    x_mm=pose_p_x_mm,
-                    y_mm=pose_p_y_mm,
-                    hand=pose_p_hand_deg,
-                    speed=60,
-                    timeout=30.0,
-                )
-                print(f"  [{LOG_PREFIX}] 初始 P 姿态恢复完成")
+                from main.task.task3.arm_poses import arm_at_pose
+                p_pose_tuple = ("0", str(pose_p_y_mm / 1000.0),
+                                str(pose_p_x_mm / 1000.0),
+                                str(pose_p_arm_deg), str(pose_p_hand_deg))
+                if arm_at_pose(arm_client, p_pose_tuple):
+                    print(f"  [{LOG_PREFIX}] 初始 P 姿态已在位, 跳过恢复")
+                else:
+                    print(f"  [{LOG_PREFIX}] 初始 P 姿态恢复 "
+                          f"(arm={pose_p_arm_deg}° x={pose_p_x_mm}mm "
+                          f"y={pose_p_y_mm}mm hand={pose_p_hand_deg}°)")
+                    arm_client.composite_run(
+                        arm=pose_p_arm_deg,
+                        x_mm=pose_p_x_mm,
+                        y_mm=pose_p_y_mm,
+                        hand=pose_p_hand_deg,
+                        speed=60,
+                        timeout=30.0,
+                    )
+                    print(f"  [{LOG_PREFIX}] 初始 P 姿态恢复完成")
             except Exception as e:
                 print(f"  [{LOG_PREFIX}] ⚠️ 初始 P 姿态恢复失败: "
                       f"{type(e).__name__}: {str(e)[:120]}")

@@ -910,20 +910,32 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
         # 臂收 X/转大臂/切 detection 姿态 (进入任务点就开始先移动 X, 跟底盘移动一起进行).
         # 臂内部仍是 3 阶段顺序 (安全位→转臂→到位), 只是跟底盘并发.
         entry_back_off_m = float(cfg.get("entry_back_off_m", 0.0))
-        logger.info("初始化: 底盘回退 %.2fm + 切 detection 姿态 (X=%.0f Y=-150 arm=%s hand=%s) 并发",
-                    entry_back_off_m, x_target_mm,
-                    detection["arm_angle_deg"], detection["hand_angle_deg"])
+        # 2026-08-09: orchestrator 已在 task3 识别结束后巡线途中预摆 detection 姿态
+        # (arm_poses.TASK2_DETECTION_ARM) → 已在位则跳过臂动作, 只做底盘回退, 省重复摆臂.
+        from main.task.task3.arm_poses import TASK2_DETECTION_ARM, arm_at_pose
+        try:
+            detection_in_place = bool(arm_at_pose(arm_client, TASK2_DETECTION_ARM))
+        except Exception:
+            detection_in_place = False
+        init_arm_kwargs = None if detection_in_place else dict(
+            arm=float(detection["arm_angle_deg"]),
+            x_mm=x_target_mm,
+            y_mm=-150.0,
+            hand=float(detection["hand_angle_deg"]),
+            speed=100,
+            timeout=10.0,
+        )
+        if detection_in_place:
+            logger.info("初始化: 臂已在 detection 姿态 (预摆完成), 只做底盘回退 %.2fm",
+                        entry_back_off_m)
+        else:
+            logger.info("初始化: 底盘回退 %.2fm + 切 detection 姿态 (X=%.0f Y=-150 arm=%s hand=%s) 并发",
+                        entry_back_off_m, x_target_mm,
+                        detection["arm_angle_deg"], detection["hand_angle_deg"])
         _parallel_chassis_arm(
             arm_client, runner,
             target_dx_m=(-entry_back_off_m) if entry_back_off_m > 1e-3 else 0.0,
-            arm_kwargs=dict(
-                arm=float(detection["arm_angle_deg"]),
-                x_mm=x_target_mm,
-                y_mm=-150.0,
-                hand=float(detection["hand_angle_deg"]),
-                speed=100,
-                timeout=10.0,
-            ),
+            arm_kwargs=init_arm_kwargs,
         )
 
         for tower_idx, tower_label in enumerate(cfg["source_position_order"]):
