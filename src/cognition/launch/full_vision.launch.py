@@ -102,12 +102,23 @@ def generate_launch_description():
 
         Node(
             package="cognition", executable="vision-overlay",
-            name="vision_overlay", output="screen",
+            name="front_vision_overlay", output="screen",
             parameters=[{
-                "front_image_topic": "/rak/sensors/camera/front/image_raw",
-                "side_image_topic": "/rak/sensors/camera/side/image_raw",
-                "lane_topic": "/rak/perception/lane",
-                "detection_topic": "/rak/perception/detections/task",
+                "camera_topic": "/rak/sensors/camera/front/image_raw",
+                "result_topic": "/rak/perception/lane",
+                "output_topic": "/rak/visualization/front_overlay",
+                "overlay_type": "lane",
+                "publish_rate_hz": LaunchConfiguration("overlay_rate_hz"),
+            }],
+        ),
+        Node(
+            package="cognition", executable="vision-overlay",
+            name="side_vision_overlay", output="screen",
+            parameters=[{
+                "camera_topic": "/rak/sensors/camera/side/image_raw",
+                "result_topic": "/rak/perception/detections/task",
+                "output_topic": "/rak/visualization/side_overlay",
+                "overlay_type": "detection",
                 "publish_rate_hz": LaunchConfiguration("overlay_rate_hz"),
             }],
         ),

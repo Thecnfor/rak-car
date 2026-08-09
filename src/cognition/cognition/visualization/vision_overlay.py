@@ -4,67 +4,67 @@
 import threading
 from typing import Optional, Tuple
 
-import cv2
 import numpy as np
 import rclpy
 from msgs.msg import DetectionArray, LaneResult
 from rclpy.node import Node
-from sensor_msgs.msg import CompressedImage, Image
+from sensor_msgs.msg import Image
 
-from .overlay_helpers import draw_detection_overlay, draw_lane_overlay, image_data_sequence
+from .overlay_helpers import (
+    draw_detection_overlay,
+    draw_lane_overlay,
+    image_data_sequence,
+)
 
-Frame = Tuple[bytes, object, str]
+Frame = Tuple[np.ndarray, object, str]
 
 
 class VisionOverlayNode(Node):
-    """Join live camera frames with structured inference results for RViz."""
+    """Publish one RViz overlay from one raw camera and one result topic."""
 
     def __init__(self) -> None:
         super().__init__("vision_overlay")
-        self.declare_parameter("front_image_topic", "/rak/sensors/camera/front/image_compressed")
-        self.declare_parameter("side_image_topic", "/rak/sensors/camera/side/image_compressed")
-        self.declare_parameter("lane_topic", "/rak/perception/lane")
-        self.declare_parameter("detection_topic", "/rak/perception/detections/task")
+        self.declare_parameter("camera_topic", "/rak/sensors/camera/front/image_raw")
+        self.declare_parameter("result_topic", "/rak/perception/lane")
+        self.declare_parameter("output_topic", "/rak/visualization/front_overlay")
+        self.declare_parameter("overlay_type", "lane")
         self.declare_parameter("publish_rate_hz", 10.0)
 
+        self._overlay_type = str(self.get_parameter("overlay_type").value)
+        if self._overlay_type not in {"lane", "detection"}:
+            raise ValueError("overlay_type must be 'lane' or 'detection'")
         self._lock = threading.Lock()
-        self._front: Optional[Frame] = None
-        self._side: Optional[Frame] = None
+        self._frame: Optional[Frame] = None
         self._lane: Optional[LaneResult] = None
         self._detections: Optional[DetectionArray] = None
         qos = 5
-        self._front_sub = self.create_subscription(
-            Image, self.get_parameter("front_image_topic").value,
-            self._on_front_raw, qos)
-        self._side_sub = self.create_subscription(
-            Image, self.get_parameter("side_image_topic").value,
-            self._on_side_raw, qos)
-        self._lane_sub = self.create_subscription(
-            LaneResult, self.get_parameter("lane_topic").value,
-            self._on_lane, qos)
-        self._detection_sub = self.create_subscription(
-            DetectionArray, self.get_parameter("detection_topic").value,
-            self._on_detections, qos)
-        self._front_pub = self.create_publisher(
-            Image, "/rak/visualization/front_overlay", qos)
-        self._side_pub = self.create_publisher(
-            Image, "/rak/visualization/side_overlay", qos)
+        camera_topic = self.get_parameter("camera_topic").value
+        result_topic = self.get_parameter("result_topic").value
+        output_topic = self.get_parameter("output_topic").value
+        self._image_sub = self.create_subscription(
+            Image, camera_topic, self._on_image, qos)
+        if self._overlay_type == "lane":
+            self._result_sub = self.create_subscription(
+                LaneResult, result_topic, self._on_lane, qos)
+        else:
+            self._result_sub = self.create_subscription(
+                DetectionArray, result_topic, self._on_detections, qos)
+        self._pub = self.create_publisher(Image, output_topic, qos)
         rate = float(self.get_parameter("publish_rate_hz").value)
         self._timer = self.create_timer(1.0 / rate, self._publish)
         self.get_logger().info(
-            "VisionOverlay up: front/side images + lane/detections -> RViz overlay topics")
+            f"VisionOverlay up: {camera_topic} + {result_topic} "
+            f"-> {output_topic} ({self._overlay_type}) @ {rate:g} Hz")
 
-    def _on_front_raw(self, msg: Image) -> None:
-        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
-            (msg.height, msg.width, 3)).copy()
+    def _on_image(self, msg: Image) -> None:
+        try:
+            row = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.step)
+            frame = row[:, :msg.width * 3].reshape(msg.height, msg.width, 3).copy()
+        except (ValueError, TypeError) as exc:
+            self.get_logger().warning(f"overlay raw image decode failed: {exc}")
+            return
         with self._lock:
-            self._front = (frame, msg.header.stamp, msg.header.frame_id)
-
-    def _on_side_raw(self, msg: Image) -> None:
-        frame = np.frombuffer(msg.data, dtype=np.uint8).reshape(
-            (msg.height, msg.width, 3)).copy()
-        with self._lock:
-            self._side = (frame, msg.header.stamp, msg.header.frame_id)
+            self._frame = (frame, msg.header.stamp, msg.header.frame_id)
 
     def _on_lane(self, msg: LaneResult) -> None:
         with self._lock:
@@ -88,22 +88,21 @@ class VisionOverlayNode(Node):
 
     def _publish(self) -> None:
         with self._lock:
-            front = None if self._front is None else (
-                self._front[0].copy(), self._front[1], self._front[2])
-            side = None if self._side is None else (
-                self._side[0].copy(), self._side[1], self._side[2])
+            if self._frame is None:
+                return
+            frame, stamp, frame_id = self._frame
+            frame = frame.copy()
             lane = self._lane
             detections = self._detections
-        if front is not None:
-            frame, stamp, frame_id = front
-            if lane is not None:
-                frame = draw_lane_overlay(frame, lane)
-            self._front_pub.publish(self._to_image(frame, stamp, frame_id))
-        if side is not None:
-            frame, stamp, frame_id = side
-            if detections is not None:
-                frame = draw_detection_overlay(frame, detections)
-            self._side_pub.publish(self._to_image(frame, stamp, frame_id))
+        if self._overlay_type == "lane":
+            if lane is None:
+                return
+            frame = draw_lane_overlay(frame, lane)
+        else:
+            if detections is None:
+                return
+            frame = draw_detection_overlay(frame, detections)
+        self._pub.publish(self._to_image(frame, stamp, frame_id))
 
 
 def main(args=None) -> None:
