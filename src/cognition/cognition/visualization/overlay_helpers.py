@@ -1,13 +1,15 @@
 # Copyright 2026 Thecnfor
 # SPDX-License-Identifier: Proprietary
 
+import array
+
 import cv2
 import numpy as np
 
 
 def image_data_sequence(frame):
     """Return Image.data as the integer sequence required by ROS2 Python."""
-    return frame.astype(np.uint8, copy=False).reshape(-1).tolist()
+    return array.array("B", frame.astype(np.uint8, copy=False).tobytes())
 
 
 def draw_lane_overlay(frame, lane):

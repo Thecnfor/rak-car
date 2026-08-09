@@ -34,4 +34,4 @@ def test_draw_detection_overlay_draws_bbox_and_class():
 
 def test_image_data_sequence_converts_frame_to_ros_byte_values():
     frame = np.zeros((2, 3, 3), dtype=np.uint8)
-    assert image_data_sequence(frame) == [0] * 18
+    assert list(image_data_sequence(frame)) == [0] * 18
