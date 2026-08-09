@@ -8,7 +8,7 @@ track_chassis 现在走 runtime (单次阻塞 HTTP), 返回带 stop_ok 的 Track
 import unittest
 from unittest.mock import patch
 
-from main.arm.each_task.task4.target4 import _track_leftmost_ball
+from main.arm.each_task.task4.track_align import _track_leftmost_ball
 from main.chassis.loops.visual_track import TrackChassisResult, TrackFrame
 
 

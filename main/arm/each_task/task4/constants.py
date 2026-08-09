@@ -224,7 +224,65 @@ Y_FINAL_MM: float = -140.0
 """最终 y (识别位姿, 历史值)。"""
 
 BALL_LABELS = ["ball_blue", "ball_yellow"]
-"""track_chassis 目标集 (PaddleDet 模型标签)。"""
+"""臂伺服目标集 (PaddleDet 模型标签)。"""
+
+# ============================================================================
+# 机械臂智能抓取对齐 (2026-08-10, 替换底盘对齐 —— 底盘打滑不准)
+# ============================================================================
+# 方案 (用户拍板 2026-08-10):
+#   - 对齐自由度: **大臂 + x 十字, y 锁 0** (走 track_velocity_pick /
+#     find_target_arm_cross: dx=cx-setpoint_x → arm, dy=cy-setpoint_y → x 十字)。
+#   - setpoint: **硬编码到本文件** (用户标记 cam2 侧摄画面里吸嘴的像素)。
+#   - 抓取降序: **高位伺服 → 最后盲降** (伺服时臂抬在 y 高位, 收敛后 y 盲降到
+#     Y_PICK_MM 吸气), 规避侧摄近地丢球 (见 memory task4-pick-servo-high-then-descend)。
+#   - 两种球同尺寸 → 蓝/黄共用一份 setpoint。
+
+# ⚠️ setpoint: 吸嘴中心在 cam2 画面的归一化像素 (用户标定后填, 见
+#    main/arm/examples/13_nozzle_align_pose_p.py 的标定方法)。当前占位 (0,0)
+#    = 对准画面中心 (旧行为)。未标定前别真跑。
+TASK4_SETPOINT_X_NORM: float = 0.0
+TASK4_SETPOINT_Y_NORM: float = 0.0
+
+TASK4_SERVO_Y_START_MM: float = TASK4_POSE_P_Y_MM
+"""臂伺服起始/抬回 y (高位, 球全程可见)。cam2 侧摄固定, y 只影响吸嘴高度,
+不影响检测; 抬在安全高位即可, 最后盲降抓球。"""
+
+TASK4_SERVO_GAIN_ARM: float = 0.4
+"""大臂控 cx 增益 (dx → d_arm)。⚠️ 现场标定。"""
+
+TASK4_SERVO_GAIN_X: float = 0.08
+"""x 十字控 cy 增益 (dy → x_vel)。⚠️ 现场标定。"""
+
+TASK4_SERVO_DEADZONE: float = 0.02
+"""收敛死区 (|dx|,|dy| < 此值视为已对准)。"""
+
+TASK4_SERVO_MAX_VEL: float = 0.15
+"""x 十字最大速度 (m/s)。"""
+
+TASK4_SERVO_HZ: float = 20.0
+"""臂伺服循环频率 (Hz)。"""
+
+TASK4_SERVO_SETTLE_HITS: int = 3
+"""收敛判定: 末段连续 settle_hits 帧命中且 |dx|,|dy| < deadzone。"""
+
+TASK4_SERVO_TIMEOUT_S: float = 30.0
+"""单球臂伺服总超时 (s)。"""
+
+TASK4_SERVO_ARM_MIN: float = -150.0
+"""大臂 clamp 下界 (°)。P 姿态 arm=+90°, 留足旋转余量。"""
+
+TASK4_SERVO_ARM_MAX: float = 150.0
+"""大臂 clamp 上界 (°)。"""
+
+TASK4_SERVO_SIGN_ARM: float = 1.0
+"""大臂方向符号 (dx>0 → d_arm)。⚠️ 现场标定 (task1 S 姿态实机 = +1)。"""
+
+TASK4_SERVO_SIGN_X: float = -1.0
+"""x 十字方向符号 (dy>0 → x_vel)。⚠️ 现场标定 (task1 S 姿态实机 = -1)。"""
+
+TASK4_SERVO_DESCEND_HAND_DEG = None
+"""盲降时手爪角度; None = 保持 P 姿态 hand 不动 (吸嘴朝下即可)。"""
+
 
 # ---- IR 生命周期 ----
 # task4 任务点由 orchestrator 的左 IR < 0.70m 触发。

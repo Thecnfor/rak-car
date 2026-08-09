@@ -11,20 +11,19 @@ PPT Slide 9:
     任务4 业务层只确保"颜色对得上 bin", 不参与分拣评分。
   - 用户决策：边采边存（采一个 → 直接放对应 bin，不在臂上累积）。
 
-子模块（执行顺序 a → (b1→b2→b3→b4)×N, 预算式收尾):
+子模块（执行顺序 a → (b1→b2→b3)×N, 预算式收尾):
 
   ┌────────────────────────────────────────────────────────────────────┐
-  │ a_approach        target1 起手: composite_run(arm=90°/y=-133/hand=0°) ∥ + x=-260│
+  │ a_approach        P 姿态起手: composite_run(arm=+90°/x=-295/y=-160/hand=+10°)│
   │   ↓                                                                   │
-  │ b1_creep_search   慢速前移 (realtime 速度 0.045m/s) + 10Hz fetch_balls, 见球即停│
+  │ b1_creep_search   慢速前移 (realtime 速度 0.12m/s) + 20Hz fetch_balls, 见球即停│
   │   ↓                                                                   │
-  │ b2_track_chassis  track_chassis select_mode="leftmost", 最左球拉到画面中心│
+  │ b2_arm_servo_pick 机械臂智能抓取 (track_velocity_pick): 大臂控 cx + x 十字控 cy,│
+  │                   y 锁 0, 高位伺服 → 最后盲降 pick_y → 吸 (2026-08-10 替换底盘对齐)│
   │   ↓                                                                   │
-  │ b3_pick_fruit     move_to_vision_target(hand=0°, 防手爪挡侧摄) 吸嘴中心对准 → 吸│
+  │ b3_store_fruit    composite_run (中转 x → bin x) → 降 y/hand → 放气    │
   │   ↓                                                                   │
-  │ b4_store_fruit    composite_run (抬 y=-190 ∥ 移 bin 蓝0/黄-65) → y=-155 → 放气│
-  │   ↓                                                                   │
-  │ 收尾              creep 预算 0.8m / picks 8 / 总时 180s 任一命中 → summary│
+  │ 收尾              IR 丢失+0.3m 主终止; creep 0.58m / picks / 总时兜底  │
   └────────────────────────────────────────────────────────────────────┘
 
 跑法:
@@ -54,8 +53,8 @@ PPT Slide 9:
   - pick_up_yellow.py 抓黄球序列 (同 pick_up_blue, 唯一区别: 步骤 5 移 -65)
   - dipan.py         底盘工具: step_chassis_forward 单步直行 (旧离散步进工具) +
                      _stop_chassis_quietly 停车兜底 (target4 finally 复用)
-  - target4.py       主流程 (2026-08-03 底盘视觉伺服版): target1 起手 +
-                     (creep 慢速搜索 → track_chassis 最左球定位 → pick_by_vision
+  - target4.py       主流程 (2026-08-10 机械臂智能抓取版): P 姿态起手 +
+                     (creep 慢速搜索 → 判色 → track_velocity_pick 大臂+x 轴对齐
                      吸嘴中心抓 → composite_run 放 bin) ×N, 预算式收尾;
                      orchestrator 入口 main/task/task4_harvest.py
 
