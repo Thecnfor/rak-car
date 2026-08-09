@@ -84,6 +84,9 @@ PICK_SERVO_SKIP_POSE_ALIGN = True
 PICK_SERVO_HZ = 20.0
 # pick_track_timeout_s 优先从 cfg 读, 此处为缺省值
 PICK_SERVO_TIMEOUT_S_DEFAULT = 4.0
+# ── 对齐失败重试 (2026-08-09 用户): 失败但看得到目标 → 加时 3s + 死区调大 ──
+PICK_SERVO_RETRY_TIMEOUT_EXTRA_S = 3.0   # 重试超时在原超时上加 3s
+PICK_SERVO_RETRY_DEADZONE = 0.10         # 重试死区调大 (默认 0.06 → 0.10), 更容易锁上
 
 # ── 抓取起始 hand 角度 ─────────────────────────────────────────────────────
 PICK_START_HAND_DEG = -15.0   # 2026-08-06: S 姿态 hand 固定 -15°
@@ -281,19 +284,46 @@ def _pick_cylinder_servo_local(
         servo_kw["deadzone"], servo_kw["max_vel"], servo_kw["arm_start"],
         servo_kw["settle_hits"], servo_kw["servo_timeout"],
     )
-    job = arm_client.http.execute(
-        "car", "run_arm_servo", kwargs=servo_kw, sync=True,
-        timeout=float(servo_kw["servo_timeout"]) + 15.0,
-    )
-    result = (job or {}).get("result") if isinstance(job, dict) else None
-    result = result if isinstance(result, dict) else {}
-    if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
-        raise RuntimeError(
-            f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
+    def _servo_once(kw: Dict[str, Any]) -> Dict[str, Any]:
+        """跑一轮 run_arm_servo 并解析 result (含 status 失败 raise)。"""
+        job = arm_client.http.execute(
+            "car", "run_arm_servo", kwargs=kw, sync=True,
+            timeout=float(kw["servo_timeout"]) + 15.0,
         )
+        result = (job or {}).get("result") if isinstance(job, dict) else None
+        result = result if isinstance(result, dict) else {}
+        if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+            raise RuntimeError(
+                f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
+            )
+        return result
+
+    result = _servo_once(servo_kw)
     logger.info("本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
                 result.get("reason"), result.get("settled"),
                 result.get("trace_hits"), result.get("end_arm"))
+    # 2026-08-09 用户: 对齐失败但这一轮看到过目标 (trace_hits>0) →
+    # 加时 3s + 死区调大重试一次。目标还在视野里只是振荡/太慢没进死区,
+    # 再给一次机会大概率能锁上; trace_hits=0 全程没看到目标, 重试也白搭。
+    if (not result.get("settled")
+            and int(result.get("trace_hits", 0) or 0) > 0):
+        retry_kw = dict(servo_kw)
+        retry_kw["servo_timeout"] = (float(servo_kw["servo_timeout"])
+                                     + PICK_SERVO_RETRY_TIMEOUT_EXTRA_S)
+        retry_kw["deadzone"] = PICK_SERVO_RETRY_DEADZONE
+        # 从上次结束角度续跑, 不回到 arm_start (-90) 起点, 免得把已对齐的角度丢回去
+        if result.get("end_arm") is not None:
+            retry_kw["arm_start"] = float(result["end_arm"])
+        logger.warning(
+            "S 视觉抓苗未收敛但看得到目标 (reason=%s trace_hits=%s) → 重试: "
+            "超时 %ss + 死区 %.3f",
+            result.get("reason"), result.get("trace_hits"),
+            retry_kw["servo_timeout"], retry_kw["deadzone"],
+        )
+        result = _servo_once(retry_kw)
+        logger.info("重试视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                    result.get("reason"), result.get("settled"),
+                    result.get("trace_hits"), result.get("end_arm"))
     if not result.get("settled"):
         raise RuntimeError(
             f"S 视觉抓苗未收敛 (reason={result.get('reason')}, "

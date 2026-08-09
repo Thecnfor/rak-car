@@ -73,7 +73,7 @@ task_cfg:
       ref_area: 1.10        # 2026-08-02 实测 PLACE 姿态 / x=-270 / 距离 T 列约 30cm: cylinder_set bbox area ≈ 1.12
       label: null           # auto
       v_max: 0.20
-      max_seconds: 8.0
+      max_seconds: 5.0      # 2026-08-09: 8.0 → 5.0 (对齐超时收紧, 最坏等待 2×5+1.2s)
 
     # 2026-08-09: 任务点触发后 step0 — lane follow 前移 0.1m @ 0.1m/s,
     # 与机械臂切 PLACE 姿态 (arm=+90 x=-300 y=-100 hand=0) 并发 (进入任务点就动臂).
