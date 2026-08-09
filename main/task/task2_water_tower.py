@@ -115,6 +115,10 @@ PICK_VISION_TIMEOUT_S: float = 3.5
 #   第3块(2): 7s — 高处堆叠抖动大收敛慢 (原 PICK_BLOCK3_TIMEOUT_S)
 PICK_BLOCK2_TIMEOUT_S: Optional[float] = 6.0
 PICK_BLOCK3_TIMEOUT_S: Optional[float] = 7.0
+# 2026-08-09 用户新规则: 视觉对齐超时**不许失败** — 降死区 + 加时重新对齐一次.
+#   默认死区 0.05 → 重试放宽到 0.07; 超时 +4s (块默认 5/6/7s → 重试 9/10/11s).
+PICK_RETRY_DEADZONE: float = 0.07
+PICK_RETRY_EXTRA_S: float = 4.0
 PICK_VISION_HZ: float = 25.0
 PICK_VISION_GAIN_ARM: float = 1.6
 PICK_VISION_GAIN_X: float = 0.35
@@ -226,15 +230,18 @@ def _parallel_chassis_arm(
     task1_seeding.py:619-631 是同样的模式; SDK 串口 SerialEngine 单 io 线程
     调度 (CLAUDE.md §Runtime concurrency model), 多线程并发安全.
     """
-    # 2026-08-06: 底盘移动前也遵循大臂转动的安全区限制 (Y ∈ [-200,-90], X ∈ [-300,-200])
-    # 这保证底盘移动期间 X/Y 已在安全区, 与大臂 3 阶段共享同一约束.
-    # 若同时转大臂, 3 阶段 phase1 已是 no-op (X/Y 已就位).
-    if abs(target_dx_m) > 1e-3:
-        _ensure_xy_in_safe_zone(arm_client, runner, timeout=timeout)
-
     tasks = []
     with ThreadPoolExecutor(max_workers=2) as ex:
-        # 2026-08-09: 前进/后退统一走 SDK move_for (4 轮等速, odom 自洽, 见 CLAUDE.md
+        # 2026-08-09: 底盘 move_for 与臂动作**从第一帧就并发** — 不再先串行调安全区.
+        # 转大臂时 _safe_arm_rotation_sequence 阶段 1 自己会调 X/Y 安全位, 与底盘移动
+        # 同时进行 (用户要求: 进入任务点就动 X, 底盘前进时臂同步; 机械臂内部顺序仍按
+        # 3 阶段). 省每块 ~2-4s 串行等待.
+        # ⚠️ 代价: 底盘移动期间 X/Y 正收回安全位 (非先收回再移动), 真机需确认无碰撞.
+        # 只有不转大臂 (arm_kwargs 无 arm) 时才先保证 X/Y 安全区 (无 3 阶段兜底).
+        if (arm_kwargs and arm_kwargs.get("arm") is None
+                and abs(target_dx_m) > 1e-3):
+            _ensure_xy_in_safe_zone(arm_client, runner, timeout=timeout)
+        # 前进/后退统一走 SDK move_for (4 轮等速, odom 自洽, 见 CLAUDE.md
         # "底盘平移一律 move_for" 规则). 不再默认走 move_along_lane 车道线.
         # use_lane_align=True 仍可强制 move_along_lane (特殊场景兜底).
         if abs(target_dx_m) > 1e-3:
@@ -469,7 +476,8 @@ def _ensure_xy_in_safe_zone(
     - 用 composite_run (无 client-side y_protected) 调 X/Y
 
     调用点:
-      1. _parallel_chassis_arm 入口 (底盘 move_for 前, 同步执行)
+      1. _parallel_chassis_arm 入口 — 仅当 arm_kwargs 无 arm (不转大臂, 无 3 阶段兜底)
+         且底盘移动时才同步执行 (2026-08-09 改: 转大臂的并发走 _safe_arm_rotation_sequence 阶段 1)
       2. _safe_arm_rotation_sequence 阶段 1 (大臂 3 阶段第 1 步)
     """
     try:
@@ -662,6 +670,27 @@ def _pick_cube_servo_local(
     logger.info("cam2 本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
                 result.get("reason"), result.get("settled"),
                 result.get("trace_hits"), result.get("end_arm"))
+    # 2026-08-09 用户新规则: 超时不许失败 — 降死区 PICK_RETRY_DEADZONE(0.07) +
+    # 加时 PICK_RETRY_EXTRA_S(4s) 重新对齐一次. 仅 timeout 重试 (stopped=急停不重试).
+    if (not result.get("settled")
+            and result.get("reason") == "timeout"):
+        logger.info("视觉对齐超时, 降死区重试: deadzone %.3f→%.3f, servo_timeout +%.0fs",
+                    servo_kw["deadzone"], PICK_RETRY_DEADZONE, PICK_RETRY_EXTRA_S)
+        servo_kw["deadzone"] = PICK_RETRY_DEADZONE
+        servo_kw["servo_timeout"] = float(servo_kw["servo_timeout"]) + PICK_RETRY_EXTRA_S
+        job = arm_client.http.execute(
+            "car", "run_arm_servo", kwargs=servo_kw, sync=True,
+            timeout=float(servo_kw["servo_timeout"]) + 15.0,
+        )
+        result = (job or {}).get("result") if isinstance(job, dict) else None
+        result = result if isinstance(result, dict) else {}
+        if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
+            raise RuntimeError(
+                f"run_arm_servo 重试任务失败: status={job.get('status')} error={job.get('error')}"
+            )
+        logger.info("cam2 本地视觉伺服重试结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
+                    result.get("reason"), result.get("settled"),
+                    result.get("trace_hits"), result.get("end_arm"))
     if not result.get("settled"):
         raise RuntimeError(
             f"cam2 本地视觉抓水立方失败 (reason={result.get('reason')}, "
@@ -872,15 +901,17 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     vision = cfg.get("pick_vision") or {}
 
     try:
-        # ===== 初始化: composite_run 4 轴并发到 detection 姿态 (transport Y=-150) =====
-        # 2026-08-06 提速: 原版 move_x → set_arm_angle → _wait_arm_angle_reached
-        #                 → set_hand_angle → time.sleep(0.5) 全串行 ~5s.
-        #                 改 composite_run 4 轴并发 ~2s, 省 3s.
-        logger.info("初始化: composite_run → detection 姿态 (X=%.0f Y=-150 arm=%s hand=%s)",
-                    x_target_mm, detection["arm_angle_deg"], detection["hand_angle_deg"])
+        # ===== 初始化: 进入任务点就动 X — 底盘回退 entry_back_off_m 与臂切 detection 姿态并发 =====
+        # 2026-08-09: orchestrator waypoint 的 back_off(0.2m) 挪进任务内, 底盘后退的同时
+        # 臂收 X/转大臂/切 detection 姿态 (进入任务点就开始先移动 X, 跟底盘移动一起进行).
+        # 臂内部仍是 3 阶段顺序 (安全位→转臂→到位), 只是跟底盘并发.
+        entry_back_off_m = float(cfg.get("entry_back_off_m", 0.0))
+        logger.info("初始化: 底盘回退 %.2fm + 切 detection 姿态 (X=%.0f Y=-150 arm=%s hand=%s) 并发",
+                    entry_back_off_m, x_target_mm,
+                    detection["arm_angle_deg"], detection["hand_angle_deg"])
         _parallel_chassis_arm(
             arm_client, runner,
-            target_dx_m=0.0,
+            target_dx_m=(-entry_back_off_m) if entry_back_off_m > 1e-3 else 0.0,
             arm_kwargs=dict(
                 arm=float(detection["arm_angle_deg"]),
                 x_mm=x_target_mm,
@@ -1004,12 +1035,19 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                                          [-50.0, -65.0, -80.0])
                     deliver_y = deliver_ys[min(picked, len(deliver_ys) - 1)]
                     d_back = -chassis_at_tower_m
-                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收-260 → 大臂转%s° → Y降%.0f → X伸%s)",
-                                picked + 1, d_back, carry["arm_angle_deg"], deliver_y, carry["x_mm"])
+                    # 2026-08-09: 投放 X 分水塔 (carry_x_by_tower_mm[tower_idx], 缺省 carry.x_mm)
+                    carry_xs = cfg.get("carry_x_by_tower_mm") or []
+                    if carry_xs and tower_idx < len(carry_xs):
+                        carry_x_mm = float(carry_xs[tower_idx])
+                    else:
+                        carry_x_mm = float(carry["x_mm"])
+                    logger.info("第 %d 块: 底盘回塔 Δ=%.2f m → carry (X收-260 → 大臂转%s° → Y降%.0f → X伸%.0f [塔%d])",
+                                picked + 1, d_back, carry["arm_angle_deg"], deliver_y,
+                                carry_x_mm, tower_idx + 1)
                     _deliver_prepare(
                         arm_client, runner,
                         target_dx_m=d_back,
-                        carry_x_mm=float(carry["x_mm"]),
+                        carry_x_mm=carry_x_mm,
                         carry_arm_deg=float(carry["arm_angle_deg"]),
                         carry_hand_deg=float(deliver_hand),
                         deliver_y_mm=deliver_y,
