@@ -195,16 +195,17 @@ def _scan_marker_present(streamer, marker_label: str) -> bool:
 
 
 def _switch_to_place_pose(
-    car, arm,
+    car,
     x_mm: float, arm_deg: float, hand_deg: float,
 ) -> bool:
     """切到 PLACE 姿态。"""
+    arm = getattr(car, "arm", None)
     state = _read_arm_state(car)
-    if state["y_mm"] > -50:
+    if arm is not None and state["y_mm"] > -50:
         arm.move_y_position(float(PLACE_Y_MM) / 1000.0)
     logger.info("  切 PLACE 姿态: arm=%.1f° x=%.1fmm y=%.1fmm hand=%.1f°",
                 arm_deg, x_mm, PLACE_Y_MM, hand_deg)
-    result = arm.composite_run(
+    result = car.composite_run(
         arm=float(arm_deg),
         x=float(x_mm) / 1000.0,
         y=float(PLACE_Y_MM) / 1000.0,
@@ -215,9 +216,9 @@ def _switch_to_place_pose(
     return result.get("ok", False) if isinstance(result, dict) else bool(result)
 
 
-def _switch_to_s_pose(arm, arm_deg: float, x_mm: float, hand_deg: float, y_mm: float) -> bool:
+def _switch_to_s_pose(car, arm_deg: float, x_mm: float, hand_deg: float, y_mm: float) -> bool:
     """切到 S 姿态。"""
-    result = arm.composite_run(
+    result = car.composite_run(
         arm=float(arm_deg),
         x=float(x_mm) / 1000.0,
         y=float(y_mm) / 1000.0,
@@ -228,10 +229,10 @@ def _switch_to_s_pose(arm, arm_deg: float, x_mm: float, hand_deg: float, y_mm: f
     return result.get("ok", False) if isinstance(result, dict) else bool(result)
 
 
-def _return_to_source_pose(arm, cfg: Dict[str, Any]) -> None:
+def _return_to_source_pose(car, cfg: Dict[str, Any]) -> None:
     """防碰撞归位。"""
     ret = cfg.get("arm_return_S1_pose", {})
-    arm.composite_run(
+    car.composite_run(
         arm=float(ret.get("arm_angle_deg", -90.0)),
         x=float(ret.get("x_mm", -100.0)) / 1000.0,
         y=float(ret.get("y_mm", -100.0)) / 1000.0,
@@ -240,7 +241,7 @@ def _return_to_source_pose(arm, cfg: Dict[str, Any]) -> None:
     )
 
 
-def _init_step0_trigger_lane_arm(car, arm, cfg: Dict[str, Any]) -> bool:
+def _init_step0_trigger_lane_arm(car, cfg: Dict[str, Any]) -> bool:
     """任务点触发后 lane follow 前移 + 臂切 PLACE 并发。"""
     settle = cfg.get("trigger_settle") or {}
     if not settle.get("enabled", False):
@@ -250,6 +251,7 @@ def _init_step0_trigger_lane_arm(car, arm, cfg: Dict[str, Any]) -> bool:
     if lane_m <= 0:
         return True
 
+    arm = getattr(car, "arm", None)
     state = _read_arm_state(car)
     if state["y_mm"] > -50:
         logger.info("step0: 当前 y=%.1f 偏低, 先抬到 %s", state["y_mm"], PLACE_Y_MM)
@@ -261,7 +263,7 @@ def _init_step0_trigger_lane_arm(car, arm, cfg: Dict[str, Any]) -> bool:
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_lane = ex.submit(car.lane_dis, lane_m, lane_vx)
         f_arm = ex.submit(
-            arm.composite_run,
+            car.composite_run,
             arm=PLACE_ARM_DEG,
             x=float(PLACE_ALIGN_X_MM) / 1000.0,
             y=float(PLACE_Y_MM) / 1000.0,
@@ -281,8 +283,9 @@ def _init_step0_trigger_lane_arm(car, arm, cfg: Dict[str, Any]) -> bool:
     return lane_done and arm_ok
 
 
-def _init_step1_place_align_arm(car, arm, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _init_step1_place_align_arm(car, cfg: Dict[str, Any]) -> Dict[str, Any]:
     """PLACE 机械臂视觉对齐。"""
+    arm = getattr(car, "arm", None)
     pa = cfg.get("place_align") or {}
     if not pa.get("enabled", False):
         return {"ok": False, "arm_deg": None, "x_mm": None}
@@ -294,7 +297,7 @@ def _init_step1_place_align_arm(car, arm, cfg: Dict[str, Any]) -> Dict[str, Any]
     init_hand_deg = float(pa.get("init_hand_deg", PLACE_HAND_DEG))
 
     try:
-        _switch_to_place_pose(car, arm, init_x_mm, init_arm_deg, init_hand_deg)
+        _switch_to_place_pose(car, init_x_mm, init_arm_deg, init_hand_deg)
     except Exception as exc:
         logger.error("step 1: 切 place_align 初始姿态失败 (%s), 回落", exc)
         return {"ok": False, "arm_deg": None, "x_mm": None}
@@ -302,7 +305,7 @@ def _init_step1_place_align_arm(car, arm, cfg: Dict[str, Any]) -> Dict[str, Any]
     logger.info("step 1: PLACE 对齐 cylinder_set — run_arm_servo(label=%s setpoint=(%.3f,%.3f) "
                 "arm_start=%.0f x_init=%.0f)", label, sp[0], sp[1], init_arm_deg, init_x_mm)
 
-    servo_result = arm.run_arm_servo(
+    servo_result = car.run_arm_servo(
         label=label,
         hz=float(pa.get("hz", PICK_SERVO_HZ)),
         gain_arm=float(pa.get("gain_arm", PICK_SERVO_GAIN_ARM)),
@@ -329,7 +332,7 @@ def _init_step1_place_align_arm(car, arm, cfg: Dict[str, Any]) -> Dict[str, Any]
             and int(servo_result.get("trace_hits", 0)) > 0):
         retry_arm_start = float(servo_result.get("end_arm", init_arm_deg))
         logger.warning("place 对齐未收敛但看得到目标 → 重试")
-        servo_result = arm.run_arm_servo(
+        servo_result = car.run_arm_servo(
             label=label,
             hz=float(pa.get("hz", PICK_SERVO_HZ)),
             gain_arm=float(pa.get("gain_arm", PICK_SERVO_GAIN_ARM)),
@@ -363,9 +366,10 @@ def _init_step1_place_align_arm(car, arm, cfg: Dict[str, Any]) -> Dict[str, Any]
             "reason": servo_result.get("reason")}
 
 
-def _init_step2_s_pose(arm, cfg: Dict[str, Any], init_y_mm: float) -> None:
+def _init_step2_s_pose(car, cfg: Dict[str, Any], init_y_mm: float) -> None:
     """初始化 S 姿态。"""
-    state = _read_arm_state(arm)
+    arm = getattr(car, "arm", None)
+    state = _read_arm_state(car)
     if state["y_mm"] > -50:
         logger.info("init step2: 当前 y=%.1f 太低, 先抬到 %s", state["y_mm"], S_POSE_Y_MM)
         arm.move_y_position(float(S_POSE_Y_MM) / 1000.0)
@@ -373,7 +377,7 @@ def _init_step2_s_pose(arm, cfg: Dict[str, Any], init_y_mm: float) -> None:
     logger.info("init step2: S 姿态 arm=%s° hand=%s° X=%smm Y=%smm",
                 pick.get("arm_angle_deg"), PICK_START_HAND_DEG,
                 pick.get("x_mm"), S_POSE_Y_MM)
-    arm.composite_run(
+    car.composite_run(
         arm=float(pick.get("arm_angle_deg", -90.0)),
         x=float(pick.get("x_mm", -70.0)) / 1000.0,
         y=float(init_y_mm) / 1000.0,
@@ -403,7 +407,7 @@ def _chassis_goto(car, target_along_m: float, pos_along: List[float],
 
 
 def _pick_at_source(
-    car, arm, streamer,
+    car, streamer,
     cfg: Dict[str, Any],
     column_idx: int,
     seen_state: Dict[str, Any],
@@ -436,7 +440,7 @@ def _pick_at_source(
     vision_cfg = cfg.get("pick_vision") or {}
     servo_timeout = float(vision_cfg.get("timeout", cfg.get("pick_track_timeout_s", PICK_SERVO_TIMEOUT_S_DEFAULT)))
 
-    servo_result = arm.run_arm_servo(
+    servo_result = car.run_arm_servo(
         label=label,
         hz=PICK_SERVO_HZ,
         gain_arm=PICK_SERVO_GAIN_ARM,
@@ -457,7 +461,7 @@ def _pick_at_source(
     if not servo_result.get("settled") and int(servo_result.get("trace_hits", 0)) > 0:
         retry_arm_start = float(servo_result.get("end_arm", pick_arm_start))
         logger.warning("S 视觉抓苗未收敛但看得到目标 → 重试")
-        servo_result = arm.run_arm_servo(
+        servo_result = car.run_arm_servo(
             label=label,
             hz=PICK_SERVO_HZ,
             gain_arm=PICK_SERVO_GAIN_ARM,
@@ -484,10 +488,11 @@ def _pick_at_source(
 
     # 对齐完成 → y 降 0 → grasp → 抬回
     logger.info("  视觉对齐完成，执行抓取")
+    arm = getattr(car, "arm", None)
     try:
-        arm.composite_run(y=0.0, speed=100, timeout=5.0)
+        car.composite_run(y=0.0, speed=100, timeout=5.0)
         arm.grasp(True)
-        arm.composite_run(y=float(init_y_mm) / 1000.0, speed=100, timeout=5.0)
+        car.composite_run(y=float(init_y_mm) / 1000.0, speed=100, timeout=5.0)
     except Exception as exc:
         raise RuntimeError(f"抓取动作失败: {exc}") from exc
 
@@ -504,9 +509,9 @@ def run_task1(car) -> dict:
     直接在 runtime 进程内执行，完全复刻 main/task/task1_seeding.py。
     """
     arm = getattr(car, "arm", None)
-    streamer = getattr(car, "streamer", None)
     if arm is None:
         return {"ok": False, "completed": [], "error": "arm 未初始化"}
+    streamer = getattr(car, "streamer", None)
     if streamer is None:
         return {"ok": False, "completed": [], "error": "streamer 未初始化"}
 
@@ -534,12 +539,12 @@ def run_task1(car) -> dict:
     place_x_mm = PLACE_X_MM_FALLBACK
 
     # ===== step0: lane follow 前移 + 臂切 PLACE 并发 =====
-    _init_step0_trigger_lane_arm(car, arm, cfg)
+    _init_step0_trigger_lane_arm(car, cfg)
 
     # ===== step1: place 对齐 =====
     align_arrived = False
     if cfg.get("place_align", {}).get("enabled", False):
-        place_mem = _init_step1_place_align_arm(car, arm, cfg)
+        place_mem = _init_step1_place_align_arm(car, cfg)
         align_arrived = place_mem.get("ok", False)
         if align_arrived:
             place_arm_deg = float(place_mem["arm_deg"])
@@ -551,7 +556,7 @@ def run_task1(car) -> dict:
         logger.info("step 1: PLACE 机械臂对齐已禁用")
 
     # ===== step2: 切 S 姿态（主循环前先到 S） =====
-    _init_step2_s_pose(arm, cfg, init_y_mm)
+    _init_step2_s_pose(car, cfg, init_y_mm)
 
     try:
         for i, column_idx in enumerate(source_position_order):
@@ -570,11 +575,11 @@ def run_task1(car) -> dict:
             # (1.5) 切 S 姿态（先回到 S 姿态再抓取）
             logger.info("  切 S 姿态: arm=%.1f° x=%.1fmm y=%.1fmm hand=%.1f°",
                         s_arm, S_POSE_X_MM, init_y_mm, PICK_START_HAND_DEG)
-            _switch_to_s_pose(arm, s_arm, S_POSE_X_MM, PICK_START_HAND_DEG, init_y_mm)
+            _switch_to_s_pose(car, s_arm, S_POSE_X_MM, PICK_START_HAND_DEG, init_y_mm)
 
             # (2) 抓取
             try:
-                label = _pick_at_source(car, arm, streamer, cfg, column_idx, seen_state)
+                label = _pick_at_source(car, streamer, cfg, column_idx, seen_state)
             except Exception as exc:
                 picked_so_far = set(completed)
                 remaining = [l for l in SOURCE_LABELS if l not in picked_so_far]
@@ -592,13 +597,13 @@ def run_task1(car) -> dict:
 
             st = _read_arm_state(car)
             if st["y_mm"] > CHASSIS_CONCURRENT_Y_THRESHOLD_MM:
-                arm.composite_run(y=float(S_POSE_Y_MM) / 1000.0, speed=100, timeout=5.0)
+                car.composite_run(y=float(S_POSE_Y_MM) / 1000.0, speed=100, timeout=5.0)
 
             logger.info("  → T%d (label=%s) 全并发", slot_idx, label)
             with ThreadPoolExecutor(max_workers=2) as ex:
                 f_chassis = ex.submit(_chassis_goto, car, target_t, pos_along, chassis_move_timeout)
                 f_arm = ex.submit(
-                    arm.composite_run,
+                    car.composite_run,
                     arm=place_arm_deg,
                     x=float(place_x_mm) / 1000.0,
                     y=float(PLACE_Y_MM) / 1000.0,
@@ -612,6 +617,7 @@ def run_task1(car) -> dict:
             # (4) 放苗：y→-20 + grasp(False) + y→-40 抬离
             logger.info("[T%d] place: y→%d + grasp(False) + y→%d",
                         slot_idx, PLACE_DESCEND_MM, PLACE_LIFT_MM)
+            arm = getattr(car, "arm", None)
             arm.move_y_position(float(PLACE_DESCEND_MM) / 1000.0)
             arm.grasp(False)
             arm.move_y_position(float(PLACE_LIFT_MM) / 1000.0)
@@ -621,7 +627,7 @@ def run_task1(car) -> dict:
                 next_col_idx = source_position_order[i + 1]
                 logger.info("  列 %d 完成，底盘相对 %.3f m → 下一列 S%d",
                             column_idx, pos_along[0], next_col_idx)
-                _return_to_source_pose(arm, cfg)
+                _return_to_source_pose(car, cfg)
 
     except Exception as exc:
         logger.exception("task1 执行失败: %s", exc)
