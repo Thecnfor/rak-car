@@ -47,6 +47,9 @@ class FakeCar:
     def move_to_detection_target(self, **kwargs):
         self.align_calls.append(kwargs)
 
+    def stop(self):
+        self.moves.append(([0.0, 0.0, 0.0], True))
+
 
 class TestTask4Direct(unittest.TestCase):
     def test_no_target_exits_after_distance_budget(self):

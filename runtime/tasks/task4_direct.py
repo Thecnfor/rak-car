@@ -150,7 +150,7 @@ class Task4Direct:
         except Exception as exc:
             reason = "error:%s" % exc
         finally:
-            self.car.move_for([0.0, 0.0, 0.0], stop=True)
+            self.car.stop()
         return {"ok": self.picked > 0, "picked": self.picked,
                 "reason": reason, "elapsed_s": time.monotonic() - self._start}
 
