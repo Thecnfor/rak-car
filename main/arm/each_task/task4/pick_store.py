@@ -1,208 +1,171 @@
-"""task4 / target4 —— 选球判色 + 机械臂智能抓取 + 放 bin。
+"""task4 / target4 —— 选球判色 + 机械臂视觉伺服 + 盲降抓取放 bin。
 
 从 target4.py 拆出 (2026-08-10 拆分): 单一职责 = 机械臂侧"抓一个球放进对应 bin"。
-- ``_color_from_track``  track 结果 final_frame.label → 球色 (兼容保留; 主流程不再用)。
-- ``_pick_best_ball``    从 fetch_balls 结果选 1 球 (score 最高, 判色)。
-- ``_pick_by_arm_servo`` 机械臂智能抓取 (2026-08-10): 大臂控 cx + x 十字控 cy,
-                         高位伺服 → 最后盲降 → 吸气 → 抬回, 替换底盘对齐。
-- ``_pick_and_store``    臂伺服抓球 + 同步放 bin (servo pick + transit → bin → release)。
+2026-08-11 新版流程:
+- ``_run_arm_servo``   调 runtime run_arm_servo (进程内闭环, 只动 x 十字 + 大臂)。
+                      4s → 超时 → 加时 4s (总 8s) + 死区放大 1.5 倍 → 仍超时返回 (上层照样盲抓)。
+- ``_servo_and_pick``  伺服对齐 → 保持姿势 → 盲降抓球 + 放 bin。
+- ``_color_from_track``  track 结果 final_frame.label → 球色。
+- ``_pick_best_ball``   从 fetch_balls 结果选 1 球 (score 最高, 兜底判色)。
 """
 from __future__ import annotations
 
+import time
 from typing import Optional
 
 from main.arm import ArmRunner  # noqa: E402
 
 from .constants import (  # noqa: E402
+    BALL_LABELS,
     COLOR_BLUE, COLOR_YELLOW,
-    TASK4_POSE_P_ARM_DEG, TASK4_POSE_P_HAND_DEG,
-    X_PICK_MM, Y_PICK_MM, TASK4_GRASP_X_OFFSET_MM,
-    X_TRANSIT_MM, Y_TRANSIT_MM, Y_PUT_MM,
-    BIN_X_MM,
-    # 机械臂智能抓取 (2026-08-10)
-    TASK4_SETPOINT_X_NORM, TASK4_SETPOINT_Y_NORM,
-    TASK4_SERVO_Y_START_MM, TASK4_SERVO_GAIN_ARM, TASK4_SERVO_GAIN_X,
-    TASK4_SERVO_DEADZONE, TASK4_SERVO_MAX_VEL, TASK4_SERVO_HZ,
-    TASK4_SERVO_SETTLE_HITS, TASK4_SERVO_TIMEOUT_S,
-    TASK4_SERVO_ARM_MIN, TASK4_SERVO_ARM_MAX,
-    TASK4_SERVO_SIGN_ARM, TASK4_SERVO_SIGN_X, TASK4_SERVO_DESCEND_HAND_DEG,
+    BIN_X_MM, BIN_HAND_DEG,
+    ALIGN_ONLY,
+    ARM_SERVO_SETPOINT_CX, ARM_SERVO_SETPOINT_CY,
+    ARM_SERVO_GAIN_ARM, ARM_SERVO_GAIN_X, ARM_SERVO_DEADZONE,
+    ARM_SERVO_RETRY_DEADZONE, ARM_SERVO_MAX_VEL,
+    ARM_SERVO_TIMEOUT_S, ARM_SERVO_RETRY_TIMEOUT_S, ARM_SERVO_SETTLE_HITS,
+    ARM_SERVO_SIGN_ARM, ARM_SERVO_SIGN_X, ARM_SERVO_ARM_START,
+    ARM_SERVO_ARM_MIN, ARM_SERVO_ARM_MAX, ARM_SERVO_HZ,
+    PICK_LOWER_Y_MM, PICK_SUCK_HAND_DEG, PICK_HOLD_S, PICK_LIFT_Y_MM,
+    PICK_BIN_ARM_DEG, PICK_RELEASE_Y_MM, PICK_RELEASE_HAND_DEG,
     _ts_str,
     LOG_PREFIX_TARGET4 as LOG_PREFIX,
 )
 
 
+def _color_from_track(track_res) -> Optional[str]:
+    """从 track 结果 final_frame.label 提球色 (ball_blue → "blue")。"""
+    ff = getattr(track_res, "final_frame", None)
+    label = getattr(ff, "label", None) if ff is not None else None
+    if label in BALL_LABELS:
+        return label.split("_", 1)[1]
+    return None
+
+
 def _pick_best_ball(balls: list) -> Optional[dict]:
-    """从 fetch_balls 结果选 1 球: score 最高, 平局取第一个 (判色用)。"""
+    """从 fetch_balls 结果选 1 球: score 最高, 平局取第一个 (兜底判色用)。"""
     candidates = [b for b in balls if b.get("color") in (COLOR_BLUE, COLOR_YELLOW)]
     if not candidates:
         return None
     return max(candidates, key=lambda b: float(b.get("score", 0.0)))
 
 
-def _pick_by_arm_servo(
+def _run_arm_servo(http_client, label: str, **overrides) -> dict:
+    """调 runtime run_arm_servo (进程内闭环, 只动 x 十字 + 大臂)。
+
+    只动 x (十字) + 大臂; setpoint 走 ARM_SERVO_* 常量。
+    4s → 超时 → 加时 4s (总上限 8s) + 死区放大 1.5 倍 → 仍超时返回结果 (不抛)。
+    ⚠️ 重试从上一轮 end_arm 续跑 (不回起点, 否则大臂拉回初始丢已转角度, task2 同语义)。
+    """
+    kw = {
+        "label": label,
+        "setpoint_x_norm": float(ARM_SERVO_SETPOINT_CX),
+        "setpoint_y_norm": float(ARM_SERVO_SETPOINT_CY),
+        "gain_arm": float(ARM_SERVO_GAIN_ARM),
+        "gain_x": float(ARM_SERVO_GAIN_X),
+        "deadzone": float(ARM_SERVO_DEADZONE),
+        "max_vel": float(ARM_SERVO_MAX_VEL),
+        "servo_timeout": float(ARM_SERVO_TIMEOUT_S),
+        "settle_hits": int(ARM_SERVO_SETTLE_HITS),
+        "sign_arm": float(ARM_SERVO_SIGN_ARM),
+        "sign_x": float(ARM_SERVO_SIGN_X),
+        "arm_start": float(ARM_SERVO_ARM_START),
+        "arm_min": float(ARM_SERVO_ARM_MIN),
+        "arm_max": float(ARM_SERVO_ARM_MAX),
+        "hz": float(ARM_SERVO_HZ),
+    }
+    kw.update(overrides)
+
+    def _call_once(tag: str) -> dict:
+        job = http_client.execute(
+            "car", "run_arm_servo", kwargs=kw, sync=True,
+            timeout=float(kw["servo_timeout"]) + 15.0,
+        )
+        result = (job or {}).get("result") if isinstance(job, dict) else None
+        result = result if isinstance(result, dict) else {}
+        print(f"  [{LOG_PREFIX}] [{_ts_str()}] 臂伺服{tag}结果: "
+              f"reason={result.get('reason')} settled={result.get('settled')} "
+              f"trace_hits={result.get('trace_hits')} end_arm={result.get('end_arm')}")
+        return result
+
+    result = _call_once("")
+    if (not result.get("settled")) and result.get("reason") == "timeout":
+        print(f"  [{LOG_PREFIX}] 臂伺服超时, 加时 {ARM_SERVO_RETRY_TIMEOUT_S:.0f}s "
+              f"死区 {ARM_SERVO_DEADZONE:.3f}→{ARM_SERVO_RETRY_DEADZONE:.3f} "
+              f"(总上限 {ARM_SERVO_TIMEOUT_S + ARM_SERVO_RETRY_TIMEOUT_S:.0f}s)")
+        kw["deadzone"] = float(ARM_SERVO_RETRY_DEADZONE)
+        kw["servo_timeout"] = float(ARM_SERVO_RETRY_TIMEOUT_S)
+        if result.get("end_arm") is not None:
+            kw["arm_start"] = float(result["end_arm"])  # 从当前大臂角度续跑, 不回起点
+        result = _call_once("重试")
+    return result
+
+
+def _servo_and_pick(
+    arm_client,
+    http_client,
     runner: ArmRunner,
     *,
     color: str,
-    servo_x_start_mm: float,
-    servo_y_start_mm: float = TASK4_SERVO_Y_START_MM,
-    servo_arm_start_deg: float = 90.0,
-    servo_hand_start_deg: float = TASK4_POSE_P_HAND_DEG,
-    grasp_y_mm: float = Y_PICK_MM,
-    setpoint_x_norm: float = TASK4_SETPOINT_X_NORM,
-    setpoint_y_norm: float = TASK4_SETPOINT_Y_NORM,
+    bin_x: Optional[float] = None,
+    release_hand: Optional[float] = None,
+    dry_run: bool = False,
 ) -> dict:
-    """机械臂智能抓取 (2026-08-10, 替换底盘对齐——底盘打滑不准)。
+    """机械臂视觉伺服 → 对齐后保持姿势 → 盲降抓球 → 放 bin。
 
-    走 runner.track_velocity_pick (velocity 模式, 免 arm_queue):
-      - find_target_arm_cross: dx=cx-setpoint_x → 大臂, dy=cy-setpoint_y → x 十字
-        (y 十字锁 0, hand 固定) —— 用户拍板"大臂 + x 轴, y 不动"。
-      - 高位伺服 (y=servo_y_start) 收敛后 → y 盲降 grasp_y_mm → 吸气。
-        (lift_back=False 不抬回; 抬高交给中转同步 composite_run)
-      - setpoint 硬编码 (TASK4_SETPOINT_*), 两种球同尺寸共用一份。
-
-    Returns:
-        {"ok": bool, "error": str|None, "result": dict|None}
+    伺服: run_arm_servo (只动 x + 大臂), 超时也照样盲抓 (2026-08-11 用户)。
+    抓放序列 (保持伺服后姿势):
+      1. y→PICK_LOWER_Y 盲降  2. 吸气  3. 保持 PICK_HOLD_S
+      4. y→PICK_LIFT_Y 抬升   5. x→bin_x 且 arm→PICK_BIN_ARM 回 +95
+      6. y→PICK_RELEASE_Y + hand→放球角  7. 放气
     """
     label = f"ball_{color}"
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] 🎯 臂伺服智能抓取 "
-          f"(label={label}, 大臂+x轴, setpoint=({setpoint_x_norm:.3f},"
-          f"{setpoint_y_norm:.3f}), y_start={servo_y_start_mm:.0f} -> "
-          f"盲降 {grasp_y_mm:.0f})")
-    result = runner.track_velocity_pick(
-        label,
-        x_start=servo_x_start_mm,
-        y_start=servo_y_start_mm,
-        arm_start=servo_arm_start_deg,
-        hand_start=servo_hand_start_deg,
-        grasp_y_mm=grasp_y_mm,
-        descend_hand_deg=TASK4_SERVO_DESCEND_HAND_DEG,
-        setpoint_x_norm=setpoint_x_norm,
-        setpoint_y_norm=setpoint_y_norm,
-        gain_arm=TASK4_SERVO_GAIN_ARM,
-        gain_x=TASK4_SERVO_GAIN_X,
-        deadzone=TASK4_SERVO_DEADZONE,
-        max_vel=TASK4_SERVO_MAX_VEL,
-        hz=TASK4_SERVO_HZ,
-        settle_hits=TASK4_SERVO_SETTLE_HITS,
-        timeout=TASK4_SERVO_TIMEOUT_S,
-        arm_min=TASK4_SERVO_ARM_MIN,
-        arm_max=TASK4_SERVO_ARM_MAX,
-        sign_arm=TASK4_SERVO_SIGN_ARM,
-        sign_x=TASK4_SERVO_SIGN_X,
-        mode="pick",
-        lock_first=True,
-        # 抓取后不自动抬回 y_start 高位: 由 _pick_and_store 的中转同步 composite_run
-        # (x=transit_x, y=transit_y) 一步抬高到中转位 (用户拍板 2026-08-10)。
-        lift_back=False,
-        # 盲降抓球时 x 后缩 +30mm (setpoint=(0,0) 对齐画面中心后补偿球位置)。
-        grasp_x_offset_mm=TASK4_GRASP_X_OFFSET_MM,
-        # P 姿态 x=-295mm 靠近 runtime 下限 -300mm，负向 x_vel 会被限幅为 0。
-        # 进入视觉循环前先摆到 X_PICK_MM=-240mm，给 x 轴双向调节余量。
-        skip_pose_align=False,
-    )
-    if not result.get("ok"):
-        return {"ok": False,
-                "error": f"臂伺服抓取未收敛 (reason={result.get('reason')}, "
-                         f"trace_hits={result.get('trace_hits')})",
-                "result": result}
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] ✅ 臂伺服收敛并抓到 {color} 球")
-    return {"ok": True, "error": None, "result": result}
+    bin_x = float(bin_x) if bin_x is not None else BIN_X_MM.get(color, 0.0)
+    release_hand = (float(release_hand) if release_hand is not None
+                    else BIN_HAND_DEG.get(color, PICK_RELEASE_HAND_DEG))
 
+    # ---- 1. 机械臂视觉伺服 ----
+    if dry_run:
+        print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过臂伺服 (label={label})")
+    else:
+        try:
+            servo = _run_arm_servo(http_client, label)
+            print(f"  [{LOG_PREFIX}] 臂伺服结束: settled={servo.get('settled')} "
+                  f"reason={servo.get('reason')}")
+        except Exception as e:
+            print(f"  [{LOG_PREFIX}] ⚠️ 臂伺服异常 "
+                  f"({type(e).__name__}: {str(e)[:100]}), 照样盲抓")
 
-def _pick_and_store(
-    arm_client,
-    runner: ArmRunner,
-    *,
-    color: str,
-    pick_y_mm: float = Y_PICK_MM,  # 盲降抓球目标 y (臂伺服 grasp_y)
-    transit_x_mm: float = X_TRANSIT_MM,
-    transit_y_mm: float = Y_TRANSIT_MM,  # 中转 y (与中转 x 同步抬高, 用户拍板 -130)
-    bin_x_mm: Optional[float] = None,  # None → 按 color 查 BIN_X_MM
-    bin_y_mm: float = Y_PUT_MM,
-    bin_hand_deg: float = TASK4_POSE_P_HAND_DEG,
-    # ---- 臂伺服 pick 参数 (默认走 constants / pose_p) ----
-    servo_x_start_mm: float = X_PICK_MM,
-    servo_y_start_mm: float = TASK4_SERVO_Y_START_MM,
-    servo_arm_start_deg: float = 90.0,
-    servo_hand_start_deg: float = TASK4_POSE_P_HAND_DEG,
-    setpoint_x_norm: float = TASK4_SETPOINT_X_NORM,
-    setpoint_y_norm: float = TASK4_SETPOINT_Y_NORM,
-) -> dict:
-    """机械臂智能抓取 + 同步放 bin。
+    if ALIGN_ONLY:
+        print(f"  [{LOG_PREFIX}] [ALIGN_ONLY] 伺服完成, 不抓取")
+        return {"ok": False, "error": "align_only", "release_thread": None}
 
-    流程 (同步, 无 sleep):
-      0. 臂伺服智能抓取: 大臂+x 轴对齐 → 高位收敛 → y 盲降 pick_y → 吸气 (不抬回)
-      1. composite_run x=transit_x, y=transit_y   中转同步抬高+横移 (用户拍板)
-      2. composite_run x=bin_x, arm=+90           横移到 bin 上方 (显式锁大臂)
-      3. composite_run y=bin_y, hand=bin_hand, arm=+90  降到放仓位 (显式锁大臂)
-      4. grasp(False)                             放气
-
-    Returns:
-        {"ok": bool, "error": str|None, "release_thread": None}
-    """
-    if bin_x_mm is None:
-        bin_x_mm = BIN_X_MM[color]  # 未显式传 → 按颜色查 bin 列
-
-    # 0. 机械臂智能抓取 (替换旧底盘对齐 + 盲降)
-    pick = _pick_by_arm_servo(
-        runner,
-        color=color,
-        servo_x_start_mm=servo_x_start_mm,
-        servo_y_start_mm=servo_y_start_mm,
-        servo_arm_start_deg=servo_arm_start_deg,
-        servo_hand_start_deg=servo_hand_start_deg,
-        grasp_y_mm=pick_y_mm,
-        setpoint_x_norm=setpoint_x_norm,
-        setpoint_y_norm=setpoint_y_norm,
-    )
-    if not pick["ok"]:
-        return {"ok": False, "error": pick["error"], "release_thread": None}
-
-    # 1. 中转 (x+y 同步: 抬高到 transit_y + 横移到 transit_x, 一次 composite_run。
-    #    用户拍板 2026-08-10: 抓取后不抬回高位, 中转即抬高, 同步走)
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [1/4] composite_run(x={transit_x_mm:+.0f}, "
-          f"y={transit_y_mm:+.0f})  中转同步抬高+横移")
-    try:
-        arm_client.composite_run(x_mm=transit_x_mm, y_mm=transit_y_mm,
-                                 speed=80, timeout=30.0)
-    except Exception as e:
-        return {"ok": False,
-                "error": f"composite_run(x={transit_x_mm}, y={transit_y_mm}) 中转失败: "
-                         f"{type(e).__name__}: {str(e)[:120]}",
-                "release_thread": None}
-
-    # 2. 横移到 bin 上方 (中转 x=transit_x → bin_x_mm; 显式 arm=+90 锁定大臂)
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [2/4] composite_run(x={bin_x_mm:+.0f}, "
-          f"arm={TASK4_POSE_P_ARM_DEG:+.0f})  横移到 {color} bin 上方")
-    try:
-        arm_client.composite_run(x_mm=bin_x_mm, arm=TASK4_POSE_P_ARM_DEG,
-                                 speed=80, timeout=30.0)
-    except Exception as e:
-        return {"ok": False,
-                "error": f"composite_run(x={bin_x_mm}) 横移失败: "
-                         f"{type(e).__name__}: {str(e)[:120]}",
-                "release_thread": None}
-
-    # 3. 降到放仓位 (y=bin_y_mm, hand=bin_hand_deg; 显式 arm=+90 锁定大臂)
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [3/4] composite_run(y={bin_y_mm:+.0f}, "
-          f"hand={bin_hand_deg:+.0f}, arm={TASK4_POSE_P_ARM_DEG:+.0f})  降到放仓位")
-    try:
-        arm_client.composite_run(y_mm=bin_y_mm, hand=bin_hand_deg,
-                                 arm=TASK4_POSE_P_ARM_DEG,
-                                 speed=80, timeout=10.0)
-    except Exception as e:
-        return {"ok": False,
-                "error": f"composite_run(y={bin_y_mm}, hand={bin_hand_deg}) 降放仓位失败: "
-                         f"{type(e).__name__}: {str(e)[:120]}",
-                "release_thread": None}
-
-    # 4. 放气 (无 sleep, 直接让下一球 goto_pose_p 回 P 姿态)
-    print(f"  [{LOG_PREFIX}] [{_ts_str()}] [4/4] grasp(False)  放气 (无 sleep)")
-    try:
-        runner.grasp(False, timeout=5.0)
-    except Exception as e:
-        return {"ok": False,
-                "error": f"grasp(False) 失败: {type(e).__name__}: {str(e)[:120]}",
-                "release_thread": None}
-
+    # ---- 2. 抓放序列 (保持伺服后姿势, 每步只动指定轴) ----
+    steps = [
+        (f"盲降 y={PICK_LOWER_Y_MM:.0f} + hand→{PICK_SUCK_HAND_DEG:.0f}°",
+         lambda: arm_client.composite_run(y_mm=PICK_LOWER_Y_MM, hand=PICK_SUCK_HAND_DEG,
+                                          speed=80, timeout=10.0)),
+        ("吸气", lambda: runner.grasp(True, timeout=5.0)),
+        (f"保持 {PICK_HOLD_S:.1f}s", lambda: time.sleep(PICK_HOLD_S)),
+        (f"抬升 y={PICK_LIFT_Y_MM:.0f}",
+         lambda: arm_client.composite_run(y_mm=PICK_LIFT_Y_MM, speed=80, timeout=10.0)),
+        (f"横移 bin x={bin_x:.0f} + 大臂回 {PICK_BIN_ARM_DEG:.0f}",
+         lambda: arm_client.composite_run(x_mm=bin_x, arm=PICK_BIN_ARM_DEG,
+                                          speed=80, timeout=20.0)),
+        (f"放球 y={PICK_RELEASE_Y_MM:.0f} + hand={release_hand:.0f}",
+         lambda: arm_client.composite_run(y_mm=PICK_RELEASE_Y_MM, hand=release_hand,
+                                          speed=80, timeout=10.0)),
+        ("放气", lambda: runner.grasp(False, timeout=5.0)),
+    ]
+    for i, (desc, action) in enumerate(steps, 1):
+        if dry_run:
+            print(f"  [{LOG_PREFIX}] [DRY-RUN] [{i}/7] {desc}")
+            continue
+        print(f"  [{LOG_PREFIX}] [{_ts_str()}] [{i}/7] {desc}")
+        try:
+            action()
+        except Exception as e:
+            return {"ok": False,
+                    "error": f"{desc} 失败: {type(e).__name__}: {str(e)[:120]}",
+                    "release_thread": None}
     return {"ok": True, "error": None, "release_thread": None}

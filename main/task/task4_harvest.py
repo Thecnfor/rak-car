@@ -23,14 +23,12 @@ def run(client: Optional[RuntimeApiClient] = None, **kwargs: Any) -> Dict[str, A
     runner = ArmRunner(arm)
 
     from main.arm.each_task.task4.target4 import step_target4
-    # step_target4 的预算参数已于 2026-08-10 冻结为 constants 默认值, 不再接收
-    # max_picks/creep_speed_mps/max_creep_m/max_seconds; 透传时必须
-    # 过滤掉这些键 (CLI --max-picks 等已是 no-op), 否则全量 **kwargs 会 TypeError。
+    # 2026-08-11 新版流程: 预算/抓取参数已冻结为 constants 默认值; 只透传
+    # 初始姿势 + bin 坐标/放球角 (可覆盖), 其余键过滤掉避免 TypeError。
     _ALLOWED = {
         "defer_task5_handoff", "dry_run",
         "pose_p_y_mm", "pose_p_x_mm", "pose_p_arm_deg", "pose_p_hand_deg",
-        "pick_y_mm", "transit_x_mm",
-        "bin_x_blue_mm", "bin_x_yellow_mm", "bin_y_blue_mm", "bin_y_yellow_mm",
+        "bin_x_blue_mm", "bin_x_yellow_mm",
         "bin_hand_blue_deg", "bin_hand_yellow_deg",
     }
     detail = step_target4(
