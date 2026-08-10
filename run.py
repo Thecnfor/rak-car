@@ -102,7 +102,7 @@ def main() -> None:
     )
     p.add_argument(
         "--direct", action="store_true",
-        help="任务1/4直接在本进程调用MyCar，不经过HTTP/WS网络栈。",
+        help="任务1/2/4直接在本进程调用MyCar，不经过HTTP/WS网络栈。",
     )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
@@ -111,8 +111,8 @@ def main() -> None:
         probe_keys()
         return
     if args.direct:
-        if args.task not in {"1", "4"}:
-            sys.stderr.write("--direct 目前只支持 --task 1 或 --task 4\n")
+        if args.task not in {"1", "2", "4"}:
+            sys.stderr.write("--direct 目前只支持 --task 1, 2 或 4\n")
             sys.exit(2)
         from runtime.services.my_car import MyCar
         car = MyCar()
@@ -120,6 +120,9 @@ def main() -> None:
             if args.task == "1":
                 from runtime.services.task1_runner import run_task1
                 result = run_task1(car)
+            elif args.task == "2":
+                from runtime.services.task2_runner import run_task2
+                result = run_task2(car)
             else:
                 from runtime.tasks.task4_direct import Task4Direct
                 result = Task4Direct(car).run()
@@ -129,10 +132,15 @@ def main() -> None:
         finally:
             car.close()
         return
-    if args.task in {"1", "4"}:
+    if args.task in {"1", "2", "4"}:
         client = RuntimeApiClient()
-        action = "run_task1" if args.task == "1" else "run_task4"
-        result = client.execute_car_action(action, timeout=180.0, sync=True)
+        if args.task == "1":
+            action = "run_task1"
+        elif args.task == "2":
+            action = "run_task2"
+        else:
+            action = "run_task4"
+        result = client.execute_car_action(action, timeout=240.0, sync=True)
         print(result)
         if isinstance(result, dict):
             payload = result.get("result", result)
