@@ -3,6 +3,9 @@
 # 2026-07-16 重构：删 TASK_ACTION_NAMES 与 get_task_actions。
 # 任务逻辑（自动播种/灌溉/收割/订单）由 main/ 业务层用 CAR_ACTIONS/ARM_ACTIONS 编排，
 # runtime 只暴露底层 action 接口，不再负责"任务"。
+# 2026-08-10: 新增 run_task1 — runtime 层 task1 核心逻辑，进程内直调跳过网络栈。
+
+from runtime.services.task1_runner import run_task1
 
 CAR_ACTIONS = {
     "beep": lambda car, *args, **kwargs: car.beep(),
@@ -58,6 +61,9 @@ CAR_ACTIONS = {
     "run_arm_servo": lambda car, *args, **kwargs: car.run_arm_servo(**kwargs),
     # 2026-08-08: 一鍵啟動 —— 讀 MC602 板上鍵（BoardKey）。純新增，供 run.py --wait-key 輪詢。
     "read_key": lambda car, *args, **kwargs: car.read_key(),
+    # 2026-08-10: runtime 层 task1 主入口，进程内直调跳过网络栈。
+    # 等价于 main/task/task1_seeding.run()，但所有 arm/car 调用走 SDK 方法。
+    "run_task1": lambda car, *args, **kwargs: run_task1(car),
 }
 
 
