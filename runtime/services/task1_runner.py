@@ -205,7 +205,7 @@ def _switch_to_place_pose(
         arm.move_y_position(float(PLACE_Y_MM) / 1000.0)
     logger.info("  切 PLACE 姿态: arm=%.1f° x=%.1fmm y=%.1fmm hand=%.1f°",
                 arm_deg, x_mm, PLACE_Y_MM, hand_deg)
-    result = car.composite_run(
+    result = arm.composite_run(
         arm=float(arm_deg),
         x=float(x_mm) / 1000.0,
         y=float(PLACE_Y_MM) / 1000.0,
@@ -218,7 +218,8 @@ def _switch_to_place_pose(
 
 def _switch_to_s_pose(car, arm_deg: float, x_mm: float, hand_deg: float, y_mm: float) -> bool:
     """切到 S 姿态。"""
-    result = car.composite_run(
+    arm = getattr(car, "arm", None)
+    result = arm.composite_run(
         arm=float(arm_deg),
         x=float(x_mm) / 1000.0,
         y=float(y_mm) / 1000.0,
@@ -231,8 +232,9 @@ def _switch_to_s_pose(car, arm_deg: float, x_mm: float, hand_deg: float, y_mm: f
 
 def _return_to_source_pose(car, cfg: Dict[str, Any]) -> None:
     """防碰撞归位。"""
+    arm = getattr(car, "arm", None)
     ret = cfg.get("arm_return_S1_pose", {})
-    car.composite_run(
+    arm.composite_run(
         arm=float(ret.get("arm_angle_deg", -90.0)),
         x=float(ret.get("x_mm", -100.0)) / 1000.0,
         y=float(ret.get("y_mm", -100.0)) / 1000.0,
@@ -263,7 +265,7 @@ def _init_step0_trigger_lane_arm(car, cfg: Dict[str, Any]) -> bool:
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_lane = ex.submit(car.lane_dis, lane_m, lane_vx)
         f_arm = ex.submit(
-            car.composite_run,
+            arm.composite_run,
             arm=PLACE_ARM_DEG,
             x=float(PLACE_ALIGN_X_MM) / 1000.0,
             y=float(PLACE_Y_MM) / 1000.0,
@@ -377,7 +379,7 @@ def _init_step2_s_pose(car, cfg: Dict[str, Any], init_y_mm: float) -> None:
     logger.info("init step2: S 姿态 arm=%s° hand=%s° X=%smm Y=%smm",
                 pick.get("arm_angle_deg"), PICK_START_HAND_DEG,
                 pick.get("x_mm"), S_POSE_Y_MM)
-    car.composite_run(
+    arm.composite_run(
         arm=float(pick.get("arm_angle_deg", -90.0)),
         x=float(pick.get("x_mm", -70.0)) / 1000.0,
         y=float(init_y_mm) / 1000.0,
@@ -488,11 +490,10 @@ def _pick_at_source(
 
     # 对齐完成 → y 降 0 → grasp → 抬回
     logger.info("  视觉对齐完成，执行抓取")
-    arm = getattr(car, "arm", None)
     try:
-        car.composite_run(y=0.0, speed=100, timeout=5.0)
+        arm.composite_run(y=0.0, speed=100, timeout=5.0)
         arm.grasp(True)
-        car.composite_run(y=float(init_y_mm) / 1000.0, speed=100, timeout=5.0)
+        arm.composite_run(y=float(init_y_mm) / 1000.0, speed=100, timeout=5.0)
     except Exception as exc:
         raise RuntimeError(f"抓取动作失败: {exc}") from exc
 
@@ -595,15 +596,16 @@ def run_task1(car) -> dict:
             slot_idx = int(target_slot_map.get(label, 1))
             target_t = SLOT_POSITIONS_M.get(slot_idx, 0.0)
 
+            arm = getattr(car, "arm", None)
             st = _read_arm_state(car)
             if st["y_mm"] > CHASSIS_CONCURRENT_Y_THRESHOLD_MM:
-                car.composite_run(y=float(S_POSE_Y_MM) / 1000.0, speed=100, timeout=5.0)
+                arm.composite_run(y=float(S_POSE_Y_MM) / 1000.0, speed=100, timeout=5.0)
 
             logger.info("  → T%d (label=%s) 全并发", slot_idx, label)
             with ThreadPoolExecutor(max_workers=2) as ex:
                 f_chassis = ex.submit(_chassis_goto, car, target_t, pos_along, chassis_move_timeout)
                 f_arm = ex.submit(
-                    car.composite_run,
+                    arm.composite_run,
                     arm=place_arm_deg,
                     x=float(place_x_mm) / 1000.0,
                     y=float(PLACE_Y_MM) / 1000.0,
@@ -617,7 +619,6 @@ def run_task1(car) -> dict:
             # (4) 放苗：y→-20 + grasp(False) + y→-40 抬离
             logger.info("[T%d] place: y→%d + grasp(False) + y→%d",
                         slot_idx, PLACE_DESCEND_MM, PLACE_LIFT_MM)
-            arm = getattr(car, "arm", None)
             arm.move_y_position(float(PLACE_DESCEND_MM) / 1000.0)
             arm.grasp(False)
             arm.move_y_position(float(PLACE_LIFT_MM) / 1000.0)
