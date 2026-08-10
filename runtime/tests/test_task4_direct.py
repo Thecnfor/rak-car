@@ -8,6 +8,10 @@ class FakeArm:
     def __init__(self):
         self.calls = []
 
+    def composite_run(self, **kwargs):
+        self.calls.append(("composite", kwargs))
+        return {"ok": True}
+
     def move_y_position(self, value):
         self.calls.append(("y", value))
 
@@ -48,7 +52,7 @@ class TestTask4Direct(unittest.TestCase):
     def test_no_target_exits_after_distance_budget(self):
         car = FakeCar()
         result = Task4Direct(car, creep_m=0.25).run()
-        self.assertEqual(result["reason"], "search_distance_exhausted")
+        self.assertEqual(result["reason"], "distance_exhausted")
         self.assertFalse(result["ok"])
         self.assertEqual(car.moves[-1], ([0.0, 0.0, 0.0], True))
 
