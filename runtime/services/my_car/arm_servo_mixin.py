@@ -208,3 +208,112 @@ class ArmServoMixin:
             "end_arm": arm_target,
             "end_x": end_x,
         }
+
+    def replay_arm_trajectory(
+        self,
+        *,
+        route: list,
+        hz: float = 30.0,
+        kp_position: float = 0.1,
+        max_speed_scale: float = 1.0,
+        home_after: bool = False,
+        **plan_kw,
+    ) -> dict:
+        """进程内连续轨迹回放（计算下沉，无每帧网络往返）。
+
+        客户端只发**一次** route（姿态 JSON 列表，首尾 goal、中间 waypoint），
+        本方法在 runtime 进程内：scipy PCHIP 规划（`main.arm.planning`，纯计算，
+        运行时与 main 同机同进程，不存在每帧 HTTP）→ 绝对定位到轨迹起点 →
+        直调 arm.x_speed/y_speed + set_arm_angle/set_hand_angle 逐帧连续喂。
+        `kp_position` 用滑台编码器做比例位置修正，防速度模式漂移。
+
+        注：`main.arm.planning` 是纯计算模块（无硬件/网络依赖），runtime 惰性
+        import 它复用规划器（本地 transport 已跨包引用，属"计算下沉"既定方向）。
+        """
+        import time as _time
+
+        from main.arm.planning.joint_trajectory import (
+            JointPose, plan_joint_trajectory,
+        )
+
+        poses = [JointPose.from_mapping(p) for p in route]
+        if len(poses) < 2:
+            raise ValueError("route 至少需要 2 个姿态（首尾 goal）")
+        traj = plan_joint_trajectory(poses, max_speed_scale=max_speed_scale,
+                                     **plan_kw)
+
+        arm = self.arm
+        # 1. 绝对定位到轨迹起点（位置闭环，把相对速度喂送锚在正确原点）
+        s = poses[0]
+        arm.composite_run(arm=s.arm_deg, x=s.x_mm / 1000.0,
+                          y=s.y_mm / 1000.0, hand=s.hand_deg,
+                          speed=80, timeout=30.0)
+
+        # 2. 连续回放（实时采样：t 用真实流逝时间，速度=位移/真实dt）
+        tick = 1.0 / max(float(hz), 1.0)
+        T = traj.total_time
+        t0 = _time.monotonic()
+        prev = traj.sample(0.0)
+        prev_t = 0.0
+        try:
+            while True:
+                try:
+                    if arm._must_stop():
+                        break
+                except Exception:
+                    pass
+                t = _time.monotonic() - t0
+                if t >= T:
+                    break
+                pose = traj.sample(t)
+                dt = t - prev_t
+                vx = (pose.x_mm - prev.x_mm) / dt if dt > 1e-6 else 0.0
+                vy = (pose.y_mm - prev.y_mm) / dt if dt > 1e-6 else 0.0
+                prev, prev_t = pose, t
+                # 滑台编码器位置修正（防速度模式漂移）
+                if kp_position > 0:
+                    try:
+                        ax = arm.x_get_position()
+                        ay = arm.y_get_position()
+                        if ax is not None:
+                            vx += kp_position * (pose.x_mm - float(ax) * 1000.0)
+                        if ay is not None:
+                            vy += kp_position * (pose.y_mm - float(ay) * 1000.0)
+                    except Exception:
+                        pass
+                try:
+                    arm.x_speed(vx / 1000.0)
+                    arm.y_speed(vy / 1000.0)
+                    arm.set_arm_angle(pose.arm_deg, speed=80)
+                    arm.set_hand_angle(pose.hand_deg, speed=80)
+                except Exception as exc:
+                    logger.warning("replay_arm_trajectory 下发异常: %s", exc)
+                _time.sleep(tick)
+        finally:
+            # 结束/异常必停滑台，收末姿态角度，恢复 arm_feed
+            try:
+                arm.x_speed(0.0)
+                arm.y_speed(0.0)
+                end = traj.sample(T)
+                arm.set_arm_angle(end.arm_deg, speed=80)
+                arm.set_hand_angle(end.hand_deg, speed=80)
+            except Exception:
+                pass
+            try:
+                self.start_arm_feed()
+            except Exception:
+                pass
+
+        if home_after:
+            try:
+                arm.composite_run(arm=90.0, hand=-90.0, y=-0.15, x=0.0,
+                                  speed=80, timeout=30.0)
+            except Exception:
+                pass
+
+        return {
+            "ok": True,
+            "T": T,
+            "elapsed_s": round(_time.monotonic() - t0, 2),
+            "end_pose": traj.sample(T).to_dict(),
+        }

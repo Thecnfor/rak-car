@@ -22,6 +22,7 @@
 """
 from __future__ import annotations
 
+import math
 import threading
 import time
 import uuid
@@ -402,6 +403,8 @@ class FakeCarRuntimeService:
             return {"key": None}
         elif name == "run_arm_servo":
             return self._run_arm_servo(args, kw)
+        elif name == "replay_arm_trajectory":
+            return self._replay_arm_trajectory(args, kw)
         self._sync_state()
         return {"ok": True, "state": self._snapshot()}
 
@@ -444,6 +447,52 @@ class FakeCarRuntimeService:
                              phase="physical_sample", state={"packets": packets})
         return {"ok": True, "reason": "settled", "trace_hits": len(detections),
                 "settled": True, "end_arm": self.sim.arm_state_mm()}
+
+    def _replay_arm_trajectory(self, args, kw):
+        """进程内连续轨迹回放（fake 版）：一次收 route，本地规划 + 逐帧喂。"""
+        import time
+
+        from main.arm.planning.joint_trajectory import (
+            JointPose, plan_joint_trajectory,
+        )
+
+        route = kw.get("route") or (args[0] if args else None)
+        if not route:
+            raise ValueError("replay_arm_trajectory 需要 route (姿态列表)")
+        poses = [JointPose.from_mapping(p) for p in route]
+        if len(poses) < 2:
+            raise ValueError("route 至少需要 2 个姿态（首尾 goal）")
+        traj = plan_joint_trajectory(
+            poses, max_speed_scale=float(kw.get("max_speed_scale", 1.0)))
+        hz = max(float(kw.get("hz", 30.0)), 1.0)
+        tick = 1.0 / hz
+        T = traj.total_time
+
+        # 1. 绝对定位到轨迹起点
+        s = poses[0]
+        self.sim.composite_move({"x_mm": s.x_mm, "y_mm": s.y_mm,
+                                 "arm_angle": s.arm_deg,
+                                 "hand_angle": s.hand_deg})
+        # 2. 连续回放（按节拍喂速度，set_arm_velocity 按墙钟积分）
+        prev = traj.sample(0.0)
+        n = max(1, int(math.ceil(T / tick)))
+        for i in range(1, n + 1):
+            t = min(T, i * tick)
+            pose = traj.sample(t)
+            vx = (pose.x_mm - prev.x_mm) / tick
+            vy = (pose.y_mm - prev.y_mm) / tick
+            prev = pose
+            self.set_arm_velocity(x_vel=vx / 1000.0, y_vel=vy / 1000.0,
+                                  arm_angle=pose.arm_deg,
+                                  hand_angle=pose.hand_deg)
+            time.sleep(tick)
+        # 3. 结束停速 + 末姿态
+        end = traj.sample(T)
+        self.set_arm_velocity(x_vel=0.0, y_vel=0.0,
+                              arm_angle=end.arm_deg, hand_angle=end.hand_deg)
+        self._sync_state()
+        return {"ok": True, "T": T, "end_pose": end.to_dict(),
+                "end_arm_state": self.sim.arm_state_mm()}
 
     # ---------------- 机械臂动作（全部路由到 FakeRobotSim） ----------------
 

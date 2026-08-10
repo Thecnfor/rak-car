@@ -62,6 +62,10 @@ CAR_ACTIONS = {
     # 2026-08-09: 进程内 arm 视觉伺服闭环 (task2 抓取下沉, main 只发目标参数,
     # 每帧读 task_feed 缓存 + 直调 arm, 无网络往返). 返回 {ok, reason, trace_hits, settled, end_arm}.
     "run_arm_servo": lambda car, *args, **kwargs: car.run_arm_servo(**kwargs),
+    # 2026-08-11: 进程内连续轨迹回放（计算下沉）——客户端只发一次姿态 JSON
+    # (route 列表, 首尾 goal / 中间 waypoint), runtime 内 scipy PCHIP 规划 +
+    # 直调 arm 逐帧连续喂, 无每帧网络往返。
+    "replay_arm_trajectory": lambda car, *args, **kwargs: car.replay_arm_trajectory(**kwargs),
     # 2026-08-08: 一鍵啟動 —— 讀 MC602 板上鍵（BoardKey）。純新增，供 run.py --wait-key 輪詢。
     "read_key": lambda car, *args, **kwargs: car.read_key(),
     # 2026-08-10: runtime 层 task1 主入口，进程内直调跳过网络栈。
