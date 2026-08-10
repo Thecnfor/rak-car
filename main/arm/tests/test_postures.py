@@ -75,5 +75,42 @@ class PostureLibraryTests(unittest.TestCase):
                              self.lib.pose(4, "pose_p"))
 
 
+class TeachJsonTests(unittest.TestCase):
+    """示教器导出 JSON（列表，首尾 goal，arm/hand 字段）→ JointPose。"""
+
+    def test_load_teach_json_list_with_arm_hand_fields(self):
+        import json
+        from main.arm.postures import load_teach_json
+        from main.arm.planning import plan_joint_trajectory
+
+        data = [
+            {"name": "pose_1", "x_mm": -223.7, "y_mm": -150.1,
+             "arm": 90, "hand": -10, "ts": 123},
+            {"name": "pose_2", "x_mm": -98.2, "y_mm": -60.3,
+             "arm": 24, "hand": -22, "ts": 456},
+            {"name": "pose_3", "x_mm": -87.7, "y_mm": -158.6,
+             "arm": -82, "hand": -22, "ts": 789},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "poses.json"
+            p.write_text(json.dumps(data), encoding="utf-8")
+            route = load_teach_json(str(p))
+        self.assertEqual(len(route), 3)
+        self.assertEqual(route[0].arm_deg, 90.0)   # arm → arm_deg 别名
+        self.assertEqual(route[2].hand_deg, -22.0)
+        # 首尾是 goal，中间是 waypoint → 直接规划成一条连续轨迹
+        traj = plan_joint_trajectory(route)
+        self.assertEqual(len(traj.legs), 1)
+        self.assertEqual(traj.sample(traj.total_time), route[-1])
+
+    def test_load_teach_json_rejects_non_list(self):
+        from main.arm.postures import load_teach_json
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "bad.json"
+            p.write_text('{"not": "a list"}', encoding="utf-8")
+            with self.assertRaises(ValueError):
+                load_teach_json(str(p))
+
+
 if __name__ == "__main__":
     unittest.main()

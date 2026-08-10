@@ -95,12 +95,12 @@ class JointPose:
 
     @classmethod
     def from_mapping(cls, m: dict, *, stop: bool = False) -> "JointPose":
-        """从姿势库 dict（字段可缺省）构造。"""
+        """从姿势 dict（字段可缺省）构造。兼容 arm_deg/hand_deg 与 arm/hand 别名。"""
         return cls(
             x_mm=float(m.get("x_mm", 0.0)),
             y_mm=float(m.get("y_mm", 0.0)),
-            arm_deg=float(m.get("arm_deg", m.get("arm_angle_deg", 0.0))),
-            hand_deg=float(m.get("hand_deg", m.get("hand_angle_deg", 0.0))),
+            arm_deg=float(m.get("arm_deg", m.get("arm_angle_deg", m.get("arm", 0.0)))),
+            hand_deg=float(m.get("hand_deg", m.get("hand_angle_deg", m.get("hand", 0.0)))),
             stop=bool(m.get("stop", stop)),
         )
 
