@@ -262,22 +262,30 @@ PICK_LIFT_Y_MM: float = -150.0
 """吸住后抬升 y (mm)。"""
 PICK_BIN_ARM_DEG: float = 95.0
 """放 bin 时大臂回的角度 (跟 x 轴一起转)。"""
-PICK_RELEASE_Y_MM: float = -140.0
-"""放球 y (mm)。"""
+PICK_RELEASE_Y_MM: float = -130.0
+"""放球 y (mm)。2026-08-11 用户: -140 → -130。"""
 PICK_RELEASE_HAND_DEG: float = 10.0
 """放球手爪角 (蓝/黄都 10, 原值, 不跟 P hand)。"""
 
 # ---- 后续球扫描 ----
-SCAN_ADVANCE_M: float = 0.10
-"""每抓完一颗 move_for 前进距离 (m)。2026-08-11 用户: 0.15 → 0.10。"""
+SCAN_ADVANCE_M: float = 0.08
+"""每抓完一颗沿车道线前进距离 (m)。2026-08-11 用户: 0.10 → 0.08, 且改用 lane_follow。"""
 SCAN_LOOK_S: float = 3.0
 """每停一站找球上限 (s)。"""
-SCAN_GRAB_CX_HALF: float = 0.2
-"""可抓窗口: |cx - ARM_SERVO_SETPOINT_CX| ≤ 此值才尝试抓 (窗口外=下一轮的球, 继续前进)。"""
+SCAN_GRAB_CX_HALF: float = 0.4
+"""可抓窗口半宽 (前段): |cx - ARM_SERVO_SETPOINT_CX| ≤ 此值才尝试抓。
+2026-08-11 用户: 0.2 → 0.4 (实车连续"未见可抓球"空轮, 放宽)。"""
+SCAN_GRAB_CX_HALF_LATE: float = 0.6
+"""可抓窗口半宽 (后段, 前 SCAN_GRAB_TIER_ADVANCES 次前进之后用): 放宽到 0.6
+(2026-08-11 用户: 梯度窗口 —— 前段球正用窄窗精确, 后段球散布宽用大窗多抓)。"""
+SCAN_GRAB_TIER_ADVANCES: int = 4
+"""前 N 次前进用 SCAN_GRAB_CX_HALF (窄窗), 之后的用 SCAN_GRAB_CX_HALF_LATE (宽窗)。"""
 SCAN_MAX_PICKS: int = 8
-"""整场最多抓球数 (前进 7 次的名义路径)。"""
-SCAN_IR_FAR_M: float = 0.75
-"""左 IR > 此值视为离区 → 退出。"""
+"""DRY-RUN 专用抓球数封顶 (占位球抓满即停, 防空转); 实车不封顶 (2026-08-11 用户)。"""
+MIN_SCAN_ADVANCES: int = 7
+"""扫描退出门槛: 至少前进这么多轮后, 才允许按"连续无球"条件退出 (2026-08-11 用户)。"""
+SCAN_EMPTY_ROUNDS: int = 2
+"""连续找球为空轮数达到此值 → 判定采区扫完收工 (2026-08-11 用户, 不依赖 IR)。"""
 
 # ---- 抓取 / 中转位姿 ----
 X_PICK_MM: float = -240.0

@@ -163,9 +163,13 @@ def _servo_and_pick(
             continue
         print(f"  [{LOG_PREFIX}] [{_ts_str()}] [{i}/7] {desc}")
         try:
-            action()
+            r = action()
         except Exception as e:
-            return {"ok": False,
-                    "error": f"{desc} 失败: {type(e).__name__}: {str(e)[:120]}",
-                    "release_thread": None}
+            err = f"{desc} 异常: {type(e).__name__}: {str(e)[:120]}"
+            print(f"  [{LOG_PREFIX}] ❌ [{i}/7] {err}")
+            return {"ok": False, "error": err, "release_thread": None}
+        if isinstance(r, dict) and r.get("ok") is False:
+            err = f"{desc} 返回 ok=False (steps={r.get('steps')})"
+            print(f"  [{LOG_PREFIX}] ❌ [{i}/7] {err}")
+            return {"ok": False, "error": err, "release_thread": None}
     return {"ok": True, "error": None, "release_thread": None}
