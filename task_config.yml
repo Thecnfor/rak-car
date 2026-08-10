@@ -272,7 +272,7 @@ task_cfg:
   post_task6:
     enabled: true
     straight_m: 0.63        # 直行距离 (m, move_for 里程计闭环, 2026-08-08: 0.2 → 0.63)
-    turn_deg: -120.0        # 顺时针 120° (度, OdomTurnPID)
+    turn_deg: -107.0        # 顺时针 120° (度, OdomTurnPID, 2026-08-10 急弯联调: -120 → -107)
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
 # 触发条件: IR (红外接近) + dis_at_least_m (累计里程计) AND/OR.
