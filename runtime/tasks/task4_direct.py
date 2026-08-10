@@ -8,7 +8,15 @@ from typing import Any, Dict, Optional
 
 
 class Task4Direct:
-    """用 MyCar 直接完成搜索、抓取和放置。"""
+    """用 MyCar 直接完成 task4 的最小抓取-放置循环。"""
+
+    P_POSE = {"x": -0.295, "y": -0.180, "arm": 90.0, "hand": 10.0}
+    PICK_Y_M = -0.065
+    TRANSIT_X_M = -0.220
+    BIN_POSE = {
+        "blue": {"x": 0.0, "y": -0.140, "hand": 10.0},
+        "yellow": {"x": -0.060, "y": -0.065, "hand": 10.0},
+    }
 
     def __init__(self, car: Any, *, max_seconds: float = 120.0,
                  creep_m: float = 0.8, creep_speed_mps: float = 0.12):
@@ -53,21 +61,41 @@ class Task4Direct:
         for detection in detections:
             if isinstance(detection, (list, tuple)) and len(detection) >= 8:
                 label = str(detection[2]).lower()
-                if label in {"ball", "crop", "fruit", "tomato"}:
+                if label in {"blue", "blue_ball", "yellow", "yellow_ball", "ball", "crop", "fruit", "tomato"}:
                     return detection
         return None
 
+    @staticmethod
+    def _color(target: list) -> str:
+        label = str(target[2]).lower()
+        return "yellow" if "yellow" in label else "blue"
+
+    def _composite(self, **kwargs) -> None:
+        result = self.car.arm.composite_run(**kwargs)
+        if isinstance(result, dict) and not result.get("ok", True):
+            raise RuntimeError("机械臂 composite_run 失败: %s" % result)
+
+    def _goto_p(self) -> None:
+        pose = self.P_POSE
+        self._composite(x=pose["x"], y=pose["y"], arm=pose["arm"], hand=pose["hand"],
+                        speed=80, timeout=30.0)
+
     def _pick_and_place(self, target: list) -> None:
-        label = target[2]
+        color = self._color(target)
         grasped = False
         try:
-            self.car.move_to_detection_target(label=label, time_out=2.0)
-            self.car.arm.move_y_position(-180)
-            self.car.arm.move_x_position(-30)
+            # 先用底盘/侧摄目标闭环完成一次对齐，再盲降抓取。
+            self.car.move_to_detection_target(label=target[2], time_out=2.0)
+            self._composite(y=self.PICK_Y_M, speed=80, timeout=15.0)
             self.car.arm.grasp(True)
             grasped = True
-            self.car.arm.move_y_position(0)
-            self.car.arm.move_x_position(0)
+            self._composite(y=self.P_POSE["y"], x=self.TRANSIT_X_M,
+                            speed=80, timeout=20.0)
+            bin_pose = self.BIN_POSE[color]
+            self._composite(x=bin_pose["x"], y=bin_pose["y"], hand=bin_pose["hand"],
+                            speed=80, timeout=20.0)
+            self.car.arm.grasp(False)
+            grasped = False
             self.picked += 1
         finally:
             if grasped:
@@ -78,21 +106,40 @@ class Task4Direct:
 
     def run(self) -> Dict[str, Any]:
         reason = "timeout"
+        triggered = False
         try:
+            # 先等任务触发，触发前不移动底盘，也不消耗 0.8m 任务距离。
             while time.monotonic() - self._start < self.max_seconds:
                 if self._stopped():
                     reason = "stopped"
                     break
-                target = self._target()
-                if target is not None and self._near_ir():
-                    self._pick_and_place(target)
-                    reason = "picked"
+                if self._near_ir():
+                    triggered = True
+                    break
+                time.sleep(0.05)
+            if not triggered:
+                return {"ok": False, "picked": self.picked, "reason": reason,
+                        "elapsed_s": time.monotonic() - self._start}
+
+            self._goto_p()
+            target_done = False
+            while time.monotonic() - self._start < self.max_seconds:
+                if self._stopped():
+                    reason = "stopped"
                     break
                 if self._walked() >= self.creep_m:
-                    reason = "search_distance_exhausted"
+                    reason = "distance_exhausted"
                     break
-                self.car.move_for([self.creep_speed_mps * 0.1, 0.0, 0.0], stop=False)
-                time.sleep(0.1)
+                target = self._target()
+                if target is not None and not target_done:
+                    self._pick_and_place(target)
+                    target_done = True
+                    reason = "picked"
+                else:
+                    self.car.move_for([self.creep_speed_mps * 0.1, 0.0, 0.0], stop=False)
+                    time.sleep(0.1)
+        except Exception as exc:
+            reason = "error:%s" % exc
         finally:
             self.car.move_for([0.0, 0.0, 0.0], stop=True)
         return {"ok": self.picked > 0, "picked": self.picked,
