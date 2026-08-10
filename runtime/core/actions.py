@@ -6,6 +6,7 @@
 # 2026-08-10: 新增 run_task1 — runtime 层 task1 核心逻辑，进程内直调跳过网络栈。
 
 from runtime.services.task1_runner import run_task1
+from runtime.tasks.task4_direct import run as run_task4
 
 CAR_ACTIONS = {
     "beep": lambda car, *args, **kwargs: car.beep(),
@@ -64,6 +65,8 @@ CAR_ACTIONS = {
     # 2026-08-10: runtime 层 task1 主入口，进程内直调跳过网络栈。
     # 等价于 main/task/task1_seeding.run()，但所有 arm/car 调用走 SDK 方法。
     "run_task1": lambda car, *args, **kwargs: run_task1(car),
+    # 2026-08-10: task4 也在 runtime 进程内执行，客户端只发 action。
+    "run_task4": lambda car, *args, **kwargs: run_task4(car, **kwargs),
 }
 
 

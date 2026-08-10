@@ -129,6 +129,16 @@ def main() -> None:
         finally:
             car.close()
         return
+    if args.task in {"1", "4"}:
+        client = RuntimeApiClient()
+        action = "run_task1" if args.task == "1" else "run_task4"
+        result = client.execute_car_action(action, timeout=180.0, sync=True)
+        print(result)
+        if isinstance(result, dict):
+            payload = result.get("result", result)
+            if isinstance(payload, dict) and not payload.get("ok", True):
+                sys.exit(1)
+        return
     orch = Orchestrator(lane_hz=args.lane_hz,
                         ir_interval_s=args.ir_interval_s)
     if args.wait_key:
