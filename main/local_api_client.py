@@ -122,6 +122,11 @@ class LocalRuntimeClient:
         return {"stopped": self.service.emergency_stop()}
 
     def close_runtime(self):
+        if getattr(self.service, "is_fake", False):
+            close = getattr(self.service, "close", None)
+            if close is not None:
+                close()
+            return {"closed": True}
         from runtime.services.local_runtime import shutdown_local_runtime
         shutdown_local_runtime()
         return {"closed": True}
@@ -267,6 +272,9 @@ def create_runtime_client(settings=None, transport=None):
     mode = (transport or os.getenv("RAK_CAR_TRANSPORT", "local")).lower()
     if mode == "local":
         return LocalRuntimeClient(settings=settings)
+    if mode == "fake":
+        from runtime.services.fake_runtime import FakeCarRuntimeService
+        return LocalRuntimeClient(service=FakeCarRuntimeService(), settings=settings)
     if mode == "http":
         from .api_client import RuntimeApiClient
         return RuntimeApiClient(settings=settings)
