@@ -29,6 +29,24 @@ class FakeRuntimeTests(unittest.TestCase):
         result = service.wait_job(submitted["job_id"], timeout=1.0)
         self.assertEqual(result["status"], "cancelled")
 
+    def test_chassis_align_no_target_then_settles(self):
+        service = FakeCarRuntimeService(action_delay=0.0)
+        # 无目标 → no_target
+        resp = service.chassis_align(target="h_tu_dou", setpoint_cxcy=[0.0, 0.0])
+        self.assertEqual(resp["result"]["reason"], "no_target")
+        self.assertFalse(resp["result"]["arrived"])
+        # 注入目标 → 对齐到 setpoint，记录 physical_sample 命令包
+        service.set_task_detections([{"label": "h_tu_dou", "cx": 0.02, "cy": -0.01,
+                                      "score": 0.9}])
+        resp2 = service.chassis_align(target="h_tu_dou", setpoint_cxcy=[0.0, 0.0])
+        self.assertTrue(resp2["result"]["arrived"])
+        self.assertTrue(resp2["result"]["final_frame"]["target_found"])
+        samples = service.recorder.matching(action="chassis_align",
+                                            phase="physical_sample")
+        self.assertTrue(samples)
+        self.assertEqual(samples[0].state["packets"][0]["name"],
+                         "set_chassis_velocity")
+
 
 if __name__ == "__main__":
     unittest.main()

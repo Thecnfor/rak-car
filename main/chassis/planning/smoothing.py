@@ -104,3 +104,85 @@ def plan_smooth_path(start: Pose2D, waypoints: Sequence[PathWaypoint],
     if points and (not samples or samples[-1].pose != goal):
         samples.append(PathSample(goal, arc, 0.0, min(max_speed_mps, goal.heading_rad * 0 + max_speed_mps), len(points) - 2))
     return SmoothPath(tuple(samples), tuple(waypoints))
+
+
+def load_waypoints_geometry(config_path: Optional[str] = None, *,
+                            spacing_m: float = 0.05,
+                            max_speed_mps: float = 0.2,
+                            max_curvature_inv_m: Optional[float] = None
+                            ) -> Tuple[list, dict]:
+    """从 task_config.yml（或自定义路径）的 waypoints 段解析几何路径配置。
+
+    只消费带几何坐标（``x_m``/``y_m``）的条目；纯任务触发条目（只有
+    ``ir_threshold_m``/``dis_at_least_m``/``task_id`` 等, 没有坐标）会被跳过——
+    保证旧的 mission-only YAML 向后兼容。每个几何条目可带:
+      heading_deg  期望航向（度；缺省 = 沿该段方向自动推导）
+      speed_mps    该点目标速度（缺省 = max_speed_mps）
+      stop         该点停车（速度压 0）
+
+    校验：有限坐标 / 有限 heading / 重复点 / spacing>0 / speed>=0。
+    返回 ``(waypoints, params)``:
+      waypoints — 校验过的 PathWaypoint 序列
+      params    — 解析后的几何参数 dict（spacing_m / max_speed_mps /
+                  max_curvature_inv_m），可直接传给 ``plan_smooth_path``。
+    """
+    import os
+    from pathlib import Path
+
+    params = {
+        "spacing_m": _finite(spacing_m, "spacing_m"),
+        "max_speed_mps": _finite(max_speed_mps, "max_speed_mps"),
+        "max_curvature_inv_m": (abs(_finite(max_curvature_inv_m, "max_curvature_inv_m"))
+                                if max_curvature_inv_m is not None else None),
+    }
+    if params["spacing_m"] <= 0 or params["max_speed_mps"] < 0:
+        raise ValueError("spacing_m must be > 0 and max_speed_mps must be >= 0")
+
+    # 定位配置文件：显式路径优先，否则仓库根目录默认 task_config.yml
+    if config_path:
+        path = Path(config_path).resolve()
+    else:
+        repo_root = Path(__file__).resolve().parents[3]
+        path = repo_root / "task_config.yml"
+    if not path.is_file():
+        raise FileNotFoundError(f"任务配置文件不存在: {path}")
+
+    try:
+        import yaml
+    except ModuleNotFoundError as exc:  # pragma: no cover
+        raise RuntimeError("缺少 PyYAML 依赖,请先执行: python3 -m pip install pyyaml") from exc
+    with path.open("r", encoding="utf-8") as f:
+        all_cfg = yaml.safe_load(f)
+    if not isinstance(all_cfg, dict):
+        raise ValueError(f"{path} 顶层必须是 mapping")
+    raw = all_cfg.get("waypoints")
+    if not isinstance(raw, list):
+        raise ValueError(f"{path} 里没有 waypoints 段 (或不是 list)")
+
+    waypoints = []
+    for index, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        x = entry.get("x_m")
+        y = entry.get("y_m")
+        if x is None or y is None:
+            continue  # 任务触发条目, 无几何坐标 —— 跳过
+        x = _finite(x, f"waypoints[{index}].x_m")
+        y = _finite(y, f"waypoints[{index}].y_m")
+        heading_rad = None
+        if entry.get("heading_deg") is not None:
+            heading_rad = math.radians(_finite(
+                entry["heading_deg"], f"waypoints[{index}].heading_deg"))
+        speed = entry.get("speed_mps")
+        if speed is not None:
+            speed = _finite(speed, f"waypoints[{index}].speed_mps")
+            if speed < 0:
+                raise ValueError("speed_mps must be >= 0")
+        waypoints.append(PathWaypoint(
+            x_m=x, y_m=y, heading_rad=heading_rad, speed_mps=speed,
+            stop=bool(entry.get("stop", False)),
+        ))
+        if len(waypoints) > 1 and (waypoints[-2].x_m == x and waypoints[-2].y_m == y):
+            raise ValueError(f"duplicate waypoint at index {index}")
+
+    return waypoints, params

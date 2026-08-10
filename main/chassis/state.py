@@ -64,15 +64,16 @@ class LaneState:
 
     @classmethod
     def from_lane_state_payload(cls, payload: dict, now: Optional[float] = None) -> "LaneState":
+        inner = _unwrap(payload, "lane_state")
         return cls(
-            error_y=payload.get("error_y"),
-            error_angle=payload.get("error_angle"),
-            forward=payload.get("forward_speed"),
-            lateral=payload.get("lateral_speed"),
-            angular=payload.get("angular_speed"),
-            distance=payload.get("distance"),
-            mode=payload.get("mode"),
-            age_ms=_age_ms_from(payload.get("updated_at"), now=now),
+            error_y=inner.get("error_y"),
+            error_angle=inner.get("error_angle"),
+            forward=inner.get("forward_speed"),
+            lateral=inner.get("lateral_speed"),
+            angular=inner.get("angular_speed"),
+            distance=inner.get("distance"),
+            mode=inner.get("mode"),
+            age_ms=_age_ms_from(inner.get("updated_at"), now=now),
         )
 
     @property

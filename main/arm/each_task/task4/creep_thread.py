@@ -15,8 +15,66 @@ from . import target2  # noqa: E402
 from .constants import (  # noqa: E402
     COLOR_BLUE, COLOR_YELLOW,
     CREEP_POLL_HZ, CREEP_MAX_SECONDS_S, CREEP_STOP_CX_MAX,
+    IR_FAR_THRESHOLD_M, IR_FAR_CONFIRM_FRAMES, POST_IR_LOSS_DISTANCE_M,
     LOG_PREFIX_TARGET4 as LOG_PREFIX,
 )
+
+
+class _Task4SearchState:
+    """跨每一球保存 task4 的 IR 生命周期和末端 0.3m 记账（纯逻辑，锁保护）。
+
+    2026-08-10 拆分回归修复: 拆分把本类从 target4.py 迁出时定义丢了
+    （constants 里 IR_FAR_* / POST_IR_LOSS_DISTANCE_M 一并丢失），
+    导致 `target4` 模块级 `from ...creep_thread import _Task4SearchState`
+    直接 ImportError。按拆分前 commit 40e9fcd 原样恢复，常量移入 constants.py。
+    """
+
+    def __init__(self, *, ir_started: bool = True,
+                 far_threshold_m: float = IR_FAR_THRESHOLD_M,
+                 far_confirm_frames: int = IR_FAR_CONFIRM_FRAMES):
+        import threading
+        self.ir_started = bool(ir_started)
+        self.far_threshold_m = float(far_threshold_m)
+        self.far_confirm_frames = max(1, int(far_confirm_frames))
+        self.ir_lost = False
+        self.far_streak = 0
+        self.post_loss_distance_m = 0.0
+        self._pending_far_distance_m = 0.0
+        self.finished_by_ir_odom = False
+        self._lock = threading.Lock()
+
+    def update_ir(self, left_ir, *, distance_m: float = 0.0) -> bool:
+        """更新左 IR；连续远读数锁存为 IR 丢失并吸收确认期间位移。"""
+        with self._lock:
+            if self.ir_lost or not self.ir_started:
+                return self.ir_lost
+            try:
+                far = float(left_ir) > self.far_threshold_m
+            except (TypeError, ValueError):
+                far = False
+            if far:
+                self.far_streak += 1
+                self._pending_far_distance_m += max(0.0, float(distance_m))
+                if self.far_streak >= self.far_confirm_frames:
+                    self.ir_lost = True
+                    self.post_loss_distance_m += self._pending_far_distance_m
+                    self._pending_far_distance_m = 0.0
+                    if self.post_loss_distance_m >= POST_IR_LOSS_DISTANCE_M:
+                        self.finished_by_ir_odom = True
+            else:
+                self.far_streak = 0
+                self._pending_far_distance_m = 0.0
+            return self.ir_lost
+
+    def add_post_loss_distance(self, delta_m: float) -> bool:
+        """累计 IR 丢失后的位移，并返回是否达到 0.30m。"""
+        with self._lock:
+            if not self.ir_lost or self.finished_by_ir_odom:
+                return self.finished_by_ir_odom
+            self.post_loss_distance_m += max(0.0, float(delta_m))
+            if self.post_loss_distance_m >= POST_IR_LOSS_DISTANCE_M:
+                self.finished_by_ir_odom = True
+            return self.finished_by_ir_odom
 
 
 def _left_half_balls(balls: list[dict]) -> list[dict]:
@@ -36,12 +94,15 @@ def _left_half_balls(balls: list[dict]) -> list[dict]:
 class _CreepThread:
     """后台线程保底盘前移 + 主线程摆臂。"""
 
-    def __init__(self, http_client, *,
+    def __init__(self, http_client, *, state=None,
                  speed_mps: float, max_distance_m: float,
                  poll_hz: float = CREEP_POLL_HZ,
                  max_seconds_s: float = CREEP_MAX_SECONDS_S):
         import threading
         self.http = http_client
+        # 拆分回归修复: `state` 形参是拆分前就有的 (target4 传 _Task4SearchState),
+        # 拆分时丢了这个参数, 但 _loop 里还读 self.state → 必崩。恢复默认兜底。
+        self.state = state if state is not None else _Task4SearchState()
         self.speed_mps = speed_mps
         self.max_distance_m = max_distance_m
         self.poll_hz = poll_hz
@@ -55,6 +116,7 @@ class _CreepThread:
         self.elapsed_s = 0.0
         self.balls = None
         self.found_ball = False
+        self.finished_by_ir_odom = False
         self.timed_out = False
         self._odo_start_x = None
         self._last_odom_x = None
@@ -140,6 +202,23 @@ class _CreepThread:
                         self.found_ball = True
                         _set_chassis_vel(self.http, 0.0)
                         break
+                    # 无球 → 按 IR 丢失后的 0.3m 规则收尾 (2026-08-10 拆分回归:
+                    # 拆分把 `add_post_loss_distance` 收尾弄丢了, 只剩确认帧检查
+                    # 后 `continue` 无限前移。恢复: IR 丢失后累计位移, 满 0.30m
+                    # 结束搜索。确认帧已计入的位移不重复累加。)
+                    if was_ir_lost and not odom_delta_available:
+                        movement_delta_m = self.speed_mps * period
+                        self.distance_m += movement_delta_m
+                    if was_ir_lost:
+                        finished = self.state.add_post_loss_distance(movement_delta_m)
+                    else:
+                        finished = self.state.finished_by_ir_odom
+                    if finished:
+                        self.finished_by_ir_odom = True
+                        print(f"  [{LOG_PREFIX}] IR 丢失后继续前进 "
+                              f"{self.state.post_loss_distance_m:.3f}m, 结束搜索")
+                        self._stop_event.set()
+                        break
                     continue
 
                 if self.elapsed_s >= self.max_seconds_s:
@@ -180,6 +259,7 @@ class _CreepThread:
             "balls": self.balls if got and self.found_ball else None,
             "distance_m": self.distance_m,
             "elapsed_s": self.elapsed_s,
+            "finished_by_ir_odom": bool(getattr(self, "finished_by_ir_odom", False)),
         }
 
     def stop_and_join(self) -> None:

@@ -25,6 +25,25 @@ class LocalRuntimeClient:
     def build_url(self, path):
         return path
 
+    def get(self, path, timeout=None):
+        """GET 直读 shim：把业务层常见的 realtime 只读端点映射到 service getter。
+
+        生产由 FastAPI 路由返回 `{"ok": True, "<xxx>_state": ...}`；这里同形返回，
+        任务代码（如 task1/task2 的 `client.get("/v1/realtime/vision/task")`）
+        无需感知 transport 差异。
+        """
+        if path.endswith("/realtime/vision/task"):
+            return {"ok": True, "task_state": self.service.get_task_state()}
+        if path.endswith("/realtime/odom/state"):
+            return {"ok": True, "odom_state": self.service.get_odom_state()}
+        if path.endswith("/lane/state"):
+            return {"ok": True, "lane_state": self.service.get_lane_state()}
+        if path.endswith("/realtime/arm/state"):
+            return {"ok": True, "arm_state": self.service.get_arm_state()}
+        if path.endswith("/realtime/ir/state"):
+            return {"ok": True, "ir_state": self.service.get_ir_state()}
+        raise NotImplementedError("本地 transport 不支持 GET: {}".format(path))
+
     def post(self, path, payload=None, timeout=None):
         if path.endswith("/arm-velocity"):
             payload = payload or {}
@@ -32,6 +51,15 @@ class LocalRuntimeClient:
                 payload.get("x_vel"), payload.get("y_vel"),
                 payload.get("arm_angle"), payload.get("hand_angle"),
             )
+        if path.endswith("/realtime/chassis-velocity"):
+            payload = payload or {}
+            return self.realtime_chassis_velocity(
+                payload.get("vx", 0.0), payload.get("vy", 0.0),
+                payload.get("wz", 0.0),
+            )
+        if path.endswith("/realtime/chassis-align"):
+            payload = payload or {}
+            return self.service.chassis_align(**payload)
         raise NotImplementedError("本地 transport 不支持路径调用: {}".format(path))
 
     def wait_until_ready(self, timeout=None, poll_interval=None):
@@ -273,8 +301,8 @@ def create_runtime_client(settings=None, transport=None):
     if mode == "local":
         return LocalRuntimeClient(settings=settings)
     if mode == "fake":
-        from runtime.services.fake_runtime import FakeCarRuntimeService
-        return LocalRuntimeClient(service=FakeCarRuntimeService(), settings=settings)
+        from runtime.services.fake_runtime import get_fake_runtime
+        return LocalRuntimeClient(service=get_fake_runtime(), settings=settings)
     if mode == "http":
         from .api_client import RuntimeApiClient
         return RuntimeApiClient(settings=settings)

@@ -194,7 +194,7 @@ class Orchestrator:
         """从 yaml 加载 waypoints, 失败返 None."""
         try:
             from main.task._config import load_waypoints
-            wp_dicts = load_waypoints()
+            wp_dicts = load_waypoints(config_path=config_path)
         except (FileNotFoundError, KeyError, ValueError) as exc:
             logger.warning("yaml load_waypoints failed, fallback DEFAULT_WAYPOINTS: %s", exc)
             return None

@@ -84,15 +84,18 @@ def load_crossroad_turn() -> Optional[int]:
     return int(v)
 
 
-def load_waypoints() -> List[Dict[str, Any]]:
+def load_waypoints(config_path: Optional[str] = None) -> List[Dict[str, Any]]:
     """读取 task_config.yml 中 waypoints 段 (8 task + 1 finish).
+
+    Args:
+        config_path: 自定义 task_config.yml 路径; None = 仓库根目录默认文件。
 
     Returns:
         List[Dict]: 每个 dict 含 name, task_id (可选), task_module, ir_threshold_m,
                     ir_side, dis_at_least_m, trigger_op, is_finish 等字段.
                     orchestrator 据此构造 Waypoint 列表.
     """
-    path = _config_path()
+    path = Path(config_path).resolve() if config_path else _config_path()
     if not path.is_file():
         raise FileNotFoundError(f"任务配置文件不存在: {path}")
     with path.open("r", encoding="utf-8") as f:

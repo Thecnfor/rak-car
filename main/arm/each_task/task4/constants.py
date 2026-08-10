@@ -114,6 +114,16 @@ CREEP_STOP_CX_MAX: float = 0.5
 """creep 见球停车判定 (用户拍板 2026-08-10): 只有目标 cx_norm < 此值 (画面左半侧)
 才停下; 球在右半侧 (cx≥此值) 继续前移, 直到球进入左半侧或退出条件触发。"""
 
+IR_FAR_THRESHOLD_M: float = 0.70
+"""左 IR 视为"离开采区"的距离阈值 (m): 读数 > 此值判定为远离 (2026-08-10 拆分
+时随 _Task4SearchState 从 target4.py 迁移到 constants.py, 值 0.70 保持原样)。"""
+
+IR_FAR_CONFIRM_FRAMES: int = 2
+"""IR 连续多少帧超阈值才锁存"IR 丢失" (防单帧抖动, 拆分迁移保持原值 2)。"""
+
+POST_IR_LOSS_DISTANCE_M: float = 0.30
+"""IR 丢失后仍前移的收尾距离 (m): 累计走满此距离即结束搜索 (0.3m 规则)。"""
+
 DEFAULT_TRACK_MAX_SECONDS: float = 6.0
 """单球底盘视觉伺服收敛预算 (s)。"""
 
