@@ -145,7 +145,7 @@ class Task4Direct:
                     target_done = True
                     reason = "picked"
                 else:
-                    self.car.move_for([self.creep_speed_mps * 0.1, 0.0, 0.0], stop=False)
+                    self.car.move_for([self.creep_speed_mps * 0.1, 0.0, 0.0])
                     time.sleep(0.1)
         except Exception as exc:
             reason = "error:%s" % exc
