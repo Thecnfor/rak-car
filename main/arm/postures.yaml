@@ -1,0 +1,68 @@
+# ============================================================================
+# 机械臂姿势库（示教器标定值，唯一调参面）
+#
+# 结构: task<N>_<业务名>:
+#          _doc: 任务说明（自由文本）
+#          命名姿势: {x_mm, y_mm, arm_deg, hand_deg, stop?}
+#             - 字段全可缺省（缺省用 0 占位）；关节单位 mm / 度
+#             - stop=False 表示该关键点"不停车直接滑过"（角点圆滑）
+#          y_mm / init_y_mm: 纯标量阈值（不校验姿势结构）
+#
+# 已种入的姿势来自 task_config.yml task_cfg 与 task4 constants.py（已验证值）；
+# 未标定的任务姿势留空，用示教器读出后填 x_mm/y_mm/arm_deg/hand_deg 即可。
+# 取姿 API: from main.arm.postures import load_postures
+#           lib.pose(4, "pose_p") / lib.route(4, ["pose_p","pick","bin_blue"])
+#           lib.plan(4, [...]) -> JointTrajectory (goal->waypoint->goal 平滑)
+# ============================================================================
+
+task1_seeding:
+  _doc: |
+    自动移苗: 右侧 S1/S2/S3 育苗筒 → 左侧 T1/T2/T3 种植槽。
+    检测/复位 X=-100, arm=-90, hand=0, Y=-100; 抓取 X=-70, Y=0;
+    运输 Y=-100; 投放 X=-270, arm=+90, Y=-30。
+  init_y_mm: -100
+  s_pose:    {x_mm: -100, y_mm: -100, arm_deg: -90, hand_deg: -10}
+  pick:      {x_mm: -70,  y_mm: 0,    arm_deg: -95, hand_deg: 0}
+  carry:     {x_mm: -100, y_mm: -100, arm_deg: -90, hand_deg: -15}
+  place:     {x_mm: -270, y_mm: -30,  arm_deg: 90,  hand_deg: 0}
+
+task2_water_tower:
+  _doc: |
+    取水: 2 座水塔 × N 水方块。检测姿态 X=-200, Y=-10, hand=-60;
+    初始姿态 X=0, Y=-150, hand=-90。arm_deg 未标定, 示教器补。
+  init:      {x_mm: 0,    y_mm: -150, hand_deg: -90}
+  detection: {x_mm: -200, y_mm: -10,  hand_deg: -60}
+  # TODO(示教器): pick / carry / place 姿势
+
+task3_pest_scout:
+  _doc: |
+    害虫侦察 + 射击。识别/射击姿态在 main/task/task3/arm_poses.py
+    (RECOGNITION_ARM / SHOOTING_ARM)。标定后回填。
+  # TODO(示教器): recognition / shooting
+
+task4_harvest:
+  _doc: |
+    采收: 慢速前移搜球 → 高位臂伺服 → 盲降抓取 → 放 bin。预算/伺服参数
+    冻结在 each_task/task4/constants.py, 这里只放关节姿势。
+  pose_p:     {x_mm: -295, y_mm: -180, arm_deg: 90, hand_deg: 10}
+  pick_y_mm: -65
+  pick:       {x_mm: -240, y_mm: -65,  arm_deg: 90, hand_deg: 10}
+  transit:    {x_mm: -220, y_mm: -130, arm_deg: 90, hand_deg: 10}
+  bin_blue:   {x_mm: 0,    y_mm: -140, arm_deg: 90, hand_deg: 10}
+  bin_yellow: {x_mm: -60,  y_mm: -140, arm_deg: 90, hand_deg: 10}
+  storage_open_deg: 75
+
+task5_sort:
+  _doc: 分拣入库 4 阶段 (高/低塔循环)。姿势在 each_task/task5/ 常量, 标定后回填。
+  # TODO(示教器): phase1 / high_tower / low_tower
+
+task6_get_order:
+  _doc: 推杆扫牌 + LLM 双轮读单 + 蔬菜识别匹配抓取。姿势在 task6_get_order.py 常量。
+  # TODO(示教器): read / push_bar / pick_veggie
+
+task7_deliver:
+  _doc: 平仓 + duiying 投放。姿势在 each_task/task7/ 常量。
+  # TODO(示教器): pingcang / delivery
+
+task3_shoot:
+  _doc: task3 射击段 (task8)。跟随 task3 姿态。
