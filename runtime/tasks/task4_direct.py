@@ -19,7 +19,7 @@ class Task4Direct:
     }
 
     def __init__(self, car: Any, *, max_seconds: float = 120.0,
-                 creep_m: float = 0.8, creep_speed_mps: float = 0.12):
+                 creep_m: float = 0.8, creep_speed_mps: float = 0.20):
         self.car = car
         self.max_seconds = max_seconds
         self.creep_m = creep_m
