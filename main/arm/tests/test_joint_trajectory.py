@@ -252,5 +252,41 @@ class FakeRobotIntegrationTests(unittest.TestCase):
         self.assertTrue(hit, "轨迹中途未经过 pick 关键点")
 
 
+class ReplayTests(unittest.TestCase):
+    """replay_trajectory：实时采样速度回放，末端精确到 goal（fake 上）。"""
+
+    def _replay(self, kp=0.0):
+        import os
+        os.environ.setdefault("RAK_CAR_TRANSPORT", "fake")
+        from main.local_api_client import create_runtime_client
+        from main.arm.postures import load_teach_json
+        from main.arm.planning.replay import replay_trajectory
+        from runtime.services.fake_runtime import reset_fake_runtime
+
+        reset_fake_runtime()
+        client = create_runtime_client(transport="fake")
+        svc = client.service
+        route = load_teach_json("/home/xrak/Downloads/rak-car-poses.json")
+        traj = plan_joint_trajectory(route)
+        s = route[0]
+        client.execute_arm_action(
+            "composite_run", arm=s.arm_deg, x=s.x_mm / 1000.0,
+            y=s.y_mm / 1000.0, hand=s.hand_deg, sync=True)
+        replay_trajectory(traj, client, hz=50, kp_position=kp)
+        return svc.get_arm_state(), route[-1]
+
+    def test_replay_ends_at_goal(self):
+        st, goal = self._replay()
+        self.assertAlmostEqual(st["x_mm"], goal.x_mm, delta=1.0)
+        self.assertAlmostEqual(st["y_mm"], goal.y_mm, delta=1.0)
+        self.assertAlmostEqual(st["arm_angle"], goal.arm_deg, delta=0.5)
+        self.assertAlmostEqual(st["hand_angle"], goal.hand_deg, delta=0.5)
+
+    def test_replay_position_correction_still_tracks(self):
+        st, goal = self._replay(kp=0.2)
+        self.assertAlmostEqual(st["x_mm"], goal.x_mm, delta=1.0)
+        self.assertAlmostEqual(st["y_mm"], goal.y_mm, delta=1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

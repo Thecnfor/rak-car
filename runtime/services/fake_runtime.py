@@ -159,6 +159,7 @@ class FakeCarRuntimeService:
         self._stop_flag = False
         self._initialized = True
         self._last_chassis_cmd_t = None  # 底盘速度命令墙钟积分基准
+        self._last_arm_vel_t = None      # 机械臂滑台速度命令墙钟积分基准
         self.sim = FakeRobotSim()
         self.state = {
             "odom": dict(self.sim.odom),
@@ -757,6 +758,11 @@ class FakeCarRuntimeService:
         self.recorder.record("realtime", "set_arm_velocity", queue=None,
                              phase="physical", x_vel=x_vel, y_vel=y_vel,
                              arm_angle=arm_angle, hand_angle=hand_angle)
+        # 滑台速度按真实墙钟积分（镜像底盘 _integrate_odom；连续轨迹回放依赖）
+        now = time.monotonic()
+        dt = (now - self._last_arm_vel_t) if self._last_arm_vel_t else 0.0
+        self._last_arm_vel_t = now
+        dt = min(max(dt, 0.0), 1.0)
         if x_vel is not None:
             self.sim.velocity_x(float(x_vel))
         if y_vel is not None:
@@ -765,6 +771,8 @@ class FakeCarRuntimeService:
             self.sim.joints["arm_angle"].set(float(arm_angle))
         if hand_angle is not None:
             self.sim.joints["hand_angle"].set(float(hand_angle))
+        if dt > 0.0:
+            self.sim.advance(dt)
         return {"ok": True}
 
     def emergency_stop(self):
