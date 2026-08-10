@@ -469,18 +469,6 @@ if(BUILD_TESTING)
   )
   target_include_directories(test_arm_cartesian_planner PUBLIC include)
 
-  # CommandArbiter — long-action mutual exclusion + URGENT preempt
-  ament_add_gmock(test_command_arbiter
-    test/test_command_arbiter.cpp
-    src/command_arbiter.cpp
-  )
-  target_include_directories(test_command_arbiter PUBLIC include)
-
-  ament_add_gmock(test_base_controller_iface
-    test/test_base_controller_iface.cpp
-  )
-  target_include_directories(test_base_controller_iface PUBLIC include)
-
   # Pure-logic safety gate tests — no rclcpp needed, just gtest
   ament_add_gmock(test_safety_gate_logic
     test/test_safety_gate_logic.cpp

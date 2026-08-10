@@ -59,14 +59,6 @@ TEST(MC602AdapterTest, PortMetadataRoundTrips)
   EXPECT_EQ(a.baud(), 1000000u);
 }
 
-TEST(MC602AdapterTest, UnsupportedSensorTypeThrows)
-{
-  MC602Adapter a("/dev/ttyUSB0", 1000000);
-  enable_injection(a, no_response);
-  a.open();
-  EXPECT_THROW(a.read_sensor(1, "no_such_sensor"), std::runtime_error);
-}
-
 TEST(MC602AdapterTest, UnsupportedActuatorTypeThrows)
 {
   MC602Adapter a("/dev/ttyUSB0", 1000000);

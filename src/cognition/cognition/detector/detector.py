@@ -97,7 +97,8 @@ class Detector:
         self.stream = cuda.Stream()
 
     def preprocess(self, img_bgr: np.ndarray) -> np.ndarray:
-        img = cv2_resize(img_bgr, (self.input_size, self.input_size))
+        import cv2  # local import — keeps this module importable without cv2
+        img = cv2.resize(img_bgr, (self.input_size, self.input_size))
         if self.bgr_to_rgb:
             img = img[:, :, ::-1]
         img = img.astype(np.float32) * self.input_scale
@@ -128,8 +129,3 @@ class Detector:
         for d in self._d_inputs.values():
             d.free()
         self._d_num_dets.free()
-
-
-def cv2_resize(img, size):
-    import cv2
-    return cv2.resize(img, size)

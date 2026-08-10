@@ -21,7 +21,6 @@
 
 #include "hardware/mecanum_chassis.hpp"
 #include "hardware/mc602_adapter.hpp"
-#include "hardware/base_controller.hpp"
 #include "hardware/transport_factory.hpp"
 
 #include <rclcpp/rclcpp.hpp>
@@ -55,18 +54,9 @@ constexpr double kN_COUNTS_PER_REV = 2015.13;
 class OdomHelper
 {
 public:
-  void init(double Lx, double Ly, double wheel_radius)
+  void init(const vw::MecanumChassis & chassis)
   {
-    Lx_ = Lx;
-    Ly_ = Ly;
-    wheel_radius_ = wheel_radius;
-    prev_counts_ = {0, 0, 0, 0};
-    prev_time_ = rclcpp::Time(0);
-    pose_.x = pose_.y = pose_.theta = 0.0;
-  }
-
-  void reset()
-  {
+    chassis_ = &chassis;
     prev_counts_ = {0, 0, 0, 0};
     prev_time_ = rclcpp::Time(0);
     pose_.x = pose_.y = pose_.theta = 0.0;
@@ -91,7 +81,7 @@ public:
 
     // Wheel linear speeds (m/s) from encoder deltas.
     const double counts_per_rev = kN_COUNTS_PER_REV;
-    const double circumference = 2.0 * vw::MC602_PI * wheel_radius_;
+    const double circumference = 2.0 * vw::MC602_PI * chassis_->wheel_radius();
     std::array<double, 4> ws;
     for (int i = 0; i < 4; ++i) {
       const double delta_rev = static_cast<double>(counts[i] - prev_counts_[i]) / counts_per_rev;
@@ -99,10 +89,7 @@ public:
     }
 
     // Forward kinematics: wheel speeds → body velocity.
-    const double k = Lx_ + Ly_;
-    vx_out   = (ws[0] + ws[1] + ws[2] + ws[3]) / 4.0;
-    vy_out   = (-ws[0] + ws[1] + ws[2] - ws[3]) / 4.0;
-    omega_out = (-ws[0] + ws[1] - ws[2] + ws[3]) / (4.0 * k);
+    chassis_->forward_kinematics(ws.data(), vx_out, vy_out, omega_out);
 
     // Integrate pose.
     pose_.x     += vx_out * dt;
@@ -122,9 +109,7 @@ public:
   const vw::Pose2D & pose() const { return pose_; }
 
 private:
-  double Lx_{0.0};
-  double Ly_{0.0};
-  double wheel_radius_{0.03};
+  const vw::MecanumChassis * chassis_{nullptr};
   std::array<int32_t, 4> prev_counts_;
   rclcpp::Time prev_time_;
   vw::Pose2D pose_;
@@ -167,7 +152,7 @@ public:
       vw::make_mc602_transport(this, transport_mode, port,
                                static_cast<uint32_t>(baud)));
     adapter_->open();
-    odom_.init(Lx, Ly, r);
+    odom_.init(*chassis_);
 
     RCLCPP_INFO(this->get_logger(),
       "MC602Adapter opened: %s @ %d baud via %s", port.c_str(), baud,
@@ -290,7 +275,6 @@ private:
     }
 
     const double counts_per_rev = kN_COUNTS_PER_REV;
-    const double wheel_r = chassis_->wheel_radius();
 
     for (int i = 0; i < 4; ++i) {
       js.position[i] = static_cast<double>(counts[i]) / counts_per_rev * 2.0 * vw::MC602_PI;
@@ -324,10 +308,10 @@ private:
 
     // Convert wheel speeds → virtual int8 via the driver (m/s → virtual).
     const double r = chassis_->wheel_radius();
-    const int8_t v_fl = adapter_->mps_to_virtual(ws.values[0], r);
-    const int8_t v_fr = adapter_->mps_to_virtual(ws.values[1], r);
-    const int8_t v_rl = adapter_->mps_to_virtual(ws.values[2], r);
-    const int8_t v_rr = adapter_->mps_to_virtual(ws.values[3], r);
+    const int8_t v_fl = adapter_->mps_to_virtual(ws[0], r);
+    const int8_t v_fr = adapter_->mps_to_virtual(ws[1], r);
+    const int8_t v_rl = adapter_->mps_to_virtual(ws[2], r);
+    const int8_t v_rr = adapter_->mps_to_virtual(ws[3], r);
 
     try {
       adapter_->set_motor4(v_fl, v_fr, v_rl, v_rr);

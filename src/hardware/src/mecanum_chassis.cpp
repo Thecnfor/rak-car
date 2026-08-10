@@ -13,7 +13,7 @@ namespace hardware
 {
 
 MecanumChassis::MecanumChassis(std::string chassis_id, double Lx, double Ly, double wheel_radius)
-: BaseChassis(std::move(chassis_id)), Lx_(Lx), Ly_(Ly), wheel_radius_(wheel_radius)
+: chassis_id_(std::move(chassis_id)), Lx_(Lx), Ly_(Ly), wheel_radius_(wheel_radius)
 {
   if (Lx <= 0.0 || Ly <= 0.0 || wheel_radius <= 0.0) {
     throw std::invalid_argument("MecanumChassis: Lx, Ly, wheel_radius must all be > 0");
@@ -26,7 +26,7 @@ void MecanumChassis::set_velocity(double vx, double vy, double omega)
   // for each wheel. Here we just store the last commanded velocity for
   // forward-kinematics testability. Hardware dispatch lands in Plan B.
   // The 4 wheel speeds are derived from inverse kinematics.
-  std::array<double, 4> ws = inverse(vx, vy, omega).values;
+  std::array<double, 4> ws = inverse(vx, vy, omega);
   // Integrate pose assuming dt = 1 for simplicity. Real impl will use the
   // ros2_control write() callback tick.
   pose_.x += vx * 1.0;
@@ -60,11 +60,11 @@ void MecanumChassis::inverse_kinematics(double vx, double vy, double omega, doub
   out[3] = vx - vy + k * omega;  // rr
 }
 
-MecanumChassis::FourWheelSpeeds MecanumChassis::inverse(double vx, double vy, double omega) const
+std::array<double, 4> MecanumChassis::inverse(double vx, double vy, double omega) const
 {
   double w[4];
   inverse_kinematics(vx, vy, omega, w);
-  return FourWheelSpeeds{std::array<double, 4>{w[0], w[1], w[2], w[3]}};
+  return std::array<double, 4>{w[0], w[1], w[2], w[3]};
 }
 
 }  // namespace hardware

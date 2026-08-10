@@ -13,7 +13,6 @@
 //
 // Lifecycle:
 //   on_init     — called once. Read params, validate config, create pubs/subs.
-//   on_activate  — called when the task should start producing work.
 //   execute     — called every tick (e.g. 50Hz). Return TaskStatus:
 //                   RUNNING  — keep calling next tick
 //                   SUCCESS  — task done, move to next
@@ -77,15 +76,6 @@ public:
   virtual TaskStatus on_init(const TaskContext & ctx) = 0;
   virtual TaskStatus execute() = 0;
   virtual void on_cleanup() = 0;
-
-  // Called when the task should start producing work (after on_init).
-  // Default no-op returns RUNNING; override for activate-style tasks.
-  // Not yet invoked by MissionRunner — reserved for lifecycle extension.
-  virtual TaskStatus on_activate() { return TaskStatus::RUNNING; }
-
-  // Optional: announce what topics this task publishes / subscribes.
-  // Used for documentation and debug introspection; not enforced.
-  virtual std::string info() const { return name(); }
 };
 
 }  // namespace hardware

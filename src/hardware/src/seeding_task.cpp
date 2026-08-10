@@ -98,12 +98,6 @@ public:
     RCLCPP_INFO(node_->get_logger(), "SeedingTask cleaned up");
   }
 
-  std::string info() const override
-  {
-    return "seeding: " + std::to_string(stations_.size()) +
-      " stations, drive + plant + retract each";
-  }
-
 private:
   struct ArmPose
   {

@@ -226,9 +226,3 @@ TEST(BaseTaskLifecycleTest, ThrowingTaskCleanupThrows)
   ThrowingTask t(nullptr);
   EXPECT_THROW(t.on_cleanup(), std::runtime_error);
 }
-
-TEST(BaseTaskLifecycleTest, InfoDefaultsToName)
-{
-  DummyTask t(nullptr);
-  EXPECT_EQ(t.info(), "dummy");  // info() default returns name()
-}

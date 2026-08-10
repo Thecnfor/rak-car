@@ -33,13 +33,6 @@ namespace
 
 constexpr char kActionName[] = "/rak/control/chassis/navigate";
 
-inline double wrap_pi(double a)
-{
-  while (a > M_PI) a -= 2.0 * M_PI;
-  while (a < -M_PI) a += 2.0 * M_PI;
-  return a;
-}
-
 }  // namespace
 
 class ChassisNavigateNode : public rclcpp::Node
@@ -152,7 +145,8 @@ private:
           if (goal->use_pose) {
             const double ex = goal->target_pose.x - pose_.x;
             const double ey = goal->target_pose.y - pose_.y;
-            const double dtheta = wrap_pi(goal->target_pose.theta - pose_.theta);
+            const double dtheta = std::remainder(goal->target_pose.theta - pose_.theta,
+                                                2.0 * M_PI);
             // Rotate the world-frame error into the body frame.
             const double c = std::cos(pose_.theta), s = std::sin(pose_.theta);
             const double bx = c * ex + s * ey;

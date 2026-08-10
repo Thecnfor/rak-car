@@ -347,19 +347,6 @@ void MC602Adapter::set_led_show(const std::string & text)
              write_opts("led_show"));
 }
 
-// ---- BaseController legacy ----
-
-double MC602Adapter::read_sensor(uint8_t port_id, const std::string & sensor_type)
-{
-  if (sensor_type == "ir") return read_ir(port_id);
-  if (sensor_type == "ultrasonic") return read_ultrasonic(port_id);
-  if (sensor_type == "analog_input") return static_cast<double>(read_analog(port_id));
-  if (sensor_type == "touch") return static_cast<double>(read_sensor_raw(port_id, SENSOR_TOUCH));
-  if (sensor_type == "ambient_light") return static_cast<double>(read_sensor_raw(port_id, SENSOR_AMBIENT));
-  if (sensor_type == "encoder") return static_cast<double>(read_encoder(port_id));
-  throw std::runtime_error("read_sensor: unsupported type '" + sensor_type + "'");
-}
-
 void MC602Adapter::write_actuator(uint8_t port_id, const std::string & actuator_type,
                                   double value)
 {
@@ -369,11 +356,6 @@ void MC602Adapter::write_actuator(uint8_t port_id, const std::string & actuator_
   if (actuator_type == "stepper") { set_stepper(port_id, static_cast<int32_t>(value), 0); return; }
   if (actuator_type == "dout") { set_dout(port_id, static_cast<int8_t>(value)); return; }
   throw std::runtime_error("write_actuator: unsupported type '" + actuator_type + "'");
-}
-
-std::map<std::string, uint32_t> MC602Adapter::enumerate_ports() const
-{
-  return {{"motor", 4}, {"servo", 7}, {"stepper", 4}, {"io", 16}};
 }
 
 // ---- Control-cycle packing ----

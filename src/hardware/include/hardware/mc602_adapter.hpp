@@ -21,14 +21,12 @@
 
 #pragma once
 
-#include "hardware/base_controller.hpp"
 #include "hardware/mc602_protocol.hpp"
 #include "hardware/serial_transport.hpp"
 
 #include <array>
 #include <cstdint>
 #include <functional>
-#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -40,7 +38,7 @@ namespace hardware
 // C++17-safe π.
 inline constexpr double MC602_PI = 3.14159265358979323846;
 
-class MC602Adapter : public BaseController
+class MC602Adapter
 {
 public:
   // Direct transport over a local serial fd (tests, mock, non-bridged use).
@@ -48,17 +46,17 @@ public:
 
   // Any transport — e.g. BridgeTransport via mc602_bridge.
   explicit MC602Adapter(std::shared_ptr<SerialTransport> transport);
-  ~MC602Adapter() override;
+  ~MC602Adapter();
 
   MC602Adapter(const MC602Adapter &) = delete;
   MC602Adapter & operator=(const MC602Adapter &) = delete;
 
-  // --- BaseController (delegated to transport) ---
-  void open() override;
-  void close() override;
-  bool is_open() const override;
-  std::string serial_port() const override;
-  uint32_t baud() const override;
+  // --- Transport lifecycle (delegated to transport) ---
+  void open();
+  void close();
+  bool is_open() const;
+  std::string serial_port() const;
+  uint32_t baud() const;
 
   // --- Encoders (raw counts) ---
   std::array<int32_t, 4> read_encoder4();   // [FL, FR, RL, RR]
@@ -115,11 +113,8 @@ public:
   void begin_burst();
   void commit_burst();
 
-  // BaseController legacy (thin mappings onto the typed driver API).
-  double read_sensor(uint8_t port_id, const std::string & sensor_type) override;
-  void write_actuator(uint8_t port_id, const std::string & actuator_type,
-                      double value) override;
-  std::map<std::string, uint32_t> enumerate_ports() const override;
+  // String-dispatched actuator write (kept for callers that select by name).
+  void write_actuator(uint8_t port_id, const std::string & actuator_type, double value);
 
   // Mode + sensor constants.
   static constexpr uint8_t MODE_GET = 1;

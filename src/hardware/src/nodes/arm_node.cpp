@@ -143,8 +143,8 @@ public:
     try {
       // Safety: release pump + valve on shutdown.
       if (adapter_) {
-        adapter_->write_actuator(2, "dout", 0);  // pump off
-        adapter_->write_actuator(3, "dout", 0);  // valve open (release)
+        adapter_->set_dout(2, 0);  // pump off
+        adapter_->set_dout(3, 0);  // valve open (release)
         adapter_->close();
       }
     } catch (...) {}

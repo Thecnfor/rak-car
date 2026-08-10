@@ -119,8 +119,8 @@ TEST(MecanumChassisTest, TypedArrayConvenienceReturns4Elements)
 {
   MecanumChassis c("mec1", 0.1, 0.1, 0.03);
   auto ws = c.inverse(1.0, 0.0, 0.0);
-  ASSERT_EQ(ws.values.size(), 4u);
-  for (double v : ws.values) {
+  ASSERT_EQ(ws.size(), 4u);
+  for (double v : ws) {
     EXPECT_NEAR(v, 1.0, kEps);
   }
 }
