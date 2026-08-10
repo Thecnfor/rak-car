@@ -12,6 +12,7 @@ import logging
 import sys
 import time
 from pathlib import Path
+from typing import List
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -99,11 +100,34 @@ def main() -> None:
             "找出「按下时 byte N 非零」的 N 填 config_car.yml io.key.button_index。"
         ),
     )
+    p.add_argument(
+        "--direct", action="store_true",
+        help="任务1/4直接在本进程调用MyCar，不经过HTTP/WS网络栈。",
+    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(name)s] %(message)s")
     if args.probe_keys:
         probe_keys()
+        return
+    if args.direct:
+        if args.task not in {"1", "4"}:
+            sys.stderr.write("--direct 目前只支持 --task 1 或 --task 4\n")
+            sys.exit(2)
+        from runtime.services.my_car import MyCar
+        car = MyCar()
+        try:
+            if args.task == "1":
+                from runtime.services.task1_runner import run_task1
+                result = run_task1(car)
+            else:
+                from runtime.tasks.task4_direct import Task4Direct
+                result = Task4Direct(car).run()
+            print(result)
+            if isinstance(result, dict) and not result.get("ok", True):
+                sys.exit(1)
+        finally:
+            car.close()
         return
     orch = Orchestrator(lane_hz=args.lane_hz,
                         ir_interval_s=args.ir_interval_s)
