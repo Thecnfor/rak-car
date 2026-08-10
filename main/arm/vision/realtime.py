@@ -32,13 +32,16 @@ class RealtimeLoop:
     """
 
     def _ensure_ws(self, ws):
-        if ws is None:
-            try:
-                from main.ws_client import RuntimeWsClient
-            except ImportError:  # pragma: no cover
-                from ws_client import RuntimeWsClient  # type: ignore
-            ws = RuntimeWsClient()
-        return ws
+        if ws is not None:
+            return ws
+        from main.local_api_client import LocalRuntimeClient
+        if isinstance(self.http, LocalRuntimeClient):
+            return self.http
+        try:
+            from main.ws_client import RuntimeWsClient
+        except ImportError:  # pragma: no cover
+            from ws_client import RuntimeWsClient  # type: ignore
+        return RuntimeWsClient()
 
     @staticmethod
     def _adaptive_gain(bbox, target_real_height_m: float,

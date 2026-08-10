@@ -17,7 +17,7 @@ import time
 from .state import LaneState, IrState, OdometryState
 
 try:
-    from main.api_client import RuntimeApiClient
+    from main.local_api_client import LocalRuntimeClient, create_runtime_client
     from main.ws_client import RuntimeWsClient
 except ImportError:  # pragma: no cover
     from api_client import RuntimeApiClient  # type: ignore
@@ -35,8 +35,8 @@ class ChassisClient:
         `read_lane()` 直接读缓存（零每帧 RTT）。订阅断线自动回退 req/resp。
     """
 
-    http: RuntimeApiClient
-    ws: RuntimeWsClient
+    http: LocalRuntimeClient
+    ws: Optional[RuntimeWsClient]
     ws_ready: bool = False
     # ---- lane_state 推送共享缓存（订阅线程写 / 外环读，GIL 下引用赋值原子）----
     _lane_sub_stop: Optional[object] = None
@@ -45,14 +45,16 @@ class ChassisClient:
 
     @classmethod
     def connect(cls) -> "ChassisClient":
-        http = RuntimeApiClient()
-        ws = RuntimeWsClient()
+        http = create_runtime_client()
+        ws = None
         ready = False
-        try:
-            ws.connect()
-            ready = True
-        except Exception:
-            ready = False
+        if not isinstance(http, LocalRuntimeClient):
+            ws = RuntimeWsClient()
+            try:
+                ws.connect()
+                ready = True
+            except Exception:
+                ready = False
         return cls(http=http, ws=ws, ws_ready=ready)
 
     # ---- lane_state 推送订阅（替代 50Hz req/resp 轮询）----
@@ -67,7 +69,8 @@ class ChassisClient:
         内部按 `ws.lane_subscription_active` 判断新鲜度，未通自动回退 req/resp）。
         """
         try:
-            stop = self.ws.subscribe_lane(self._on_lane_push, hz=hz)
+            subscriber = self.ws if self.ws is not None else self.http
+            stop = subscriber.subscribe_lane(self._on_lane_push, hz=hz)
             self._lane_sub_stop = stop
             return True
         except Exception:
@@ -94,7 +97,7 @@ class ChassisClient:
         新鲜度用本地 `time.monotonic()` 算（服务端 updated_at 是另一台机的
         wall clock，跨机时钟可能不同步——本地单调时钟最稳）。
         """
-        if not self.ws.lane_subscription_active:
+        if self.ws is None or not self.ws.lane_subscription_active:
             return None
         if self._latest_lane_state is None or self._latest_lane_mono is None:
             return None
@@ -385,8 +388,9 @@ class ChassisClient:
             pass
         # 推送订阅是独立连接（_PushSubscriber），不随 ws.close() 关闭——必须显式停
         self.stop_lane_subscription()
-        try:
-            self.ws.close()
-        except Exception:
-            pass
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
         self.ws_ready = False
