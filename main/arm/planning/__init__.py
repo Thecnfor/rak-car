@@ -9,11 +9,11 @@
 from main.arm.planning.joint_trajectory import (
     ARM_MAX_DEG, ARM_MIN_DEG, HAND_MAX_DEG, HAND_MIN_DEG,
     Y_MAX_MM, Y_MIN_MM,
-    JointPose, JointSegment, JointTrajectory, plan_joint_trajectory,
+    JointLeg, JointPose, JointTrajectory, plan_joint_trajectory,
 )
 
 __all__ = [
-    "JointPose", "JointSegment", "JointTrajectory", "plan_joint_trajectory",
+    "JointLeg", "JointPose", "JointTrajectory", "plan_joint_trajectory",
     "ARM_MIN_DEG", "ARM_MAX_DEG", "HAND_MIN_DEG", "HAND_MAX_DEG",
     "Y_MIN_MM", "Y_MAX_MM",
 ]

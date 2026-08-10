@@ -20,18 +20,19 @@ task1_seeding:
     自动移苗: 右侧 S1/S2/S3 育苗筒 → 左侧 T1/T2/T3 种植槽。
     检测/复位 X=-100, arm=-90, hand=0, Y=-100; 抓取 X=-70, Y=0;
     运输 Y=-100; 投放 X=-270, arm=+90, Y=-30。
+    stop: true=动作点停车; false=运输点滑过不停。
   init_y_mm: -100
-  s_pose:    {x_mm: -100, y_mm: -100, arm_deg: -90, hand_deg: -10}
-  pick:      {x_mm: -70,  y_mm: 0,    arm_deg: -95, hand_deg: 0}
-  carry:     {x_mm: -100, y_mm: -100, arm_deg: -90, hand_deg: -15}
-  place:     {x_mm: -270, y_mm: -30,  arm_deg: 90,  hand_deg: 0}
+  s_pose:    {x_mm: -100, y_mm: -100, arm_deg: -90, hand_deg: -10, stop: false}
+  pick:      {x_mm: -70,  y_mm: 0,    arm_deg: -95, hand_deg: 0,   stop: true}
+  carry:     {x_mm: -100, y_mm: -100, arm_deg: -90, hand_deg: -15, stop: false}
+  place:     {x_mm: -270, y_mm: -30,  arm_deg: 90,  hand_deg: 0,   stop: true}
 
 task2_water_tower:
   _doc: |
     取水: 2 座水塔 × N 水方块。检测姿态 X=-200, Y=-10, hand=-60;
     初始姿态 X=0, Y=-150, hand=-90。arm_deg 未标定, 示教器补。
-  init:      {x_mm: 0,    y_mm: -150, hand_deg: -90}
-  detection: {x_mm: -200, y_mm: -10,  hand_deg: -60}
+  init:      {x_mm: 0,    y_mm: -150, hand_deg: -90, stop: false}
+  detection: {x_mm: -200, y_mm: -10,  hand_deg: -60, stop: true}
   # TODO(示教器): pick / carry / place 姿势
 
 task3_pest_scout:
@@ -44,12 +45,12 @@ task4_harvest:
   _doc: |
     采收: 慢速前移搜球 → 高位臂伺服 → 盲降抓取 → 放 bin。预算/伺服参数
     冻结在 each_task/task4/constants.py, 这里只放关节姿势。
-  pose_p:     {x_mm: -295, y_mm: -180, arm_deg: 90, hand_deg: 10}
+  pose_p:     {x_mm: -295, y_mm: -180, arm_deg: 90, hand_deg: 10, stop: true}
   pick_y_mm: -65
-  pick:       {x_mm: -240, y_mm: -65,  arm_deg: 90, hand_deg: 10}
-  transit:    {x_mm: -220, y_mm: -130, arm_deg: 90, hand_deg: 10}
-  bin_blue:   {x_mm: 0,    y_mm: -140, arm_deg: 90, hand_deg: 10}
-  bin_yellow: {x_mm: -60,  y_mm: -140, arm_deg: 90, hand_deg: 10}
+  pick:       {x_mm: -240, y_mm: -65,  arm_deg: 90, hand_deg: 10, stop: true}
+  transit:    {x_mm: -220, y_mm: -130, arm_deg: 90, hand_deg: 10, stop: false}
+  bin_blue:   {x_mm: 0,    y_mm: -140, arm_deg: 90, hand_deg: 10, stop: true}
+  bin_yellow: {x_mm: -60,  y_mm: -140, arm_deg: 90, hand_deg: 10, stop: true}
   storage_open_deg: 75
 
 task5_sort:

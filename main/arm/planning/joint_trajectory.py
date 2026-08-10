@@ -1,28 +1,41 @@
 """main/arm/planning/joint_trajectory.py
-机械臂 4-DOF 多关键点平滑轨迹（goal → waypoint → … → goal）。
+机械臂 4-DOF 多关键点平滑轨迹（goal → waypoint → … → goal），样条版。
 
-纯 Python（stdlib math 即可），不依赖硬件、不依赖 numpy/scipy/PyBullet；
-离线可跑在 FakeRobotSim 上仿真，真机可把 dense_waypoints 喂给 composite_run。
+依赖：**scipy.interpolate.PchipInterpolator**（关节空间插值的事实标准，C¹ 连续、
+单调无过冲、精确过点）+ numpy（弧长/速度采样）。scipy/numpy 缺失时自动降级为
+线性路径（仍按弧长时间参数化，连续不停顿），保证 Jetson 无 scipy 也能跑。
 
-输入：示教器标定的关节姿势序列 `JointPose(x_mm, y_mm, arm_deg, hand_deg)`。
-约束：
-  - 每个关键点**精确经过**（硬约束——示教点是有意义的物理位置）；
-  - 每个关键点默认**停车**（v=0，与真机 composite_run 逐点到位语义一致）；
-  - 中间点若 `stop=False`，则计算"可穿越速度"做角点圆滑（速度连续，
-    不停车直接滑过），本模块给出保守上界（相邻段各留一半做加减速）。
+为什么用 PCHIP 而不是 CubicSpline：
+  - PCHIP 在数据点之间**单调、无过冲** → 机械臂不会"甩过"关键点（靠限位的点安全）；
+  - CubicSpline C² 更光滑但会在点间过冲，机械臂场景风险大。速度连续性由
+    弧长时间参数化保证（C¹ 路径 + 弧长上连续速度 → 关节速度连续）。
 
-算法：逐段做 4 轴**带终端速度的梯形**（accel→cruise→decel 到 v_end），
-四轴以 `T = max(各轴时间)` 同步（复用 main/arm/trajectory.py 的 _norm 缩放
-约定，两轴同步已实车验证过）；`sample(t)` 沿时间轴采样全部 4 关节值。
+语义：
+  - **所有关键点默认连续平滑经过（不停顿）**，任意数量都行；
+  - 仅 `stop=True` 的关键点在该处停车（速度归 0 → 再起步），用于取/放等动作点；
+  - 每条关节速度/加速度被保守约束在限位内（弧长速度 = 各关节限速的公共上界）。
 
-参考：Biagiotti & Melchiorri, "Trajectory Planning for Automatic Machines
-and Robots"（与 main/arm/trajectory.py 同源）。
+离线：FakeRobotSim 可仿真；真机：`dense_waypoints()` 喂 composite_run。
 """
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Sequence, Tuple
+
+try:  # pragma: no cover
+    import numpy as _np
+    _HAS_NUMPY = True
+except Exception:  # pragma: no cover
+    _np = None
+    _HAS_NUMPY = False
+
+try:  # pragma: no cover
+    from scipy.interpolate import PchipInterpolator as _PchipInterpolator
+    _HAS_SCIPY = True
+except Exception:  # pragma: no cover
+    _PchipInterpolator = None
+    _HAS_SCIPY = False
 
 # ---- 关节限位（同步 runtime/safety.py 硬限） ----
 ARM_MIN_DEG, ARM_MAX_DEG = -150.0, 150.0
@@ -30,11 +43,15 @@ HAND_MIN_DEG, HAND_MAX_DEG = -90.0, 10.0
 Y_MIN_MM, Y_MAX_MM = -200.0, 0.0
 X_MIN_MM, X_MAX_MM = -300.0, 300.0
 
-# ---- 默认运动学规格 (mm / deg / s) ----
-DEFAULT_V_MAX = 150.0     # 主滑块 x mm/s
-DEFAULT_A_MAX = 400.0     # mm/s^2
-DEFAULT_ARM_DEG_S = 90.0  # 大臂角速度 deg/s
-DEFAULT_HAND_DEG_S = 90.0  # 手爪角速度 deg/s
+# ---- 默认运动学规格（按轴，mm/s·mm/s² / deg/s·deg/s²） ----
+JOINT_VMAX = {"x_mm": 150.0, "y_mm": 90.0, "arm_deg": 90.0, "hand_deg": 90.0}
+JOINT_AMAX = {"x_mm": 400.0, "y_mm": 240.0, "arm_deg": 100.0, "hand_deg": 100.0}
+# 弧长默认兜底（各关节都不动时） mm/s / mm/s²
+DEFAULT_ARC_VMAX = 120.0
+DEFAULT_ARC_AMAX = 240.0
+
+# 弧长加速的保守系数（考虑 sdot²·d²q/ds² 曲率项，取半）
+_ACCEL_SAFETY = 0.5
 
 
 def _sign(x: float) -> float:
@@ -47,13 +64,16 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 @dataclass(frozen=True)
 class JointPose:
-    """4-DOF 关节姿势（示教器标定值，单位 mm / deg）。"""
+    """4-DOF 关节姿势（示教器标定值，单位 mm / deg）。
+
+    stop: True=该关键点停车（取/放等动作点）；False（默认）=连续平滑经过。
+    """
 
     x_mm: float
     y_mm: float
     arm_deg: float
     hand_deg: float
-    stop: bool = True  # True=该关键点停车；False=不停直接滑过（角点圆滑）
+    stop: bool = False
 
     def __post_init__(self):
         for name, value, lo, hi in (
@@ -74,8 +94,8 @@ class JointPose:
                 "stop": self.stop}
 
     @classmethod
-    def from_mapping(cls, m: dict, *, stop: bool = True) -> "JointPose":
-        """从姿势库 dict（字段可缺省，缺省保持当前语义用 0 占位）构造。"""
+    def from_mapping(cls, m: dict, *, stop: bool = False) -> "JointPose":
+        """从姿势库 dict（字段可缺省）构造。"""
         return cls(
             x_mm=float(m.get("x_mm", 0.0)),
             y_mm=float(m.get("y_mm", 0.0)),
@@ -85,15 +105,11 @@ class JointPose:
         )
 
 
-# ---- 单轴梯形 profile（带终端速度） ----
+# ---- 单轴梯形 profile（带终端速度，用于弧长 s(t)） ----
 
 def _trapezoid_v(d_signed: float, v_start: float, v_end: float,
                  v_max: float, a_max: float) -> dict:
-    """带起止速度的单轴梯形 profile。
-
-    返回 dict: t_acc / t_run / t_dec / t_total / v_peak / v_end / sign / d_abs。
-    处理 v_end>0 的角点穿越；距离过短时自动降 v_peak 成三角形。
-    """
+    """带起止速度的单轴梯形 profile：accel→cruise→decel 到 v_end。"""
     d = abs(d_signed)
     sign = _sign(d_signed)
     v_max = max(abs(v_start), abs(v_end), abs(v_max))
@@ -104,11 +120,9 @@ def _trapezoid_v(d_signed: float, v_start: float, v_end: float,
         if abs(v_start - v_end) < 1e-9:
             return dict(t_acc=0.0, t_run=0.0, t_dec=0.0, t_total=0.0,
                         v_peak=0.0, v_end=0.0, sign=0.0, d_abs=0.0)
-        # 0 距离但起止速度不同 → 原地变速（近似：按加减速时间算）
         t_acc = (v_end - v_start) / a
         return dict(t_acc=t_acc, t_run=0.0, t_dec=0.0, t_total=abs(t_acc),
                     v_peak=max(v_start, v_end), v_end=v_end, sign=sign, d_abs=0.0)
-    # 三段：accel(0→v_peak) → cruise → decel(v_peak→v_end)
     d_acc = (v_max * v_max - v_start * v_start) / (2.0 * a)
     d_dec = (v_max * v_max - v_end * v_end) / (2.0 * a)
     if d_acc + d_dec <= d:
@@ -118,8 +132,6 @@ def _trapezoid_v(d_signed: float, v_start: float, v_end: float,
         return dict(t_acc=t_acc, t_run=t_run, t_dec=t_dec,
                     t_total=t_acc + t_run + t_dec,
                     v_peak=v_max, v_end=v_end, sign=sign, d_abs=d)
-    # 到不了 v_max：三角形（无 cruise），反解 v_peak
-    #  (v_peak² - v_start²) + (v_peak² - v_end²) = 2 a d
     v_peak = math.sqrt((2.0 * a * d + v_start * v_start + v_end * v_end) / 2.0)
     t_acc = (v_peak - v_start) / a
     t_dec = (v_peak - v_end) / a
@@ -129,7 +141,6 @@ def _trapezoid_v(d_signed: float, v_start: float, v_end: float,
 
 
 def _eval_trapezoid_v(prof: dict, t: float) -> Tuple[float, float]:
-    """给定 profile 和时间 t（0..t_total），返回 (s, v)。"""
     t = max(0.0, min(t, prof["t_total"]))
     sign = prof["sign"]
     v_peak = prof["v_peak"]
@@ -151,102 +162,152 @@ def _eval_trapezoid_v(prof: dict, t: float) -> Tuple[float, float]:
     return sign * s, sign * v
 
 
-# ---- 分段轨迹 ----
+# ---- 关节空间路径（弧长参数化） ----
+
+class _JointPath:
+    """关节空间几何路径：s(弧长) -> 4 关节值。
+
+    scipy 可用 → PCHIP（C¹、单调无过冲）；否则线性插值（C⁰，仍时间平滑）。
+    """
+
+    def __init__(self, poses: List[JointPose], engine: str):
+        pts = [[p.x_mm, p.y_mm, p.arm_deg, p.hand_deg] for p in poses]
+        self.poses = poses
+        if _HAS_NUMPY:
+            arr = _np.array(pts, dtype=float)
+            d = _np.linalg.norm(_np.diff(arr, axis=0), axis=1)
+            self.s = _np.concatenate([[0.0], _np.cumsum(d)])
+            self.L = float(self.s[-1])
+        else:  # pragma: no cover（无 numpy 的兜底）
+            self.s = [0.0]
+            for i in range(1, len(pts)):
+                self.s.append(self.s[-1] + math.hypot(
+                    pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1]))
+            self.L = self.s[-1]
+        if engine == "scipy" and _HAS_SCIPY and _HAS_NUMPY:
+            self._interp = [_PchipInterpolator(self.s, arr[:, j]) for j in range(4)]
+            self._deriv = [p.derivative() for p in self._interp]
+        else:
+            self._interp = None
+
+    def value_at(self, s: float, j: Optional[int] = None):
+        """弧长 s 处的关节值（0..L）。返回单个关节（j 给定）或 4 元组。"""
+        s = float(_clamp(float(s), 0.0, self.L))
+        if self._interp is not None:
+            if j is not None:
+                return float(self._interp[j](s))
+            return [float(p(s)) for p in self._interp]
+        # 线性兜底（按弧长分段线性）
+        pts = [self._pose_vals(i) for i in range(len(self.poses))]
+        for i in range(len(self.s) - 1):
+            if self.s[i] <= s <= self.s[i + 1]:
+                span = self.s[i + 1] - self.s[i]
+                r = (s - self.s[i]) / span if span > 1e-9 else 0.0
+                vals = [a + (b - a) * r for a, b in zip(pts[i], pts[i + 1])]
+                return vals[j] if j is not None else vals
+        return self._pose_vals(-1)[j] if j is not None else self._pose_vals(-1)
+
+    def dq_ds(self, s: float, j: Optional[int] = None):
+        """弧长导数 dq/ds。scipy 用解析导数；线性用所在段斜率。"""
+        if self._interp is not None:
+            if j is not None:
+                return float(self._deriv[j](s))
+            return [float(p(s)) for p in self._deriv]
+        # 线性路径：d q/d s = 所在线段的斜率（分段常值）
+        s = float(_clamp(float(s), 0.0, self.L))
+        pts = [self._pose_vals(i) for i in range(len(self.poses))]
+        for i in range(len(self.s) - 1):
+            if self.s[i] <= s <= self.s[i + 1]:
+                span = self.s[i + 1] - self.s[i]
+                if span > 1e-9:
+                    slope = [(pts[i + 1][k] - pts[i][k]) / span for k in range(4)]
+                    return slope[j] if j is not None else slope
+                break
+        zero = [0.0, 0.0, 0.0, 0.0]
+        return zero[j] if j is not None else zero
+
+    def _pose_vals(self, i: int) -> List[float]:
+        p = self.poses[i]
+        return [p.x_mm, p.y_mm, p.arm_deg, p.hand_deg]
+
 
 @dataclass
-class JointSegment:
-    """相邻两关键点之间的一整段（4 轴各自 profile + 同步时长）。"""
+class JointLeg:
+    """弧长区间 [s_start, s_end] + 该区间梯形 s(t)；区间内部连续不停车。"""
 
-    start: JointPose
-    end: JointPose
-    profiles: dict          # {axis: profile}
-    T: float                # 本段同步时长 (s)
-    pass_speed: float       # 本段到达速度（= 下个关键点穿越速度，mm/s 量纲的保守上界）
+    path: _JointPath
+    s_start: float
+    s_end: float
+    profile: dict          # 弧长梯形 s(t)，起点/终点速度 0
+    arc_vmax: float
+    arc_amax: float
+    kp_start: int          # keypoints 下标（区间的起点关键点）
+    kp_end: int            # keypoints 下标（区间的终点关键点）
 
-    def axis_pose(self, t: float) -> JointPose:
-        values = {}
-        for attr, prof in self.profiles.items():
-            values[attr] = self._axis_value(attr, prof, t)
-        return JointPose(
-            x_mm=values["x_mm"], y_mm=values["y_mm"],
-            arm_deg=values["arm_deg"], hand_deg=values["hand_deg"],
-            stop=False,
-        )
+    @property
+    def T(self) -> float:
+        return self.profile["t_total"]
 
-    def _axis_value(self, attr: str, prof: dict, t: float) -> float:
-        start_val = getattr(self.start, attr)
-        end_val = getattr(self.end, attr)
-        span = end_val - start_val
-        if abs(span) < 1e-9:
-            return end_val
-        s, _v = _eval_trapezoid_v(prof, t)
-        return start_val + s
+    def pose_at(self, t: float) -> JointPose:
+        s, _v = _eval_trapezoid_v(self.profile, t)
+        q = self.path.value_at(self.s_start + s)
+        return JointPose(q[0], q[1], q[2], q[3], stop=False)
 
 
 @dataclass
 class JointTrajectory:
-    """goal → waypoint → … → goal 的 4-DOF 平滑轨迹。"""
+    """goal → waypoint → … → goal 的 4-DOF 平滑轨迹（连续经过，任意数量点）。"""
 
     keypoints: Tuple[JointPose, ...]
-    segments: Tuple[JointSegment, ...]
+    legs: Tuple[JointLeg, ...]
     sample_hz: float = 50.0
 
     @property
     def total_time(self) -> float:
-        return sum(seg.T for seg in self.segments)
+        return sum(leg.T for leg in self.legs)
 
-    def segment_at(self, t: float) -> Tuple[int, JointSegment, float]:
-        """定位 (segment_index, segment, 段内时间 t_in)。"""
+    def leg_at(self, t: float) -> Tuple[int, JointLeg, float]:
         t = max(0.0, min(float(t), self.total_time))
         acc = 0.0
-        for index, seg in enumerate(self.segments):
-            if t <= acc + seg.T + 1e-9:
-                return index, seg, max(0.0, t - acc)
-            acc += seg.T
-        seg = self.segments[-1]
-        return len(self.segments) - 1, seg, seg.T
+        for index, leg in enumerate(self.legs):
+            if t <= acc + leg.T + 1e-9:
+                return index, leg, max(0.0, t - acc)
+            acc += leg.T
+        leg = self.legs[-1]
+        return len(self.legs) - 1, leg, leg.T
 
     def sample(self, t: float) -> JointPose:
-        """任意时刻 t 的 4-DOF 位姿（末端停在最后一个关键点）。
-
-        段边界精确命中关键点时返回原关键点（保留 stop 标志），
-        避免梯形求值的浮点误差污染"关键点精确经过"语义。
-        """
-        if not self.segments:
+        """任意时刻 t 的 4-DOF 位姿（末端停在最后一个关键点）。"""
+        if not self.legs:
             return self.keypoints[-1]
         if t <= 0.0:
             return self.keypoints[0]
         if t >= self.total_time:
             return self.keypoints[-1]
-        _idx, seg, t_in = self.segment_at(t)
-        if t_in <= 1e-9 and _idx > 0:
-            return self.keypoints[_idx]
-        if abs(t_in - seg.T) <= 1e-9:
-            return self.keypoints[_idx + 1]
-        return seg.axis_pose(t_in)
+        _idx, leg, t_in = self.leg_at(t)
+        # 区间边界精确命中关键点（保留 stop 标志，避免浮点误差）
+        if t_in <= 1e-9 and leg.kp_start != 0:
+            return self.keypoints[leg.kp_start]
+        if abs(t_in - leg.T) <= 1e-9:
+            return self.keypoints[leg.kp_end]
+        return leg.pose_at(t_in)
 
     def dense_waypoints(self, spacing_mm: float = 5.0,
                         sample_hz: float = 50.0) -> List[JointPose]:
-        """把整条轨迹重采样成密集姿势序列（供 composite_run 逐点喂给真机）。
-
-        spacing_mm 以 x 轴位移为主度量；每个关键点本身**精确**出现
-        （段末直接写回原关键点，保证 stop 标志与示教值原样保留）。
-        """
+        """重采样成密集姿势序列（composite_run 喂点）；关键点精确保留。"""
         dt = 1.0 / max(sample_hz, 1.0)
         out: List[JointPose] = [self.keypoints[0]]
         last = self.keypoints[0]
-        for i, seg in enumerate(self.segments):
-            end_kp = self.keypoints[i + 1]
-            n = max(1, int(math.ceil(seg.T / dt)))
+        for leg in self.legs:
+            end_kp = self.keypoints[leg.kp_end]
+            n = max(1, int(math.ceil(leg.T / dt)))
             for k in range(1, n + 1):
-                pose = seg.axis_pose(seg.T * k / n)
+                pose = leg.pose_at(leg.T * k / n)
                 if abs(pose.x_mm - last.x_mm) >= spacing_mm:
                     out.append(pose)
                     last = pose
-            # 段末：精确落回原关键点（硬约束，不被重采样稀释）
-            out.append(end_kp)
+            out.append(end_kp)   # 关键点硬保留
             last = end_kp
-        # 去掉连续重复（零位移段）
         dedup = [out[0]]
         for pose in out[1:]:
             if (pose.x_mm, pose.y_mm, pose.arm_deg, pose.hand_deg) != \
@@ -255,88 +316,106 @@ class JointTrajectory:
         return dedup
 
     def describe(self) -> str:
-        seg_lines = []
-        for i, seg in enumerate(self.segments):
-            a, b = seg.start, seg.end
-            seg_lines.append(
-                f"  seg{i}: ({a.x_mm:.0f},{a.y_mm:.0f},{a.arm_deg:.0f},"
-                f"{a.hand_deg:.0f}) -> ({b.x_mm:.0f},{b.y_mm:.0f},"
-                f"{b.arm_deg:.0f},{b.hand_deg:.0f}) T={seg.T:.2f}s "
-                f"v_pass={seg.pass_speed:.0f}")
-        return ("JointTrajectory(kp=%d segs=%d T=%.2fs)\n%s"
-                % (len(self.keypoints), len(self.segments),
-                   self.total_time, "\n".join(seg_lines)))
+        lines = []
+        for i, leg in enumerate(self.legs):
+            a = leg.path.value_at(leg.s_start)
+            b = leg.path.value_at(leg.s_end)
+            lines.append(
+                f"  leg{i}: s[{leg.s_start:.0f},{leg.s_end:.0f}] "
+                f"({a[0]:.0f},{a[1]:.0f},{a[2]:.0f},{a[3]:.0f}) -> "
+                f"({b[0]:.0f},{b[1]:.0f},{b[2]:.0f},{b[3]:.0f}) "
+                f"T={leg.T:.2f}s arc_v={leg.arc_vmax:.0f} arc_a={leg.arc_amax:.0f}")
+        return ("JointTrajectory(kp=%d legs=%d T=%.2fs engine=%s)\n%s"
+                % (len(self.keypoints), len(self.legs), self.total_time,
+                   _ENGINE_NAME, "\n".join(lines)))
 
 
-_AXES = ("x_mm", "y_mm", "arm_deg", "hand_deg")
+_ENGINE_NAME = "scipy-pchip" if (_HAS_SCIPY and _HAS_NUMPY) else "linear-fallback"
 
 
-def _axis_specs() -> dict:
-    """每个轴的 JointPose 属性名 / 速度规格 / 加速度规格。"""
-    return {
-        "x_mm":   (DEFAULT_V_MAX,      DEFAULT_A_MAX),
-        "y_mm":   (DEFAULT_V_MAX * 0.6, DEFAULT_A_MAX),
-        "arm_deg": (DEFAULT_ARM_DEG_S,  DEFAULT_A_MAX / 4.0),
-        "hand_deg": (DEFAULT_HAND_DEG_S, DEFAULT_A_MAX / 4.0),
-    }
+def _dedup_poses(poses: List[JointPose]) -> List[JointPose]:
+    out = []
+    for p in poses:
+        if not out or (p.x_mm, p.y_mm, p.arm_deg, p.hand_deg) != \
+                      (out[-1].x_mm, out[-1].y_mm, out[-1].arm_deg, out[-1].hand_deg):
+            out.append(p)
+    return out
 
 
-def _pass_speed(prev: JointPose, way: JointPose, nxt: JointPose) -> float:
-    """中间关键点不停车时可穿越的保守上界速度。
-
-    规则：任一刀轴在"进段后半 + 出段前半"内要能从 0 加速到 v 再减到 0，
-    v ≤ sqrt(a * min(dist_in, dist_out)) 每条轴都满足 → 取全部轴的最小。
-    """
-    specs = _axis_specs()
-    speeds = []
-    for attr, (v_max, a_max) in specs.items():
-        d_in = abs(getattr(way, attr) - getattr(prev, attr))
-        d_out = abs(getattr(nxt, attr) - getattr(way, attr))
-        # 半程加减速空间 = 两侧各一半
-        room = min(d_in, d_out) / 2.0
-        # 三角形：v² = a·room（从 0 加到 v 再减到 0，各占 room/2）
-        v_tri = math.sqrt(max(a_max * room, 0.0))
-        speeds.append(min(v_max, v_tri))
-    return min(speeds) if speeds else 0.0
+def _arc_limits(path: _JointPath, joint_vmax: dict, joint_amax: dict,
+                max_speed_scale: float) -> Tuple[float, float]:
+    """弧长速度/加速上界 = 各关节限速(限加速)/|dq/ds| 的公共下界（保守）。"""
+    if path.L <= 1e-9 or not _HAS_NUMPY:
+        return DEFAULT_ARC_VMAX * max_speed_scale, DEFAULT_ARC_AMAX * max_speed_scale
+    grid = _np.linspace(0.0, path.L, max(8, int(path.L / 2.0) + 1))
+    dq = _np.abs(_np.array([path.dq_ds(float(s)) for s in grid]))  # (N, 4)
+    axes = ["x_mm", "y_mm", "arm_deg", "hand_deg"]
+    v_scale = [joint_vmax[a] / float(dq[:, j].max())
+               for j, a in enumerate(axes)
+               if float(dq[:, j].max()) > 1e-6]
+    a_scale = [joint_amax[a] / float(dq[:, j].max())
+               for j, a in enumerate(axes)
+               if float(dq[:, j].max()) > 1e-6]
+    arc_v = (min(v_scale) if v_scale else DEFAULT_ARC_VMAX) * max_speed_scale
+    arc_a = (min(a_scale) if a_scale else DEFAULT_ARC_AMAX) * _ACCEL_SAFETY * max_speed_scale
+    return float(max(arc_v, 1e-6)), float(max(arc_a, 1e-6))
 
 
 def plan_joint_trajectory(keypoints: Sequence[JointPose], *,
+                          joint_vmax: Optional[Dict[str, float]] = None,
+                          joint_amax: Optional[Dict[str, float]] = None,
                           sample_hz: float = 50.0,
-                          max_speed_scale: float = 1.0) -> JointTrajectory:
-    """把关键点序列规划成 4-DOF 平滑轨迹。
+                          max_speed_scale: float = 1.0,
+                          engine: str = "auto") -> JointTrajectory:
+    """把关键点序列规划成 4-DOF 平滑轨迹（任意数量点，连续不停顿）。
 
-    - 每个关键点精确经过；`stop=True`（默认）处速度归零停车；
-    - `stop=False` 的中间点按 `_pass_speed` 的保守上界不停穿越（角点圆滑）；
-    - 每段以最慢轴的时间为段时长，快轴到位后保持（与真机四电机并发一致），
-      `sample(t)` 可任意时刻查询。
+    - 路径：scipy PCHIP 关节空间插值（C¹、精确过点、无过冲）；无 scipy 降级线性。
+    - 时间：弧长梯形 s(t)，弧长速度 = 各关节限速的公共下界 → 全程关节速度
+      ≤ 限速；弧长加速取半作曲率项保守余量。
+    - 语义：`stop=True` 关键点停车（切开成独立 leg，速度归 0 再起步）；
+      其余关键点**连续平滑经过，不停顿**。
 
     max_speed_scale: 全局速度缩放（0~1，现场降速用）。
+    engine: "auto"（scipy 可用则用）/ "scipy" / "linear"。
     """
     if len(keypoints) < 2:
         raise ValueError("至少需要 2 个关键点（start + goal）")
-    kps = tuple(keypoints)
     max_speed_scale = _clamp(float(max_speed_scale), 0.0, 1.0)
-    specs = _axis_specs()
+    jv = dict(JOINT_VMAX)
+    ja = dict(JOINT_AMAX)
+    if joint_vmax:
+        jv.update({k: float(v) for k, v in joint_vmax.items()})
+    if joint_amax:
+        ja.update({k: float(v) for k, v in joint_amax.items()})
 
-    segments: List[JointSegment] = []
-    for i in range(len(kps) - 1):
-        a, b = kps[i], kps[i + 1]
-        # 到达 b 时的速度：b 若要求停车或就是终点 → 0；否则可穿越上界
-        if b.stop or i + 1 == len(kps) - 1:
-            v_pass = 0.0
-        else:
-            v_pass = _pass_speed(a, b, kps[i + 2]) * max_speed_scale
+    use_scipy = engine in ("auto", "scipy") and _HAS_SCIPY and _HAS_NUMPY
+    global _ENGINE_NAME
+    _ENGINE_NAME = "scipy-pchip" if use_scipy else "linear-fallback"
 
-        profiles = {}
-        for attr, (v_max, a_max) in specs.items():
-            d = getattr(b, attr) - getattr(a, attr)
-            v_max_a = v_max * max_speed_scale
-            prof = _trapezoid_v(d, 0.0, v_pass, v_max_a, a_max)
-            profiles[attr] = prof
-        T = max(p["t_total"] for p in profiles.values())
-        if T < 1e-9:
-            T = 0.0
-        segments.append(JointSegment(start=a, end=b, profiles=profiles,
-                                     T=T, pass_speed=v_pass))
+    # 一整条 PCHIP 关节空间路径；stop=True 的关键点在弧长对应位置切开
+    # （速度归 0 再起步），其余关键点全部连续平滑经过。
+    pts = _dedup_poses(list(keypoints))
+    if len(pts) < 2:
+        raise ValueError("去重后至少需要 2 个关键点（start + goal）")
+    path = _JointPath(pts, "scipy" if use_scipy else "linear")
+    arc_v, arc_a = _arc_limits(path, jv, ja, max_speed_scale)
 
-    return JointTrajectory(tuple(kps), tuple(segments), sample_hz=sample_hz)
+    s_of = path.s
+    bounds_idx = [0]
+    for i in range(1, len(pts) - 1):
+        if pts[i].stop:
+            bounds_idx.append(i)
+    bounds_idx.append(len(pts) - 1)
+    bounds_idx = sorted(set(bounds_idx))
+
+    legs: List[JointLeg] = []
+    for a_i, b_i in zip(bounds_idx, bounds_idx[1:]):
+        s0, s1 = float(s_of[a_i]), float(s_of[b_i])
+        if s1 - s0 < 1e-9:
+            continue
+        prof = _trapezoid_v(s1 - s0, 0.0, 0.0, arc_v, arc_a)
+        legs.append(JointLeg(path=path, s_start=s0, s_end=s1, profile=prof,
+                             arc_vmax=arc_v, arc_amax=arc_a,
+                             kp_start=a_i, kp_end=b_i))
+
+    return JointTrajectory(tuple(pts), tuple(legs), sample_hz=sample_hz)
