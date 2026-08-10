@@ -192,13 +192,16 @@ def _stop_chassis(car) -> None:
 
 def _chassis_move_for(car, dx_m: float, timeout: float,
                        speed_mps: float = CHASSIS_MOVE_MAX_VEL_MPS) -> None:
-    """SDK 直发 move_for —— 与 main/task2 的 _chassis_move_for 等价。"""
-    logger.info("底盘 move_for(dx=%.3f m, speed=%.2f m/s) → 阻塞 ≤ %.0fs",
-                dx_m, speed_mps, timeout)
+    """SDK 直发 move_for —— 与 main/task2 的 _chassis_move_for 等价。
+    move_for 同步阻塞到位置到位，不需要 timeout 参数 (task1_runner 范式)。
+    timeout 参数保留兼容，但 SDK 不接受，传给 caller 抛 TypeError → 我们直接丢弃。
+    """
+    del timeout  # SDK move_for 不接受 timeout, 保留接口参数仅为与 main/task2 同款
+    logger.info("底盘 move_for(dx=%.3f m, speed=%.2f m/s)",
+                dx_m, speed_mps)
     car.move_for(
         [float(dx_m), 0.0, 0.0],
         max_velocities=[float(speed_mps), float(speed_mps), math.pi / 3.0],
-        timeout=timeout,
     )
 
 
@@ -682,7 +685,7 @@ def run_task2(car) -> Dict[str, Any]:
 
             logger.info("Y 下降到 %.0fmm 执行检测", detection["y_mm"])
             try:
-                arm.move_y_position(float(detection["y_mm"]) / 1000.0, timeout=5.0)
+                arm.move_y_position(float(detection["y_mm"]) / 1000.0)
             except Exception:
                 logger.warning("Y 下降失败, 跳过水塔 %s", tower_label)
                 continue
