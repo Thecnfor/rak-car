@@ -207,15 +207,19 @@ class FromMappingTests(unittest.TestCase):
 
 
 class FakeRobotIntegrationTests(unittest.TestCase):
-    """姿势库 route → plan_joint_trajectory → FakeRobotSim：关节真的动起来。"""
+    """route → plan_joint_trajectory → FakeRobotSim：关节真的动起来。"""
+
+    # task4 收放路线（内联，不依赖已删姿势库 / 外部文件）
+    TASK4_ROUTE = [
+        JointPose(x_mm=-295.0, y_mm=-180.0, arm_deg=90.0, hand_deg=10.0, stop=True),
+        JointPose(x_mm=-240.0, y_mm=-65.0, arm_deg=90.0, hand_deg=10.0, stop=True),
+        JointPose(x_mm=0.0, y_mm=-140.0, arm_deg=90.0, hand_deg=10.0, stop=True),
+    ]
 
     def test_route_drives_sim_through_every_keypoint(self):
         from runtime.services.fake_robot import FakeRobotSim
 
-        from main.arm.postures import load_postures
-
-        lib = load_postures()
-        traj = lib.plan(4, ["pose_p", "pick", "bin_blue", "pose_p"])
+        traj = plan_joint_trajectory(self.TASK4_ROUTE)
         sim = FakeRobotSim()
         n = max(1, int(traj.total_time * 50))
         for i in range(n + 1):
@@ -225,18 +229,15 @@ class FakeRobotIntegrationTests(unittest.TestCase):
                 "arm_angle": pose.arm_deg, "hand_angle": pose.hand_deg,
             })
         end = sim.arm_state_mm()
-        self.assertAlmostEqual(end["x_mm"], -295.0, places=0)
-        self.assertAlmostEqual(end["y_mm"], -180.0, places=0)
+        self.assertAlmostEqual(end["x_mm"], 0.0, places=0)      # bin_blue.x
+        self.assertAlmostEqual(end["y_mm"], -140.0, places=0)    # bin_blue.y
         self.assertAlmostEqual(end["arm_angle"], 90.0, places=0)
         self.assertAlmostEqual(end["hand_angle"], 10.0, places=0)
 
     def test_each_keypoint_reached_during_sim(self):
         from runtime.services.fake_robot import FakeRobotSim
 
-        from main.arm.postures import load_postures
-
-        lib = load_postures()
-        traj = lib.plan(4, ["pose_p", "pick", "bin_blue"])
+        traj = plan_joint_trajectory(self.TASK4_ROUTE)
         sim = FakeRobotSim()
         seen = []
         n = max(1, int(traj.total_time * 50))
@@ -255,18 +256,24 @@ class FakeRobotIntegrationTests(unittest.TestCase):
 class ReplayTests(unittest.TestCase):
     """replay_trajectory：实时采样速度回放，末端精确到 goal（fake 上）。"""
 
+    # 示教器 3 点路线（goal → waypoint → goal），与真实 JSON 数据一致
+    TEACH_ROUTE = [
+        JointPose(x_mm=-223.7, y_mm=-150.1, arm_deg=90.0, hand_deg=-10.0),
+        JointPose(x_mm=-98.2, y_mm=-60.3, arm_deg=24.0, hand_deg=-22.0),
+        JointPose(x_mm=-87.7, y_mm=-158.6, arm_deg=-82.0, hand_deg=-22.0),
+    ]
+
     def _replay(self, kp=0.0):
         import os
         os.environ.setdefault("RAK_CAR_TRANSPORT", "fake")
         from main.local_api_client import create_runtime_client
-        from main.arm.postures import load_teach_json
         from main.arm.planning.replay import replay_trajectory
         from runtime.services.fake_runtime import reset_fake_runtime
 
         reset_fake_runtime()
         client = create_runtime_client(transport="fake")
         svc = client.service
-        route = load_teach_json("/home/xrak/Downloads/rak-car-poses.json")
+        route = self.TEACH_ROUTE
         traj = plan_joint_trajectory(route)
         s = route[0]
         client.execute_arm_action(

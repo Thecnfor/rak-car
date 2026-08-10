@@ -56,11 +56,6 @@ class HarnessResult:
             return bool(self.result.get("ok"))
         return bool(self.result)
 
-    @property
-    def signature_actions(self) -> List[str]:
-        """本任务实际发出的动作名（car+arm 合并，按 recorder 顺序去重）。"""
-        raise NotImplementedError  # 由调用方按任务断言，这里不预设
-
     def summary(self) -> str:
         status = "done" if self.done else "TIMEOUT"
         ok = "ok" if self.ok else "fail"
@@ -109,13 +104,11 @@ class TaskHarness:
         self.service.set_ir_distances(left=left, right=right)
 
     def patch(self, target: str, replacement: Callable) -> None:
-        """替换模块属性（mock.patch 的轻量版），tearDown 自动还原。"""
-        import importlib
-        module_name, _, attr = target.rpartition(".")
-        module = importlib.import_module(module_name)
-        original = getattr(module, attr)
-        setattr(module, attr, replacement)
-        self._restore.append(lambda: setattr(module, attr, original))
+        """替换模块属性，tearDown 自动还原（stdlib unittest.mock.patch）。"""
+        import unittest.mock as mock
+        p = mock.patch(target, replacement)
+        p.start()
+        self._restore.append(p.stop)
 
     # ---------------- 跑任务 ----------------
 
