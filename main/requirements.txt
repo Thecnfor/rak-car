@@ -4,3 +4,4 @@ textual>=8.0,<9.0            # TUI 仪表盘（lane_monitor_tui.py）
 rich>=13.0,<15.0             # 底盘外环 TUI 调试面板（loops/tui.py，--tui）
 PyYAML>=6.0,<7.0             # task_config.yml / arm_origin.yaml 解析
 filterpy>=1.4,<2.0   # 常速 Kalman (arm 视觉伺服平滑 bbox, 纯 numpy 3.8 兼容)
+scipy>=1.10,<2.0     # 关节空间 PCHIP 平滑 (planning/joint_trajectory.py; 缺失自动降级线性)

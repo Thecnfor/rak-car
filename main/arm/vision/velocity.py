@@ -110,13 +110,16 @@ class VelocityLoop:
     """velocity 追踪 mixin. 需 self.http (RuntimeApiClient) + 懒建 self.ws."""
 
     def _ensure_ws(self, ws):
-        if ws is None:
-            try:
-                from main.ws_client import RuntimeWsClient
-            except ImportError:  # pragma: no cover
-                from ws_client import RuntimeWsClient  # type: ignore
-            ws = RuntimeWsClient()
-        return ws
+        if ws is not None:
+            return ws
+        from main.local_api_client import LocalRuntimeClient
+        if isinstance(self.http, LocalRuntimeClient):
+            return self.http
+        try:
+            from main.ws_client import RuntimeWsClient
+        except ImportError:  # pragma: no cover
+            from ws_client import RuntimeWsClient  # type: ignore
+        return RuntimeWsClient()
 
     def _default_post_fn(self) -> Callable:
         """POST /v1/realtime/arm-velocity (免 queue 直发); 单测可注入 post_fn 覆盖.
@@ -124,6 +127,15 @@ class VelocityLoop:
         内部 step 用领域词 arm/hand, 端点 payload 要求 arm_angle/hand_angle —
         这里做映射, 注入的 post_fn 则原样收到 arm/hand (内部契约)。
         """
+        from main.local_api_client import LocalRuntimeClient
+        if isinstance(self.http, LocalRuntimeClient):
+            def post(**kw) -> dict:
+                return self.http.realtime_arm_velocity(
+                    kw.get("x_vel"), kw.get("y_vel"),
+                    kw.get("arm"), kw.get("hand"),
+                )
+            return post
+
         import requests
 
         def post(**kw) -> dict:

@@ -26,7 +26,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from main.api_client import RuntimeApiClient
+from main.local_api_client import create_runtime_client
 from main.chassis import LANE_FOLLOW
 from main.chassis.api import ChassisClient
 from main.chassis.loops.closed_loop import DoubleLoopRunner
@@ -194,7 +194,7 @@ class Orchestrator:
         """从 yaml 加载 waypoints, 失败返 None."""
         try:
             from main.task._config import load_waypoints
-            wp_dicts = load_waypoints()
+            wp_dicts = load_waypoints(config_path=config_path)
         except (FileNotFoundError, KeyError, ValueError) as exc:
             logger.warning("yaml load_waypoints failed, fallback DEFAULT_WAYPOINTS: %s", exc)
             return None
@@ -233,7 +233,7 @@ class Orchestrator:
         start_lane=False 時 lane runner 線程**不啟動**：等待階段車子不許動，
         由 wait_key_then_run 在按鍵按下瞬間才啟動（保證按下即開始、無預移動）。
         """
-        client = RuntimeApiClient()
+        client = create_runtime_client()
         if not client.wait_until_ready(timeout=10.0):
             raise RuntimeError("runtime not ready (pm2 logs rak-car-api)")
 
@@ -1124,9 +1124,9 @@ class Orchestrator:
 
         def _wait_job_silent(action_name: str, kwargs: dict, wait_s: float) -> bool:
             """fire-and-forget 提交一个 arm action, 阻塞等到 succeeded 或超时。"""
-            from main.api_client import RuntimeApiClient
+            from main.local_api_client import create_runtime_client
             try:
-                client = RuntimeApiClient()
+                client = create_runtime_client()
                 job = client.execute("arm", action_name, kwargs=kwargs, sync=False)
                 jid = job.get("id") if isinstance(job, dict) else None
                 if jid:

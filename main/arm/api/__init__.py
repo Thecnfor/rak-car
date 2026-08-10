@@ -10,7 +10,7 @@ import os
 import threading
 from typing import Optional
 
-from main.api_client import RuntimeApiClient
+from main.local_api_client import LocalRuntimeClient, create_runtime_client
 from main.ws_client import RuntimeWsClient
 
 from ..state import ArmOrigin
@@ -31,7 +31,7 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
                 ResetOpsMixin, StorageMixin, StateIOMixin, VisServoMixin):
     """机械臂专用 client. 薄封装 main.api_client / main.ws_client."""
 
-    def __init__(self, http: RuntimeApiClient,
+    def __init__(self, http: LocalRuntimeClient,
                  ws: Optional[RuntimeWsClient] = None,
                  origin: Optional[ArmOrigin] = None,
                  traj: Optional[TrajectoryGenerator] = None):
@@ -52,15 +52,16 @@ class ArmClient(SafetyMixin, MotionMixin, SettersMixin, CompositeMixin,
 
     @classmethod
     def connect(cls, load_origin: bool = True) -> "ArmClient":
-        http = RuntimeApiClient()
+        http = create_runtime_client()
         ws: Optional[RuntimeWsClient] = None
         ready = False
-        try:
-            ws = RuntimeWsClient()
-            ws.connect()
-            ready = True
-        except Exception:
-            ready = False
+        if not isinstance(http, LocalRuntimeClient):
+            try:
+                ws = RuntimeWsClient()
+                ws.connect()
+                ready = True
+            except Exception:
+                ready = False
         client = cls(http=http, ws=ws)
         client.ws_ready = ready
         if load_origin:
