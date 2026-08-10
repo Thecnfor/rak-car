@@ -26,7 +26,8 @@ class Task4Direct:
         self.creep_speed_mps = creep_speed_mps
         self.picked = 0
         self._start = time.monotonic()
-        self._start_x = self._odom_x()
+        self._last_x = self._odom_x()
+        self._travelled = 0.0
 
     def _odom_x(self) -> float:
         value = self.car.get_odometry()
@@ -40,7 +41,10 @@ class Task4Direct:
             return 0.0
 
     def _walked(self) -> float:
-        return abs(self._odom_x() - self._start_x)
+        current_x = self._odom_x()
+        self._travelled += abs(current_x - self._last_x)
+        self._last_x = current_x
+        return self._travelled
 
     def _stopped(self) -> bool:
         return bool(getattr(self.car, "_must_exit", lambda: False)())
@@ -51,10 +55,15 @@ class Task4Direct:
             values = state.values()
         else:
             values = state
-        try:
-            return any(0.0 < float(v) <= 0.7 for v in values if v not in (None, "", "---"))
-        except (TypeError, ValueError):
-            return False
+        for value in values:
+            if value in (None, "", "---"):
+                continue
+            try:
+                if float(value) <= 0.7:
+                    return True
+            except (TypeError, ValueError):
+                continue
+        return False
 
     def _target(self) -> Optional[list]:
         detections = self.car.get_detection_results(sort_pos=(0, 0)) or []
