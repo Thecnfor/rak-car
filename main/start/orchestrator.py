@@ -321,14 +321,9 @@ class Orchestrator:
                          args=(tui_buf, tui_running),
                          daemon=True, name="tui").start()
 
-        # 后台 D：下位机 led_show 屏幕 UI（250ms 刷新，带帧率限制）
+        # 下位机 led_show UI 默认关闭：避免 show_text 任务占用 runtime 队列和串口。
         display_running = threading.Event()
-        display_running.set()
-        from main.start.display_ui import Mc602Display
-        display_ui = Mc602Display(client, layout="20x5")
-        threading.Thread(target=self._display_ui_loop,
-                         args=(display_ui, tui_buf, display_running),
-                         daemon=True, name="display").start()
+        display_ui = None
 
         return {
             "client": client, "api": api, "runner": runner,
@@ -566,11 +561,13 @@ class Orchestrator:
             except Exception:
                 pass
             # 下位机屏幕清屏（best-effort）
-            try:
-                display_ui.clear()
-                display_ui.render(throttle_s=0.0)
-            except Exception:
-                pass
+            # display_ui 默认关闭，无需向 runtime 提交 show_text。
+            if display_ui is not None:
+                try:
+                    display_ui.clear()
+                    display_ui.render(throttle_s=0.0)
+                except Exception:
+                    pass
             # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
             logger.info("mission completed: %s", completed)
         return completed
