@@ -60,7 +60,9 @@ from main.arm.each_task.task4.constants import (  # noqa: E402
     P_POSE_SKIP_TOL_ARM_DEG, P_POSE_SKIP_TOL_HAND_DEG,
     # 新版流程 (2026-08-11)
     FIRST_CREEP_MAX_M, TRACK_EXTEND_SECONDS,
-    SCAN_MAX_PICKS, SCAN_ADVANCE_M, SCAN_LOOK_S, SCAN_GRAB_CX_HALF, SCAN_IR_FAR_M,
+    SCAN_MAX_PICKS, SCAN_ADVANCE_M, SCAN_LOOK_S, SCAN_GRAB_CX_HALF,
+    SCAN_GRAB_CX_HALF_LATE, SCAN_GRAB_TIER_ADVANCES,
+    MIN_SCAN_ADVANCES, SCAN_EMPTY_ROUNDS,
     ARM_SERVO_SETPOINT_CX, ARM_SERVO_SETPOINT_CY, PICK_RELEASE_HAND_DEG,
     # 临时调试开关
     ALIGN_ONLY,
@@ -84,22 +86,11 @@ LOG_PREFIX: str = LOG_PREFIX_TARGET4
 
 # ---------- 新版流程 helpers (2026-08-11) ----------
 
-def _ir_far(http_client, threshold_m: float = SCAN_IR_FAR_M) -> bool:
-    """左 IR > 阈值 → 视为离区 (退出条件)。读不到按 False (不误退)。"""
-    try:
-        payload = http_client.get_ir_state() or {}
-        left = (payload.get("ir_state") or {}).get("left")
-        if left is None:
-            return False
-        return float(left) > threshold_m
-    except Exception:
-        return False
-
-
 def _advance_and_arm_init(arm_client, http_client, *, pose_p_x_mm, pose_p_y_mm,
                           pose_p_arm_deg, pose_p_hand_deg, dry_run=False) -> None:
-    """move_for 前进 SCAN_ADVANCE_M ∥ 并发 臂回初始姿势。
+    """沿车道线前进 SCAN_ADVANCE_M ∥ 并发 臂回初始姿势。
 
+    前进走 move_along_lane (lane_follow, 视觉对齐车道中心不偏), 不用 move_for。
     串口抢占风险已接受 (2026-08-11 用户) —— 前进与臂回初始同时进行。
     """
     if dry_run:
@@ -118,22 +109,22 @@ def _advance_and_arm_init(arm_client, http_client, *, pose_p_x_mm, pose_p_y_mm,
     t = _th.Thread(target=_arm_init, name="task4-arm-init", daemon=True)
     t.start()
     try:
-        http_client.execute_car_action(
-            "move_for", [SCAN_ADVANCE_M, 0.0, 0.0],
-            timeout=10.0, sync=True, max_velocities=[0.05, 0.05, 3.14159 / 3],
-        )
-        print(f"  [{LOG_PREFIX}] 前进 {SCAN_ADVANCE_M:.2f}m 完成 (臂回初始并发)")
+        from main.chassis.controllers import move_along_lane
+        move_along_lane(vx=0.05, distance_m=SCAN_ADVANCE_M)
+        print(f"  [{LOG_PREFIX}] 前进 {SCAN_ADVANCE_M:.2f}m 完成 (lane_follow, 臂回初始并发)")
     except Exception as e:
-        print(f"  [{LOG_PREFIX}] ⚠️ move_for 前进失败 ({type(e).__name__}: {str(e)[:80]})")
+        print(f"  [{LOG_PREFIX}] ⚠️ lane_follow 前进失败 ({type(e).__name__}: {str(e)[:80]})")
     t.join(timeout=35.0)
 
 
 def _look_grabbable_ball(http_client, *, timeout_s: float = SCAN_LOOK_S,
+                         grab_half: float = SCAN_GRAB_CX_HALF,
                          dry_run: bool = False) -> Optional[dict]:
     """找球 ≤timeout_s: 轮询 fetch_balls, 过滤到可抓窗口
-    (|cx_norm - ARM_SERVO_SETPOINT_CX| ≤ SCAN_GRAB_CX_HALF), 取最左 (cx 最小)。
+    (|cx_norm - ARM_SERVO_SETPOINT_CX| ≤ grab_half), 取最左 (cx 最小)。
 
     窗口内无球 → None (没球 / 球在窗口外 = 下一轮的球, 上层继续前进)。
+    grab_half 由主循环按梯度 (前 N 次窄窗, 之后宽窗) 传入。
     """
     if dry_run:
         return {"color": COLOR_BLUE, "cx_norm": 0.0, "score": 1.0}
@@ -151,7 +142,7 @@ def _look_grabbable_ball(http_client, *, timeout_s: float = SCAN_LOOK_S,
         in_window = [
             b for b in balls
             if b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
-            and abs(float(b.get("cx_norm", 0.0)) - ARM_SERVO_SETPOINT_CX) <= SCAN_GRAB_CX_HALF
+            and abs(float(b.get("cx_norm", 0.0)) - ARM_SERVO_SETPOINT_CX) <= grab_half
         ]
         if in_window:
             return min(in_window, key=lambda b: float(b.get("cx_norm", 0.0)))
@@ -209,10 +200,12 @@ def step_target4(
     print(f"  模式: {'DRY-RUN (不动硬件)' if dry_run else 'EXECUTE (动硬件)'}")
     print(f"  初始姿势: x={pose_p_x_mm} y={pose_p_y_mm} arm={pose_p_arm_deg}° hand={pose_p_hand_deg}°")
     print(f"  第一球 creep {creep_speed_mps:.2f}m/s | 后续 前进 {SCAN_ADVANCE_M}m × "
-          f"{SCAN_LOOK_S:.0f}s 找球")
+          f"{SCAN_LOOK_S:.0f}s 找球 (窗口梯度: 前{SCAN_GRAB_TIER_ADVANCES}次 "
+          f"{SCAN_GRAB_CX_HALF:.1f}, 之后 {SCAN_GRAB_CX_HALF_LATE:.1f})")
     print(f"  底盘对齐 ≤{track_max_seconds:.0f}s (+超时加时 {TRACK_EXTEND_SECONDS:.0f}s, "
           f"失败也继续) | 臂伺服 setpoint=({ARM_SERVO_SETPOINT_CX},{ARM_SERVO_SETPOINT_CY})")
-    print(f"  退出: 左 IR>{SCAN_IR_FAR_M:.2f}m 或 picks≥{SCAN_MAX_PICKS} | ALIGN_ONLY={ALIGN_ONLY}")
+    print(f"  退出: 连续{SCAN_EMPTY_ROUNDS}轮无球 且 前进≥{MIN_SCAN_ADVANCES}次 "
+          f"| 无抓球数封顶 | ALIGN_ONLY={ALIGN_ONLY}")
 
     for name, val in (("max_seconds", max_seconds), ("creep_speed_mps", creep_speed_mps),
                       ("track_max_seconds", track_max_seconds)):
@@ -361,10 +354,13 @@ def step_target4(
         release_thread = None
 
         def _record_pick(idx, color, res) -> int:
+            ok = bool(res["ok"])
             history.append({"ball": idx,
-                            "action": "picked" if res["ok"] else "pick_failed",
+                            "action": "picked" if ok else "pick_failed",
                             "color": color, "error": res["error"]})
-            return 1 if res["ok"] else 0
+            if not ok:
+                print(f"  [{LOG_PREFIX}] ❌ 第 {idx} 球抓取失败: {res['error']}")
+            return 1 if ok else 0
 
         def _grab(color) -> dict:
             return _servo_and_pick(
@@ -428,16 +424,15 @@ def step_target4(
                     n_pick_failures += 1
                 release_thread = res.get("release_thread")
 
-        # ---- 2.2 后续球循环 (picks<8 且 未离区) ----
-        while final_reason == "unknown" and n_picks < SCAN_MAX_PICKS:
+        # ---- 2.2 后续球循环 (无抓球数封顶) ----
+        #    退出 = 前进≥MIN_SCAN_ADVANCES 且 连续 SCAN_EMPTY_ROUNDS 轮无球 且 左 IR 离区
+        scan_advances = 0      # 已前进次数
+        consecutive_empty = 0  # 连续找球为空轮数
+        while final_reason == "unknown":
             elapsed = time.monotonic() - t_start
             if elapsed >= max_seconds:
                 final_reason = "time_budget"
                 print(f"  [{LOG_PREFIX}] ⏱ 总时长 {elapsed:.1f}s 达预算, 收尾")
-                break
-            if _ir_far(http_client):
-                final_reason = "zone_cleared"
-                print(f"  [{LOG_PREFIX}] 🏁 左 IR > {SCAN_IR_FAR_M:.2f}m, 已离区, 收工")
                 break
             ball_idx += 1
             print(f"\n========== [{LOG_PREFIX}] 第 {ball_idx} 球 (扫描前进) ==========")
@@ -450,11 +445,24 @@ def step_target4(
                 pose_p_arm_deg=pose_p_arm_deg, pose_p_hand_deg=pose_p_hand_deg,
                 dry_run=dry_run,
             )
-            # 找球 ≤3s (可抓窗口 + 最左); 窗口内无球 → 继续前进 (IR 检查在循环顶)
-            ball = _look_grabbable_ball(http_client, timeout_s=SCAN_LOOK_S, dry_run=dry_run)
+            scan_advances += 1
+            # 梯度窗口: 前 SCAN_GRAB_TIER_ADVANCES 次前进用窄窗, 之后放宽到宽窗
+            grab_half = (SCAN_GRAB_CX_HALF if scan_advances <= SCAN_GRAB_TIER_ADVANCES
+                         else SCAN_GRAB_CX_HALF_LATE)
+            # 找球 ≤3s (可抓窗口 + 最左); 窗口内无球 → 累积空轮, 达标才退出
+            ball = _look_grabbable_ball(http_client, timeout_s=SCAN_LOOK_S,
+                                        grab_half=grab_half, dry_run=dry_run)
             if ball is None:
-                print(f"  [{LOG_PREFIX}] 未见可抓球 (窗口内无球), 下一轮继续前进")
+                consecutive_empty += 1
+                print(f"  [{LOG_PREFIX}] 未见可抓球 (窗口内无球), 空轮 {consecutive_empty} 次")
+                if (scan_advances >= MIN_SCAN_ADVANCES
+                        and consecutive_empty >= SCAN_EMPTY_ROUNDS):
+                    final_reason = "zone_cleared"
+                    print(f"  [{LOG_PREFIX}] 🏁 已前进 {scan_advances} 次, 连续 "
+                          f"{consecutive_empty} 轮无球, 收工")
+                    break
                 continue
+            consecutive_empty = 0
             color = ball["color"]
             print(f"  [{LOG_PREFIX}] ✓ 锁定 {color} 球 "
                   f"(最左, cx={float(ball.get('cx_norm', 0)):.3f})")
@@ -463,10 +471,11 @@ def step_target4(
             if not res["ok"]:
                 n_pick_failures += 1
             release_thread = res.get("release_thread")
-        else:
-            if final_reason == "unknown":
+            if dry_run and n_picks >= SCAN_MAX_PICKS:
+                # dry-run 占位球抓满即停, 防止空转 (实车不封顶)
                 final_reason = "completed"
-                print(f"  [{LOG_PREFIX}] 🏁 已抓 {SCAN_MAX_PICKS} 球, 封顶收工")
+                print(f"  [{LOG_PREFIX}] [DRY-RUN] 抓满 {SCAN_MAX_PICKS} 占位球, 收工")
+                break
 
     except KeyboardInterrupt:
         final_reason = "keyboard_interrupt"
@@ -555,7 +564,7 @@ def step_target4(
 
     elapsed = time.monotonic() - t_start
     print(f"\n========== {LOG_PREFIX} 完成 ==========")
-    print(f"  reason={final_reason}  picks={n_picks}/{SCAN_MAX_PICKS}  "
+    print(f"  reason={final_reason}  picks={n_picks}  "
           f"skips={n_skips}  pick_failures={n_pick_failures}  "
           f"前移={total_creep_m:.3f}m  elapsed={elapsed:.1f}s")
 
