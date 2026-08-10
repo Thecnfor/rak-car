@@ -69,8 +69,8 @@ CAR_ACTIONS = {
     "run_task1": lambda car, *args, **kwargs: run_task1(car),
     # 2026-08-10: runtime 层 task2 (water_tower_task) 主入口，进程内直调跳过网络栈。
     # 等价于 main/task/task2_water_tower.run()，但所有 arm/car 走 SDK 直调
-    # （car.composite_run / car.run_arm_servo / car.arm.move_y_position /
-    # car.arm.grasp 等），不进 HTTP job_queue，不持 car_lock。
+    # （car.arm.composite_run / car.run_arm_servo / car.arm.move_y_position /
+    # car.arm.grasp / car.move_for 等），不进 HTTP job_queue，不持 car_lock。
     "run_task2": lambda car, *args, **kwargs: run_task2(car),
     # 2026-08-10: task4 也在 runtime 进程内执行，客户端只发 action。
     "run_task4": lambda car, *args, **kwargs: run_task4(car, **kwargs),

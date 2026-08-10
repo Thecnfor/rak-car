@@ -3,7 +3,7 @@
 """Runtime 层 task2 (water_tower_task) 核心逻辑 — 进程内直调，跳过网络栈。
 
 完全复刻 main/task/task2_water_tower.py 的业务逻辑，所有 arm/car 调用直接走
-SDK 方法（car.composite_run / car.run_arm_servo / car.arm.move_y_position /
+SDK 方法（car.arm.composite_run / car.run_arm_servo / car.arm.move_y_position /
 car.arm.grasp 等），不经过 HTTP API。
 
 调用方式：
@@ -208,7 +208,12 @@ def _chassis_move_for(car, dx_m: float, timeout: float,
 def _safe_composite_run(car, *, arm=None, x_mm=None, y_mm=None, hand=None,
                          speed: int = COMPOSITE_SPEED_DEFAULT,
                          timeout: float = COMPOSITE_TIMEOUT_S_DEFAULT) -> None:
-    """composite_run 直发，m 单位自动转换。"""
+    """composite_run 直发，m 单位自动转换 (调用 car.arm.composite_run)。
+    composite_run 是 ArmController 上的方法（arm_base.py:994），MyCar 不直接持有。
+    """
+    arm_obj = getattr(car, "arm", None)
+    if arm_obj is None:
+        raise RuntimeError("car.arm 未初始化, composite_run 无法调用")
     if arm is None and x_mm is None and y_mm is None and hand is None:
         return
     kwargs: Dict[str, Any] = dict(speed=speed, timeout=timeout)
@@ -220,7 +225,7 @@ def _safe_composite_run(car, *, arm=None, x_mm=None, y_mm=None, hand=None,
         kwargs["y"] = float(y_mm) / 1000.0
     if hand is not None:
         kwargs["hand"] = float(hand)
-    car.composite_run(**kwargs)
+    arm_obj.composite_run(**kwargs)
 
 
 def _ensure_xy_in_safe_zone(car, *, timeout: float = 10.0) -> None:
@@ -538,12 +543,12 @@ def _pick_cube_servo_local(
     if hand_param is not None:
         hand_param = float(hand_param)
     target_m = float(vision.get("grasp_y_mm", pick["y_descend_mm"])) / 1000.0
-    car.composite_run(arm=None, x=None, y=target_m, hand=hand_param,
-                       speed=100, timeout=5.0)
+    arm_obj.composite_run(arm=None, x=None, y=target_m, hand=hand_param,
+                          speed=100, timeout=5.0)
     arm.grasp(True)
     servo_y = float(vision.get("servo_y_mm", pick["y_transition_mm"]))
-    car.composite_run(arm=None, x=None, y=servo_y / 1000.0, hand=None,
-                       speed=100, timeout=5.0)
+    arm_obj.composite_run(arm=None, x=None, y=servo_y / 1000.0, hand=None,
+                          speed=100, timeout=5.0)
     return result
 
 
