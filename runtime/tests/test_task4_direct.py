@@ -40,8 +40,8 @@ class FakeCar:
     def get_detection_results(self, **kwargs):
         return self.detections
 
-    def move_for(self, vector, stop=True):
-        self.moves.append((vector, stop))
+    def move_for(self, vector):
+        self.moves.append(vector)
         self.x += vector[0]
 
     def move_to_detection_target(self, **kwargs):

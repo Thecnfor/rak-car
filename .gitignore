@@ -168,3 +168,7 @@ vel_trace_*.jsonl
 servo4_trace_*.jsonl
 .claude/worktrees/
 main/chassis/tests/test_move_along_lane.py
+
+# 视觉对齐代码包 (visual align code, 现场打包不提交)
+visual_align_code.tar.gz
+visual_align_code/

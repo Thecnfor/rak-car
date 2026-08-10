@@ -19,7 +19,7 @@ class Task4Direct:
     }
 
     def __init__(self, car: Any, *, max_seconds: float = 120.0,
-                 creep_m: float = 0.8, creep_speed_mps: float = 0.12):
+                 creep_m: float = 0.8, creep_speed_mps: float = 0.20):
         self.car = car
         self.max_seconds = max_seconds
         self.creep_m = creep_m
@@ -145,7 +145,7 @@ class Task4Direct:
                     target_done = True
                     reason = "picked"
                 else:
-                    self.car.move_for([self.creep_speed_mps * 0.1, 0.0, 0.0], stop=False)
+                    self.car.move_for([self.creep_speed_mps * 0.1, 0.0, 0.0])
                     time.sleep(0.1)
         except Exception as exc:
             reason = "error:%s" % exc
