@@ -98,7 +98,7 @@ task_cfg:
       max_vel: 0.08          # 2026-08-10: 0.5 → 0.08 (x十字速度上限收紧, 80mm/s)
       settle_hits: 3
       sign_arm: 1
-      sign_x: -1
+      sign_x: 1              # 2026-08-12: -1 → +1 (task2 同朝向 arm=+95 实测 +1; place arm=+90 几何与抓苗 -90 相反, 沿用 -1 是搬错 → 实车 divergence 冲 X_MIN)
       arm_min: 30
       arm_max: 150           # 2026-08-10: 90 → 150 (大臂 clamp 放宽, 对齐范围更大)
 
