@@ -8,6 +8,7 @@ import uuid
 try:
     from websocket import (
         WebSocketConnectionClosedException,
+        WebSocketException,
         WebSocketTimeoutException,
         create_connection,
     )
@@ -447,11 +448,23 @@ class _PushSubscriber:
             self._thread.join(timeout=1.0)
 
     def _run(self):
+        # 瞬时 Wi-Fi 抖动 / 服务重启：connect 失败不能杀订阅线程（lane_state 推送断供，
+        # 外环被迫回退 req/resp）。指数退避重连直到 stop —— 与主连接 request() 的
+        # auto_reconnect 同一思路。
+        backoff = 1.0
+        while not self._stop_event.is_set():
+            try:
+                self._conn = create_connection(self._ws_url, timeout=5.0)
+                break
+            except (OSError, WebSocketException):
+                self._stop_event.wait(min(backoff, 10.0))
+                backoff *= 2
+        if self._conn is None:
+            return
         try:
-            self._conn = create_connection(self._ws_url, timeout=2.0)
             # server 立刻发 welcome,先吃掉
             try:
-                self._conn.settimeout(2.0)
+                self._conn.settimeout(5.0)
                 self._conn.recv()
             except Exception:
                 pass
@@ -460,7 +473,7 @@ class _PushSubscriber:
                 json.dumps({"op": self._subscribe_op, "hz": 1.0 / self._poll_interval})
             )
             try:
-                self._conn.settimeout(2.0)
+                self._conn.settimeout(5.0)
                 ack = self._conn.recv()
                 ack_data = json.loads(ack)
                 if not ack_data.get("ok"):
