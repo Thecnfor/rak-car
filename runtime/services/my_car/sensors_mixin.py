@@ -19,8 +19,8 @@ from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
 from runtime.core.key_input import board_key_pressed
 
 # 射击继电器高电平保持时长 (s) = 枪口继电器激活时间.
-# 2026-08-12 用户: 0.25 → 0.28 (原 0.25s 激活时间太短射不出弹, 先调 0.28 现场看效果再微调).
-SHOOT_RELAY_HOLD_S = 0.28
+# 2026-08-12 用户: 0.25 → 0.28 → 0.32 (0.25/0.28 疑似激活不够射不出弹, 现场逐档上调看效果).
+SHOOT_RELAY_HOLD_S = 0.32
 
 
 class SensorsMixin:
