@@ -414,6 +414,21 @@ def _safe_composite_run(
     jid = job.get("id") if isinstance(job, dict) else None
     if jid:
         arm_client.http.wait_job(jid, timeout=timeout + 5.0)
+    # x 到位校验 (2026-08-12 task1 同款补丁移植): composite_run 并发/单独跑时
+    # move_x_position 假收敛 (X 只走一半, SDK 报 ok). 用 arm_feed 真值校验,
+    # 未到位单轴补走 (arm=None 只动 X), 最多 3 次. 仅当本次命令带 x_mm 才校验.
+    if x_mm is not None:
+        for _ in range(3):
+            try:
+                actual_x = arm_client._read_x_mm_realtime()
+                if actual_x is None or abs(float(actual_x) - float(x_mm)) < 15.0:
+                    break
+            except (TypeError, ValueError):
+                break
+            logger.warning("  X 未到位 (实际=%.0fmm 目标=%.0fmm), 单轴补走",
+                           actual_x, x_mm)
+            arm_client.composite_run(
+                x_mm=float(x_mm), speed=speed, timeout=15.0)
 
 
 def _deliver_prepare(
@@ -536,20 +551,20 @@ def _ensure_xy_in_safe_zone(
     if need_x_adj and need_y_adj:
         if -150.0 <= cur_x <= -10.0:
             if abs(safe_x - cur_x) > 1.0:
-                runner.client.composite_run(x_mm=safe_x, timeout=timeout)
+                _safe_composite_run(arm_client, x_mm=safe_x, timeout=timeout)
             if abs(safe_y - cur_y) > 1.0:
-                runner.client.composite_run(y_mm=safe_y, timeout=timeout)
+                _safe_composite_run(arm_client, y_mm=safe_y, timeout=timeout)
         else:
             if abs(safe_y - cur_y) > 1.0:
-                runner.client.composite_run(y_mm=safe_y, timeout=timeout)
+                _safe_composite_run(arm_client, y_mm=safe_y, timeout=timeout)
             if abs(safe_x - cur_x) > 1.0:
-                runner.client.composite_run(x_mm=safe_x, timeout=timeout)
+                _safe_composite_run(arm_client, x_mm=safe_x, timeout=timeout)
     elif need_x_adj:
         if abs(safe_x - cur_x) > 1.0:
-            runner.client.composite_run(x_mm=safe_x, timeout=timeout)
+            _safe_composite_run(arm_client, x_mm=safe_x, timeout=timeout)
     elif need_y_adj:
         if abs(safe_y - cur_y) > 1.0:
-            runner.client.composite_run(y_mm=safe_y, timeout=timeout)
+            _safe_composite_run(arm_client, y_mm=safe_y, timeout=timeout)
     # else: 都在安全区, 直接返回
 
 
