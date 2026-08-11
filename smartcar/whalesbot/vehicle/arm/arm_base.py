@@ -550,21 +550,21 @@ class ArmController:
 
     def move_x_position(self, target, out_time = 6.0, v_max_mms: float = None):
         """
-        移动水平方向指定位置。开环 bang-bang + 统一慢速,无中途撞墙 calibrate。
+        移动水平方向指定位置。PID 闭环 (2026-08-12 用户决定替换 bang-bang)。
 
-        2026-08-01 三次根治: 用户报 "x/y 来回走 3-4 秒才稳定"。
-        二次根治 (WIP) 把 PID 改 bang-bang 但 v_max=100mm/s,50ms 周期下每帧 5mm
-        位移撞 0.4mm 阈值,机械惯性反复过冲 → 振荡 3-4s。
-        本次改成统一慢速 40mm/s + 10ms 控制周期 消除振荡根源:
-          - 10ms 周期 × 0.04 m/s = 0.4mm/帧 = POSITION_ERROR_THRESHOLD,刚好不超调;
-          - 50ms 周期下 0.04 m/s = 2mm/帧,反复过线振荡 15s+ 真机测出过;
-          - 业务层 v_max_mms 仍可临时覆盖(默认 40mm/s 透传到 x_pid.output_limits)。
+        原 bang-bang (08-01) 全速 (v_max) 冲到目标 1.5mm 内立刻停 → 皮带回弹/背隙
+        导致 "转不到位就停止" (X 短 30-114mm, SDK 却报 ok). 改回 PID:
+          近目标自动减速, 停止柔, 回弹小 — 用 "慢速接近 + 可能轻微振荡但最终到位"
+          换 "全速冲但停不到位". 控制律 = x_pid (Kp=6, Ki=0, Kd=1.0,
+          arm_cfg.yaml horiz_cfg.pid), output_limits 收紧到 ±v_max:
+          远段饱和 = bang-bang 快速赶路, 误差 < ~16mm 内 PID 温柔收尾.
 
         算法:
-          - |error| > POSITION_ERROR_THRESHOLD (1.5mm) → x_speed(+v_max / -v_max)
-          - |error| <= 1.5mm → x_speed(0) 等带子减速
-          - 连续 5 帧 < 1.5mm (x_pid_flag CountRecord) → 到位退出
-          - out_time 超时兜底
+          - setpoint=target, output_limits=±v_max (默认 40mm/s; composite_run 传
+            x_v_max_mms=100 → 100mm/s)
+          - 循环调 x_pid_moveto(target): 单步 PID + 连续 5 帧 <1.5mm 到位判定
+          - 到位 → x_speed(0); out_time 超时 / 急停 → 兜底退出
+          - 10ms 采样 (x_pid.sample_time=0.01 默认)
 
         Args:
             target: 目标位置 (m)
@@ -576,17 +576,15 @@ class ArmController:
         prev_pos = self.x_get_position()
         self._x_expected_total_delta += abs(target - prev_pos)
 
-        # 可选临时收紧 PID 限幅(虽不用 PID,保留 output_limits / x_velocity_limit
-        # 同步收紧,避免其他动作意外)。
-        saved_pid_limits = None
-        saved_vel_limit = None
-        v_max = 0.04  # 默认 40 mm/s (匀速消振荡: 50ms 周期 × 0.04 = 2mm/帧)
+        # 临时收紧 PID 限幅 (try/finally 还原, 防污染后续 move_x / goto_position)
+        saved_pid_limits = self.x_pid.output_limits
+        saved_vel_limit = self.x_velocity_limit
+        v_max = 0.04  # 默认 40 mm/s
         if v_max_mms is not None:
             v_max = float(v_max_mms) / 1000.0
-            saved_pid_limits = self.x_pid.output_limits
-            saved_vel_limit = self.x_velocity_limit
-            self.x_pid.output_limits = (-v_max, v_max)
-            self.x_velocity_limit = (-v_max, v_max)
+        self.x_pid.setpoint = float(target)
+        self.x_pid.output_limits = (-v_max, v_max)
+        self.x_velocity_limit = (-v_max, v_max)
 
         end_time = time.time() + out_time
         try:
@@ -595,27 +593,16 @@ class ArmController:
                     break
                 if time.time() > end_time:
                     break
-                # 读当前位置 + 计算 error
-                cur = self.x_get_position()
-                error = target - cur
-                if abs(error) <= POSITION_ERROR_THRESHOLD:
-                    # 收敛判定: 连续 5 帧 < 0.4mm
-                    if self.x_pid_flag(True):
-                        break
+                if self.x_pid_moveto(float(target)):
                     self.x_speed(0)
-                else:
-                    # error > 死区 → 开环驱动,并清零收敛计数器(CountRecord False 分支清零)
-                    self.x_pid_flag(False)
-                    self.x_speed(v_max if error > 0 else -v_max)
-                # 周期 10ms: 让 v_max=0.04 m/s × 0.01s = 0.4mm/帧 = 阈值,刚好不超调
-                # (50ms 周期下 0.04 m/s = 2mm/帧,反复过线振荡 15s+ 测出过)
+                    break
+                # PID 采样周期 10ms (x_pid.sample_time=0.01 默认)
                 time.sleep(0.01)
         finally:
             self.x_speed(0)
             # 还原 PID 限幅,避免临时收紧污染后续 move_x / goto_position 的初始状态
-            if saved_pid_limits is not None:
-                self.x_pid.output_limits = saved_pid_limits
-                self.x_velocity_limit = saved_vel_limit
+            self.x_pid.output_limits = saved_pid_limits
+            self.x_velocity_limit = saved_vel_limit
 
         # 2) 命令/编码器核对(仅在已知 ref 时)
         if self._x_ref_encoder_at_zero is not None:
