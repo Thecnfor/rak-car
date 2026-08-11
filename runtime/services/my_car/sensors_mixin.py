@@ -18,6 +18,10 @@ from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
 
 from runtime.core.key_input import board_key_pressed
 
+# 射击继电器高电平保持时长 (s) = 枪口继电器激活时间.
+# 2026-08-12 用户: 0.25 → 0.28 (原 0.25s 激活时间太短射不出弹, 先调 0.28 现场看效果再微调).
+SHOOT_RELAY_HOLD_S = 0.28
+
 
 class SensorsMixin:
     """MyCar 的传感器 / 外设行为。"""
@@ -128,7 +132,7 @@ class SensorsMixin:
         time.sleep(0.05)
         try:
             self.shoot.set(1)
-            time.sleep(0.25)
+            time.sleep(SHOOT_RELAY_HOLD_S)   # 继电器激活时长 (0.28s, 可调)
         finally:
             self.shoot.set(0)
         time.sleep(0.2)

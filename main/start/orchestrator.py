@@ -509,8 +509,9 @@ class Orchestrator:
                 # 不能再启动通用 home reset 抢占同一条臂串口。
                 if task4_task5_handoff is None:
                     if wp.task_id == 1:
-                        # 2026-08-09 用户: task1 结束后, 前往 task3 识别区的
-                        # 巡线途中后台摆好识别姿态 (来不及就等任务点停下调整).
+                        # 2026-08-12 用户指令(更新): task1 结束后, 前往 task3 识别区的
+                        # 巡线途中后台把臂摆到识别位置 → **识别任务本身不再动臂**
+                        # (task3_pipeline/recognize_targets 已取消识别前摆臂, 靠这里预摆).
                         from main.task.task3.arm_poses import RECOGNITION_ARM
                         self._schedule_arm_pose(RECOGNITION_ARM, "recognition",
                                                 target_task_id=3)

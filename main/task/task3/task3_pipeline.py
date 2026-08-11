@@ -2,11 +2,11 @@
 # -*- coding: utf-8 -*-
 """Task 3 pipeline: record four boards, judge them after driving, then shoot.
 
-The recognition phase moves the arm to the recognition pose, drives slowly
-until all target crops are recorded without waiting for the LLM. After the car
-stops, the crops are judged in order. The operator then moves the car to the
-shooting area; Enter starts the existing shooting algorithm after the arm is
-moved to its shooting pose.
+The recognition phase drives slowly until all target crops are recorded,
+judging each one inline (with front/back recapture on unknown). The arm is
+NOT adjusted before recognition (2026-08-12 user directive). After the car
+stops, the operator moves the car to the shooting area; Enter starts the
+existing shooting algorithm after the arm is moved to its shooting pose.
 
 Run from the repository root:
     python -m main.task.task3.task3_pipeline --token <ERNIE_TOKEN>
@@ -29,7 +29,7 @@ import requests
 import yaml
 
 from main.api_client import RuntimeApiClient
-from main.task.task3.arm_poses import RECOGNITION_ARM, SHOOTING_ARM, arm_at_pose
+from main.task.task3.arm_poses import SHOOTING_ARM, arm_at_pose
 from main.task.task3.llm_ernie import call_vision, check_health, load_token, mask_token
 
 
@@ -79,6 +79,12 @@ DEFAULT_MIN_GAP = 0.16          # 卡片中心距 16cm → 去重窗口需覆盖
 DEFAULT_CLASSIFY_WORKERS = 2
 DEFAULT_TARGET_SPACING_M = 0.16       # 卡片中心距 16cm (2026-08-09: 改回 16; 补录推进 + 超程保护都用它)
 DEFAULT_TARGET_SETTLE_S = 0.15
+# 前后微调识别 (2026-08-12 用户需求: 识别不出目标时前后微调, 直到识别出来再继续 16cm)
+DEFAULT_RECOG_SEARCH_STEP_M = 0.04        # 微调步长 4cm
+DEFAULT_RECOG_SEARCH_BACK_MAX_M = 0.12    # 向后微调上限 12cm (over-shot 常见, 先退)
+DEFAULT_RECOG_SEARCH_FWD_MAX_M = 0.16     # 向前微调上限 16cm
+# LLM 判定 result=None (判不出害虫/益虫) 时前后微调重拍 (2026-08-12 用户需求)
+MAX_LLM_RECAPTURE = 2                     # 单张卡判定失败最大重拍次数
 
 
 def step_for_xc(xc, base=DEFAULT_TARGET_SPACING_M, adjust=0.02, tol=DEFAULT_CENTER_TOL):
@@ -268,6 +274,104 @@ def read_traveled(client):
         return None
 
 
+def search_front_back(detect_fn, move_fn, *,
+                      step_m=DEFAULT_RECOG_SEARCH_STEP_M,
+                      back_max_m=DEFAULT_RECOG_SEARCH_BACK_MAX_M,
+                      fwd_max_m=DEFAULT_RECOG_SEARCH_FWD_MAX_M,
+                      label="目标"):
+    """识别不出目标时的前后微调搜索 (2026-08-12 用户需求).
+
+    顺序: 当前位置 → 后退(≤back_max_m) → 前进(≤back_max_m+fwd_max_m, 穿过原点)。
+    每步 move_fn(distance) 后用 detect_fn() 看是否识别到完整目标;
+    第一个识别到即返回 (net_offset_m 为相对起点的净位移, 后退负/前进正);
+    全程没识别到 → 回到原点, 返回 (None, 0.0) (不改变车位)。
+
+    Args:
+        detect_fn: () -> det|None, 需自带「稳定确认」语义 (调用方用 make_latch+wait 包一层).
+        move_fn:   (distance_m) -> None, 前后移动 (负=后退), 走 move_for.
+    Returns:
+        (det|None, net_offset_m)
+    """
+    offset = 0.0
+
+    def try_detect():
+        det = detect_fn()
+        if det is not None:
+            print(f"  [recog-search] {label} 前后微调 {offset:+.2f}m 后识别到 "
+                  f"(xc={animal_center(det):+.3f})", flush=True)
+            return det
+        return None
+
+    # Phase 1: 优先后退 (over-shot 常见: 目标可能刚被越过)
+    while offset - step_m >= -back_max_m - 1e-9:
+        move_fn(-step_m)
+        offset -= step_m
+        det = try_detect()
+        if det is not None:
+            return det, round(offset, 3)
+
+    # Phase 2: 前进 (从后退终点穿过原点向前, 覆盖「目标偏前」的情况)
+    while offset + step_m <= fwd_max_m + 1e-9:
+        move_fn(+step_m)
+        offset += step_m
+        det = try_detect()
+        if det is not None:
+            return det, round(offset, 3)
+
+    # 兜底: 前后都没找到 → 回到原点
+    if abs(offset) >= step_m * 0.5:
+        print(f"  [recog-search] {label} 前后 {back_max_m*100:.0f}/{fwd_max_m*100:.0f}"
+              f"cm 均未识别到, 回到原点", flush=True)
+        move_fn(-offset)
+    return None, 0.0
+
+
+def judge_and_recapture(record, *, classify_fn, search_fn, recapture_fn,
+                        max_retries=MAX_LLM_RECAPTURE, label="目标"):
+    """内联 LLM 判定当前卡; **result=None (判不出害虫/益虫) 时前后微调重拍** (2026-08-12).
+
+    用户需求: 卡识别到了但 LLM 判不出是什么 → 前后微调重拍, 最多 max_retries 次;
+    重拍后仍判不出 → 保留原结果 (result=None, 不射该卡)。
+
+    Args:
+        record:     目标记录 dict (image_path/detection/xc/...).
+        classify_fn: (record) -> verdict {name, result, analysis}, result∈{0,1,None}.
+        search_fn:   () -> (det|None, net_offset_m): 前后微调找目标.
+        recapture_fn:(det) -> None: 用新检测重拍并就地更新 record 的 image/detection.
+        max_retries: 判定失败重拍上限.
+        label:       日志用 (如 "目标 #3").
+    Returns:
+        verdict: 最终判定 (可能仍为 result=None).
+    """
+    verdict = classify_fn(record)
+    retries = 0
+    while verdict.get("result") is None and retries < max_retries:
+        retries += 1
+        print(f"[warn] {label} LLM 判定 result=None, 前后微调重拍 "
+              f"(第 {retries}/{max_retries} 次)", file=sys.stderr, flush=True)
+        try:
+            det, _net = search_fn()
+        except Exception as exc:
+            print(f"[warn] {label} 重拍移动失败: {exc}, 保留原图",
+                  file=sys.stderr, flush=True)
+            break
+        if det is None:
+            print(f"[warn] {label} 重拍未找到目标, 保留原图",
+                  file=sys.stderr, flush=True)
+            break
+        recapture_fn(det)
+        verdict = classify_fn(record)
+    record["species"] = str(verdict.get("name") or "unknown")
+    record["result"] = verdict.get("result")
+    record["analysis"] = str(verdict.get("analysis") or "")
+    record["classification"] = ("pest" if verdict.get("result") == 0
+                                else "beneficial" if verdict.get("result") == 1
+                                else "unknown")
+    print(f"  -> {label}: {record['species']} / {record['classification']} "
+          f"(recapture={retries})", flush=True)
+    return verdict
+
+
 def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
                                 defer_judge: bool = False):
     """首卡定位后按固定卡间距逐个记录，避免同一张卡重复计数。"""
@@ -438,6 +542,57 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
               f"at {live:.2f}m image={'saved' if image_path else 'missing'}",
               flush=True)
 
+    def judge_and_recapture_slot(record, number):
+        """内联 LLM 判定当前 slot; result=None 时前后微调重拍 (2026-08-12 用户需求)."""
+        def classify(rec):
+            return classify_target(token, rec.get("image_path"), args.llm_timeout)
+
+        def search():
+            nonlocal nominal_travel
+            det, net = search_front_back(
+                detect_fn=lambda: wait_for_target(
+                    make_latch(None, required_samples=2), args.slot_wait_s),
+                move_fn=move_forward_fallback,
+                step_m=args.recog_search_step_m,
+                back_max_m=args.recog_search_back_max_m,
+                fwd_max_m=args.recog_search_fwd_max_m,
+                label=f"slot #{number} LLM 重拍",
+            )
+            nominal_travel += max(0.0, net)
+            return det, net
+
+        def recapture(det):
+            image_path = capture_target(
+                streamer_url, det, args.crop_padding, output_dir, number,
+            )
+            if image_path is None:
+                time.sleep(0.10)
+                image_path = capture_target(
+                    streamer_url, det, args.crop_padding, output_dir, number,
+                )
+            record["image_path"] = (str(image_path) if image_path
+                                    else record.get("image_path"))
+            record["detection"] = dict(det)
+            record["xc"] = animal_center(det)
+            record["yc"] = float(bbox(det).get("y_center", 0.0))
+            record["score"] = float(det.get("score") or 0.0)
+
+        judge_and_recapture(record, classify_fn=classify, search_fn=search,
+                            recapture_fn=recapture,
+                            max_retries=args.max_llm_recapture,
+                            label=f"目标 #{number}")
+
+    def save_and_judge(det, number):
+        """记录一张卡; 非 defer-judge 且有 token 时当场 LLM 判定 + result=None 重拍."""
+        save_slot(det, number)
+        if not defer_judge and token and not args.dry_run:
+            try:
+                judge_and_recapture_slot(records[-1], number)
+            except Exception as exc:
+                # LLM/网络故障不能打断识别 → 留 result=None, 末尾兜底判定.
+                print(f"[warn] 目标 #{number} 内联判定异常: {exc}",
+                      file=sys.stderr, flush=True)
+
     def move_forward_fallback(distance):
         print(f"  [drive] move_for fallback {distance:+.2f}m", flush=True)
         job = client.execute_car_action(
@@ -527,6 +682,20 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
             search_distance = 0.0
             initial = make_latch(None, required_samples=2)
             first_det = wait_for_target(initial, args.slot_wait_s)
+            if first_det is None:
+                # **2026-08-12 用户需求**: 首卡识别不出 → 前后微调搜索,
+                # 直到识别出来再继续 16cm 移动; 前后都找不到才走向前蠕行兜底.
+                print("[recognition] 首卡未识别到, 前后微调搜索", flush=True)
+                first_det, search_net = search_front_back(
+                    detect_fn=lambda: wait_for_target(
+                        make_latch(None, required_samples=2), args.slot_wait_s),
+                    move_fn=move_forward_fallback,
+                    step_m=args.recog_search_step_m,
+                    back_max_m=args.recog_search_back_max_m,
+                    fwd_max_m=args.recog_search_fwd_max_m,
+                    label="首卡",
+                )
+                nominal_travel += max(0.0, search_net)
             while first_det is None and search_distance < args.max_travel:
                 search_step = min(0.04, args.max_travel - search_distance)
                 move_latch = make_latch(None, required_samples=1,
@@ -558,7 +727,7 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
         if first_det is None:
             print("[warn] 未找到首卡, 结束识别", file=sys.stderr)
         else:
-            save_slot(first_det, 1)
+            save_and_judge(first_det, 1)
         if records and not args.dry_run:
             # 2026-08-09 用户: 完整识别到第一个目标后立即停车,
             # 再连续前进 3 次 16cm 补录后面 3 个目标.
@@ -601,10 +770,28 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
                           flush=True)
                     det = nearest
                 if det is None:
-                    print(f"[warn] slot {next_number} 未找到目标，车辆保持停车",
-                          file=sys.stderr)
-                    break
-            save_slot(det, next_number)
+                    # **2026-08-12 用户需求**: 识别不出目标 → 前后微调找目标,
+                    # 找到再继续 16cm 移动; 前后预算内都找不到才放弃该槽.
+                    print(f"[warn] slot {next_number} 未识别到目标, "
+                          f"前后微调搜索", file=sys.stderr, flush=True)
+                    det, search_net = search_front_back(
+                        detect_fn=lambda: wait_for_target(
+                            make_latch(None, required_samples=2), args.slot_wait_s),
+                        move_fn=move_forward_fallback,
+                        step_m=args.recog_search_step_m,
+                        back_max_m=args.recog_search_back_max_m,
+                        fwd_max_m=args.recog_search_fwd_max_m,
+                        label=f"slot #{next_number}",
+                    )
+                    if det is not None:
+                        nominal_travel += max(0.0, search_net)
+                        print(f"  [slot] #{next_number} 前后微调 "
+                              f"{search_net:+.2f}m 后识别到", flush=True)
+                    else:
+                        print(f"[warn] slot {next_number} 前后微调后仍未识别到, "
+                              f"放弃该槽", file=sys.stderr)
+                        break
+            save_and_judge(det, next_number)
     finally:
         detector.stop()
         if not args.dry_run:
@@ -617,13 +804,28 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
         print(f"[recognition] driving complete; deferring LLM judging "
               f"({len(records)} targets, status=pending)")
         return records, traveled_now()
-    judged = _classify_records(
-        token, records, args.llm_timeout, args.classify_workers,
-    )
-    if len(judged) != args.target_count:
-        print(f"[warn] recorded {len(judged)}/{args.target_count} targets",
+    # 2026-08-12: 内联判定已当场覆盖大部分 (含 result=None 重拍);
+    # 仅兜底判定仍缺 result 的 (重拍预算耗尽 / 内联判定异常) —— 不重判已判定的卡,
+    # 避免 LLM 非确定性覆盖内联结果.
+    pending = [r for r in records if r.get("result") is None]
+    if pending:
+        print(f"[recognition] 内联判定缺 {len(pending)} 张, 兜底批量判定", flush=True)
+        try:
+            judged = _classify_records(
+                token, pending, args.llm_timeout, args.classify_workers,
+            )
+            judged_by_num = {j["number"]: j for j in judged}
+            for i, r in enumerate(records):
+                if r["number"] in judged_by_num:
+                    records[i] = judged_by_num[r["number"]]
+        except Exception as exc:
+            # 2026-08-12: ERNIE 异常不打断识别 → 保留 result=None, 后台可重试.
+            print(f"[warn] 兜底批量判定异常: {exc} (保留未判定, 后台可重试)",
+                  file=sys.stderr, flush=True)
+    if len(records) != args.target_count:
+        print(f"[warn] recorded {len(records)}/{args.target_count} targets",
               file=sys.stderr)
-    return judged, traveled_now()
+    return records, traveled_now()
 
 
 def save_result(path_text, args, targets, traveled, *, status: str = "done"):
@@ -690,6 +892,17 @@ def main():
                         help="seconds to wait for a centered target after each fixed move")
     parser.add_argument("--target-settle-s", type=float, default=DEFAULT_TARGET_SETTLE_S,
                         help="stable observation time before a card is recorded (seconds)")
+    parser.add_argument("--recog-search-step-m", type=float,
+                        default=DEFAULT_RECOG_SEARCH_STEP_M,
+                        help="前后微调识别步长 m (默认 4cm)")
+    parser.add_argument("--recog-search-back-max-m", type=float,
+                        default=DEFAULT_RECOG_SEARCH_BACK_MAX_M,
+                        help="前后微调向后上限 m (默认 12cm)")
+    parser.add_argument("--recog-search-fwd-max-m", type=float,
+                        default=DEFAULT_RECOG_SEARCH_FWD_MAX_M,
+                        help="前后微调向前上限 m (默认 16cm)")
+    parser.add_argument("--max-llm-recapture", type=int, default=MAX_LLM_RECAPTURE,
+                        help="单张卡 LLM 判定 result=None 时前后微调重拍最大次数 (默认 2)")
     parser.add_argument("--classify-workers", type=int, default=DEFAULT_CLASSIFY_WORKERS,
                         help="parallel vision requests after scanning")
     parser.add_argument("--save", default="audit/task3_pipeline.json")
@@ -708,7 +921,8 @@ def main():
             or args.dry_run_steps < 1 or args.target_spacing <= 0
             or args.slot_wait_s <= 0 or args.target_settle_s < 0
             or args.classify_workers < 1
-            or args.min_gap < 0):
+            or args.min_gap < 0
+            or args.max_llm_recapture < 0):
         parser.error("target-count/creep-speed/dry-run-steps values are invalid")
     # --defer-judge: 识别段完全不碰 LLM (token/health 都省), 判定由后台线程做.
     if args.defer_judge:
@@ -718,13 +932,19 @@ def main():
         token = load_token(args.token)
         print(f"[ready] token={mask_token(token)}")
         if not args.dry_run:
-            check_health(token, timeout=args.llm_timeout)
+            try:
+                check_health(token, timeout=args.llm_timeout)
+            except Exception as exc:
+                # 2026-08-12: ERNIE 异常不打断识别 → 卡照录, 内联判定留 result=None,
+                # 末尾兜底/后台线程可重试.
+                print(f"[warn] ERNIE health 检查失败: {exc} (识别照跑, 判定后置)",
+                      file=sys.stderr, flush=True)
     client = RuntimeApiClient()
     if not args.dry_run:
         client.wait_until_ready()
     settings = __import__("main.settings", fromlist=["load_settings"]).load_settings()
-    if run_arm_pose(args, "recognition pose", RECOGNITION_ARM, client=client) != 0:
-        return 1
+    # 2026-08-12 用户指令: task3 识别前**不对机械臂做任何调整** (原 RECOGNITION_ARM 摆臂取消).
+    # 需要恢复时改回:  if run_arm_pose(args, "recognition pose", RECOGNITION_ARM, client=client) != 0: return 1
     image_dir = Path(__file__).resolve().parent / "audit" / "task3_pipeline" / "targets"
     targets, traveled = recognize_phase_fixed_slots(
         client, args, token, settings.streamer_url, image_dir,

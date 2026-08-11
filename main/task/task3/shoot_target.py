@@ -201,6 +201,22 @@ NO_PROGRESS_MAX_STEPS = 6          # 视野空连续步数上限 (防死循环)
 # 防止死循环跑出场 (用户实测: 1.3.4 测试时 #4 找不到 → 跑出视野)
 MAX_SEARCH_M = 0.30                # 30cm 兜底 (用户硬约束)
 
+# 初始定位 (2026-08-12 用户需求: 停车位不适时可后退/前进, **优先后退**射最前目标 #1)
+# 达标标准 = 距离窗口: 最前目标 bbox 宽度反推距离落在 [D_min, D_max] 内 (现场可调).
+# 判定用**原始 bbox 宽度 wn**, 不用 estimate_distance_from_bbox 的 clamp [0.4,1.2]
+# (clamp 会把过近/过远都压到边界, 丢失方向信息).
+SHOOT_DISTANCE_MIN_M = 0.45        # 可射击距离窗口下界 (最前目标 bbox 反推, 现场可调)
+SHOOT_DISTANCE_MAX_M = 1.00        # 可射击距离窗口上界
+POSITION_STEP_M = 0.10             # 定位搜索单步 10cm
+POSITION_BACKUP_MAX_M = 0.50       # 优先后退搜索上限 50cm
+POSITION_FORWARD_MAX_M = 0.50      # 后退未果后前进搜索上限 50cm
+POSITION_STABLE_FRAMES = 2         # 最前板左缘需连续稳定 N 步才接受 (防锁到临时 #2/#3)
+POSITION_EDGE_MARGIN_NORM = 0.08   # 最前板左缘贴边(截断)判定余量: xc - wn/2 >= -1+margin
+POSITION_NEW_BOARD_XC_TOL = 0.15   # 后退时最前板 xc 左跳超过此值 = 又有更前的板入画
+POSITION_SETTLE_S = 0.30           # 每步移动后等检测稳定
+POSITION_MAX_OBSERVATIONS = 30     # 观测上限 (安全阀)
+POSITION_REACQUIRE_STEPS = 3       # 主循环 #1 空视野时优先后退重获的最大步数 (有界)
+
 
 # ============================================================================
 # helpers
@@ -1080,6 +1096,330 @@ def ask_targets_interactive(n_total):
             print(f"  输入解析失败, 重输", flush=True)
 
 
+# ============================================================================
+# 初始定位 (2026-08-12 用户需求: 停车位不适时可后退/前进, 优先后退射最前目标 #1)
+# ============================================================================
+
+def width_norm_for_distance(distance_m, target_width_m=TARGET_BOARD_WIDTH_M,
+                            hfov_deg=YAW_HFOV_DEG):
+    """由目标距离反推 bbox width_norm (针孔模型, 与 estimate_distance_from_bbox 互逆).
+
+    wn = W / (2·D·tan(H/2))。D 越大 wn 越小。
+    """
+    distance_m = max(float(distance_m), 0.05)
+    hfov_rad = math.radians(hfov_deg)
+    return float(target_width_m) / (2.0 * distance_m * math.tan(hfov_rad / 2.0))
+
+
+def distance_window_to_width_window(d_min_m=SHOOT_DISTANCE_MIN_M,
+                                    d_max_m=SHOOT_DISTANCE_MAX_M):
+    """距离窗口 → wn 窗口: 近界(D_min)↔大宽度, 远界(D_max)↔小宽度."""
+    wn_min = width_norm_for_distance(d_max_m)   # 远界 → 小宽度
+    wn_max = width_norm_for_distance(d_min_m)   # 近界 → 大宽度
+    return wn_min, wn_max
+
+
+def estimate_unclamped_distance_from_bbox(wn, target_width_m=TARGET_BOARD_WIDTH_M,
+                                          hfov_deg=YAW_HFOV_DEG):
+    """未 clamp 的 bbox 反推距离 (仅日志; 窗口判定一律用 wn 原始值)."""
+    if wn is None or wn <= 0.0:
+        return None
+    hfov_rad = math.radians(hfov_deg)
+    return float(target_width_m) / (2.0 * float(wn) * math.tan(hfov_rad / 2.0))
+
+
+def classify_shoot_distance(wn, wn_min, wn_max):
+    """按原始 bbox 宽度判距: "far"/"ok"/"near"/"invalid".
+
+    用 wn 直接判定 (clamp 后的距离会丢失方向信息)。窗口边界含端点。
+    """
+    try:
+        wn = float(wn)
+    except (TypeError, ValueError):
+        return "invalid"
+    if not math.isfinite(wn) or wn <= 0.0:
+        return "invalid"
+    if wn < wn_min:
+        return "far"
+    if wn > wn_max:
+        return "near"
+    return "ok"
+
+
+def is_complete_left_target(animal, edge_margin=POSITION_EDGE_MARGIN_NORM):
+    """最左板需「完整入画」: bbox 左缘不贴边截断 (xc - wn/2 >= -1+margin).
+
+    排除左缘被画面截断的目标 —— 截断框不能作为距离锚点。
+    """
+    b = animal.get("bbox_norm") or {}
+    try:
+        xc = float(b.get("x_center", 0.0))
+        wn = float(b.get("width", 0.0))
+        h = float(b.get("height", 0.0))
+    except (TypeError, ValueError):
+        return False
+    if wn <= 0.0 or h <= 0.0:
+        return False
+    return (xc - wn / 2.0) >= (-1.0 + edge_margin)
+
+
+def frontmost_complete(animals, min_score,
+                       edge_margin=POSITION_EDGE_MARGIN_NORM):
+    """最左且完整入画的目标, 作为物理 #1 的视觉候选 (无则 None)."""
+    candidates = [
+        a for a in animals or []
+        if float(a.get("score") or 0.0) >= min_score
+        and is_complete_left_target(a, edge_margin)
+    ]
+    return min(candidates, key=bbox_xc) if candidates else None
+
+
+def is_good_shooting_position(animals, wn_min=None, wn_max=None,
+                              min_score=MIN_YOLO_SCORE,
+                              edge_margin=POSITION_EDGE_MARGIN_NORM):
+    """当前视野是否适合射击: 最前完整目标距离在窗口内."""
+    if wn_min is None or wn_max is None:
+        wn_min, wn_max = distance_window_to_width_window()
+    front = frontmost_complete(animals, min_score, edge_margin)
+    if front is None:
+        return False
+    return classify_shoot_distance(bbox_width(front), wn_min, wn_max) == "ok"
+
+
+def _window_score(animals, wn_min, wn_max, min_score,
+                  edge_margin=POSITION_EDGE_MARGIN_NORM):
+    """窗口评分: 0=在窗口内; 负=离窗口越远; -1=无目标. 越高越好."""
+    front = frontmost_complete(animals, min_score, edge_margin)
+    if front is None:
+        return -1.0
+    wn = bbox_width(front)
+    if wn < wn_min:
+        return wn - wn_min          # (<0) 太远
+    if wn > wn_max:
+        return wn_max - wn          # (<0) 太近
+    return 0.0
+
+
+def move_position_step(client, distance_m, label="position"):
+    """定位移动: **只走 move_for([±d,0,0])** (CLAUDE.md: 底盘平移一律 move_for).
+
+    负 distance_m = 后退。失败抛 RuntimeError, 调用方停止搜索不累积虚假位移。
+    """
+    if abs(distance_m) < 0.005:
+        return
+    direction = "后" if distance_m < 0 else "前"
+    print(f"  [position] {direction} {abs(distance_m)*100:.0f}cm ({label})",
+          flush=True)
+    car_call(client, "move_for", [distance_m, 0.0, 0.0],
+             timeout=max(5, abs(distance_m) * DRIVE_STEP_TIMEOUT_PER_M))
+    time.sleep(POSITION_SETTLE_S)
+
+
+def observe_animals(detect_fn, frames=POSITION_STABLE_FRAMES,
+                    settle_s=POSITION_SETTLE_S):
+    """稳定采样: 采 frames 次, 返回非空帧中检测数最多的一帧 (排序 L→R)."""
+    best = []
+    for i in range(max(1, frames)):
+        animals = detect_fn() or []
+        if len(animals) > len(best):
+            best = animals
+        if i < frames - 1:
+            time.sleep(settle_s)
+    return sorted(best, key=bbox_xc)
+
+
+def _anchor_identity(animals, front, identity_fn):
+    """用 identity_fn 判断最前目标是否物理 #1; 无 identity/无法确认返回 unknown."""
+    if front is None or identity_fn is None:
+        return {"board_num": None, "is_1": False}
+    try:
+        mapping = identity_fn(sorted(animals or [], key=bbox_xc)) or {}
+    except Exception as exc:
+        print(f"  [position] identity 失败: {exc}", file=sys.stderr, flush=True)
+        return {"board_num": None, "is_1": False}
+    for index, a in enumerate(sorted(animals or [], key=bbox_xc)):
+        if a is front or a.get("det_id") == front.get("det_id"):
+            if index in mapping:
+                board_num = int(mapping[index])
+                return {"board_num": board_num, "is_1": board_num == 1}
+            break
+    return {"board_num": None, "is_1": False}
+
+
+def position_for_shooting(
+    client, min_score, *,
+    step_m=POSITION_STEP_M,
+    backup_max_m=POSITION_BACKUP_MAX_M,
+    forward_max_m=POSITION_FORWARD_MAX_M,
+    d_min_m=SHOOT_DISTANCE_MIN_M,
+    d_max_m=SHOOT_DISTANCE_MAX_M,
+    settle_s=POSITION_SETTLE_S,
+    detect_fn=None,
+    move_fn=None,
+    identity_fn=None,
+):
+    """停车定位: 优先后退再前进, 把最前目标 (物理 #1) 送进可射击距离窗口.
+
+    - 达标 = 最前「完整入画」目标 bbox 宽度落在距离窗口 (用户确认的达标标准).
+    - **优先后退** (把 over-shot/过近时被挤出视野的最前板 #1 找进窗口);
+      后退方向错(已太远)提前切前进兜底.
+    - 后退阶段用「最前板 xc 左跳 > POSITION_NEW_BOARD_XC_TOL + 左缘连续稳定
+      POSITION_STABLE_FRAMES 步」防锁到临时 #2/#3.
+    - 全程未达标 → 回到窗口分最佳位置, positioned=False (主循环原前进兜底接管).
+    - 移动一律 move_for([±d,0,0]).
+
+    Args:
+        client: RuntimeApiClient.
+        min_score: YOLO 置信度阈值.
+        detect_fn: () -> animals, 默认 get_animals_retry (供离线单测注入).
+        move_fn: (distance_m, label) -> None, 默认 move_position_step.
+        identity_fn: (sorted_animals) -> {cam_index: board_num}, 可选.
+
+    Returns:
+        dict(positioned, anchor, animals, final_offset_m, best_offset_m,
+             best_score, reason, identity_confirmed, identity_board_num,
+             observations)
+    """
+    if detect_fn is None:
+        detect_fn = lambda: get_animals_retry(            # noqa: E731
+            client, min_score, label="positioning",
+            retries=DETECT_RETRIES, delay=DETECT_DELAY_S)
+    if move_fn is None:
+        move_fn = lambda d, label: move_position_step(client, d, label)  # noqa: E731
+
+    wn_min, wn_max = distance_window_to_width_window(d_min_m, d_max_m)
+
+    def observe():
+        return observe_animals(detect_fn, settle_s=settle_s)
+
+    observations = []
+    offset = 0.0
+    best_offset = 0.0
+    best_score = None
+
+    def record(animals):
+        nonlocal best_offset, best_score
+        front = frontmost_complete(animals, min_score)
+        wn = bbox_width(front) if front else None
+        obs = {
+            "offset_m": round(offset, 3),
+            "wn": round(wn, 4) if wn else None,
+            "distance_m": round(estimate_unclamped_distance_from_bbox(wn), 3)
+                          if wn else None,
+            "class": (classify_shoot_distance(wn, wn_min, wn_max)
+                      if front else "none"),
+        }
+        observations.append(obs)
+        score = _window_score(animals, wn_min, wn_max, min_score)
+        if best_score is None or score > best_score:
+            best_score = score
+            best_offset = offset
+        return obs
+
+    def result(positioned, reason, animals, anchor=None):
+        ident = _anchor_identity(animals, anchor, identity_fn)
+        return {
+            "positioned": positioned,
+            "anchor": anchor,
+            "animals": sorted(animals or [], key=bbox_xc),
+            "final_offset_m": round(offset, 3),
+            "best_offset_m": round(best_offset, 3),
+            "best_score": best_score,
+            "reason": reason,
+            "identity_confirmed": bool(ident.get("is_1")),
+            "identity_board_num": ident.get("board_num"),
+            "observations": observations,
+        }
+
+    # ---- Phase 0: 当前停车位直接判定 ----
+    animals = observe()
+    front = frontmost_complete(animals, min_score)
+    print(f"\n[position] 起点检测 {len(animals)} 只", flush=True)
+    record(animals)
+    if is_good_shooting_position(animals, wn_min, wn_max, min_score):
+        print(f"  [position] 起点已达标 (wn="
+              f"{bbox_width(front):.3f}), 无需定位", flush=True)
+        return result(True, "already_good", animals, anchor=front)
+
+    # ---- Phase A: 优先后退 (每步 -step_m, 累计 ≥ -backup_max_m) ----
+    print(f"  [position] 起点未达标 → 优先后退搜索 "
+          f"(步长 {step_m*100:.0f}cm, 上限 {backup_max_m*100:.0f}cm)",
+          flush=True)
+    prev_left_xc = bbox_xc(front) if front is not None else None
+    left_stable = 0
+    while offset - step_m >= -backup_max_m - 1e-9:
+        try:
+            move_fn(-step_m, "position backup")
+        except Exception as exc:
+            print(f"  [position] 后退失败: {exc}", file=sys.stderr, flush=True)
+            return result(False, "move_failed", animals, anchor=front)
+        offset -= step_m
+        animals = observe()
+        front = frontmost_complete(animals, min_score)
+        record(animals)
+        if front is None:
+            prev_left_xc = None
+            left_stable = 0
+            continue
+        cur_left = bbox_xc(front)
+        if (prev_left_xc is not None
+                and abs(cur_left - prev_left_xc) > POSITION_NEW_BOARD_XC_TOL):
+            # 最前板身份变了: 更前的板从左侧入画 (cur_left 大幅左移),
+            # 或原最前板移出/左缘截断导致 frontmost 跳到右侧板 → 重置稳定计数
+            left_stable = 0
+        else:
+            left_stable += 1
+        prev_left_xc = cur_left
+        cls = classify_shoot_distance(bbox_width(front), wn_min, wn_max)
+        if cls == "ok" and left_stable >= POSITION_STABLE_FRAMES:
+            print(f"  [position] 后退到 offset={offset:+.2f}m 达标 "
+                  f"(wn={bbox_width(front):.3f}, left_stable={left_stable})",
+                  flush=True)
+            return result(True, "backup", animals, anchor=front)
+        if cls == "far":
+            print(f"  [position] 已太远(far), 后退方向错 → 切前进",
+                  flush=True)
+            break
+
+    # ---- Phase B: 前进兜底 (从后退终点向前扫, 穿过原点) ----
+    print(f"  [position] 前进兜底搜索 (累计向前上限 "
+          f"{backup_max_m + forward_max_m:.2f}m)", flush=True)
+    while offset + step_m <= forward_max_m + 1e-9:
+        try:
+            move_fn(+step_m, "position forward")
+        except Exception as exc:
+            print(f"  [position] 前进失败: {exc}", file=sys.stderr, flush=True)
+            return result(False, "move_failed", animals, anchor=front)
+        offset += step_m
+        animals = observe()
+        front = frontmost_complete(animals, min_score)
+        record(animals)
+        if front is not None:
+            cls = classify_shoot_distance(bbox_width(front), wn_min, wn_max)
+            if cls == "ok":
+                print(f"  [position] 前进到 offset={offset:+.2f}m 达标 "
+                      f"(wn={bbox_width(front):.3f})", flush=True)
+                return result(True, "forward", animals, anchor=front)
+            if cls == "near":
+                print(f"  [position] 已太近(near), 越过窗口 → 停", flush=True)
+                break
+
+    # ---- 兜底: 回到窗口分最佳位置 ----
+    if abs(best_offset - offset) >= step_m * 0.5:
+        print(f"  [position] 全程未达标, 回最佳位 offset={best_offset:+.2f}m",
+              flush=True)
+        try:
+            move_fn(best_offset - offset, "position return-to-best")
+        except Exception as exc:
+            print(f"  [position] 回最佳位失败: {exc}", file=sys.stderr,
+                  flush=True)
+        offset = best_offset
+    animals = observe()
+    front = frontmost_complete(animals, min_score)
+    record(animals)
+    return result(False, "no_good_position", animals, anchor=front)
+
+
 def wait_for_initial_detect(client, min_score):
     """等起点 cam 视野出现 ≥1 只目标, 返回 sorted animals (L→R)。"""
     print(f"\n[ready] 等待 cam 视野出现 ≥1 只目标 (最多 "
@@ -1107,17 +1447,48 @@ def main():
                     help="recognition manifest used to preserve global board numbers")
     ap.add_argument("--min-score", type=float, default=MIN_YOLO_SCORE,
                     help=f"YOLO 置信度阈值 (默认 {MIN_YOLO_SCORE})")
+    ap.add_argument("--position-step-m", type=float, default=POSITION_STEP_M,
+                    help=f"定位搜索单步 (默认 {POSITION_STEP_M}m)")
+    ap.add_argument("--backup-max-m", type=float, default=POSITION_BACKUP_MAX_M,
+                    help=f"优先后退搜索上限 (默认 {POSITION_BACKUP_MAX_M}m)")
+    ap.add_argument("--forward-max-m", type=float, default=POSITION_FORWARD_MAX_M,
+                    help=f"前进兜底搜索上限 (默认 {POSITION_FORWARD_MAX_M}m)")
+    ap.add_argument("--d-shoot-min-m", type=float, default=SHOOT_DISTANCE_MIN_M,
+                    help=f"可射击距离窗口下界 (默认 {SHOOT_DISTANCE_MIN_M}m)")
+    ap.add_argument("--d-shoot-max-m", type=float, default=SHOOT_DISTANCE_MAX_M,
+                    help=f"可射击距离窗口上界 (默认 {SHOOT_DISTANCE_MAX_M}m)")
     args = ap.parse_args()
 
-    # ---- 1. 启动 + 等待起点 cam 视野 ----
+    # ---- 1. 启动 + 初始检测 + 停车定位 (2026-08-12: 不再空视野直接退出) ----
     client = RuntimeApiClient()
     client.wait_until_ready()
     settings = __import__("main.settings", fromlist=["load_settings"]).load_settings()
 
+    # identity matcher 提前创建 (定位阶段用于确认最前目标是否物理 #1)
+    identity_matcher = TargetIdentityMatcher(args.identity_file, settings.streamer_url)
+
     sorted_animals = wait_for_initial_detect(client, args.min_score)
-    if sorted_animals is None:
-        print(f"[err] cam 视野 {INITIAL_WAIT_TIMEOUT_S:.0f}s 都没目标, 退出",
-              file=sys.stderr)
+    pos = position_for_shooting(
+        client, args.min_score,
+        step_m=args.position_step_m,
+        backup_max_m=args.backup_max_m,
+        forward_max_m=args.forward_max_m,
+        d_min_m=args.d_shoot_min_m,
+        d_max_m=args.d_shoot_max_m,
+        detect_fn=lambda: get_animals_retry(            # noqa: E731
+            client, args.min_score, label="定位",
+            retries=DETECT_RETRIES, delay=DETECT_DELAY_S),
+        move_fn=lambda d, label: move_position_step(client, d, label),  # noqa: E731
+        identity_fn=lambda animals: identity_matcher.identify(          # noqa: E731
+            animals, identity_matcher.fetch_frame()),
+    )
+    print(f"\n[position] result: positioned={pos['positioned']} "
+          f"offset={pos['final_offset_m']:+.2f}m reason={pos['reason']} "
+          f"identity=#{pos['identity_board_num'] or 'unknown'} "
+          f"confirmed={pos['identity_confirmed']}", flush=True)
+    sorted_animals = pos.get("animals") or sorted_animals or []
+    if not sorted_animals:
+        print("[err] 前后定位搜索后 cam 视野仍无目标, 退出", file=sys.stderr)
         return 1
 
     print(f"[detect] 起点 cam 视野 {len(sorted_animals)} 只 (L→R):",
@@ -1135,7 +1506,6 @@ def main():
               f"取前 {N_TOTAL_BOARDS} 只", flush=True)
 
     # ---- 2. 询问 / 解析 --targets ----
-    identity_matcher = TargetIdentityMatcher(args.identity_file, settings.streamer_url)
     initial_identity = identity_matcher.identify(
         sorted_animals, identity_matcher.fetch_frame()
     )
@@ -1185,14 +1555,39 @@ def main():
                                     retries=DETECT_RETRIES, delay=DETECT_DELAY_S)
         if not animals:
             print(f"\n========== 板上 #{shot_seq} ==========", flush=True)
-            print(f"  [warn] cam 视野空, 直行 16cm 找板上 #{shot_seq}",
-                  flush=True)
-            drive_forward(client, BOARD_SPACING_M, label=f"视野空")
-            no_progress_steps += 1
-            if no_progress_steps > NO_PROGRESS_MAX_STEPS:
-                print(f"[err] 连续 {no_progress_steps} 步视野空, 退出",
-                      file=sys.stderr)
-                break
+            # **2026-08-12 用户需求**: #1 空视野时优先后退重获 (定位阶段已退过/预算
+            # 耗尽则不再盲退), shot_seq>1 保持原前进 16cm 逻辑.
+            reacquired = False
+            if (shot_seq == 1 and tracker.get_xc(1) is not None
+                    and no_progress_steps == 0):
+                # 仅本 shot_seq 首次空视野尝试一次后退重获 (定位阶段已退过/失败则不再盲退,
+                # 避免「后退 3 步 → 前进 1 步」来回振荡).
+                print(f"  [warn] cam 视野空, 优先后退重获板上 #{shot_seq} "
+                      f"(≤{POSITION_REACQUIRE_STEPS} 步 × "
+                      f"{POSITION_STEP_M*100:.0f}cm)", flush=True)
+                for _ in range(POSITION_REACQUIRE_STEPS):
+                    try:
+                        move_position_step(client, -POSITION_STEP_M,
+                                           label=f"#1 空视野后退重获")
+                    except Exception as exc:
+                        print(f"  [position] 后退重获失败: {exc}",
+                              file=sys.stderr, flush=True)
+                        break
+                    animals = get_animals_retry(
+                        client, args.min_score, label=f"#{shot_seq} reacquire",
+                        retries=DETECT_RETRIES, delay=DETECT_DELAY_S)
+                    if animals:
+                        reacquired = True
+                        break
+            if not reacquired:
+                print(f"  [warn] cam 视野空, 直行 {BOARD_SPACING_M*100:.0f}cm "
+                      f"找板上 #{shot_seq}", flush=True)
+                drive_forward(client, BOARD_SPACING_M, label=f"视野空")
+                no_progress_steps += 1
+                if no_progress_steps > NO_PROGRESS_MAX_STEPS:
+                    print(f"[err] 连续 {no_progress_steps} 步视野空, 退出",
+                          file=sys.stderr)
+                    break
             continue
 
         sorted_animals = sorted(animals, key=bbox_xc)

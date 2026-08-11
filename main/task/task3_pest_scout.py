@@ -9,11 +9,10 @@ shoot_target 三段式流水线。本文件只是 orchestrator registry 期望�
 容错语义: 与占位期一致, 但不再抛 NotImplementedError —— 任何子进程失败
 仍以 subprocess 非零退出码冒泡, orchestrator 看到的 ok 决定后续动作。
 
-编排模式 (2026-08-07): 默认带 --no-shoot --defer-judge —— 识别段只存 raw
-targets (status=pending) 立即返回, **LLM 判定放到本进程后台线程**, 不阻塞车;
-orchestrator 恢复巡线继续走 task2, 后台线程判定完回写 status=done + pest_numbers。
-射击由 task3_shoot waypoint (task_id 8) 读识别 json 负责。手动全流程
-(识别→pause→射击) 直接跑 task3_pipeline 本体。
+编排模式 (2026-08-12 更新): 带 --no-shoot —— 识别段当场内联 LLM 判定
+(识别不出卡 → 前后微调; LLM 判不出害虫/益虫 → 前后微调重拍), 保存
+status=done + pest_numbers, 不阻塞后续 task2。射击由 task3_shoot waypoint
+(task_id 8) 读识别 json 负责。后台线程只作兜底 (已 done 则 no-op)。
 """
 from __future__ import annotations
 
@@ -35,9 +34,10 @@ DEFAULT_LLM_TIMEOUT = 15.0
 
 
 def _judge_background(manifest: Path, llm_timeout: float = DEFAULT_LLM_TIMEOUT) -> None:
-    """后台线程: 读 pending json → 逐张 LLM 判定 → 回写 done json。
+    """后台兜底判定: 读识别 json → 逐张 LLM 判定 → 回写 done json。
 
-    在 orchestrator 进程跑 (task3_pest_scout.run 的调用方), 车已恢复巡线不受影响。
+    2026-08-12: 识别段已当场内联判定 (含 result=None 重拍), json 通常是 done;
+    本线程只在 json 仍 pending (识别异常/内联判定被跳过) 时兜底补判。
     失败只打日志, 不抛 —— 超时未 done 时 task3_shoot 读到空 pest_numbers 跳过射击。
     """
     try:
@@ -82,13 +82,14 @@ def run(
         {"ok": bool, "status": "ok"|"failed", "exit_code": int, "args": [...]}
     """
     cmd = [sys.executable, "-m", "main.task.task3.task3_pipeline",
-           "--no-shoot", "--defer-judge"]
+           "--no-shoot"]
     if extra_args:
         cmd.extend(extra_args)
 
     print(f"[task3] launching: {' '.join(cmd)}", flush=True)
     proc = subprocess.run(cmd, check=False)
-    # 识别段返回即起后台判定线程 —— 车继续巡线走 task2, 判定不阻塞.
+    # 2026-08-12: 识别段已当场内联 LLM 判定 (含 result=None 前后微调重拍), manifest 直接
+    # status=done + pest_numbers; 后台线程只作兜底 (status 已是 done 则 no-op).
     if proc.returncode == 0:
         threading.Thread(target=_judge_background, args=(DEFAULT_MANIFEST,),
                          daemon=True, name="task3-judge").start()
