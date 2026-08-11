@@ -527,23 +527,24 @@ def _init_step0_trigger_lane_arm(
     arm_client: ArmClient,
     cfg: Dict[str, Any],
 ) -> bool:
-    """2026-08-09: 任务点触发后 step0 — lane follow 前移 与 臂切 PLACE 并发.
+    """2026-08-09: 任务点触发后 step0 — 底盘前移 与 臂切 PLACE 并发.
 
     编排层 waypoint 触发 (右侧 IR<阈值 AND 里程≥阈值) 后、step1 视觉对齐前:
-      1. 底盘 move_along_lane(vx, distance_m) 沿车道线前进 (拉近 marker, 不偏航)
-      2. 机械臂并发 composite_run 切 PLACE 对齐姿态 (arm=+90, x=-300, y=-100,
-         hand=0) — "进入任务点就动臂" (task2 同款并发范式, task1_seeding 原本
-         step1 也要切 PLACE, 提前并发省串行等待).
+      1. 底盘 move_for([lane_m,0,0]) 沿车头前移 lane_m (拉近 marker).
+         ⚠️ 2026-08-12: 原用 move_along_lane (lane 视觉), 但其 runner 挂
+         500ms watchdog — lane_state stale 时静默 emergency_stop+break, 车不动
+         也不报错 (实车 step0 没触发). 0.15m 直走 odom 闭环 move_for 就够,
+         符合 "底盘平移一律 move_for" 规则, 不依赖 lane.
+      2. 机械臂并发 composite_run 切 PLACE 对齐姿态 (arm=+90, x=-235, y=-100,
+         hand=0) — "进入任务点就动臂" (task2 同款并发范式).
 
     参数走 task_config.yml trigger_settle 段 (enabled / lane_follow_m /
     lane_speed_mps). 关闭或 lane_m<=0 → 原样返回.
 
-    安全: 当前 y > -50 (臂偏低) 先串行抬到 PLACE_Y_MM 再并发, 防底盘前进撞臂
-    (与 _switch_to_place_pose 同规则). lane follow 需要 lane_feed 存活
-    (orchestrator 触发后只 pause 外环 runner, feed 仍跑, 与 settle_forward 同理).
+    安全: 当前 y > -50 (臂偏低) 先串行抬到 PLACE_Y_MM 再并发, 防底盘前进撞臂.
 
-    失败不阻塞任务: lane follow 或臂切失败只记 warning, 继续 step1.
-    Returns: lane follow 且 臂切 是否都完成.
+    失败不阻塞任务: 底盘前移或臂切失败只记 warning, 继续 step1.
+    Returns: 底盘前移 且 臂切 是否都完成.
     """
     settle = cfg.get("trigger_settle") or {}
     if not settle.get("enabled", False):
@@ -563,32 +564,46 @@ def _init_step0_trigger_lane_arm(
         logger.warning("step0: 检查/抬升 y 失败 (%s), 继续", exc)
 
     from concurrent.futures import ThreadPoolExecutor
-    from main.chassis import move_along_lane
 
-    logger.info("step0: lane follow %.2fm @ %.2fm/s 并发臂切 PLACE "
+    logger.info("step0: 底盘前移 %.2fm @ %.2fm/s 并发臂切 PLACE "
                 "(arm=%s° x=%s y=%s hand=%s°)",
                 lane_m, lane_vx, PLACE_ARM_DEG, PLACE_ALIGN_X_MM,
                 PLACE_Y_MM, PLACE_HAND_DEG)
     lane_done = True
     arm_ok = False
     with ThreadPoolExecutor(max_workers=2) as ex:
-        f_lane = ex.submit(move_along_lane, vx=lane_vx, distance_m=lane_m)
+        # 前移走 move_for (car_queue, sync) — 与臂 composite_run (arm_queue,
+        # sync=False+wait_job) 分属不同 worker, 并发不拥塞 (同 _parallel_chassis_arm).
+        def _step0_forward():
+            arm_client.http.execute_car_action(
+                "move_for", [lane_m, 0.0, 0.0],
+                timeout=10.0, sync=True,
+                max_velocities=[lane_vx, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
+            )
+        f_chassis = ex.submit(_step0_forward)
         f_arm = ex.submit(
-            arm_client.composite_run,
-            arm=PLACE_ARM_DEG, x_mm=PLACE_ALIGN_X_MM, y_mm=PLACE_Y_MM,
-            hand=PLACE_HAND_DEG, speed=COMPOSITE_SPEED_DEFAULT, timeout=20.0,
+            arm_client.http.execute,
+            "arm", "composite_run",
+            kwargs=dict(arm=PLACE_ARM_DEG, x=PLACE_ALIGN_X_MM / 1000.0,
+                        y=PLACE_Y_MM / 1000.0, hand=PLACE_HAND_DEG,
+                        speed=COMPOSITE_SPEED_DEFAULT, timeout=20.0),
+            sync=False,
         )
         try:
-            f_lane.result()
+            f_chassis.result()
         except Exception as exc:
             lane_done = False
-            logger.warning("step0: lane follow 失败 (%s), 继续 step1", exc)
+            logger.warning("step0: 底盘前移失败 (%s), 继续 step1", exc)
         try:
-            arm_ok = bool(f_arm.result())
+            arm_job = f_arm.result()
+            ajid = arm_job.get("id") if isinstance(arm_job, dict) else None
+            if ajid:
+                arm_client.http.wait_job(ajid, timeout=30.0)
+            arm_ok = True
         except Exception as exc:
             logger.warning("step0: 臂切 PLACE 失败 (%s), 继续 step1", exc)
     if not lane_done:
-        logger.warning("step0: lane follow 未完成, step1 对齐从当前位置开始")
+        logger.warning("step0: 底盘前移未完成, step1 对齐从当前位置开始")
     return lane_done and arm_ok
 
 
@@ -931,14 +946,22 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             # composite_run 并发时 move_x_position 假收敛 — 大臂旋转 + 串口争用下 X 只走一半
             # (PLACE x=-235 → S x=-70 实测停在 -152, SDK 却报 x:true). 用 arm_feed
             # 编码器 (唯一可信源) 校验, 未到位单轴补走 (arm=None 只动 X, 大臂已停不抢串口).
+            # 补走循环: 2026-08-12 实车发现 move_x_position 反馈滞后 → 每次补走只净前进
+            # ~30mm (6s 超时), 固定 3 次从 X=-288 (place_align 失败甩出去的) 到不了 -70.
+            # 改成循环到到位: 上限 8 次, 且连续两次读数无进展 (>5mm) 视为机械卡死放弃.
             # 读数失败 (feed 未启 / 测试 mock 返回非数值) → 直接跳过补走, 不阻塞任务.
-            for _ in range(3):
+            prev_x = None
+            for _ in range(8):
                 try:
                     actual_x = arm_client._read_x_mm_realtime()
                     if actual_x is None or abs(float(actual_x) - S_POSE_X_MM) < 15.0:
                         break
                 except (TypeError, ValueError):
                     break
+                if prev_x is not None and abs(float(actual_x) - prev_x) < 5.0:
+                    logger.warning("  切 S: X 补走无进展 (卡在 %.0fmm), 放弃", actual_x)
+                    break
+                prev_x = float(actual_x)
                 logger.warning("  切 S: x 未到位 (实际=%.0fmm 目标=%.0fmm), 单轴补走",
                                actual_x, S_POSE_X_MM)
                 arm_client.composite_run(

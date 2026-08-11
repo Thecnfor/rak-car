@@ -579,7 +579,10 @@ class TestRun(unittest.TestCase):
 
 
 class TestStep0TriggerLaneArm(unittest.TestCase):
-    """2026-08-09: step0 — 触发后 lane follow 并发臂切 PLACE."""
+    """2026-08-09: step0 — 触发后底盘前移 并发臂切 PLACE.
+    2026-08-12: lane follow 改 move_for — lane_state stale 时 move_along_lane 的
+    500ms watchdog 会静默 emergency_stop+break (车不动也不报错). 0.15m 直走
+    odom 闭环 move_for 就够, 不依赖 lane."""
 
     def _call(self, cfg_override=None):
         import main.task.task1_seeding as m
@@ -594,46 +597,59 @@ class TestStep0TriggerLaneArm(unittest.TestCase):
         arm.get_state.return_value = MagicMock(y_mm=-100)
         return m._init_step0_trigger_lane_arm(arm, cfg), arm
 
-    def test_lane_and_arm_run_concurrently(self):
-        """move_along_lane(vx=0.1, distance_m=0.1) 与 composite_run(PLACE) 并发. """
+    def test_chassis_and_arm_run_concurrently(self):
+        """move_for([0.1,0,0]) 底盘前移 与 composite_run(PLACE) 并发. """
         import main.task.task1_seeding as m
-        with patch("main.chassis.move_along_lane") as mal:
-            ok, arm = self._call()
+        ok, arm = self._call()
         self.assertTrue(ok)
-        mal.assert_called_once_with(vx=0.1, distance_m=0.1)
-        arm.composite_run.assert_called_once()
-        kw = arm.composite_run.call_args.kwargs
+        # 底盘: move_for([0.1,0,0], max_velocities=[0.1,0.1,pi/3])
+        car_calls = [c for c in arm.http.execute_car_action.call_args_list
+                     if c.args and c.args[0] == "move_for"]
+        self.assertTrue(car_calls, "应调 move_for 前移")
+        dx = car_calls[0].args[1][0]
+        self.assertAlmostEqual(dx, 0.1, places=6)
+        # 臂: composite_run 走 http.execute (sync=False)
+        arm_calls = [c for c in arm.http.execute.call_args_list
+                     if c.args and c.args[1] == "composite_run"]
+        self.assertTrue(arm_calls, "应调 composite_run 切 PLACE")
+        kw = arm_calls[0].kwargs["kwargs"]
         self.assertEqual(kw["arm"], m.PLACE_ARM_DEG)
-        self.assertEqual(kw["x_mm"], m.PLACE_ALIGN_X_MM)
-        self.assertEqual(kw["y_mm"], m.PLACE_Y_MM)
+        self.assertEqual(kw["x"], m.PLACE_ALIGN_X_MM / 1000.0)
+        self.assertEqual(kw["y"], m.PLACE_Y_MM / 1000.0)
         self.assertEqual(kw["hand"], m.PLACE_HAND_DEG)
 
     def test_disabled_skips(self):
         """enabled=False → 直接返回 True, 不碰底盘/臂. """
-        with patch("main.chassis.move_along_lane") as mal:
-            ok, arm = self._call({"trigger_settle": {"enabled": False}})
+        ok, arm = self._call({"trigger_settle": {"enabled": False}})
         self.assertTrue(ok)
-        mal.assert_not_called()
-        arm.composite_run.assert_not_called()
+        arm.http.execute_car_action.assert_not_called()
+        arm.http.execute.assert_not_called()
 
     def test_y_low_raises_before_concurrent(self):
         """y > -50 先串行抬到 PLACE_Y_MM 再并发 (防撞). """
         import main.task.task1_seeding as m
         arm = MagicMock()
         arm.get_state.return_value = MagicMock(y_mm=0)
-        with patch("main.chassis.move_along_lane"):
-            m._init_step0_trigger_lane_arm(arm, {
-                "trigger_settle": {"enabled": True,
-                                   "lane_follow_m": 0.1, "lane_speed_mps": 0.1},
-            })
+        m._init_step0_trigger_lane_arm(arm, {
+            "trigger_settle": {"enabled": True,
+                               "lane_follow_m": 0.1, "lane_speed_mps": 0.1},
+        })
         arm.move_y.assert_called_once_with(m.PLACE_Y_MM, timeout=5.0)
 
-    def test_lane_failure_continues(self):
-        """lane follow 抛错 → 记 warning 返回 False 不阻塞. """
-        def _boom(*a, **kw):
-            raise RuntimeError("lane 断")
-        with patch("main.chassis.move_along_lane", side_effect=_boom):
-            ok, _ = self._call()
+    def test_chassis_failure_continues(self):
+        """底盘 move_for 抛错 → 记 warning 返回 False 不阻塞. """
+        import main.task.task1_seeding as m
+        arm = MagicMock()
+        arm.get_state.return_value = MagicMock(y_mm=-100)
+
+        def _boom(name, *args, **kwargs):
+            if name == "move_for":
+                raise RuntimeError("move_for 断")
+            return {"id": "j1", "status": "succeeded"}
+        arm.http.execute_car_action.side_effect = _boom
+        cfg = {"trigger_settle": {"enabled": True,
+                                  "lane_follow_m": 0.1, "lane_speed_mps": 0.1}}
+        ok = m._init_step0_trigger_lane_arm(arm, cfg)
         self.assertFalse(ok)
 
 

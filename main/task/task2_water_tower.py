@@ -416,15 +416,22 @@ def _safe_composite_run(
         arm_client.http.wait_job(jid, timeout=timeout + 5.0)
     # x 到位校验 (2026-08-12 task1 同款补丁移植): composite_run 并发/单独跑时
     # move_x_position 假收敛 (X 只走一半, SDK 报 ok). 用 arm_feed 真值校验,
-    # 未到位单轴补走 (arm=None 只动 X), 最多 3 次. 仅当本次命令带 x_mm 才校验.
+    # 未到位单轴补走 (arm=None 只动 X). 补走循环: 实车发现每次补走只净前进 ~30mm
+    # (反馈滞后 6s 超时), 固定 3 次不够 → 循环到到位 (上限 8), 连续两次无进展
+    # (>5mm) 视为机械卡死放弃. 仅当本次命令带 x_mm 才校验.
     if x_mm is not None:
-        for _ in range(3):
+        prev_x = None
+        for _ in range(8):
             try:
                 actual_x = arm_client._read_x_mm_realtime()
                 if actual_x is None or abs(float(actual_x) - float(x_mm)) < 15.0:
                     break
             except (TypeError, ValueError):
                 break
+            if prev_x is not None and abs(float(actual_x) - prev_x) < 5.0:
+                logger.warning("  X 补走无进展 (卡在 %.0fmm), 放弃", actual_x)
+                break
+            prev_x = float(actual_x)
             logger.warning("  X 未到位 (实际=%.0fmm 目标=%.0fmm), 单轴补走",
                            actual_x, x_mm)
             arm_client.composite_run(
