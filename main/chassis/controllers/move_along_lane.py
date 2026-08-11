@@ -123,14 +123,25 @@ def move_along_lane(
         straight    - 透传 ``StraightOuterLoop`` 调参（kp_theta / sign_theta /
                       k_ey_omega / omega_max …），现场方向反了改这里。
                       ``vx_cruise`` 恒用 vx，``strafe_v`` 恒 0，不可覆盖。
+                      ω 矫正默认已温和化（omega_max=0.12 / kp_theta=0.8 /
+                      k_ey_omega=0.2），想更小/恢复激进用这个参数覆盖。
     """
     straight_kwargs = dict(straight or {})
+    # 只在此方法内温和化 ω 矫正（不影响 mission / lane_only 的 StraightOuterLoop 默认）：
+    # setdefault = 调用方显式传了 straight= 以调用方为准。
+    straight_kwargs.setdefault("omega_max", 0.12)    # 默认 0.25 → 矫正幅度钳低
+    straight_kwargs.setdefault("kp_theta", 0.8)      # 默认 1.5 → 反应更轻
+    straight_kwargs.setdefault("k_ey_omega", 0.2)    # 默认 0.5 → cross-track 贡献减小
     straight_kwargs["vx_cruise"] = float(vx)
     straight_kwargs["strafe_v"] = 0.0  # 锁死 vy：物理上只有前进/后退
     outer = StraightOuterLoop(**straight_kwargs)
 
     if distance_m is None:
-        # 纯时间模式：委托 subscribe_lane_state（原行为，max_seconds 默认 5.0）
+        # 纯时间模式：委托 subscribe_lane_state（原行为，max_seconds 默认 5.0）。
+        # subscribe_lane_state 无 stop_when 钩子 → 时间模式不生效，显式报错防静默踩坑。
+        if stop_when is not None:
+            raise ValueError("move_along_lane: stop_when 只在 distance_m 模式下生效"
+                             "（时间模式委托 subscribe_lane_state，无停止钩子）")
         from main.chassis import subscribe_lane_state
         return subscribe_lane_state(
             outer=outer,
