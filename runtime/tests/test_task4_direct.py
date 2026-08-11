@@ -5,9 +5,8 @@ arm.composite_run / arm.grasp / run_arm_servo / streamer.task_state ...),
 不触任何硬件。覆盖:
   - dry_run 不构造硬件
   - 找球过滤 + 颜色映射 (_fetch_balls)
-  - 左 IR 离区判定 (_ir_far)
   - 业务 mm 位姿 → SDK 米制换算 (_composite_m)
-  - 全流程: creep 见球 → 底盘对齐 → 臂伺服 → 抓放 → 前进 → 预算退出
+  - 全流程: creep 见球 → 底盘对齐 → 臂伺服 → 抓放 → lane_follow 前进 → 空轮退出
 """
 import time
 import unittest
@@ -17,7 +16,6 @@ from runtime.tasks.task4_direct import (
     run,
     _composite_m,
     _fetch_balls,
-    _ir_far,
     _label_to_color,
     COLOR_BLUE,
     COLOR_YELLOW,
@@ -133,13 +131,33 @@ class TestTask4DirectFlow(unittest.TestCase):
         self.assertEqual(result["reason"], "dry_run")
         self.assertEqual(result["picked"], 0)
 
-    def test_ir_far_detects_left_exit(self):
-        car_near = FakeCar(ir={"left": 0.4, "right": 0.4})
-        self.assertFalse(_ir_far(car_near))
-        car_far = FakeCar(ir={"left": 0.9, "right": 0.4})
-        self.assertTrue(_ir_far(car_far))
-        car_none = FakeCar(ir={"left": "---", "right": "---"})
-        self.assertFalse(_ir_far(car_none))
+    def test_flow_ends_after_min_advances_and_empty_rounds(self):
+        """首球抓完后无球: 前进≥MIN_SCAN_ADVANCES 且 连续 SCAN_EMPTY_ROUNDS 轮无球
+        → zone_cleared。不依赖 IR (2026-08-11 用户: 实车 IR 一直 0.4~0.7 顶不到)。
+
+        streamer 只在首个 creep 期间给一球, 之后空窗; patch 小常量让退出快速触发。
+        """
+        from unittest.mock import patch
+
+        class OneShotStreamer(FakeStreamer):
+            def __init__(self, detections):
+                super().__init__(detections)
+                self._served = False
+
+            def get_task_state(self):
+                if not self._served:
+                    self._served = True
+                    return super().get_task_state()
+                return {"active": True, "detections": [], "updated_at": time.time()}
+
+        car = FakeCar()
+        car.streamer = OneShotStreamer([_ball_det("ball_blue", cx=0.0, cy=0.0)])
+        with patch("runtime.tasks.task4_direct.MIN_SCAN_ADVANCES", 1), \
+             patch("runtime.tasks.task4_direct.SCAN_EMPTY_ROUNDS", 1), \
+             patch("runtime.tasks.task4_direct.SCAN_LOOK_S", 0.1):
+            result = Task4Direct(car, max_seconds=30.0).run()
+        self.assertEqual(result["reason"], "zone_cleared")
+        self.assertEqual(result["picked"], 1)
 
     def test_fetch_balls_filters_and_maps_color(self):
         car = FakeCar(detections=[
@@ -187,8 +205,8 @@ class TestTask4DirectFlow(unittest.TestCase):
 
         # creep 下发过非零底盘速度
         self.assertTrue(any(v[0] > 0 for v in car.vels))
-        # 后续球 move_for 前进
-        self.assertTrue(any(k == "move_for" and m[0][0] > 0 for k, *m in car.moves))
+        # 后续球 lane_follow 前进 (lane_dis_offset, 不再是 move_for)
+        self.assertTrue(any(k == "lane" and m[0] > 0 for k, *m in car.moves))
         # 开仓 75 + 关仓 98
         self.assertIn(75, [a for a, _ in car.storage_angles])
         self.assertIn(98, [a for a, _ in car.storage_angles])
@@ -196,13 +214,6 @@ class TestTask4DirectFlow(unittest.TestCase):
         events = car.feed_events
         self.assertIn(("arm_feed", "stop", True), events)
         self.assertIn(("arm_feed", "start", 20.0), events)
-
-    def test_flow_ends_when_left_ir_far(self):
-        car = FakeCar(detections=[_ball_det("ball_yellow", cx=0.0, cy=0.0)],
-                      ir={"left": 0.9, "right": 0.4})
-        result = Task4Direct(car, max_seconds=10.0).run()
-        self.assertEqual(result["reason"], "zone_cleared")
-        self.assertGreaterEqual(result["picked"], 1)
 
     def test_flow_respects_cooperative_stop(self):
         car = FakeCar(detections=[_ball_det("ball_blue", cx=0.0, cy=0.0)])

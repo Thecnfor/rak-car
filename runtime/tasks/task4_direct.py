@@ -107,15 +107,18 @@ PICK_SUCK_HAND_DEG: float = 0.0
 PICK_HOLD_S: float = 0.5
 PICK_LIFT_Y_MM: float = -150.0
 PICK_BIN_ARM_DEG: float = 95.0
-PICK_RELEASE_Y_MM: float = -140.0
+PICK_RELEASE_Y_MM: float = -130.0
 PICK_RELEASE_HAND_DEG: float = 10.0
 
-# 后续球扫描
-SCAN_ADVANCE_M: float = 0.10
+# 后续球扫描 (2026-08-11 用户: 退出去 IR, 改前进≥MIN_SCAN_ADVANCES 且 连续空轮)
+SCAN_ADVANCE_M: float = 0.08
 SCAN_LOOK_S: float = 3.0
-SCAN_GRAB_CX_HALF: float = 0.2
+SCAN_GRAB_CX_HALF: float = 0.4
+SCAN_GRAB_CX_HALF_LATE: float = 0.6
+SCAN_GRAB_TIER_ADVANCES: int = 4
 SCAN_MAX_PICKS: int = 8
-SCAN_IR_FAR_M: float = 0.75
+MIN_SCAN_ADVANCES: int = 7
+SCAN_EMPTY_ROUNDS: int = 2
 
 ALIGN_ONLY: bool = False
 BIN_X_MM: Dict[str, float] = {COLOR_BLUE: 0.0, COLOR_YELLOW: -60.0}
@@ -141,32 +144,6 @@ def _odom_x(car) -> float:
         return float(value)
     except (TypeError, ValueError, IndexError):
         return 0.0
-
-
-def _ir_left(car) -> Optional[float]:
-    """读左 IR 距离 (m)。读不到 / 值非法 → None。"""
-    try:
-        state = car.get_all_ir_distance()
-    except Exception:
-        return None
-    if isinstance(state, dict):
-        left = state.get("left")
-    elif isinstance(state, (list, tuple)) and len(state) >= 1:
-        left = state[0]
-    else:
-        return None
-    if left in (None, "", "---"):
-        return None
-    try:
-        return float(left)
-    except (TypeError, ValueError):
-        return None
-
-
-def _ir_far(car, threshold_m: float = SCAN_IR_FAR_M) -> bool:
-    """左 IR > 阈值 → 离区 (退出条件)。读不到按 False (不误退)。"""
-    left = _ir_left(car)
-    return left is not None and left > threshold_m
 
 
 def _set_chassis_vel(car, vx: float, vy: float = 0.0) -> None:
@@ -548,10 +525,15 @@ def _servo_and_pick(
             continue
         print(f"  [{LOG_PREFIX}] [{i}/7] {desc}")
         try:
-            action()
+            r = action()
         except Exception as e:
-            return {"ok": False,
-                    "error": f"{desc} 失败: {type(e).__name__}: {str(e)[:120]}"}
+            err = f"{desc} 异常: {type(e).__name__}: {str(e)[:120]}"
+            print(f"  [{LOG_PREFIX}] ❌ [{i}/7] {err}")
+            return {"ok": False, "error": err}
+        if isinstance(r, dict) and r.get("ok") is False:
+            err = f"{desc} 返回 ok=False (steps={r.get('steps')})"
+            print(f"  [{LOG_PREFIX}] ❌ [{i}/7] {err}")
+            return {"ok": False, "error": err}
     return {"ok": True, "error": None}
 
 
@@ -660,10 +642,11 @@ class _CreepThread:
 
 def _advance_and_arm_init(car, *, pose_p_x_mm, pose_p_y_mm,
                           pose_p_arm_deg, pose_p_hand_deg, dry_run=False) -> None:
-    """move_for 前进 SCAN_ADVANCE_M ∥ 并发 臂回初始姿势。
+    """lane_follow 前进 SCAN_ADVANCE_M ∥ 并发 臂回初始姿势。
 
-    对应网络版 /v1/execute move_for ∥ ArmClient.composite_run。串口抢占风险
-    已接受 (2026-08-11 用户) —— 前进与臂回初始同时进行。
+    前进走 car.lane_dis_offset (SDK 原生 lane-follow, 视觉对齐车道中心不偏,
+    对应网络版 move_along_lane), 不用 move_for。并发 臂回初始。
+    串口抢占风险已接受 (2026-08-11 用户) —— 前进与臂回初始同时进行。
     """
     if dry_run:
         print(f"  [{LOG_PREFIX}] [DRY-RUN] 跳过 前进{SCAN_ADVANCE_M:.2f}m ∥ 臂回初始")
@@ -680,19 +663,20 @@ def _advance_and_arm_init(car, *, pose_p_x_mm, pose_p_y_mm,
     t = threading.Thread(target=_arm_init, name="task4-arm-init", daemon=True)
     t.start()
     try:
-        car.move_for([SCAN_ADVANCE_M, 0.0, 0.0],
-                     max_velocities=[0.05, 0.05, 3.14159 / 3])
-        print(f"  [{LOG_PREFIX}] 前进 {SCAN_ADVANCE_M:.2f}m 完成 (臂回初始并发)")
+        car.lane_dis_offset(speed=0.05, dis_hold=SCAN_ADVANCE_M)
+        print(f"  [{LOG_PREFIX}] 前进 {SCAN_ADVANCE_M:.2f}m 完成 (lane_follow, 臂回初始并发)")
     except Exception as e:
-        print(f"  [{LOG_PREFIX}] ⚠️ move_for 前进失败 ({type(e).__name__}: {str(e)[:80]})")
+        print(f"  [{LOG_PREFIX}] ⚠️ lane_follow 前进失败 ({type(e).__name__}: {str(e)[:80]})")
     t.join(timeout=35.0)
 
 
 def _look_grabbable_ball(car, *, timeout_s: float = SCAN_LOOK_S,
+                         grab_half: float = SCAN_GRAB_CX_HALF,
                          dry_run: bool = False) -> Optional[dict]:
     """找球 ≤timeout_s: 轮询 _fetch_balls, 过滤到可抓窗口
-    (|cx_norm - ARM_SERVO_SETPOINT_CX| ≤ SCAN_GRAB_CX_HALF), 取最左 (cx 最小)。
+    (|cx_norm - ARM_SERVO_SETPOINT_CX| ≤ grab_half), 取最左 (cx 最小)。
 
+    grab_half 由主循环按梯度 (前 SCAN_GRAB_TIER_ADVANCES 次窄窗, 之后宽窗) 传入。
     窗口内无球 → None (球在窗口外 = 下一轮的球, 上层继续前进)。
     """
     if dry_run:
@@ -706,7 +690,7 @@ def _look_grabbable_ball(car, *, timeout_s: float = SCAN_LOOK_S,
         in_window = [
             b for b in balls
             if b.get("color") in (COLOR_BLUE, COLOR_YELLOW)
-            and abs(float(b.get("cx_norm", 0.0)) - ARM_SERVO_SETPOINT_CX) <= SCAN_GRAB_CX_HALF
+            and abs(float(b.get("cx_norm", 0.0)) - ARM_SERVO_SETPOINT_CX) <= grab_half
         ]
         if in_window:
             return min(in_window, key=lambda b: float(b.get("cx_norm", 0.0)))
@@ -773,7 +757,9 @@ def step_target4(
           f"{SCAN_LOOK_S:.0f}s 找球")
     print(f"  底盘对齐 ≤{track_max_seconds:.0f}s (+超时加时 {TRACK_EXTEND_SECONDS:.0f}s, "
           f"失败也继续) | 臂伺服 setpoint=({ARM_SERVO_SETPOINT_CX},{ARM_SERVO_SETPOINT_CY})")
-    print(f"  退出: 左 IR>{SCAN_IR_FAR_M:.2f}m 或 picks≥{SCAN_MAX_PICKS} | ALIGN_ONLY={ALIGN_ONLY}")
+    print(f"  退出: 前进≥{MIN_SCAN_ADVANCES}次 且 连续{SCAN_EMPTY_ROUNDS}轮无球 "
+          f"(窗口梯度: 前{SCAN_GRAB_TIER_ADVANCES}次{SCAN_GRAB_CX_HALF:.1f}/"
+          f"后{SCAN_GRAB_CX_HALF_LATE:.1f}) | ALIGN_ONLY={ALIGN_ONLY}")
 
     for name, val in (("max_seconds", max_seconds), ("creep_speed_mps", creep_speed_mps),
                       ("track_max_seconds", track_max_seconds)):
@@ -928,8 +914,11 @@ def step_target4(
                 if not res["ok"]:
                     n_pick_failures += 1
 
-        # ---- 2.2 后续球循环 (picks<8 且 未离区) ----
-        while final_reason == "unknown" and n_picks < SCAN_MAX_PICKS:
+        # ---- 2.2 后续球循环 (无抓球数封顶, 实车) ----
+        #    退出 = 前进≥MIN_SCAN_ADVANCES 且 连续 SCAN_EMPTY_ROUNDS 轮无球 (不依赖 IR)
+        scan_advances = 0      # 已前进次数
+        consecutive_empty = 0  # 连续找球为空轮数
+        while final_reason == "unknown":
             elapsed = time.monotonic() - t_start
             if _stopped(car):
                 final_reason = "stopped"
@@ -939,10 +928,6 @@ def step_target4(
                 final_reason = "time_budget"
                 print(f"  [{LOG_PREFIX}] ⏱ 总时长 {elapsed:.1f}s 达预算, 收尾")
                 break
-            if _ir_far(car):
-                final_reason = "zone_cleared"
-                print(f"  [{LOG_PREFIX}] 🏁 左 IR > {SCAN_IR_FAR_M:.2f}m, 已离区, 收工")
-                break
             ball_idx += 1
             print(f"\n========== [{LOG_PREFIX}] 第 {ball_idx} 球 (扫描前进) ==========")
             _advance_and_arm_init(
@@ -950,10 +935,23 @@ def step_target4(
                 pose_p_arm_deg=pose_p_arm_deg, pose_p_hand_deg=pose_p_hand_deg,
                 dry_run=dry_run,
             )
-            ball = _look_grabbable_ball(car, timeout_s=SCAN_LOOK_S, dry_run=dry_run)
+            scan_advances += 1
+            # 梯度窗口: 前 SCAN_GRAB_TIER_ADVANCES 次前进用窄窗, 之后放宽到宽窗
+            grab_half = (SCAN_GRAB_CX_HALF if scan_advances <= SCAN_GRAB_TIER_ADVANCES
+                         else SCAN_GRAB_CX_HALF_LATE)
+            ball = _look_grabbable_ball(car, timeout_s=SCAN_LOOK_S,
+                                        grab_half=grab_half, dry_run=dry_run)
             if ball is None:
-                print(f"  [{LOG_PREFIX}] 未见可抓球 (窗口内无球), 下一轮继续前进")
+                consecutive_empty += 1
+                print(f"  [{LOG_PREFIX}] 未见可抓球 (窗口内无球), 空轮 {consecutive_empty} 次")
+                if (scan_advances >= MIN_SCAN_ADVANCES
+                        and consecutive_empty >= SCAN_EMPTY_ROUNDS):
+                    final_reason = "zone_cleared"
+                    print(f"  [{LOG_PREFIX}] 🏁 已前进 {scan_advances} 次, 连续 "
+                          f"{consecutive_empty} 轮无球, 收工")
+                    break
                 continue
+            consecutive_empty = 0
             color = ball["color"]
             print(f"  [{LOG_PREFIX}] ✓ 锁定 {color} 球 "
                   f"(最左, cx={float(ball.get('cx_norm', 0)):.3f})")
@@ -961,10 +959,11 @@ def step_target4(
             n_picks += _record_pick(ball_idx, color, res)
             if not res["ok"]:
                 n_pick_failures += 1
-        else:
-            if final_reason == "unknown":
+            if dry_run and n_picks >= SCAN_MAX_PICKS:
+                # dry-run 占位球抓满即停, 防止空转 (实车不封顶)
                 final_reason = "completed"
-                print(f"  [{LOG_PREFIX}] 🏁 已抓 {SCAN_MAX_PICKS} 球, 封顶收工")
+                print(f"  [{LOG_PREFIX}] [DRY-RUN] 抓满 {SCAN_MAX_PICKS} 占位球, 收工")
+                break
 
     except KeyboardInterrupt:
         final_reason = "keyboard_interrupt"
