@@ -12,7 +12,6 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import List
 
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
@@ -100,52 +99,11 @@ def main() -> None:
             "找出「按下时 byte N 非零」的 N 填 config_car.yml io.key.button_index。"
         ),
     )
-    p.add_argument(
-        "--direct", action="store_true",
-        help="任务1/2/4直接在本进程调用MyCar，不经过HTTP/WS网络栈。",
-    )
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(name)s] %(message)s")
     if args.probe_keys:
         probe_keys()
-        return
-    if args.direct:
-        if args.task not in {"1", "2", "4"}:
-            sys.stderr.write("--direct 目前只支持 --task 1, 2 或 4\n")
-            sys.exit(2)
-        from runtime.services.my_car import MyCar
-        car = MyCar()
-        try:
-            if args.task == "1":
-                from runtime.services.task1_runner import run_task1
-                result = run_task1(car)
-            elif args.task == "2":
-                from runtime.services.task2_runner import run_task2
-                result = run_task2(car)
-            else:
-                from runtime.tasks.task4_direct import Task4Direct
-                result = Task4Direct(car).run()
-            print(result)
-            if isinstance(result, dict) and not result.get("ok", True):
-                sys.exit(1)
-        finally:
-            car.close()
-        return
-    if args.task in {"1", "2", "4"}:
-        client = RuntimeApiClient()
-        if args.task == "1":
-            action = "run_task1"
-        elif args.task == "2":
-            action = "run_task2"
-        else:
-            action = "run_task4"
-        result = client.execute_car_action(action, timeout=240.0, sync=True)
-        print(result)
-        if isinstance(result, dict):
-            payload = result.get("result", result)
-            if isinstance(payload, dict) and not payload.get("ok", True):
-                sys.exit(1)
         return
     orch = Orchestrator(lane_hz=args.lane_hz,
                         ir_interval_s=args.ir_interval_s)

@@ -100,7 +100,6 @@ class ArmServoMixin:
         reason = "timeout"
         period = 1.0 / max(hz, 1.0)
         deadline = time.time() + max(0.0, float(servo_timeout))
-        end_x: Optional[float] = None  # 2026-08-10: 记录对齐终点 x (m), 供任务侧读日志
 
         def _read_pick():
             """读 streamer task_feed 缓存，选离画面中心(吸嘴)最近的目标。"""
@@ -164,7 +163,6 @@ class ArmServoMixin:
                     try:
                         x_pos = arm.x_get_position()
                         if x_pos is not None:
-                            end_x = float(x_pos)  # 2026-08-10: 记录最后一次读到的 x 位置
                             if x_vel > 0 and float(x_pos) >= X_MAX_M:
                                 x_vel = 0.0
                             elif x_vel < 0 and float(x_pos) <= X_MIN_M:
@@ -206,5 +204,4 @@ class ArmServoMixin:
             "trace_hits": hits,
             "settled": settled,
             "end_arm": arm_target,
-            "end_x": end_x,
         }

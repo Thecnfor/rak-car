@@ -46,7 +46,6 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -74,10 +73,10 @@ TASK1_NOZZLE_OFFSET_MAP: Dict[str, Tuple[float, float]] = {
 }
 
 # ── 视觉伺服参数 (track_velocity_pick) ─────────────────────────────────────
-PICK_SERVO_GAIN_ARM = 0.5     # 2026-08-10: 0.7 → 0.5 (用户: 大臂增量再调缓, 每帧 +0.7×dx → +0.5×dx)
+PICK_SERVO_GAIN_ARM = 1.0
 PICK_SERVO_GAIN_X = 0.30
-PICK_SERVO_DEADZONE = 0.05    # 2026-08-10: 0.06 → 0.05 (第一次死区收紧)
-PICK_SERVO_MAX_VEL = 0.3      # 2026-08-10: 0.5 → 0.3 (x十字速度上限收紧)
+PICK_SERVO_DEADZONE = 0.06
+PICK_SERVO_MAX_VEL = 0.5
 PICK_SERVO_SETTLE_HITS = 3
 PICK_SERVO_HOLD_S = 0.05
 PICK_SERVO_LIFT_BACK = True
@@ -87,7 +86,7 @@ PICK_SERVO_HZ = 20.0
 PICK_SERVO_TIMEOUT_S_DEFAULT = 4.0
 # ── 对齐失败重试 (2026-08-09 用户): 失败但看得到目标 → 加时 3s + 死区调大 ──
 PICK_SERVO_RETRY_TIMEOUT_EXTRA_S = 3.0   # 重试超时在原超时上加 3s
-PICK_SERVO_RETRY_DEADZONE = 0.10         # 重试死区调大 (第一次 0.05 → 0.10), 更容易锁上
+PICK_SERVO_RETRY_DEADZONE = 0.10         # 重试死区调大 (默认 0.06 → 0.10), 更容易锁上
 
 # ── 抓取起始 hand 角度 ─────────────────────────────────────────────────────
 PICK_START_HAND_DEG = -15.0   # 2026-08-06: S 姿态 hand 固定 -15°
@@ -103,16 +102,7 @@ PLACE_ARM_DEG = 90.0
 PLACE_HAND_DEG = 0.0
 PLACE_Y_MM = -100.0          # 工作平面安全高度 (mm)
 PLACE_X_MM_FALLBACK = -235.0 # 唯一依据，禁止从 cfg / overrides 覆盖
-# 2026-08-10: PLACE 对齐初始姿态 = 现 place 姿态 (原 -300 是"视觉对齐稍收回",
-# 用户改为 place_x=-235 起步, 见 task_config.yml place_align 段).
-PLACE_ALIGN_X_MM = -235.0
-PLACE_ALIGN_LABEL = "cylinder_set"
-PLACE_ALIGN_SETPOINT_CXCY = (0.072, -0.331)  # 2026-08-10 用户标定 (0.042,-0.359) → (0.072,-0.331)
-PLACE_ALIGN_TIMEOUT_S = 5.0
-PLACE_ALIGN_SERVO_ARM_MIN = 30.0  # 起始 +90, 允许向下微调到 +30
-PLACE_ALIGN_SERVO_ARM_MAX = 150.0  # 2026-08-10: 90 → 150 (clamp 放宽, 与 yaml arm_max 对齐)
-PLACE_ALIGN_SERVO_SIGN_ARM = 1.0  # ⚠️ 沿用抓苗标定; 若"越对越偏"取反 (task2 同规则)
-PLACE_ALIGN_SERVO_SIGN_X = -1.0   # ⚠️ 同上
+PLACE_ALIGN_X_MM = -300.0    # 视觉对齐时稍收回 (mm)
 
 # ── 释放 y 轨迹 (单位 mm; 负 = 向下) ──────────────────────────────────────
 PLACE_DESCEND_MM = -20.0   # 吸住后下降到 -20mm
@@ -122,10 +112,6 @@ PLACE_LIFT_MM = -40.0      # 释放后抬离到 -40mm, 防拖拽
 # ── 底盘安全约束 ──────────────────────────────────────────────────────────
 # y 高于此值 (mm) 时才允许并发移动底盘 + 机械臂 (防撞)
 CHASSIS_CONCURRENT_Y_THRESHOLD_MM = -30.0
-
-# ── 底盘网格移动速度 (move_for max_velocities) ───────────────────────────
-# 2026-08-10: SDK 默认 0.2 → 0.1 m/s (xy 平移降速, 角速度留 π/3 默认)
-CHASSIS_MOVE_MAX_VEL_MPS = 0.1
 
 # ── composite_run 公共参数 ─────────────────────────────────────────────────
 COMPOSITE_SPEED_DEFAULT = 100
@@ -267,7 +253,7 @@ def _pick_cylinder_servo_local(
     控制律 (arm 控 cx + x 十字控 cy) 与 find_target_arm_cross 同构, 方向符号沿用
     task1 标定: sign_arm=+1, sign_x=-1.
 
-    Returns: run_arm_servo 结果 dict (含 ok/settled/trace_hits/end_arm/end_x).
+    Returns: run_arm_servo 结果 dict (含 ok/settled/trace_hits/end_arm).
     未收敛抛 RuntimeError (主循环跳过该列, 与旧路径一致).
     """
     vision = cfg.get("pick_vision") or {}
@@ -313,9 +299,9 @@ def _pick_cylinder_servo_local(
         return result
 
     result = _servo_once(servo_kw)
-    logger.info("本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s end_x=%s",
+    logger.info("本地视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
                 result.get("reason"), result.get("settled"),
-                result.get("trace_hits"), result.get("end_arm"), result.get("end_x"))
+                result.get("trace_hits"), result.get("end_arm"))
     # 2026-08-09 用户: 对齐失败但这一轮看到过目标 (trace_hits>0) →
     # 加时 3s + 死区调大重试一次。目标还在视野里只是振荡/太慢没进死区,
     # 再给一次机会大概率能锁上; trace_hits=0 全程没看到目标, 重试也白搭。
@@ -335,9 +321,9 @@ def _pick_cylinder_servo_local(
             retry_kw["servo_timeout"], retry_kw["deadzone"],
         )
         result = _servo_once(retry_kw)
-        logger.info("重试视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s end_x=%s",
+        logger.info("重试视觉伺服结果: reason=%s settled=%s trace_hits=%s end_arm=%s",
                     result.get("reason"), result.get("settled"),
-                    result.get("trace_hits"), result.get("end_arm"), result.get("end_x"))
+                    result.get("trace_hits"), result.get("end_arm"))
     if not result.get("settled"):
         raise RuntimeError(
             f"S 视觉抓苗未收敛 (reason={result.get('reason')}, "
@@ -592,121 +578,105 @@ def _init_step0_trigger_lane_arm(
     return lane_done and arm_ok
 
 
-def _init_step1_place_align_arm(
+def _init_step1_place_align(
     arm_client: ArmClient,
     cfg: Dict[str, Any],
-) -> Dict[str, Any]:
-    """step 1 (2026-08-10 替代原底盘对齐): 放苗侧 cylinder_set 机械臂视觉对齐.
+) -> bool:
+    """新 step 1 (替代 S-pose): PLACE 视觉对齐底盘.
 
-    原 track_chassis("cylinder_set") 底盘对齐已禁用 → 改机械臂对齐:
-      1. 切初始姿态 arm=+90, x=-235, y=-100, hand=0 (= 现 place 姿态)
-      2. run_arm_servo("cylinder_set", setpoint=(cx,cy)) 视觉伺服收敛
-         (大臂控 cx + x 十字控 cy, 与抓苗同机制, runtime 进程内闭环)
-      3. 记住收敛终点 (end_arm, end_x) → 本次运行放苗直接开到这个姿态,
-         单次运行内恒定, 跨运行重新对齐重记.
-    未收敛 → 回落写死 place 姿态 (-235/+90), 完赛优先.
+    用户 (2026-08-02 20:38): 用现成 main.chassis.track_chassis (经过实机调好的
+    P 控制器, sign_vx/vy 已经现场对标, 不会反转). 它本身支持 'nearest_to_center'
+    选目标 (避免多 set 互相干扰), deadband=0.08, hold 5 帧.
 
-    Returns: {"ok": bool, "arm_deg": float|None, "x_mm": float|None,
-              "reason": str|None, "end_arm": float|None, "end_x": float|None}
+    流程:
+      1. 切 PLACE 姿态 (arm=+90, x=-320, y=-100, hand=0) — x=-320 是用户为视觉对齐
+         设的稍收回位置 (因为会偏一点).
+      2. track_chassis("cylinder_set") 闭环对齐底盘, 让 set 落在画面中心.
     """
-    pa = cfg.get("place_align") or {}
-    label = str(pa.get("label", PLACE_ALIGN_LABEL))
-    sp = tuple(float(v) for v in pa.get("setpoint_cxcy", PLACE_ALIGN_SETPOINT_CXCY))
-    init_x_mm = float(pa.get("init_x_mm", PLACE_ALIGN_X_MM))
-    init_arm_deg = float(pa.get("init_arm_deg", PLACE_ARM_DEG))
-    init_hand_deg = float(pa.get("init_hand_deg", PLACE_HAND_DEG))
+    logger.info("step 1 (新): PLACE-side 视觉对齐 — 用现成 main.chassis.track_chassis")
 
-    # (a) 切对齐初始姿态 (现 place 姿态)
-    try:
-        _switch_to_place_pose(arm_client, x_mm=init_x_mm, arm_deg=init_arm_deg,
-                              hand_deg=init_hand_deg)
-    except Exception as exc:
-        logger.error("step 1: 切 place_align 初始姿态失败 (%s), 回落写死 place 姿态", exc)
-        return {"ok": False, "arm_deg": None, "x_mm": None,
-                "reason": f"init_pose_fail: {exc}", "end_arm": None, "end_x": None}
+    # (a) 切 PLACE 姿态 (用 x=PLACE_ALIGN_X_MM 钉死, 用户 20:44 实测 marker 留中心)
+    _switch_to_place_pose(arm_client, x_mm=PLACE_ALIGN_X_MM)
 
-    # (b) 视觉伺服收敛 (run_arm_servo, 参数走 yaml place_align 段, 缺省回落 PICK_SERVO_*)
-    servo_kw = dict(
-        label=label,
-        hz=float(pa.get("hz", PICK_SERVO_HZ)),
-        gain_arm=float(pa.get("gain_arm", PICK_SERVO_GAIN_ARM)),
-        gain_x=float(pa.get("gain_x", PICK_SERVO_GAIN_X)),
-        deadzone=float(pa.get("deadzone", PICK_SERVO_DEADZONE)),
-        max_vel=float(pa.get("max_vel", PICK_SERVO_MAX_VEL)),
-        arm_start=init_arm_deg,
-        sign_arm=float(pa.get("sign_arm", PLACE_ALIGN_SERVO_SIGN_ARM)),
-        sign_x=float(pa.get("sign_x", PLACE_ALIGN_SERVO_SIGN_X)),
-        setpoint_x_norm=sp[0],
-        setpoint_y_norm=sp[1],
-        arm_min=float(pa.get("arm_min", PLACE_ALIGN_SERVO_ARM_MIN)),
-        arm_max=float(pa.get("arm_max", PLACE_ALIGN_SERVO_ARM_MAX)),
-        servo_timeout=float(pa.get("timeout", PLACE_ALIGN_TIMEOUT_S)),
-        settle_hits=int(pa.get("settle_hits", PICK_SERVO_SETTLE_HITS)),
-    )
-    logger.info("step 1 (新): PLACE 机械臂对齐 cylinder_set — run_arm_servo(label=%s "
-                "setpoint=(%.3f,%.3f) arm_start=%.0f x_init=%.0f)",
-                label, sp[0], sp[1], init_arm_deg, init_x_mm)
-
-    def _servo_once(kw: Dict[str, Any]) -> Dict[str, Any]:
-        job = arm_client.http.execute(
-            "car", "run_arm_servo", kwargs=kw, sync=True,
-            timeout=float(kw["servo_timeout"]) + 15.0,
+    # (b) 跑 track_chassis (用户 20:38 实机验证 33 帧 arrived)
+    # 2026-08-03: max_seconds 从 cfg 读 (yaml 之前写 12.0 但代码硬编码 2.0, 配置撒谎),
+    # 缺省回落 2.0; 想调直接改 task_config.yml chassis_align.max_seconds。
+    # 2026-08-06: 失败重试 1 次 (用户决策)。align 是 task1 整个网格的原点参考,
+    # 单次 timeout/no_target 就静默放行会让后面所有 S/T 列错位; 重试仍失败则
+    # ERROR 大声告警但照样放行 (比赛完赛优先)。
+    marker_label = cfg.get("marker_label", "cylinder_set")
+    align_max_s = float(cfg.get("chassis_align", {}).get("max_seconds", 2.0))
+    from main.chassis import track_chassis
+    result = None
+    for attempt in (1, 2):
+        logger.info("  track_chassis #%d (target=%r, dry_run=False, max_seconds=%.1f)",
+                    attempt, marker_label, align_max_s)
+        # 2026-08-09: 控制律已下沉 runtime, on_tick 逐帧回调不可用 (会打 warning),
+        # 逐帧轨迹改为 runtime result 的 frames/elapsed_s 摘要。
+        result = track_chassis(
+            marker_label,
+            setpoint_cxcy=(0.0, 0.0),
+            kp=0.2,
+            v_max=0.2,
+            deadband=0.05,
+            hold_frames=4,
+            v_slew=0.04,
+            # 2026-08-09: task1 单独开解耦 (单轴驱动) 治对角双轴打滑; task4 保留 False 场测对比.
+            decouple_xy=True,
+            dry_run=False,
+            max_seconds=align_max_s,
         )
-        result = (job or {}).get("result") if isinstance(job, dict) else None
-        result = result if isinstance(result, dict) else {}
-        if isinstance(job, dict) and job.get("status") not in (None, "succeeded"):
-            raise RuntimeError(
-                f"run_arm_servo 任务失败: status={job.get('status')} error={job.get('error')}"
-            )
-        return result
+        logger.info("  track_chassis #%d result: arrived=%s reason=%s frames=%d",
+                    attempt, result.arrived, result.reason, result.frames)
+        if result.arrived:
+            break
+        if attempt == 1:
+            logger.warning("  对齐未收敛 (reason=%s), 重试第 2 次...", result.reason)
+    if not result.arrived:
+        logger.error("  底盘对齐两次均失败 (reason=%s)! task1 放行, 但后续 S/T 列"
+                     "网格原点不可信, 请检查 task_feed / 检测 label / realtime 速度通道!",
+                     result.reason)
+    if not getattr(result, "stop_ok", True):
+        logger.warning("  align 闭环零速下发失败 (stop_ok=False)! 显式停车兜底, "
+                       "但注意底盘可能仍在按最后非零指令滑行 (串口/下位机异常)")
+    # track_chassis 用 realtime/chassis-velocity, 结束后必须显式停车 + 确认停稳!
+    # 用户 00:26: pick 第二个时车会往前跑 — 因为零速指令是异步的, 车还没停就开始 pick
+    try:
+        arm_client.http.post("/v1/realtime/chassis-velocity",
+                             {"vx": 0.0, "vy": 0.0, "wz": 0.0}, timeout=2.0)
+    except Exception:
+        pass
+    # 等车真正停稳: 真实编码器反馈双采样判定轮子不动才继续 (最多等 1s).
+    # 2026-08-09: 旧实现 GET /v1/realtime/wheels/speeds 端点只存在 POST (405) →
+    # 等待立即 break, "车会往前跑" 的保护从来没生效过; 改为编码器双采样
+    # (与 target4 rearm 判停同构)。停稳失败只 warn, 不阻塞任务 (完赛优先)。
+    if not arm_client.http.wait_wheels_stopped(settle_s=0.2, timeout_s=1.0):
+        logger.warning("  align 后 1s 内轮子未停稳 (编码器仍位移), 继续但注意漂移")
+    time.sleep(0.2)  # 额外喘气, 防 504
+    def _odom_curr() -> tuple:
+        try:
+            resp = arm_client.http.get("/v1/realtime/odom/state", timeout=3)
+            odom = (resp or {}).get("odom_state") or {}
+            return float(odom.get("x", 0.0)), float(odom.get("y", 0.0))
+        except Exception:
+            return 0.0, 0.0
 
-    result = _servo_once(servo_kw)
-    logger.info("place 对齐结果: reason=%s settled=%s trace_hits=%s end_arm=%s end_x=%s",
-                result.get("reason"), result.get("settled"),
-                result.get("trace_hits"), result.get("end_arm"), result.get("end_x"))
-    # 对齐失败但这一轮看到过目标 (trace_hits>0) → 加时 + 死区调大重试一次
-    if (not result.get("settled")
-            and int(result.get("trace_hits", 0) or 0) > 0):
-        retry_kw = dict(servo_kw)
-        retry_kw["servo_timeout"] = (float(servo_kw["servo_timeout"])
-                                     + PICK_SERVO_RETRY_TIMEOUT_EXTRA_S)
-        retry_kw["deadzone"] = PICK_SERVO_RETRY_DEADZONE
-        if result.get("end_arm") is not None:
-            retry_kw["arm_start"] = float(result["end_arm"])
-        logger.warning("place 对齐未收敛但看得到目标 → 重试: 超时 %ss + 死区 %.3f",
-                       retry_kw["servo_timeout"], retry_kw["deadzone"])
-        result = _servo_once(retry_kw)
-        logger.info("place 对齐重试结果: reason=%s settled=%s end_arm=%s end_x=%s",
-                    result.get("reason"), result.get("settled"),
-                    result.get("end_arm"), result.get("end_x"))
-
-    arm_deg = float(result["end_arm"]) if result.get("end_arm") is not None else None
-    x_mm = float(result["end_x"]) * 1000.0 if result.get("end_x") is not None else None
-    # ok 需 arm 和 x 都在 (end_x 缺失 = runtime 未升级, 也算失败, 防放苗段 float(None))
-    ok = bool(result.get("settled")) and arm_deg is not None and x_mm is not None
-    if ok:
-        logger.info("step 1: 记住放苗姿态 arm=%.1f° x=%.1fmm (本次运行通用)", arm_deg, x_mm)
-    else:
-        logger.error("step 1: place 对齐未收敛 (reason=%s), 回落写死 place 姿态 (-235/+90)",
-                     result.get("reason"))
-    return {"ok": ok, "arm_deg": arm_deg, "x_mm": x_mm,
-            "reason": result.get("reason"),
-            "end_arm": result.get("end_arm"), "end_x": result.get("end_x")}
+    align_odom_x, _ = _odom_curr()
+    logger.info("  align 完后 chassis 在 odom x=%.3f m (作为'0'参考)", align_odom_x)
+    return result.arrived, align_odom_x
 
 
-def _switch_to_place_pose(arm_client: ArmClient, x_mm: float = PLACE_ALIGN_X_MM,
-                          arm_deg: float = PLACE_ARM_DEG,
-                          hand_deg: float = PLACE_HAND_DEG) -> bool:
-    """切到 PLACE 对齐姿态 (arm=给参默认+90, y=-100, hand=给参默认0, x=给参). 抬高 y 防止保护区拒绝."""
+def _switch_to_place_pose(arm_client: ArmClient, x_mm: float = PLACE_ALIGN_X_MM) -> bool:
+    """切到 PLACE 对齐姿态 (arm=+90, y=-100, hand=0, x=给参). 抬高 y 防止保护区拒绝."""
     state = arm_client.get_state()
     if state.y_mm > -50:
         if hasattr(arm_client, "move_y"):
             arm_client.move_y(PLACE_Y_MM)
         else:
             arm_client.http.execute_arm_action("move_y_position", PLACE_Y_MM, timeout=3.0)
-    logger.info("  切 PLACE 姿态: arm=%s° x=%s y=%s hand=%s°", arm_deg, x_mm, PLACE_Y_MM, hand_deg)
+    logger.info("  切 PLACE 姿态: arm=+90° x=%s y=%s hand=0°", x_mm, PLACE_Y_MM)
     ok = arm_client.composite_run(
-        arm=arm_deg, x_mm=x_mm, y_mm=PLACE_Y_MM, hand=hand_deg,
+        arm=PLACE_ARM_DEG, x_mm=x_mm, y_mm=PLACE_Y_MM, hand=PLACE_HAND_DEG,
         speed=COMPOSITE_SPEED_DEFAULT, timeout=20.0,
     )
     return ok.get("ok", False) if isinstance(ok, dict) else bool(ok)
@@ -791,24 +761,23 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
     init_y_mm = cfg.get("init_y_mm", -180)
 
     try:
-        # ===== 初始化步骤 0 (2026-08-09 用户): 任务点触发后 lane follow 0.15m
-        #     并发臂切 PLACE 初始姿态 (arm=+90, x=-235, y=-100, hand=0) =====
+        # ===== 初始化步骤 0 (2026-08-09 用户): 任务点触发后 lane follow 0.1m
+        #     并发臂切 PLACE (进入任务点就动臂, 拉近 marker 再视觉对齐) =====
         _init_step0_trigger_lane_arm(arm_client, cfg)
-        # ===== 初始化步骤 1 (2026-08-10): 放苗侧 cylinder_set 机械臂对齐 =====
-        # 原 track_chassis 底盘对齐已禁用 → 改机械臂视觉对齐 (place_align 段):
-        #   1. 切初始姿态 arm=+90, x=-235, y=-100, hand=0 (= 现 place 姿态)
-        #   2. run_arm_servo("cylinder_set") 收敛 → 记住 (arm, x)
-        #   3. 本次运行放苗直接开到这个记忆姿态 (不再用写死 -235/+90)
-        # 未收敛 → 回落写死 place 姿态 (-235/+90), 完赛优先.
+        # ===== 初始化步骤 1 (用户 20:53): PLACE 视觉对齐 — 一次性 step 1 =====
+        # 用户: "开始place对齐（x=-320，只在任务第一次触发时定位0在哪）"
+        # 1. 切 PLACE 姿态 (arm=+90, x=-320, y=-100, hand=0) — x=-320 是用户标定的
+        #    视觉对齐位置 (比实际 PLACE 落点 x=-250 略收回)
+        # 2. track_chassis("cylinder_set") — 用户 20:38 实机验证 33 帧 arrived
+        # 3. 记录 align 完后 chassis 的 odom x 作为 "0 参考" — main loop 后面用
+        #    此偏移算 S/T 实际 odom 目标 (避免从 PLACE 退到 S 时的 2.8m "反向跑")
         align_arrived = False
         align_odom_x = 0.0
-        place_mem: Dict[str, Any] = {"ok": False, "arm_deg": None, "x_mm": None}
-        if cfg.get("place_align", {}).get("enabled", False):
-            place_mem = _init_step1_place_align_arm(arm_client, cfg)
-            align_arrived = place_mem.get("ok", False)
+        if cfg.get("chassis_align", {}).get("enabled", False):
+            align_arrived, align_odom_x = _init_step1_place_align(arm_client, cfg)
         else:
-            logger.info("step 1: PLACE 机械臂对齐已禁用 (place_align.enabled=False)")
-        align_odom_x, _, _ = _odom_curr_x_y_theta()
+            logger.info("step 1: PLACE visual align 已禁用 (chassis_align.enabled=False)")
+            align_odom_x, _, _ = _odom_curr_x_y_theta()
 
         # ===== 初始化: 直接到 S 姿态开始 (用户 22:56: 不要 reset_x!) =====
         #   注意: 主循环 _pick_at_source 前也会调用 _init_step2_s_pose 来切换到 S 姿态.
@@ -834,17 +803,9 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
 
         # 给 place 用的 PLACE 工作平面参数 (cfg 一次性读完)
         place_pose = cfg["arm_place_pose_T2"]
-        place_arm   = float(place_pose["arm_angle_deg"])   # 90 (place_align 失败兜底)
-        place_x_mm  = PLACE_X_MM_FALLBACK                   # -235 (同上兜底)
+        place_arm   = float(place_pose["arm_angle_deg"])   # 90
+        place_x_mm  = PLACE_X_MM_FALLBACK
         place_hand  = float(place_pose["hand_angle_deg"])  # 0 (保持)
-        # 2026-08-10: place_align 记住的对齐终点优先 — 放苗直接开到记忆姿态
-        if place_mem.get("ok"):
-            place_arm = float(place_mem["arm_deg"])
-            place_x_mm = float(place_mem["x_mm"])
-            logger.info("  放苗姿态用记忆值: arm=%.1f° x=%.1fmm (本次运行通用)",
-                        place_arm, place_x_mm)
-        else:
-            logger.info("  放苗姿态用兜底写死: arm=%.1f° x=%.1fmm", place_arm, place_x_mm)
         s_arm       = float(cfg["arm_pick_pose"]["arm_angle_deg"])  # -90
         s_x_mm      = float(cfg["arm_pick_pose"]["x_mm"])           # -100
 
@@ -879,7 +840,6 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             arm_client.http.execute_car_action(
                 "move_for", [dx, 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
-                max_velocities=[CHASSIS_MOVE_MAX_VEL_MPS, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
             )
             pos_along[0] = target_along_m
 
@@ -1015,7 +975,6 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 "move_for",
                 [SOURCE_POSITIONS_M[3] - pos_along[0], 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
-                max_velocities=[CHASSIS_MOVE_MAX_VEL_MPS, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
             )
             pos_along[0] = SOURCE_POSITIONS_M[3]
             logger.info("  异常路径也已把底盘移到 S3 (%.3f m)", pos_along[0])
@@ -1036,7 +995,6 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 "move_for",
                 [s3_dx, 0.0, 0.0],
                 timeout=chassis_move_timeout, sync=True,
-                max_velocities=[CHASSIS_MOVE_MAX_VEL_MPS, CHASSIS_MOVE_MAX_VEL_MPS, math.pi / 3.0],
             )
         else:
             logger.info("task1 结束, 底盘已在 S3 (%.3f m, |dx|=%.3f < 5cm) 跳过移动",

@@ -84,29 +84,6 @@ def load_crossroad_turn() -> Optional[int]:
     return int(v)
 
 
-def load_turn_cfg() -> Dict[str, Any]:
-    """读取 task_config.yml 顶层 turn: 段（弯道识别/阶梯转弯参数）。
-
-    返回 {"detector": {...}, "staircase": {...}}，供 orchestrator 装配
-    CurveDetector / StaircaseTurn。缺 turn 段或解析失败 → 空 dict（等价
-    lane_only._build_turn 缺段回退类默认）。换场地调 yml，不动任务代码。
-    """
-    path = _config_path()
-    if not path.is_file():
-        return {}
-    with path.open("r", encoding="utf-8") as f:
-        all_cfg = yaml.safe_load(f)
-    if not isinstance(all_cfg, dict):
-        return {}
-    turn = all_cfg.get("turn")
-    if not isinstance(turn, dict):
-        return {}
-    return {
-        "detector": turn.get("detector") or {},
-        "staircase": turn.get("staircase") or {},
-    }
-
-
 def load_waypoints() -> List[Dict[str, Any]]:
     """读取 task_config.yml 中 waypoints 段 (8 task + 1 finish).
 

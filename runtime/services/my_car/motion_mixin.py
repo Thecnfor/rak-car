@@ -36,14 +36,7 @@ class MotionMixin:
         # self.pid_y = PID(lane_pid_cfg['y'], 0, 0)
         # self.lane_pid = LanePidCal(**cfg['lane_pid'])
         # self.det_pid = DetPidCal(**cfg['det_pid'])
-        _lane_pid = dict(cfg["lane_pid"])
-        # 巡线转向符号：lane_base 用 get_out(sign*ey, sign*ea)。
-        # 现代巡线外环（run_lane_follow）实车标定 sign_y/sign_theta=+1：
-        # error_y>0=车在线右、+vy=物理左移；error_angle>0=车头偏右、+ω=逆时针左转。
-        # legacy 模板的 get_out(-ey,-ea) 符号相反 → 进弯朝车道外打，看起来"直走不转弯"。
-        # 真车反了在 config_car.yml lane_pid 下改 sign: -1。
-        self.lane_sign = float(_lane_pid.pop("sign", 1.0))
-        self.lane_pid = PidCal2(**_lane_pid)
+        self.lane_pid = PidCal2(**cfg["lane_pid"])
         self.det_pid = PidCal2(**cfg["det_pid"])
 
     # 延时函数
@@ -386,9 +379,7 @@ class MotionMixin:
                 return
 
             error_y, error_angle = self.get_lane_results()
-            y_speed, angle_speed = self.lane_pid.get_out(
-                self.lane_sign * error_y, self.lane_sign * error_angle
-            )
+            y_speed, angle_speed = self.lane_pid.get_out(-error_y, -error_angle)
             self.set_velocity(speed, y_speed, angle_speed)
             if hasattr(self.streamer, "set_lane_state"):
                 self.streamer.set_lane_state(
@@ -566,7 +557,7 @@ class MotionMixin:
                     # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
                     self.set_velocity(0, 0, 0)
                     self.arm.x_speed(0)
-                    return det[0], det[2]
+                    # return det[0],det[2]
             else:
                 x_count(False)
                 y_count(False)

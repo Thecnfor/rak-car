@@ -337,10 +337,10 @@ class TestRun(unittest.TestCase):
             self.assertAlmostEqual(dx, 0.15, places=6)
 
     def test_align_disabled_no_crash(self):
-        # place_align.enabled=False 分支: 旧代码在使用 _odom_curr_x_y 之后才定义它
+        # chassis_align.enabled=False 分支: 旧代码在使用 _odom_curr_x_y 之后才定义它
         # → UnboundLocalError。修复后必须正常跑完。
         cfg = CFG.copy()
-        cfg["place_align"] = {"enabled": False}
+        cfg["chassis_align"] = {"enabled": False}
         result, _arm, _runner = self._run_with(
             [
                 _ts(True, [_det("cylinder_1")]),
@@ -353,116 +353,73 @@ class TestRun(unittest.TestCase):
         self.assertNotIn("error", result)
 
     def test_align_retries_once_on_failure(self):
-        """2026-08-10: place_align 机械臂对齐失败重试 1 次 (trace_hits>0);
-        第 2 次收敛 → 记住放苗姿态 + chassis_aligned=True。"""
+        """2026-08-06: 对齐失败重试 1 次 (用户决策); 第 2 次成功 → arrived + chassis_aligned=True。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
         from main.task import task1_seeding as m
         arm_client, runner, _vision = _make_runtime()
         cfg = CFG.copy()
-        cfg["place_align"] = {
-            "enabled": True, "label": "cylinder_set",
-            "setpoint_cxcy": [0.072, -0.331],
-            "init_x_mm": -235, "init_arm_deg": 90, "init_hand_deg": 0,
-            "timeout": 0.01,
-        }
+        cfg["chassis_align"] = {"enabled": True, "max_seconds": 0.01}
 
-        first_fail = {"status": "succeeded",
-                      "result": {"ok": True, "reason": "timeout", "settled": False,
-                                 "trace_hits": 5, "end_arm": 89.0, "end_x": -0.233}}
-        second_ok = {"status": "succeeded",
-                     "result": {"ok": True, "reason": "settled", "settled": True,
-                                "trace_hits": 8, "end_arm": 88.0, "end_x": -0.232}}
-        servo_results = iter([first_fail, second_ok])
+        first_fail = SimpleNamespace(arrived=False, reason="timeout", frames=10, elapsed_s=1.0,
+                                     final_frame=None)
+        second_ok = SimpleNamespace(arrived=True, reason="arrived", frames=33, elapsed_s=1.6,
+                                    final_frame=None)
 
-        def _execute(*args, **kwargs):
-            if args[:2] == ("car", "run_arm_servo"):
-                return next(servo_results)
-            return {"status": "succeeded", "result": {"ok": True}}
-
-        arm_client.http.execute.side_effect = _execute
         http = MagicMock()
         http.wait_until_ready.return_value = True
         http.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
 
-        with patch.object(m, "load_task_config", return_value=cfg.copy()), \
-             patch.object(m, "ArmClient") as arm_cls, \
-             patch.object(m, "RuntimeApiClient", return_value=http):
+        with _patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             _patch.object(m, "ArmClient") as arm_cls, \
+             _patch.object(m, "RuntimeApiClient", return_value=http), \
+             _patch("main.chassis.track_chassis", side_effect=[first_fail, second_ok]) as tc, \
+             _patch("main.chassis.track_trace", return_value=None):
             arm_cls.connect.return_value = arm_client
-            with patch.object(m, "ArmRunner", return_value=runner):
+            with _patch.object(m, "ArmRunner", return_value=runner):
                 result = m.run(http)
         self.assertTrue(result["ok"], result)
         self.assertTrue(result["chassis_aligned"])
-        # run_arm_servo 恰好 2 次 (第 1 次失败→重试, 第 2 次收敛)
-        servo_calls = [c for c in arm_client.http.execute.call_args_list
-                       if c.args[:2] == ("car", "run_arm_servo")]
-        self.assertEqual(len(servo_calls), 2)
-        # 第 1 次参数: setpoint + 起始姿态来自 yaml place_align 段
-        # (execute 调用是 kwargs=kw, 所以 kw 在 recorded.kwargs["kwargs"] 里)
-        kw0 = servo_calls[0].kwargs["kwargs"]
-        self.assertEqual(kw0["setpoint_x_norm"], 0.072)
-        self.assertEqual(kw0["setpoint_y_norm"], -0.331)
-        self.assertEqual(kw0["arm_start"], 90)
-        self.assertEqual(kw0["label"], "cylinder_set")
-        # 放苗用记住的姿态 (arm=88, x=-232mm), 不是写死 -235/+90
-        place_calls = [c for c in arm_client.http.execute.call_args_list
-                       if c.args[:2] == ("arm", "composite_run")]
-        place_kw = [c.kwargs["kwargs"] for c in place_calls]
-        self.assertTrue(
-            any(abs(p["arm"] - 88.0) < 1e-6 and abs(p["x"] - (-0.232)) < 1e-6
-                for p in place_kw if p.get("arm") is not None and p.get("x") is not None),
-            place_kw)
+        self.assertEqual(tc.call_count, 2)
+        self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
+        for call_item in tc.call_args_list:
+            kwargs = call_item.kwargs
+            self.assertTrue(kwargs["decouple_xy"])  # 2026-08-09: task1 开解耦治对角打滑
+            self.assertEqual(kwargs["kp"], 0.2)
+            self.assertEqual(kwargs["v_max"], 0.2)
+            self.assertEqual(kwargs["v_slew"], 0.04)
+            self.assertEqual(kwargs["deadband"], 0.05)
+            self.assertEqual(kwargs["hold_frames"], 4)
 
     def test_align_failure_after_two_tries_still_proceeds(self):
-        """2026-08-10: place_align 机械臂对齐重试后仍失败 → ERROR 告警 + 放行;
-        chassis_aligned=False, ok=True (比赛完赛优先), 放苗回落写死姿态。"""
+        """2026-08-06: 重试后仍失败 → ERROR 告警 + 放行; chassis_aligned=False, ok=True (比赛完赛优先)。"""
+        from types import SimpleNamespace
+        from unittest.mock import patch as _patch
         from main.task import task1_seeding as m
         arm_client, runner, _vision = _make_runtime()
         cfg = CFG.copy()
-        cfg["place_align"] = {
-            "enabled": True, "label": "cylinder_set",
-            "setpoint_cxcy": [0.072, -0.331],
-            "init_x_mm": -235, "init_arm_deg": 90, "init_hand_deg": 0,
-            "timeout": 0.01,
-        }
+        cfg["chassis_align"] = {"enabled": True, "max_seconds": 0.01}
 
-        fail1 = {"status": "succeeded",
-                 "result": {"ok": True, "reason": "timeout", "settled": False,
-                            "trace_hits": 3, "end_arm": 90.0, "end_x": -0.235}}
-        fail2 = {"status": "succeeded",
-                 "result": {"ok": True, "reason": "timeout", "settled": False,
-                            "trace_hits": 1, "end_arm": 90.0, "end_x": -0.235}}
-        servo_results = iter([fail1, fail2])
+        fail = SimpleNamespace(arrived=False, reason="no_target", frames=8, elapsed_s=0.8,
+                               final_frame=None)
 
-        def _execute(*args, **kwargs):
-            if args[:2] == ("car", "run_arm_servo"):
-                return next(servo_results)
-            return {"status": "succeeded", "result": {"ok": True}}
-
-        arm_client.http.execute.side_effect = _execute
         http = MagicMock()
         http.wait_until_ready.return_value = True
         http.get.return_value = {"odom_state": {"x": 0.0, "y": 0.0, "theta": 0.0}}
 
-        with patch.object(m, "load_task_config", return_value=cfg.copy()), \
-             patch.object(m, "ArmClient") as arm_cls, \
-             patch.object(m, "RuntimeApiClient", return_value=http):
+        with _patch.object(m, "load_task_config", return_value=cfg.copy()), \
+             _patch.object(m, "ArmClient") as arm_cls, \
+             _patch.object(m, "RuntimeApiClient", return_value=http), \
+             _patch("main.chassis.track_chassis", return_value=fail) as tc, \
+             _patch("main.chassis.track_trace", return_value=None):
             arm_cls.connect.return_value = arm_client
-            with patch.object(m, "ArmRunner", return_value=runner):
+            with _patch.object(m, "ArmRunner", return_value=runner):
                 result = m.run(http)
         self.assertTrue(result["ok"], result)
         # 失败仍放行, chassis_aligned 写 False 让上层编排/日志能看见
         self.assertFalse(result["chassis_aligned"])
-        servo_calls = [c for c in arm_client.http.execute.call_args_list
-                       if c.args[:2] == ("car", "run_arm_servo")]
-        self.assertEqual(len(servo_calls), 2)
+        self.assertEqual(tc.call_count, 2)
         self.assertEqual(result["completed"], ["cylinder_1", "cylinder_2", "cylinder_3"])
-        # 未记住 → 放苗回落写死姿态 (arm=90, x=-235mm)
-        place_calls = [c for c in arm_client.http.execute.call_args_list
-                       if c.args[:2] == ("arm", "composite_run")]
-        place_kw = [c.kwargs["kwargs"] for c in place_calls]
-        self.assertTrue(
-            any(abs(p["arm"] - 90.0) < 1e-6 and abs(p["x"] - (-0.235)) < 1e-6
-                for p in place_kw if p.get("arm") is not None and p.get("x") is not None),
-            place_kw)
 
     def test_run_ends_at_S3_via_move_for(self):
         """2026-08-07: 不管在哪结束, 末尾都把底盘移到 S3 (pos_along=0.30m) 作为终点。

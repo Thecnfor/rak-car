@@ -556,6 +556,64 @@ class LaneInfer(InferInterface):
         super().close()
 
 
+class LaneBlendInfer(InferInterface):
+    """两个 lane cnn 叠加:d_a(距离)+d_e(偏航)。
+
+    2026-08-03 优化：单 cnn 的 lane 模型在 d_a / d_e 上各有强弱:
+      - lane_model/cnn_lane.pdmodel (live):  d_a 完美, d_e 假 (偏航不灵敏)
+      - lane_model_d_e/cnn_lane.pdmodel:     d_e 完美, d_a 假 (距离不灵敏)
+
+    本类在 __init__ 时同时加载两个 LaneInfer,predict() 各跑一次,
+    拼接成 [d_a, d_e] 输出,跟单 LaneInfer 接口一致 — 上层 lane_feed
+    透传 result[0] / result[1] 无需改动。
+
+    输入 img 是 cam1 原始 BGR 帧(任何尺寸,内部各自 resize 到 128x128)。
+    两个 cnn 各跑 ~5-10ms,合并后 lane 推理从 ~8ms 涨到 ~15-20ms,
+    在 30Hz 采样周期 (33ms) 内仍有余量。
+    """
+
+    def __init__(self, model_dir_d_a="lane_model", model_dir_d_e="lane_model_d_e",
+                 run_mode="paddle"):
+        # 不调 super().__init__() — 我们是复合类,不是单一 InferInterface 实例
+        self.model_dir_d_a = model_dir_d_a
+        self.model_dir_d_e = model_dir_d_e
+        self.run_mode = run_mode
+        # 直接构造两个 LaneInfer,共享同一份 Paddle 设备
+        self._infer_d_a = LaneInfer(model_dir=model_dir_d_a, run_mode=run_mode)
+        self._infer_d_e = LaneInfer(model_dir=model_dir_d_e, run_mode=run_mode)
+        # img_size 校验:两边都得是 128x128
+        if self._infer_d_a.img_size != self._infer_d_e.img_size:
+            raise ValueError(
+                "LaneBlendInfer: d_a img_size={} != d_e img_size={}".format(
+                    self._infer_d_a.img_size, self._infer_d_e.img_size,
+                )
+            )
+        self.img_size = self._infer_d_a.img_size
+
+    def __call__(self, *args, **kwargs):
+        return self.predict(*args, **kwargs)
+
+    def predict(self, img, normalize_out=False):
+        """两次 LaneInfer 推理,拼接输出。
+
+        返回 numpy array shape (2,),d_a 在 [0], d_e 在 [1] — 与 LaneInfer.predict 一致。
+        """
+        out_a = self._infer_d_a.predict(img, normalize_out=normalize_out)
+        out_e = self._infer_d_e.predict(img, normalize_out=normalize_out)
+        # out_a / out_e 都是 shape (2,); 取 [0]=d_a, [1]=d_e
+        # (两路都训的是同一对 d_a/d_e,所以各自都是 [d_a, d_e])
+        d_a = float(out_a[0])
+        d_e = float(out_e[1])
+        if normalize_out:
+            return [d_a, d_e]
+        return np.array([d_a, d_e], dtype=np.float32)
+
+    def close(self):
+        try: self._infer_d_a.close()
+        except Exception: pass
+        try: self._infer_d_e.close()
+        except Exception: pass
+    
 # def human_attr_test():
 #     from camera import Camera
 #     cap = Camera(0)

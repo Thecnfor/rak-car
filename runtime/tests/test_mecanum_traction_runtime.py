@@ -38,15 +38,6 @@ class TestRuntimeFourWheelTraction(unittest.TestCase):
         car.wheels_chassis.set_linear.assert_called_once_with(requested_wheels)
         self.assertEqual(result["wheel_speeds"], requested_wheels)
         self.assertEqual(len(result["wheel_speeds"]), 4)
-    def test_low_speed_partial_wheel_command_stops_all_wheels(self):
-        self.assertEqual(
-            CarRuntimeService._guard_low_speed_wheels([0.12, 0.01, -0.12, -0.01]),
-            [0.0, 0.0, 0.0, 0.0],
-        )
-
-    def test_low_speed_all_effective_wheels_are_preserved(self):
-        speeds = [0.12, 0.02, -0.12, -0.02]
-        self.assertEqual(CarRuntimeService._guard_low_speed_wheels(speeds), speeds)
 
 
 if __name__ == "__main__":

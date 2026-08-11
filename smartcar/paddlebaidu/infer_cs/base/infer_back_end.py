@@ -34,7 +34,7 @@ os.environ.setdefault("FLAGS_init_allocator_mb", "32")
 
 # 导入infer_front中的函数
 from smartcar.paddlebaidu.infer_cs.base.infer_front import get_yaml, get_path_relative
-from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco
+from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco, LaneBlendInfer
 # from smartcar.whalesbot.tools.tools_class import get_yaml
 
 # #region debug-point A:infer-backend-startup
@@ -158,11 +158,12 @@ class InferServer:
             # 添加进程
             self.threads_list.append(thread_tmp)
 
-        from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco # , HummanAtrr, MotHuman
+        from smartcar.paddlebaidu.paddle_jetson import YoloeInfer, LaneInfer, OCRReco, LaneBlendInfer # , HummanAtrr, MotHuman
 
         InferFactory = {
             "YoloeInfer": YoloeInfer,
             "LaneInfer": LaneInfer,
+            "LaneBlendInfer": LaneBlendInfer,
             "OCRReco": OCRReco,
             # "HummanAtrr": HummanAtrr,
             # "MotHuman": MotHuman
@@ -409,6 +410,19 @@ class InferServer:
                     infer = InferType(conf['det_model_dir'], conf['rec_model_dir'], run_mode=conf['run_mode'])
                 else:
                     raise InferType()
+            elif InferType == LaneBlendInfer:
+                # 双 cnn 叠加:d_a (model_dir) + d_e (model_dir_d_e)
+                # 配置示例:
+                #   infer_type: LaneBlendInfer
+                #   model_dir: lane_model
+                #   model_dir_d_e: lane_model_d_e
+                model_dir_d_a = conf.get('model_dir', 'lane_model')
+                model_dir_d_e = conf.get('model_dir_d_e', 'lane_model_d_e')
+                infer = InferType(
+                    model_dir_d_a=model_dir_d_a,
+                    model_dir_d_e=model_dir_d_e,
+                    run_mode=conf.get('run_mode', 'paddle'),
+                )
             else:
                 if 'model_dir' in conf:
                     infer = InferType(conf['model_dir'], run_mode=conf['run_mode'])

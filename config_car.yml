@@ -23,17 +23,16 @@ speed:
   angle:
     limit: 3
 lane_pid:
-  sign: 1.0   # 巡线转向符号：+1 = error>0(车在线右/偏右) 朝左回中（实车标定，反了改 -1）
   cfg_pid_y:
-    Kp: 0
-    Ki: 0
+    Kp: 5
+    Ki: 0.1
     Kd: 0
     setpoint: 0
     output_limits:
     - -0.7
     - 0.7
   cfg_pid_angle:
-    Kp: 1
+    Kp: 3
     Ki: 0
     Kd: 0
     setpoint: 0
@@ -76,8 +75,9 @@ location_pid:
     - 0.7
 infer_cfg:
 - name: lane
-  infer_type: LaneInfer
+  infer_type: LaneBlendInfer
   model_dir: lane_model
+  model_dir_d_e: lane_model_d_e
   port: 5001
   img_size:
   - 128

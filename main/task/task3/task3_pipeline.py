@@ -29,7 +29,6 @@ import requests
 import yaml
 
 from main.api_client import RuntimeApiClient
-from main.task.task3.arm_poses import RECOGNITION_ARM, SHOOTING_ARM, arm_at_pose
 from main.task.task3.llm_ernie import call_vision, check_health, load_token, mask_token
 
 
@@ -79,21 +78,8 @@ DEFAULT_MIN_GAP = 0.16          # 卡片中心距 16cm → 去重窗口需覆盖
 DEFAULT_CLASSIFY_WORKERS = 2
 DEFAULT_TARGET_SPACING_M = 0.16       # 卡片中心距 16cm (2026-08-09: 改回 16; 补录推进 + 超程保护都用它)
 DEFAULT_TARGET_SETTLE_S = 0.15
-
-
-def step_for_xc(xc, base=DEFAULT_TARGET_SPACING_M, adjust=0.02, tol=DEFAULT_CENTER_TOL):
-    """按上一个目标的横向位置决定下一步长度 (最后一个目标除外).
-
-    xc 为 [-1,1] 中心化坐标 (正=目标偏右, 负=目标偏左):
-      正中 (|xc|<=tol) -> base        (16cm)
-      偏右 (xc>tol)    -> base+adjust  (18cm, 多走 2cm)
-      偏左 (xc<-tol)   -> base-adjust  (14cm, 少走 2cm)
-    """
-    if xc > tol:
-        return base + adjust
-    if xc < -tol:
-        return base - adjust
-    return base
+RECOGNITION_ARM = ("-0.100", "-0.040", "-0.270", "90", "-70")
+SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
 
 
 def read_detections(client):
@@ -150,11 +136,7 @@ def safe_car_call(client, name, *args, timeout=20.0):
         return None
 
 
-def run_arm_pose(args, label, pose, client=None):
-    # 2026-08-09: orchestrator 已在途中摆好姿态 → 已在位则跳过, 省任务点串行等待.
-    if client is not None and not args.dry_run and arm_at_pose(client, pose):
-        print(f"[arm] {label}: 已在目标姿态 {pose}, 跳过摆臂", flush=True)
-        return 0
+def run_arm_pose(args, label, pose):
     command = [sys.executable, "-m", "main.task.task3.arm_seq_v9",
                "--y1", pose[0], "--y2", pose[1], "--x", pose[2],
                "--arm-angle", pose[3], "--hand-angle", pose[4]]
@@ -275,7 +257,7 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
     period = max(args.poll_interval, 0.05)
     # 后续卡锁存器要求的最小稳定帧数: 2→4 (2026-08-09 用户要求, 卡要连续 4 帧稳定)
     # 公式含义: settle 秒内能采到的样本数; max(4, ...) 保证至少 4 帧, settle 调大可更多.
-    # (行驶中首卡用 required_samples=1 触发停车, 停车后再用本稳定帧数确认 —— 2026-08-09)
+    # (首卡不受影响 —— 显式 required_samples=1, 车在前进卡可能只在中心出现一帧)
     min_samples = max(4, int(args.target_settle_s / period) + 1)
     first_window = max(args.center_tol, 0.30)
     slot_window = max(args.center_tol * 2.0, 0.35)
@@ -318,16 +300,8 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
                     if updated != self._cache_updated and not error:
                         self._cache_updated = updated
                         self._publish(state.get("detections"))
-                        warned = False
-                    # 2026-08-09: task_feed 缓存不新鲜(识别起点/补录时 feed 可能未刷新)
-                    # 或报错 → 主动跑一次同步推理, 避免"车已在卡面前却识别不到".
                     now = time.monotonic()
-                    try:
-                        age = time.time() - float(updated) if updated is not None else float("inf")
-                    except (TypeError, ValueError):
-                        age = float("inf")
-                    stale = (error or self._cache_updated is None or age > 0.6)
-                    if stale and now - self._last_direct >= 0.45:
+                    if error and now - self._last_direct >= 0.45:
                         self._last_direct = now
                         result = direct_client.request_vision_task(timeout=3.0)
                         if result.get("ok"):
@@ -356,34 +330,10 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
             return nominal_travel
         return max(nominal_travel, distance - start_odom)
 
-    def is_complete(det, edge_tol=0.02):
-        """目标"完整入画": bbox 未被画面边缘截断 (完整目标, 不需要在视野正中央).
-
-        bbox_norm 是 [-1,1] 中心化坐标 (runtime 实测 norm=(px/dim)*2-1,
-        width_norm=(px_w/dim)*2), 画面边缘 = ±1, 不是 [0,1]!
-        """
-        b = bbox(det)
-        try:
-            w = float(b.get("width") or 0.0)
-            h = float(b.get("height") or 0.0)
-            xc = float(b.get("x_center") or 0.0)
-            yc = float(b.get("y_center") or 0.0)
-        except (TypeError, ValueError):
-            return False
-        if w <= 0.0 or h <= 0.0:
-            return False
-        return (xc - w / 2.0 >= -1.0 - edge_tol and xc + w / 2.0 <= 1.0 + edge_tol
-                and yc - h / 2.0 >= -1.0 - edge_tol and yc + h / 2.0 <= 1.0 + edge_tol)
-
     def centered(window):
-        """返回最接近画面中央的合格目标; window=None 时只看"完整入画", 不限 xc."""
         detections = [det for det in detector.read() if eligible(det)]
-        if window is None:
-            candidates = [det for det in detections if is_complete(det)]
-        else:
-            candidates = [det for det in detections
-                          if is_complete(det)
-                          and abs(animal_center(det)) <= window]
+        candidates = [det for det in detections
+                      if abs(animal_center(det)) <= window]
         return min(candidates, key=lambda det: abs(animal_center(det))) \
             if candidates else None
 
@@ -470,32 +420,24 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
             move_forward_fallback(distance)
             after = read_traveled(client)
         else:
-            try:
-                lane_move(
-                    vx=eff_vx,
-                    distance_m=distance,
-                    profile=LANE_FOLLOW.tuned(watchdog_ms=None),
-                    max_seconds=max(
-                        5.0,
-                        distance / max(eff_vx, 0.05) * 3.0 + 2.0,
-                    ),
-                    stop_when=stop_when,
-                )
-            except Exception as exc:
-                # 2026-08-09: lane 偶发异常不能把整个识别任务打挂 → 回退 move_for.
-                print(f"  [warn] move_along_lane 异常({exc}), 切换 move_for",
+            lane_move(
+                vx=eff_vx,
+                distance_m=distance,
+                profile=LANE_FOLLOW.tuned(watchdog_ms=None),
+                max_seconds=max(
+                    5.0,
+                    distance / max(eff_vx, 0.05) * 3.0 + 2.0,
+                ),
+                stop_when=stop_when,
+            )
+            after = read_traveled(client)
+            moved = (after is not None and before is not None
+                     and after >= before + max(0.02, distance * 0.25))
+            if not moved and not (stopped and stopped()):
+                print("  [warn] move_along_lane 无里程变化，切换 move_for",
                       file=sys.stderr, flush=True)
                 move_forward_fallback(distance)
                 after = read_traveled(client)
-            else:
-                after = read_traveled(client)
-                moved = (after is not None and before is not None
-                         and after >= before + max(0.02, distance * 0.25))
-                if not moved and not (stopped and stopped()):
-                    print("  [warn] move_along_lane 无里程变化，切换 move_for",
-                          file=sys.stderr, flush=True)
-                    move_forward_fallback(distance)
-                    after = read_traveled(client)
         if before is not None and after is not None:
             return max(0.0, float(after) - float(before))
         return distance
@@ -508,98 +450,96 @@ def recognize_phase_fixed_slots(client, args, token, streamer_url, output_dir,
             time.sleep(period)
         return None
 
-    print(f"[recognition] move_along_lane 首卡定位，之后按上张卡横向位置 "
-          f"步进 14/16/18cm (偏左/正中/偏右, 最后一个目标除外)，直到记录 "
-          f"{args.target_count} 个目标或前进 {args.max_travel:.2f}m")
+    print(f"[recognition] move_along_lane 首卡定位，之后每次前进 "
+          f"{args.target_spacing:.2f}m，直到记录 {args.target_count} 个目标"
+          f"或前进 {args.max_travel:.2f}m")
     try:
-        # 2026-08-09 用户: 车完成 task1 到达识别区时已在第一张卡面前, 无需微调.
-        # 起点直接识别"完整目标"(整张卡完整入画即可, 不需要在视野正中央):
-        #   有 → 直接记录 #1; 没有 → 缓慢前进(4cm/步)直到第一张卡完整入画.
-        first_det = None
-        best_det = None
+        # 车辆行驶时首卡可能只在一个检测周期内经过中心，因此首卡不要求
+        # 连续两帧；停车后再用普通稳定条件确认并裁剪。
+        first_latch = make_latch(first_window, required_samples=1,
+                                 sample_period=0.05)
         if args.dry_run:
-            first_latch = make_latch(None, required_samples=1, sample_period=0.05)
             first_det = wait_for_target(
                 first_latch, args.dry_run_steps * period,
             )
             nominal_travel += args.creep_speed * args.dry_run_steps * period
         else:
+            first_det = None
             search_distance = 0.0
-            initial = make_latch(None, required_samples=2)
-            first_det = wait_for_target(initial, args.slot_wait_s)
+            best_det = None
+            best_abs_x = None
+            best_distance = 0.0
+            initial = make_latch(first_window, required_samples=1)
+            first_det = wait_for_target(initial, min(args.slot_wait_s, 0.5))
             while first_det is None and search_distance < args.max_travel:
                 search_step = min(0.04, args.max_travel - search_distance)
-                move_latch = make_latch(None, required_samples=1,
-                                        sample_period=0.05)
+                first_latch = make_latch(first_window, required_samples=1,
+                                         sample_period=0.05)
                 move_along_lane(search_step,
-                                stop_when=lambda *_: move_latch[1](),
-                                stopped=lambda: move_latch[0]["ready"])
+                                stop_when=lambda *_: first_latch[1](),
+                                stopped=lambda: first_latch[0]["ready"])
                 search_distance += search_step
                 time.sleep(max(period, 0.10))
-                confirm = make_latch(None, required_samples=2)
-                first_det = wait_for_target(confirm, args.slot_wait_s)
-                if first_det is None and move_latch[0]["ready"]:
-                    first_det = move_latch[0]["det"]
+                first_confirm = make_latch(first_window, required_samples=1)
+                first_det = wait_for_target(first_confirm, min(args.slot_wait_s, 0.5))
+                if first_det is None and first_latch[0]["ready"]:
+                    first_det = first_latch[0]["det"]
+                nearest = centered(1.0)
+                if nearest is not None:
+                    nearest_abs_x = abs(animal_center(nearest))
+                    print(f"  [search] nearest xc={animal_center(nearest):+.3f}",
+                          flush=True)
+                    if best_abs_x is None or nearest_abs_x < best_abs_x:
+                        best_det = dict(nearest)
+                        best_abs_x = nearest_abs_x
+                        best_distance = search_distance
+                    elif (best_abs_x < nearest_abs_x
+                          and search_distance > best_distance
+                          and best_abs_x <= first_window):
+                        backoff = min(search_step, search_distance - best_distance)
+                        move_forward_fallback(-backoff)
+                        search_distance -= backoff
+                        first_det = best_det
                 if first_det is None:
-                    nearest = centered(None)
-                    if nearest is not None:
-                        print(f"  [search] nearest xc={animal_center(nearest):+.3f}",
-                              flush=True)
-                        if best_det is None or abs(animal_center(nearest)) < abs(
-                                animal_center(best_det)):
-                            best_det = dict(nearest)
                     print(f"  [search] checked {search_distance:.2f}m, "
-                          "首卡尚未完整入画", flush=True)
+                          "首卡尚未进入中心", flush=True)
             nominal_travel = max(nominal_travel, search_distance)
-        if first_det is None and best_det is not None:
-            print(f"[warn] 首卡未完整入画稳定识别, 用最近目标补偿 "
-                  f"(xc={animal_center(best_det):+.3f})", file=sys.stderr)
-            first_det = best_det
         if first_det is None:
-            print("[warn] 未找到首卡, 结束识别", file=sys.stderr)
+            if best_det is not None:
+                print(f"[warn] 首卡未在中心窗口内稳定识别，"
+                      f"用最近接的 best_det (xc={animal_center(best_det):+.3f}) 補救",
+                      file=sys.stderr)
+                first_det = best_det
+                save_slot(first_det, 1)
+            else:
+                print("[warn] 首卡未在中心窗口內穩定識別", file=sys.stderr)
         else:
             save_slot(first_det, 1)
-        if records and not args.dry_run:
-            # 2026-08-09 用户: 完整识别到第一个目标后立即停车,
-            # 再连续前进 3 次 16cm 补录后面 3 个目标.
-            safe_car_call(client, "stop", timeout=args.job_timeout)
 
         while records and len(records) < args.target_count:
             next_number = len(records) + 1
-            # 2026-08-09 用户: 按上一个目标的横向位置决定下一步长度 (最后一个目标除外):
-            #   正中 -> 16cm; 偏右 -> 18cm (多走 2cm); 偏左 -> 14cm (少走 2cm).
-            last_xc = records[-1].get("xc") or 0.0
-            step = step_for_xc(last_xc, base=args.target_spacing, tol=args.center_tol)
-            side = ("偏右" if last_xc > args.center_tol
-                    else "偏左" if last_xc < -args.center_tol else "居中")
-            if traveled_now() + step > args.max_travel + 0.02:
+            if traveled_now() + args.target_spacing > args.max_travel + 0.02:
                 print("[warn] 已达到识别区最大行程，停止补录", file=sys.stderr)
                 break
-            nominal_travel += step
+            nominal_travel += args.target_spacing
             if next_number == args.target_count:
-                # 2026-08-09: 最后一次 (补录最后一张卡前) 改 move_for 直线
+                # 2026-08-09: 最后一次 16cm (补录最后一张卡前) 改 move_for 直线
                 print(f"[recognition] slot {next_number}: move_for "
-                      f"+{step:.2f}m ({side}, 上张卡 xc={last_xc:+.3f}, 最后一次)",
-                      flush=True)
-                move_forward_fallback(step)
+                      f"+{args.target_spacing:.2f}m (最后一次)", flush=True)
+                move_forward_fallback(args.target_spacing)
             else:
                 print(f"[recognition] slot {next_number}: move_along_lane "
-                      f"+{step:.2f}m ({side}, 上张卡 xc={last_xc:+.3f})", flush=True)
-                move_along_lane(step)
+                      f"+{args.target_spacing:.2f}m", flush=True)
+                move_along_lane(args.target_spacing)
             latch = make_latch(slot_window)
             det = wait_for_target(latch, args.slot_wait_s)
             if det is None:
-                # 2026-08-09 用户: 目标不在视野正中央不能跳过 →
-                # 兜底: 只要有一张完整入画的卡就记录(选最接近中央的).
-                det = wait_for_target(
-                    make_latch(None, required_samples=2), args.slot_wait_s,
-                )
-            if det is None:
-                nearest = centered(None)
+                nearest = centered(1.0)
                 if nearest is not None:
                     print(f"  [slot] nearest xc={animal_center(nearest):+.3f}",
                           flush=True)
-                    det = nearest
+                    if abs(animal_center(nearest)) <= 0.45:
+                        det = nearest
                 if det is None:
                     print(f"[warn] slot {next_number} 未找到目标，车辆保持停车",
                           file=sys.stderr)
@@ -723,7 +663,7 @@ def main():
     if not args.dry_run:
         client.wait_until_ready()
     settings = __import__("main.settings", fromlist=["load_settings"]).load_settings()
-    if run_arm_pose(args, "recognition pose", RECOGNITION_ARM, client=client) != 0:
+    if run_arm_pose(args, "recognition pose", RECOGNITION_ARM) != 0:
         return 1
     image_dir = Path(__file__).resolve().parent / "audit" / "task3_pipeline" / "targets"
     targets, traveled = recognize_phase_fixed_slots(
@@ -746,7 +686,7 @@ def main():
             "place it correctly, then press Enter to continue: "
         )
     print(f"[shooting] preparing confirmed pest targets: {pests}", flush=True)
-    if run_arm_pose(args, "shooting pose", SHOOTING_ARM, client=client) != 0:
+    if run_arm_pose(args, "shooting pose", SHOOTING_ARM) != 0:
         return 1
     return run_shooting(client, args, pests, result_path)
 

@@ -237,16 +237,6 @@ class TestArmCross(unittest.TestCase):
         self.assertAlmostEqual(posts[0]["x_vel"], -0.0815, places=4)
         self.assertEqual(posts[0]["y_vel"], 0.0)
 
-    def test_task4_setpoint_dy_drives_x_vel(self):
-        # task4 最新标定 cy=-0.70: 目标 cy=-0.50 时必须产生负向 x 速度。
-        result, posts = self._run(
-            [_frame("ball_yellow", 0.08, -0.50)],
-            gain_arm=0.4, gain_x=0.08, max_vel=0.15,
-            setpoint_x_norm=0.08, setpoint_y_norm=-0.70,
-            sign_x=-1.0)
-        self.assertAlmostEqual(posts[0]["x_vel"], -0.016, places=5)
-        self.assertEqual(posts[0]["y_vel"], 0.0)
-
     def test_y_vel_always_zero(self):
         result, posts = self._run([_frame("ball_yellow", 0.5, 0.5)],
                                   gain_arm=0.4, gain_x=0.08)

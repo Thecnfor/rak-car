@@ -118,7 +118,8 @@ class TestWalkWaypointsEmptyCleanup(unittest.TestCase):
         state = {
             "client": MagicMock(),
             "api": MagicMock(),
-            "nav": MagicMock(),
+            "runner": MagicMock(),
+            "runner_thread": MagicMock(),
             "dis_buf": [0.0], "dis_epoch": [0],
             "tui_buf": [{}], "tui_running": MagicMock(),
             "display_ui": MagicMock(), "display_running": MagicMock(),
@@ -126,7 +127,7 @@ class TestWalkWaypointsEmptyCleanup(unittest.TestCase):
         }
         completed = orch._walk_waypoints(state, [])
         self.assertEqual(completed, [])
-        state["nav"].stop.assert_called_once()
+        state["runner"].stop.assert_called_once()
         state["api"].stop_wheel_speeds.assert_called_once()
 
 
@@ -166,62 +167,3 @@ class TestReadKeyPressed(unittest.TestCase):
         self.assertIsNone(Orchestrator._read_key_pressed(c1))
         c2 = self._make_client({"ok": False})
         self.assertIsNone(Orchestrator._read_key_pressed(c2))
-
-
-class TestWaitRuntimeReady(unittest.TestCase):
-    """_wait_runtime_ready：runtime 就绪等待带预算重试，期间不崩进程。
-
-    旧逻辑单次 wait(10s) 在 runtime 初始化（~40-60s）期間必超時 → 崩進程 → PM2 反覆重啟。
-    helper 應在 budget 內反覆重試，成功即返回；超 budget 仍未就緒才 raise。
-    """
-
-    @staticmethod
-    def _client_with_sequence(results):
-        from unittest.mock import MagicMock
-        c = MagicMock()
-        it = iter(results)
-
-        def _call(**kw):
-            v = next(it)
-            if isinstance(v, BaseException):
-                raise v
-            return v
-
-        c.wait_until_ready.side_effect = _call
-        return c
-
-    def test_first_call_success(self):
-        from unittest.mock import MagicMock
-        from main.start.orchestrator import Orchestrator
-        c = MagicMock()
-        c.wait_until_ready.return_value = True
-        Orchestrator._wait_runtime_ready(c, budget=5.0, poll=0.01)
-        c.wait_until_ready.assert_called_once()
-        self.assertEqual(c.wait_until_ready.call_count, 1)
-
-    def test_retries_then_success(self):
-        """前两次失敗（runtime 還在初始化），第三次成功 → 不 raise、返回 None。"""
-        from main.start.orchestrator import Orchestrator
-        c = self._client_with_sequence([False, False, True])
-        Orchestrator._wait_runtime_ready(c, budget=5.0, poll=0.01)
-        self.assertEqual(c.wait_until_ready.call_count, 3)
-
-    def test_transient_exception_retries(self):
-        """wait_until_ready 抛異常（runtime 未就緒時連線層報錯）→ 當作暫時失敗重試。"""
-        from main.start.orchestrator import Orchestrator
-        c = self._client_with_sequence([False, RuntimeError("down"), True])
-        Orchestrator._wait_runtime_ready(c, budget=5.0, poll=0.01)
-        self.assertEqual(c.wait_until_ready.call_count, 3)
-
-    def test_exhausts_budget_then_raises(self):
-        """一直失敗直到超 budget → raise RuntimeError（PM2 autorestart 兜底）。"""
-        from main.start.orchestrator import Orchestrator
-        c = self._client_with_sequence([False] * 100)
-        with self.assertRaises(RuntimeError):
-            Orchestrator._wait_runtime_ready(c, budget=0.05, poll=0.02)
-
-    def test_board_key_confirm_constant_is_200ms(self):
-        """去抖常量 ≥0.2s：毛刺不致误触，正常按压（≥200ms）可触发。"""
-        from main.start.orchestrator import _BOARD_KEY_CONFIRM_S
-        self.assertGreaterEqual(_BOARD_KEY_CONFIRM_S, 0.2)
-

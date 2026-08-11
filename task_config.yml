@@ -37,7 +37,7 @@ task_cfg:
 
     arm_pick_pose:
       x_mm: -70            # 2026-08-09: -80 → -70 (S 姿态 x 前移, 与 S_POSE_X_MM 一致)
-      arm_angle_deg: -95   # 2026-08-10: -90 → -95 (用户: S 姿态/视觉对齐起始大臂角)
+      arm_angle_deg: -90
       y_mm: 0              # 2026-08-02: 吸取动作位置 (吸嘴触底)
       hand_angle_deg: 0    # 吸取时末端向下
 
@@ -68,45 +68,18 @@ task_cfg:
 
     # 2026-08-02: pick 前视觉对齐底盘 (用户自己写 _chassis_align_by_area,
     # 用 set_chassis_velocity 经 IK, 不像 VisualAlignRunner 那样旋转).
-    # 2026-08-10: 放苗侧 cylinder_set 改用机械臂对齐 (place_align), 本底盘对齐段作废
-    # (代码已不读 chassis_align, 保留做历史参考).
     chassis_align:
-      enabled: false        # 作废 — 被 place_align 替代
-      ref_area: 1.10
-      label: null
+      enabled: true         # 启用 — 经 IK 的 set_chassis_velocity 路径
+      ref_area: 1.10        # 2026-08-02 实测 PLACE 姿态 / x=-270 / 距离 T 列约 30cm: cylinder_set bbox area ≈ 1.12
+      label: null           # auto
       v_max: 0.20
-      max_seconds: 5.0
-
-    # 2026-08-10: 放苗侧 cylinder_set 机械臂视觉对齐 (替代原底盘对齐).
-    # 初始姿态 = 现 place 姿态 (arm=+90, x=-235, y=-100, hand=0);
-    # 收敛后记住 (arm, x) → 本次运行放苗直接开到这个姿态 (不再用写死 -235/+90),
-    # 单次运行内恒定, 跨运行重新对齐重记. 未收敛 → 回落写死 place 姿态.
-    # ⚠️ 方向: sign_arm/sign_x 沿用 task1 抓苗标定 (+1/-1); place 在 arm=+90
-    # 与抓苗 -90 几何相反, 若"越对越偏"分别取反 (task2 同规则).
-    place_align:
-      enabled: true
-      label: "cylinder_set"
-      setpoint_cxcy: [0.072, -0.331]   # 2026-08-10 用户标定 (0.042,-0.359) → (0.072,-0.331)
-      init_x_mm: -235
-      init_arm_deg: 90
-      init_hand_deg: 0
-      timeout: 5.0
-      hz: 20.0
-      gain_arm: 0.3          # 2026-08-10: 0.7 → 0.3 (大臂增量减半)
-      gain_x: 0.2            # 2026-08-10: 0.30 → 0.2 (x十字增益调缓)
-      deadzone: 0.06
-      max_vel: 0.08          # 2026-08-10: 0.5 → 0.08 (x十字速度上限收紧, 80mm/s)
-      settle_hits: 3
-      sign_arm: 1
-      sign_x: -1
-      arm_min: 30
-      arm_max: 150           # 2026-08-10: 90 → 150 (大臂 clamp 放宽, 对齐范围更大)
+      max_seconds: 5.0      # 2026-08-09: 8.0 → 5.0 (对齐超时收紧, 最坏等待 2×5+1.2s)
 
     # 2026-08-09: 任务点触发后 step0 — lane follow 前移 0.1m @ 0.1m/s,
     # 与机械臂切 PLACE 姿态 (arm=+90 x=-300 y=-100 hand=0) 并发 (进入任务点就动臂).
     trigger_settle:
       enabled: true
-      lane_follow_m: 0.15   # 2026-08-10: 0.14 → 0.15
+      lane_follow_m: 0.1
       lane_speed_mps: 0.1
 
     # 2026-08-09: 抓苗视觉伺服传输开关 (同 task2/task6 pick_vision):
@@ -135,10 +108,9 @@ task_cfg:
     # 在 task2 init 里与臂切 detection 姿态**并发** (进入任务点就开始动 X, 跟底盘移动一起).
     entry_back_off_m: 0.2
 
-    # 2026-08-10: detect_retry_step_m/max 作废 — 识别逻辑改"先对齐再识别" (代码已不读).
-    # 原: cam2 未识别到等级标 → 底盘前移重试; 现: 对齐后识别, 未识别到第一座默认1块/第二座不拿.
-    # detect_retry_step_m: 0.10
-    # detect_retry_max: 2
+    # cam2 未识别到水塔等级标 → 底盘前移重试 (2026-08-03 用户规定: 前进 0.1m 再 cam2 检测)
+    detect_retry_step_m: 0.10    # 2026-08-09: 0.15 → 0.10 (cam2 未识别到等级标 → 底盘前移重试)
+    detect_retry_max: 2
 
     init_pose:
       y_mm: -150
@@ -156,9 +128,6 @@ task_cfg:
     # 2026-08-09: 第二块 X 从 -210 改 -240 (用户实测摆放位置).
     # 识别/视觉对齐前姿态 X 由 cube_x_mm 决定, 见 _pick_cube.init_x_mm.
     second_cube_x_mm: -240
-    # 2026-08-10: 转动大臂时的安全 X (所有块通用, 不再只第 1 块)。
-    # -185 → -200 (改回通用安全区边界)。抓取 X 仍走 first_cube_x_mm。
-    first_cube_safe_x_mm: -200
 
     # cam2 视觉闭环: 底盘对齐到水塔等级标 (track_chassis 参数)
     track_align:
@@ -184,10 +153,6 @@ task_cfg:
       hold_frames: 6                # 2026-08-08: 4→6 (锁死帧数更严)
       max_lost_frames: 30
       max_seconds: 5.0          # 2026-08-09: 6.0 → 5.0 (底盘对齐时间)
-      # 2026-08-10: 对齐超时/丢目标 → 重试 1 次: 死区扩到 retry_deadband +
-      # max_seconds 原基础上加 retry_extra_s (底盘从当前位置续跑, 不回起点).
-      retry_deadband: 0.06       # 死区 0.02 → 0.06 (更易锁上)
-      retry_extra_s: 3.0         # 原基础上 +3s → 5+3=8s
 
     # 同一水塔内第 1/2/3 块的投放 Y 深度梯度 (避免堆叠碰撞)
     # 2026-08-06: -40/-60/-80 → -10/-55/-75 → 0/-50/-75 → 0/-45/-70 → -10/-45/-75 (用户新规定)
@@ -235,7 +200,7 @@ task_cfg:
       timeout: 5.0              # 2026-08-09: 4.0 → 5.0 (第 1 块默认; 第 2 块 override 6s, 第 3 块 override 7s)
       hz: 25.0                  # 2026-08-06: 20 → 25 (闭环频率↑, 同样帧数收敛更快)
       # 2026-08-06: 提速放宽标准 (对齐时间太久)
-      gain_arm: 0.15            # 2026-08-10: 0.3 → 0.15 (用户: 大臂增量再减半, 每帧 +0.3×dx → +0.15×dx)
+      gain_arm: 0.3             # 2026-08-09: 0.8 → 0.6 → 0.3 (大臂增量过大 → 过冲振荡"左右晃", 减半再减半)
       gain_x: 0.25              # 2026-08-09: 0.35 → 0.25 (x 十字速度增益调缓, 防超调/抖动)
       deadzone: 0.05            # 2026-08-09: 0.04 → 0.05 (所有水立方统一放宽, 更容易锁上)
       max_vel: 0.03             # 2026-08-08: 0.05 → 0.03 (视觉对齐 x 十字速度, 30mm/s 上限)
@@ -272,7 +237,7 @@ task_cfg:
   post_task6:
     enabled: true
     straight_m: 0.63        # 直行距离 (m, move_for 里程计闭环, 2026-08-08: 0.2 → 0.63)
-    turn_deg: -107.0        # 顺时针 120° (度, OdomTurnPID, 2026-08-10 急弯联调: -120 → -107)
+    turn_deg: -120.0        # 顺时针 120° (度, OdomTurnPID)
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
 # 触发条件: IR (红外接近) + dis_at_least_m (累计里程计) AND/OR.
@@ -283,26 +248,6 @@ task_cfg:
 #   (里程碑窗口出口判定 + 触发后冷却), 其余弯走原版单帧判定.
 #   None/删掉 = 所有弯道原版. 2026-08-05: 第 2 个弯是 45° 弯出口接十字路口.
 crossroad_turn: 0
-
-# 弯道视觉转弯 (全流程 orchestrator 用, 2026-08-11 从 lane_only.yml 同步):
-#   CurveDetector 识别 → StaircaseTurn 阶梯 θ 闭环 45→90→120°。
-#   换场地调这里, 别改代码。缺字段用类默认 (等价旧硬编码 CurveDetector()).
-turn:
-  detector:                  # CurveDetector（弯道识别）
-    tol_deg: 20              # 识别阈值 (deg)：|error_angle| 持续超过才判弯；急弯降阈值
-    sustain: 5               # 连续帧数（50Hz 下 5 帧=0.1s 去抖）
-    sign_cal: 1              # error_angle→转向 符号标定，实车转反了改 -1
-    rearm_clean: 0           # 触发后需连续干净直道帧数才允许再触发（0=不冷却）
-  staircase:                 # StaircaseTurn（阶梯转弯）
-    targets_deg: [45, 90, 120]    # 阶梯目标角度（弯角未知时逐档抬升）
-    tol_deg: 2.0                   # 里程碑容忍（|θ_target-θ| 此内=已到档）
-    straight_tol_deg: 6.0          # 出口判定：|error_angle| 在此内=已回正
-    straight_tol_y_m: 0.05         # 出口判定：error_y 居中容忍
-    min_align_rot_deg: 5.0         # 至少转这么多才做出口判定
-    exit_window_deg: null          # 加固转弯专用；None=原版单帧出口
-    exit_sustain: 1
-    escalate_sustain: 1
-    kd_alpha: 0.0                  # 内部 OdomTurnPID 的 D 低通，>0 才生效
 
 waypoints:
 

@@ -336,9 +336,8 @@ class Mc602Display:
         if len(text) > max_chars:
             text = text[:max_chars]
         try:
-            # 同步发送：显示动作必须串行完成，禁止高频异步提交堆满 job_queue。
-            self.api.execute("car", "show_text", kwargs={"text": text},
-                             sync=True, timeout=1.0)
+            # 异步发送，不阻塞 orchestrator
+            self.api.execute("car", "show_text", kwargs={"text": text}, sync=False)
             self._frame_id += 1
             return True
         except Exception:

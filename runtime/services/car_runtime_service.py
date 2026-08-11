@@ -27,7 +27,6 @@ from runtime.services.inference_service import InferBackendService
 from ._common import normalize_value
 from .controller_watcher import ControllerWatcherMixin
 from .jobs_mixin import JobsMixin
-from .lane_nav import LaneNavController
 from .lifecycle_mixin import LifecycleMixin
 from .loops_mixin import LoopsMixin
 
@@ -162,10 +161,6 @@ class CarRuntimeService(
 
         # 2026-08-09: 底盘视觉对齐闭环锁。整段 1-15s 闭环独占 chassis velocity 下发。
         self._chassis_align_lock = threading.Lock()
-        # 2026-08-11: 巡线导航环（进程内闭环，不走每帧 HTTP）。
-        # 客户端只发低频 start/pause/resume/stop；控制环本身在这里读 streamer
-        # 缓存 + 直发轮速。见 runtime/services/lane_nav.py。
-        self.lane_nav = LaneNavController(self)
 
     @property
     def car_lock(self):
@@ -203,22 +198,6 @@ class CarRuntimeService(
             car = self.car
         return car.set_wheel_speeds(speeds)
 
-    @staticmethod
-    def _guard_low_speed_wheels(wheel_speeds):
-        """防止微调时仅剩斜对角轮有效而原地打滑。
-
-        MC602 将轮速量化为整数；当某些轮速落入死区时，继续发送剩余
-        两个轮子的命令只会让底盘打滑。因此只要四轮中有一轮过小，
-        就整车停止，交给上层 deadband 重新判断是否到位。
-        """
-        speeds = [float(s) for s in wheel_speeds]
-        if len(speeds) != 4:
-            return speeds
-        effective_min = 0.015
-        if any(abs(speed) < effective_min for speed in speeds):
-            return [0.0, 0.0, 0.0, 0.0]
-        return speeds
-
     def set_chassis_velocity(self, vx, vy, wz, duration=None):
         """
         上层外环专用：(vx, vy, wz) → 4 轮速直发，绕开 set_velocity 的里程计耦合。
@@ -236,7 +215,6 @@ class CarRuntimeService(
         wheel_speeds = list(
             car.chassis.calculate_wheel_velocities(vx, vy, wz)
         )
-        wheel_speeds = self._guard_low_speed_wheels(wheel_speeds)
         # 直发轮速，绕开 set_velocity（set_velocity 会反复 lock + set）
         car.wheels_chassis.set_linear([float(s) for s in wheel_speeds])
         with self._chassis_cmd_lock:

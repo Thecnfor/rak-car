@@ -4,20 +4,22 @@
   - y 轴  → -133 mm
   - 大臂角度 →  +90°  (MID / init / 复位位)
   - 手爪角度 →   0°   (DOWN)
-  - x 轴  → -210 mm
+  - x 轴  → -260 mm
 
 动作顺序 (用户 2026-07-22 指定, 2026-07-27 arm 0°→90°, 2026-07-28 y -125→-133):
   1. move_y(-133)            先把 y 移出保护区 [0,-30]
   2. set_arm_angle(+90°)     MID/复位位, init 例外位, 保护区允许
   3. set_hand_angle(0°)      DOWN, arm=+90° 已在复位安全带 (>= +30°),
                               api.py:432-435 自动跳过 y 保护区拦截
-  4. move_x(-210)            远距 210mm, hard_reach 模式 (split + reset_x 撞墙兜底)
+  4. move_x(-260)            远距 260mm, hard_reach 模式 (split + reset_x 撞墙兜底)
                                 —— 走 common.move_x_hard_reach
                                    (split 试一次 → 没到位 → reset_x 撞墙 → 再 split)
                                 底层走 api.move_x (v_max_mms 透传 + _check_step_loss)
                                 + api._read_x_mm_realtime 校验 (x_get_position 坏)
-                                ⚠️ x 物理墙现场实测 ≈ -221.5mm (2026-08-01),
-                                   目标 -210 留余量; split + reset_x 撞墙兜底
+                                ⚠️ **目标超物理墙 (≈ -119.5mm, 见 ARM_API §7.2)**
+                                   实测 motor 只走到 ≈ -80mm (belt-slip 等), split 模式
+                                   反复 stall → reset_x 撞墙重置 → 再 split
+                                   **最终位置 ≈ -119.5mm, 不到 -260mm**
 
 ⚠️ 本文件**自包含**: 只依赖 main.arm (ArmClient/ArmRunner) + main.arm.each_task.common
    (共享工具, 不依赖 task4 包内其它模块如 constants.py / pick_up_blue.py)。
@@ -102,13 +104,15 @@ def step_target1(client: ArmClient, runner: ArmRunner,
                  x_mm: float = TARGET1_X_MM,
                  arm_deg: float = TARGET1_ARM_DEG,
                  hand_deg: float = TARGET1_HAND_DEG) -> dict:
-    """把臂摆到 target1 位姿 (y=-100→arm=+90°→hand=0°→x=-210).
+    """把臂摆到 target1 位姿 (y=-100→arm=+90°→hand=0°→x=-260).
 
     Returns:
         {"ok": True, "y_mm": float, "x_info": dict, "arm_deg": float, "hand_deg": float}
 
-    ⚠️ x 物理墙现场实测 ≈ -221.5mm (2026-08-01); 目标 -210 在墙内留余量,
-       split + reset_x 撞墙兜底。
+    ⚠️ **x=-260 超过物理墙 ≈ -119.5mm** (ARM_API §7.2 / test_x_to_150.py):
+       stall 检测 (3 轮无进展) 兜底 → 最终位置 ≈ -119.5mm, **不到 -260mm**。
+       ⚠️ **2026-07-31 实测更差**: motor 实际只走到 ≈ -80mm (belt-slip 等问题),
+       trust 模式不报 stall, 业务层看不见。代码保持 -260 是用户决定。
     """
     print(f"\n========== {LOG_PREFIX} step_target1 ==========")
     if x_mm < -119.5:

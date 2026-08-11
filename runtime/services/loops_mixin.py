@@ -174,11 +174,11 @@ class LoopsMixin:
     # - restart_method：MyCar 上的 stop+start 方法
     # - default_hz：默认频率
     _FEED_WATCHDOG_TABLE = (
-        ("lane", "_lane_feed_thread", "_lane_feed_health", "restart_lane_feed", 30.0),
-        ("task", "_task_feed_thread", "_task_feed_health", "restart_task_feed", 15.0),
-        ("arm",  "_arm_feed_thread",  "_arm_feed_health",  "restart_arm_feed",  10.0),
-        ("ir",   "_ir_feed_thread",   "_ir_feed_health",   "restart_ir_feed",   20.0),
-        ("odom", "_odom_feed_thread", "_odom_feed_health", "restart_odom_feed", 20.0),
+        ("lane", "_lane_feed_thread", "_lane_feed_health", "restart_lane_feed", 50.0),
+        ("task", "_task_feed_thread", "_task_feed_health", "restart_task_feed", 30.0),
+        ("arm",  "_arm_feed_thread",  "_arm_feed_health",  "restart_arm_feed",  20.0),
+        ("ir",   "_ir_feed_thread",   "_ir_feed_health",   "restart_ir_feed",   50.0),
+        ("odom", "_odom_feed_thread", "_odom_feed_health", "restart_odom_feed", 50.0),
     )
 
     def _feed_watchdog_loop(self):
@@ -190,8 +190,8 @@ class LoopsMixin:
         # 启动后给 30s 让 init 路径完成
         time.sleep(30.0)
         # stale 阈值：health.last_iter_at 距今超过这个秒数就算"卡了"
-        # lane 30Hz (period≈33ms) → 5s 阈值仍能容忍 init / 重连慢路径，
-        # 又不会让车在路上失明太久。
+        # lane 50Hz (period=20ms) → 1s 内至少 50 次 iter；
+        # 5s 阈值足够宽（容忍 init / 重连慢路径），又不会让车在路上失明太久。
         stale_iter_seconds = 5.0
         while True:
             try:
@@ -227,18 +227,15 @@ class LoopsMixin:
         ) in self._FEED_WATCHDOG_TABLE:
             thread = getattr(car_ref, thread_attr, None)
             health = getattr(car_ref, health_attr, None)
-            # 未启用的按需 feed 不自动拉起；显式停止也必须保持停止。
-            if thread is None and health is None:
-                continue
-            explicit_stop = (
-                isinstance(health, dict) and health.get("alive") is False
-            )
-            if explicit_stop:
-                continue
             # 1) 线程不存在 / 已经死掉 → restart
             dead = (
                 thread is None
                 or not thread.is_alive()
+            )
+            # 2) 线程活着但 health 报告自己 alive=False → 已经显式 stop 过，不动
+            # （业务调 stop_lane_feed 是用户的意图）
+            explicit_stop = (
+                isinstance(health, dict) and health.get("alive") is False
             )
             # 3) 线程活着 + health 报告 alive=True 但 last_iter_at 太久没动
             # → 卡在 ZMQ 永久 EAGAIN / cv2 永久失败 → restart

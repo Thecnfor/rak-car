@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import math
-import os
 import sys
 import threading
 import time
@@ -127,76 +126,6 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
 ]
 
 
-class _NavHandle:
-    """导航环统一句柄 —— runtime 进程内闭环 或 客户端 DoubleLoopRunner。
-
-    2026-08-11 起优先 runtime 进程内闭环（读 streamer 缓存 + 直发轮速，无每帧
-    HTTP）；旧 runtime（无 /realtime/lane-nav/* 端点）回退客户端 runner。
-    调用方（_walk_waypoints / wait_key_then_run / _pause_lane / _resume_lane）
-    只调 start / pause / resume / stop，不关心后端。
-    """
-
-    def __init__(self, backend: str, api=None, runner=None, thread=None,
-                 start_kwargs: Optional[dict] = None) -> None:
-        self.backend = backend          # "runtime" | "client"
-        self._api = api                 # runtime 后端用的 ChassisClient
-        self._runner = runner           # client 后端用的 DoubleLoopRunner
-        self._thread = thread           # client 后端线程
-        self._start_kwargs = start_kwargs or {}
-        self._started = False
-
-    def start(self) -> bool:
-        """启动导航环。runtime 后端发 start_lane_nav 端点；client 后端 start 线程。"""
-        if self.backend == "runtime":
-            if self._started:
-                return True
-            try:
-                self._api.start_lane_nav(**self._start_kwargs)
-                self._started = True
-                return True
-            except Exception as exc:
-                logger.warning("runtime lane nav start failed: %s", exc)
-                return False
-        if self._thread is not None:
-            self._thread.start()
-            return True
-        return False
-
-    def pause(self, timeout: float = 1.0) -> bool:
-        if self.backend == "runtime":
-            try:
-                resp = self._api.pause_lane_nav()
-                r = resp.get("result") if isinstance(resp, dict) else None
-                return bool(isinstance(r, dict) and r.get("paused"))
-            except Exception:
-                return False
-        if self._runner is not None:
-            return self._runner.pause(timeout=timeout)
-        return True
-
-    def resume(self) -> None:
-        if self.backend == "runtime":
-            try:
-                self._api.resume_lane_nav()
-            except Exception:
-                pass
-            return
-        if self._runner is not None:
-            self._runner.resume()
-
-    def stop(self) -> None:
-        if self.backend == "runtime":
-            try:
-                self._api.stop_lane_nav(force=True)
-            except Exception:
-                pass
-            return
-        if self._runner is not None:
-            self._runner.stop()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-
-
 class PressDetector:
     """按鍵邊沿偵測 + 去抖（純邏輯，無 IO，可離線單測）。
 
@@ -237,12 +166,6 @@ class PressDetector:
         return False
 
 
-# 板键按下确认时长（秒）：要求 `pressed` 连续保持这么久才判定为一次真实按下。
-# 2026-08-11: 0.04 → 0.2。MC602 板键毛刺（<200ms 偶发按下采样）可能误触发 mission，
-# 进而加载 task/OCR 模型顶爆 3.2GB 内存 → 全系统卡；正常按压 ≥200ms，提上去抖不丢真实按键。
-_BOARD_KEY_CONFIRM_S = 0.2
-
-
 class Orchestrator:
     """巡线导航 + 任务点位调度器。"""
 
@@ -262,13 +185,7 @@ class Orchestrator:
                                len(self.waypoints))
         self.lane_hz = lane_hz
         self.ir_interval_s = ir_interval_s
-        # runtime 初始化（臂复位等）通常 ~40-60s；oneclick 启动期等它就绪的预算。
-        self._runtime_ready_budget = float(
-            os.environ.get("RAK_CAR_RUNTIME_READY_BUDGET", "75")
-        )
         self._ball_counts: Dict[str, int] = {}
-        # task1→识别区 / task2→射击区 途中后台摆臂的完成句柄 (task3 用).
-        self._pending_arm_pose: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _load_waypoints_from_yaml(config_path: Optional[str]) -> Optional[List[Waypoint]]:
@@ -307,30 +224,6 @@ class Orchestrator:
         logger.info("loaded %d waypoints from task_config.yml: %s", len(out), wp_summary)
         return out
 
-    @staticmethod
-    def _wait_runtime_ready(client, budget: float = 75.0, poll: float = 2.0,
-                            per_call_timeout: float = 8.0) -> None:
-        """等待 runtime 就绪，带预算重试，期间不崩进程。
-
-        旧逻辑单次 `wait_until_ready(timeout=10.0)` 在 runtime 初始化（~40-60s）期间
-        必超时 → 抛异常 → PM2 autorestart 反复重启（实测 3 次）。改为在 budget 内
-        反复重试：成功即返回；超 budget 仍未就绪才 raise（PM2 autorestart 兜底）。
-
-        可离线单测：client.wait_until_ready 由外部 mock。
-        """
-        deadline = time.time() + float(budget)
-        while True:
-            try:
-                if client.wait_until_ready(timeout=per_call_timeout):
-                    return
-            except Exception as exc:
-                logger.warning("wait runtime ready transient err: %s", exc)
-            if time.time() >= deadline:
-                raise RuntimeError(
-                    "runtime not ready within {:.0f}s (pm2 logs rak-car-api)".format(budget)
-                )
-            time.sleep(poll)
-
     def _init_mission(self, start_lane: bool = True) -> Dict[str, Any]:
         """建好整套任務機制並回傳 state（初始化/巡線/IR/里程計/TUI/下位機屏幕）。
 
@@ -339,9 +232,8 @@ class Orchestrator:
         由 wait_key_then_run 在按鍵按下瞬間才啟動（保證按下即開始、無預移動）。
         """
         client = RuntimeApiClient()
-        # runtime 初始化（臂复位等）需 ~40-60s，单次 wait 10s 必超时 → 崩进程 → PM2 反复重启。
-        # 改为带预算的重试：budget 内等待 runtime 就绪，超预算仍失败才 raise（PM2 autorestart 兜底）。
-        self._wait_runtime_ready(client, budget=self._runtime_ready_budget)
+        if not client.wait_until_ready(timeout=10.0):
+            raise RuntimeError("runtime not ready (pm2 logs rak-car-api)")
 
         # 任务启动前清零里程计：每次 run.py 从零点起算，避免沿用上次任务的累计距离。
         # 旧 car_start_2026.py 的 init() 会清零；orchestrator 接管后必须显式补上，
@@ -370,68 +262,43 @@ class Orchestrator:
         else:
             logger.warning("ir_feed not active after 5s, IR reads may use slow fallback")
 
-        # 用 LANE_FOLLOW profile 装配导航环（#1）
+        # 用 LANE_FOLLOW profile 装配 DoubleLoopRunner（#1）
         # —— 不再自己 new CurvatureAdaptiveOuterLoop + WheelSmoother。
         profile = LANE_FOLLOW
         # 弯道阶梯转弯常开（巡线段随时可能遇弯）：CurveDetector 识别 →
         # StaircaseTurn θ 闭环 45→90→120°，lane 回正后交还 outer。
         # crossroad_turn（task_config.yml 顶层声明）：第几个弯出口紧接着十字路口，
         # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
-        # 弯道识别/阶梯转弯参数从 task_config.yml turn: 段读（缺段回退类默认）。
-        # 换场地调 yml, 不动代码 —— 2026-08-11 全流程对齐 lane_only.py 的 yml 化。
+        from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
         from main.task._config import (load_crossroad_turn, load_post_task1,
-                                       load_post_task6, load_turn_cfg)
-        turn_cfg = load_turn_cfg()
-        nav_start_kwargs = dict(
+                                       load_post_task6)
+        runner = DoubleLoopRunner(
+            api=api,
+            outer=profile.build_outer(),
             hz=self.lane_hz,
-            controller_type=profile.controller_type.value,
-            turn_cfg=turn_cfg,
             watchdog_ms=profile.watchdog_ms,
             lost_line_ms=profile.lost_line_ms,
+            smoother=profile.build_smoother(),
+            turn=StaircaseTurn(),
+            detector=CurveDetector(),
             crossroad_turn=load_crossroad_turn(),
         )
-        # 导航后端：优先 runtime 进程内闭环（读 streamer 缓存 + 直发轮速，
-        # 无每帧 HTTP，免疫客户端网络/时钟问题）；旧 runtime（无
-        # /realtime/lane-nav/* 端点）→ 回退客户端 DoubleLoopRunner。
-        # 探测用 GET state（廉价，不启动环）。
-        backend = "client"
-        try:
-            api.lane_nav_state()
-            backend = "runtime"
-        except Exception:
-            backend = "client"
-        if backend == "runtime":
-            nav = _NavHandle("runtime", api=api, start_kwargs=nav_start_kwargs)
-            logger.info("lane nav backend: runtime in-process loop (no per-frame HTTP)")
-        else:
-            # 旧 runtime：客户端 DoubleLoopRunner 装配与控制律与 runtime 完全一致。
-            from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
-            client_runner = DoubleLoopRunner(
-                api=api,
-                outer=profile.build_outer(),
-                hz=self.lane_hz,
-                watchdog_ms=profile.watchdog_ms,
-                lost_line_ms=profile.lost_line_ms,
-                smoother=profile.build_smoother(),
-                turn=StaircaseTurn(**turn_cfg.get("staircase", {})),
-                detector=CurveDetector(**turn_cfg.get("detector", {})),
-                crossroad_turn=load_crossroad_turn(),
-            )
-            client_thread = threading.Thread(
-                target=client_runner.run,
-                kwargs={"max_seconds": math.inf},
-                daemon=True, name="lane",
-            )
-            nav = _NavHandle("client", runner=client_runner, thread=client_thread)
-            logger.info("lane nav backend: client DoubleLoopRunner (fallback)")
         # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
         # None = task_config.yml 未配 / enabled=false → 保持现状 (只清零里程).
         post_task1 = load_post_task1()
         # task6 结束后同款盲转段 (读订单后掉头 120° 去 task7 投放), 见 post_task6.
         post_task6 = load_post_task6()
+
+        # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）
+        # max_seconds=inf：常驻，由 runner.stop() 终止
+        runner_thread = threading.Thread(
+            target=runner.run,
+            kwargs={"max_seconds": math.inf},
+            daemon=True, name="lane",
+        )
         # start_lane=False（一鍵啟動等待階段）→ 只建不啟，按鍵按下才 .start()
         if start_lane:
-            nav.start()
+            runner_thread.start()
 
         # 后台 B：里程计（全程累计，写共享 buffer）
         dis_buf = [0.0]
@@ -452,12 +319,18 @@ class Orchestrator:
                          args=(tui_buf, tui_running),
                          daemon=True, name="tui").start()
 
-        # 下位机 led_show UI 默认关闭：避免 show_text 任务占用 runtime 队列和串口。
+        # 后台 D：下位机 led_show 屏幕 UI（250ms 刷新，带帧率限制）
         display_running = threading.Event()
-        display_ui = None
+        display_running.set()
+        from main.start.display_ui import Mc602Display
+        display_ui = Mc602Display(client, layout="20x5")
+        threading.Thread(target=self._display_ui_loop,
+                         args=(display_ui, tui_buf, display_running),
+                         daemon=True, name="display").start()
 
         return {
-            "client": client, "api": api, "nav": nav,
+            "client": client, "api": api, "runner": runner,
+            "runner_thread": runner_thread,
             "dis_buf": dis_buf, "dis_epoch": dis_epoch,
             "tui_buf": tui_buf, "tui_running": tui_running,
             "display_ui": display_ui, "display_running": display_running,
@@ -471,7 +344,8 @@ class Orchestrator:
         返回 completed 列表。结束/异常时清理 runner / 线程 / feeds / 下位机屏幕。
         """
         api = state["api"]
-        nav = state["nav"]
+        runner = state["runner"]
+        runner_thread = state["runner_thread"]
         dis_buf = state["dis_buf"]
         dis_epoch = state["dis_epoch"]
         tui_buf = state["tui_buf"]
@@ -484,7 +358,6 @@ class Orchestrator:
 
         completed: List[str] = []
         task4_task5_handoff = None
-        self._pending_arm_pose = None   # 每次 mission 重置, 防上次中断残留
         try:
             for waypoint_index, wp in enumerate(waypoints):
                 logger.info("=== navigating to %s ===", wp.name)
@@ -493,7 +366,7 @@ class Orchestrator:
                 # 触发后立即 pause 后台 lane 巡线 runner (settle_forward/back_off
                 # 要新建自己的 DoubleLoopRunner, 跟后台 A 的 runner 共享 lane_feed
                 # 但各自独立发轮速, 必须先 pause 否则两个 runner 互相打架 "原地抽搐".
-                self._pause_lane(nav, api)
+                self._pause_lane(runner, api)
                 # settle_forward_s: 沿中心车道线直行 N 秒 (走 move_along_lane,
                 # vy=0 + ω 锁对齐, 不偏航). 用户 2026-08-06 规定: task2 出弯后
                 # 沿车道直行 1.5s 拉直车身/车头, 不再让外环自由跑 (会偏).
@@ -583,9 +456,6 @@ class Orchestrator:
                         task4_task5_handoff = None
                     if wp.task_id == 5:
                         extra_kwargs["prev_ball_counts"] = dict(self._ball_counts)
-                    # 2026-08-09 用户: task3 识别/射击区, 车已停在任务点,
-                    # 先确认途中摆臂完成 (来不及就停下调整).
-                    self._wait_pending_arm_pose(wp.task_id)
                     task_result = self._run_task(client, wp, **extra_kwargs)
                     if not task_result.get("ok"):
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
@@ -638,33 +508,8 @@ class Orchestrator:
                 # task4→task5 handoff 已在后台处理关仓 + Phase 1 姿态，
                 # 不能再启动通用 home reset 抢占同一条臂串口。
                 if task4_task5_handoff is None:
-                    if wp.task_id == 1:
-                        # 2026-08-09 用户: task1 结束后, 前往 task3 识别区的
-                        # 巡线途中后台摆好识别姿态 (来不及就等任务点停下调整).
-                        from main.task.task3.arm_poses import RECOGNITION_ARM
-                        self._schedule_arm_pose(RECOGNITION_ARM, "recognition",
-                                                target_task_id=3)
-                    elif wp.task_id == 3:
-                        # 2026-08-09 用户: task3 识别结束后, 前往 task2 水塔区的
-                        # 巡线途中后台摆好 task2 detection 姿态 (省 task2 init 摆臂).
-                        from main.task.task3.arm_poses import TASK2_DETECTION_ARM
-                        self._schedule_arm_pose(TASK2_DETECTION_ARM, "detection",
-                                                target_task_id=2)
-                    elif wp.task_id == 2:
-                        # 2026-08-09 用户: task2 结束后, 前往 task3 射击区的
-                        # 巡线途中后台摆好射击姿态.
-                        from main.task.task3.arm_poses import SHOOTING_ARM
-                        self._schedule_arm_pose(SHOOTING_ARM, "shooting",
-                                                target_task_id=8)
-                    elif wp.task_id == 8:
-                        # 2026-08-09 用户: task3 射击结束后, 前往 task4 收割区的
-                        # 巡线途中后台摆好 task4 P 姿态 (省 task4 初始 P 恢复).
-                        from main.task.task3.arm_poses import TASK4_P_ARM
-                        self._schedule_arm_pose(TASK4_P_ARM, "p_pose",
-                                                target_task_id=4)
-                    else:
-                        self._schedule_arm_home_reset()
-                self._resume_lane(nav)
+                    self._schedule_arm_home_reset()
+                self._resume_lane(runner)
                 completed.append(wp.name)
         except KeyboardInterrupt:
             logger.info("interrupted by user")
@@ -674,8 +519,7 @@ class Orchestrator:
             if task4_task5_handoff is not None and task4_task5_handoff.is_alive():
                 logger.info("[task4→task5] 收尾时 handoff 仍在跑, join 等它结束")
                 task4_task5_handoff.join()
-            # 终止导航环（#1）：runtime 后端 stop_lane_nav（内部零速收尾）；
-            # client 后端 runner.stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
+            # 终止 runner（#1）：stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
             # join 等其 finally 块跑完（smoother 归零 + api.close()）。
             # 同时关掉 TUI + 下位机屏幕后台线程。
             tui_running.clear()
@@ -684,19 +528,18 @@ class Orchestrator:
                 api.stop_wheel_speeds()
             except Exception:
                 pass
-            nav.stop()
+            runner.stop()
+            runner_thread.join(timeout=2.0)
             try:
                 api.stop_lane_feed()
             except Exception:
                 pass
             # 下位机屏幕清屏（best-effort）
-            # display_ui 默认关闭，无需向 runtime 提交 show_text。
-            if display_ui is not None:
-                try:
-                    display_ui.clear()
-                    display_ui.render(throttle_s=0.0)
-                except Exception:
-                    pass
+            try:
+                display_ui.clear()
+                display_ui.render(throttle_s=0.0)
+            except Exception:
+                pass
             # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
             logger.info("mission completed: %s", completed)
         return completed
@@ -731,7 +574,7 @@ class Orchestrator:
         """等待 MC602 板上鍵按下（邊沿 + 40ms 時間窗口去抖）。等待期間屏幕顯示 READY。"""
         det = PressDetector(confirm_samples=1)
         press_start = None
-        confirm_duration_s = _BOARD_KEY_CONFIRM_S
+        confirm_duration_s = 0.04
         error_streak = 0
         tui_buf[0] = {"wp": "PRESS BOARD KEY", "dis": 0.0,
                       "ir_left": None, "ir_right": None, "state": "READY"}
@@ -768,8 +611,8 @@ class Orchestrator:
         state = self._init_mission(start_lane=False)
         while True:
             self._wait_board_key(state["client"], state["tui_buf"])
-            # 按下 → 立刻開始：啟動導航環（runtime 首幀輪速 ~20-40ms 內下發）
-            state["nav"].start()
+            # 按下 → 立刻開始：啟動 runner 線程（首幀輪速 ~20-40ms 內下發）
+            state["runner_thread"].start()
             threading.Thread(target=self._beep_async,
                              args=(state["client"],), daemon=True).start()
             try:
@@ -911,26 +754,25 @@ class Orchestrator:
     # ── 主线程辅助 ──────────────────────────────────────────
 
     @staticmethod
-    def _pause_lane(nav: "_NavHandle", api: ChassisClient) -> None:
-        """暂停导航环：同步等到环确认停住（已补发零速），再主动发零速兜底
-        （双保险，防止在途非零帧残留）。
+    def _pause_lane(runner: DoubleLoopRunner, api: ChassisClient) -> None:
+        """暂停外环（#1）：runner.pause() 同步等到外环确认停住（已补发零速），
+        再主动发零速兜底（双保险，防止在途非零帧残留）。
 
-        runtime 后端 pause_lane_nav 阻塞到 ack；client 后端 runner.pause() 同步
-        等到外环确认（旧实现 pause() 是异步的：外环当前帧可能在
-        stop_wheel_speeds() 之后又下发非零，且随后阻塞不再补零 → 车停不下来）。
+        旧实现 pause() 是异步的：外环当前帧可能在 stop_wheel_speeds() 之后
+        又下发非零，且随后阻塞不再补零 → 车停不下来。现在 pause() 同步后才返回。
         """
-        paused = nav.pause()
+        paused = runner.pause()
         if not paused:
-            logger.warning("lane nav pause() 超时未确认，环可能已退出，仍补发零速")
+            logger.warning("runner.pause() 超时未确认，外环线程可能已退出，仍补发零速")
         try:
             api.stop_wheel_speeds()
         except Exception:
             pass
 
     @staticmethod
-    def _resume_lane(nav: "_NavHandle") -> None:
-        """恢复导航环：resume() 唤醒 + 清 smoother 记忆，从静止起步。"""
-        nav.resume()
+    def _resume_lane(runner: DoubleLoopRunner) -> None:
+        """恢复外环（#1）：resume() 唤醒 + 清 smoother 记忆，从静止起步。"""
+        runner.resume()
 
     @staticmethod
     def _wait_until_triggered(wp: Waypoint, api: ChassisClient,
@@ -1291,64 +1133,6 @@ class Orchestrator:
 
         threading.Thread(target=_bg_reset, daemon=True,
                          name="arm-home-reset").start()
-
-    def _schedule_arm_pose(self, pose, label: str,
-                           target_task_id: Optional[int] = None) -> None:
-        """后台线程把机械臂摆到目标姿态 (不阻塞巡航), 供 task3 识别/射击区途中准备.
-
-        与 task3_shoot._set_shooting_pose 同款 subprocess 调 arm_seq_v9;
-        _wait_pending_arm_pose 在目标任务点前等待完成 (车已停, 来不及就停下调整).
-        """
-        import subprocess
-
-        done = threading.Event()
-
-        def _bg() -> None:
-            try:
-                command = [
-                    sys.executable, "-m", "main.task.task3.arm_seq_v9",
-                    "--y1", pose[0], "--y2", pose[1], "--x", pose[2],
-                    "--arm-angle", pose[3], "--hand-angle", pose[4],
-                ]
-                logger.info("[arm-pose] %s 后台摆臂启动: %s",
-                            label, " ".join(command))
-                rc = subprocess.run(command, check=False).returncode
-                logger.info("[arm-pose] %s 后台摆臂%s", label,
-                            "完成" if rc == 0 else f"失败 (rc={rc})")
-            except Exception as exc:
-                logger.warning("[arm-pose] %s 后台摆臂异常: %s", label, exc)
-            finally:
-                done.set()
-
-        threading.Thread(target=_bg, daemon=True,
-                         name=f"arm-pose-{label}").start()
-        self._pending_arm_pose = {
-            "label": label, "done": done, "target_task_id": target_task_id,
-        }
-
-    def _wait_pending_arm_pose(self, task_id: Optional[int],
-                               timeout_s: float = 60.0) -> None:
-        """目标任务点触发后 (车已停) 等待后台摆臂完成; 无 pending 直接返回.
-
-        若 pending 姿态不是给当前任务准备的, 不等待 (留给后续目标任务).
-        """
-        pending = getattr(self, "_pending_arm_pose", None)
-        if not pending:
-            return
-        if pending.get("target_task_id") not in (None, task_id):
-            return
-        self._pending_arm_pose = None
-        done = pending["done"]
-        label = pending["label"]
-        if done.is_set():
-            logger.info("[arm-pose] %s 途中摆臂已完成", label)
-            return
-        logger.info("[arm-pose] 车已停, 等待 %s 摆臂完成 (最多 %.0fs)...",
-                    label, timeout_s)
-        if done.wait(timeout_s):
-            logger.info("[arm-pose] %s 摆臂就绪", label)
-        else:
-            logger.warning("[arm-pose] %s 摆臂超时未完成, 任务内会再次确认姿态", label)
 
     @staticmethod
     def _run_task(client: RuntimeApiClient, wp: Waypoint,

@@ -14,7 +14,7 @@ PPT Slide 9:
 子模块（执行顺序 a → (b1→b2→b3→b4)×N, 预算式收尾):
 
   ┌────────────────────────────────────────────────────────────────────┐
-  │ a_start          触发后三步并发: 四轴联动 P 姿态(已到位跳过) ∥ lane 前进 0.1m ∥ 开仓 75°│
+  │ a_approach        target1 起手: composite_run(arm=90°/y=-133/hand=0°) ∥ + x=-260│
   │   ↓                                                                   │
   │ b1_creep_search   慢速前移 (realtime 速度 0.045m/s) + 10Hz fetch_balls, 见球即停│
   │   ↓                                                                   │

@@ -42,9 +42,7 @@ def _read_distance(api: ChassisClient, *, timeout: float = 5.0) -> float:
         odom = payload.get("odom_state") or {}
         if odom.get("active") and odom.get("distance") is not None:
             return float(odom["distance"])
-    if not allow_job_fallback:
-        return 0.0
-    # 可选 fallback：只有明确允许时才进入 job_queue，避免后台轮询堆积任务。
+    # fallback：原 job_queue + car_lock 路径
     try:
         dist = api.http.execute("car", "get_distance", timeout=timeout, sync=True)
         if isinstance(dist, dict) and "result" in dist:
@@ -62,7 +60,6 @@ def read_dis(
     on_tick: Optional[DisTickCallback] = None,
     timeout: float = 2.0,
     reset_epoch: Optional[list] = None,
-    allow_job_fallback: bool = False,
 ) -> None:
     """实时轮询车端里程计累计距离，每帧调用 on_tick。
 
