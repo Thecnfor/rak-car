@@ -510,29 +510,35 @@ def step_target4(
                     print(f"  [{LOG_PREFIX}] ⚠️ 关仓失败 ({type(e).__name__}: {str(e)[:80]})")
             else:
                 print(f"  [{LOG_PREFIX}] task4→task5 交接: 关仓交给巡航后台线程")
-            # ---- 结束回到 bin/P 姿态 ----
+            # ---- 结束回到固定收尾姿势 ----
+            # 退出任务点后并行四轴联动 (arm=90 / x=-28 / y=-121 / hand=-58)。
             # 正常 task4→task5 交接由 orchestrator 后台送到 task5 Phase 1，
             # 不再启动旧的 daemon P 归位，避免和交接动作抢串口。
             if not handoff_deferred:
                 try:
                     import threading as _th
-                    def _return_to_pose_p():
+                    _END_X_MM = -28.0
+                    _END_Y_MM = -121.0
+                    _END_ARM_DEG = 90.0
+                    _END_HAND_DEG = -58.0
+
+                    def _return_to_pose():
                         try:
-                            print(f"  [{LOG_PREFIX}] 后台回到 P 姿态 "
-                                  f"(x={pose_p_x_mm} y={pose_p_y_mm} "
-                                  f"arm={pose_p_arm_deg} hand={pose_p_hand_deg})")
+                            print(f"  [{LOG_PREFIX}] 后台回到收尾姿势 "
+                                  f"(x={_END_X_MM} y={_END_Y_MM} "
+                                  f"arm={_END_ARM_DEG} hand={_END_HAND_DEG})")
                             arm_client.composite_run(
-                                arm=pose_p_arm_deg,
-                                x_mm=pose_p_x_mm,
-                                y_mm=pose_p_y_mm,
-                                hand=pose_p_hand_deg,
+                                arm=_END_ARM_DEG,
+                                x_mm=_END_X_MM,
+                                y_mm=_END_Y_MM,
+                                hand=_END_HAND_DEG,
                                 speed=80,
                                 timeout=30.0,
                             )
                         except Exception as e:
-                            print(f"  [{LOG_PREFIX}] ⚠️ 回 P 姿态失败 "
+                            print(f"  [{LOG_PREFIX}] ⚠️ 回收尾姿势失败 "
                                   f"({type(e).__name__}: {str(e)[:80]})")
-                    _th.Thread(target=_return_to_pose_p, daemon=True).start()
+                    _th.Thread(target=_return_to_pose, daemon=True).start()
                 except Exception:
                     pass
             # ---- 恢复 arm_feed (2026-08-06 修) ----
