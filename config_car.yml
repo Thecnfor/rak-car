@@ -24,15 +24,15 @@ speed:
     limit: 3
 lane_pid:
   cfg_pid_y:
-    Kp: 5
-    Ki: 0.1
+    Kp: 0
+    Ki: 0
     Kd: 0
     setpoint: 0
     output_limits:
     - -0.7
     - 0.7
   cfg_pid_angle:
-    Kp: 3
+    Kp: 1
     Ki: 0
     Kd: 0
     setpoint: 0
@@ -75,9 +75,8 @@ location_pid:
     - 0.7
 infer_cfg:
 - name: lane
-  infer_type: LaneBlendInfer
+  infer_type: LaneInfer
   model_dir: lane_model
-  model_dir_d_e: lane_model_d_e
   port: 5001
   img_size:
   - 128
