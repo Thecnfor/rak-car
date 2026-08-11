@@ -23,6 +23,7 @@ speed:
   angle:
     limit: 3
 lane_pid:
+  sign: 1.0   # 巡线转向符号：+1 = error>0(车在线右/偏右) 朝左回中（实车标定，反了改 -1）
   cfg_pid_y:
     Kp: 0
     Ki: 0
