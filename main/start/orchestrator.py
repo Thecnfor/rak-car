@@ -267,13 +267,13 @@ class Orchestrator:
         # 用 LANE_FOLLOW profile 装配 DoubleLoopRunner（#1）
         # —— 不再自己 new CurvatureAdaptiveOuterLoop + WheelSmoother。
         profile = LANE_FOLLOW
-        # 弯道阶梯转弯常开（巡线段随时可能遇弯）：CurveDetector 识别 →
-        # StaircaseTurn θ 闭环 45→90→120°，lane 回正后交还 outer。
-        # crossroad_turn（task_config.yml 顶层声明）：第几个弯出口紧接着十字路口，
-        # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
-        from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
-        from main.task._config import (load_crossroad_turn, load_post_task1,
-                                       load_post_task6)
+        # 弯道转弯常开（巡线段随时可能遇弯）：CurveDetector 识别 →
+        # TurnV2 视觉巡线过弯（vx 巡航 + 外/内侧差速），lane 回正后交还 outer。
+        # 注：TurnV2 无阶梯升档/十字路口加固档；closed_loop 的 crossroad 加固机制已随
+        # StaircaseTurn 移除，转弯统一走 turn_v2。
+        from main.chassis.controllers.odom_turn import CurveDetector
+        from main.chassis.controllers.turn_v2 import TurnV2
+        from main.task._config import (load_post_task1, load_post_task6)
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -281,9 +281,8 @@ class Orchestrator:
             watchdog_ms=profile.watchdog_ms,
             lost_line_ms=profile.lost_line_ms,
             smoother=profile.build_smoother(),
-            turn=StaircaseTurn(),
+            turn=TurnV2(),
             detector=CurveDetector(),
-            crossroad_turn=load_crossroad_turn(),
         )
         # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
         # None = task_config.yml 未配 / enabled=false → 保持现状 (只清零里程).

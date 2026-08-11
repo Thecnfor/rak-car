@@ -277,12 +277,6 @@ task_cfg:
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
 # 触发条件: IR (红外接近) + dis_at_least_m (累计里程计) AND/OR.
 # 换场地改这里, 业务代码不动.
-#
-# 十字路口弯声明 (main.chassis.loops.closed_loop 用):
-#   第几个转弯的出口紧接着十字路口 = 那个弯用加固转弯逻辑
-#   (里程碑窗口出口判定 + 触发后冷却), 其余弯走原版单帧判定.
-#   None/删掉 = 所有弯道原版. 2026-08-05: 第 2 个弯是 45° 弯出口接十字路口.
-crossroad_turn: 0
 
 waypoints:
 

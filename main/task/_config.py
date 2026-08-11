@@ -66,24 +66,6 @@ def require(cfg: Dict[str, Any], key: str, kind: type) -> Any:
     return v
 
 
-def load_crossroad_turn() -> Optional[int]:
-    """读取 task_config.yml 顶层 crossroad_turn：第几个转弯出口紧接着十字路口（需加固）。
-
-    返回 int 或 None（未声明 = 所有弯道走原版逻辑）。换场地改 yml，不动任务代码。
-    """
-    path = _config_path()
-    if not path.is_file():
-        return None
-    with path.open("r", encoding="utf-8") as f:
-        all_cfg = yaml.safe_load(f)
-    if not isinstance(all_cfg, dict):
-        return None
-    v = all_cfg.get("crossroad_turn")
-    if v is None:
-        return None
-    return int(v)
-
-
 def load_waypoints() -> List[Dict[str, Any]]:
     """读取 task_config.yml 中 waypoints 段 (8 task + 1 finish).
 
