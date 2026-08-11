@@ -200,9 +200,9 @@ def demo():
     # CurveDetector：|ea|>tol 持续 sustain 帧触发；rearm 冷却内不重触发
     det = CurveDetector(rearm_clean=20)
     fresh = lambda ea: LaneState(error_angle=math.radians(ea), error_y=0.0, age_ms=0)
-    for _ in range(4):
+    for _ in range(3):
         assert det.update(fresh(30.0)) is None, "sustain 前不触发"
-    assert det.update(fresh(30.0)) is not None, "第 5 帧触发"
+    assert det.update(fresh(30.0)) is not None, "第 4 帧触发"
     for _ in range(60):
         assert det.update(fresh(-28.0)) is None, "rearm 冷却内不重触发"
     for _ in range(20):

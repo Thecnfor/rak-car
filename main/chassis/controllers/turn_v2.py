@@ -15,10 +15,12 @@
 状态机（phase ∈ idle/turning/done/fail）：
   1. 识别（由外环 CurveDetector 负责）→ start() 入 turning
   2. turning 每帧：
-     - lane 新鲜：回正(|ea|≤straight_tol 且转过 min_align_rot) 连续 straight_sustain 帧
-       → done "straight"；过转(转过 min_align_rot 且反向残余大误差) → done "overshoot"
-       （横向残余交给直道 vy 回正）；否则 ω = 视觉巡线继续过弯
-     - lane 丢失：盲差速续转（沿弯道方向 ω=fallback_omega），lane 回来即恢复视觉
+     - lane 新鲜：回正(|ea|≤straight_tol、转过 min_align_rot、且实际转向已停 |θ̇|<tol_dot)
+       连续 straight_sustain 帧 → done "straight"；过转(转过 min_align_rot 后反向大误差
+       连续 overshoot_sustain 帧) → done "overshoot"（横向残余交给直道 vy 回正）；
+       否则 ω = 视觉巡线继续过弯
+     - lane 丢失：沿用最后一次视觉 ω 盲差速续转（从没拿到过视觉才用 fallback_omega），
+       lane 回来即恢复视觉
      - 累计转过 max_turn_deg 仍不回正 → fail "max_turn_deg"（兜底）
   3. done/fail 后交还外环（closed_loop._compute_raw 走 outer）
 
@@ -57,12 +59,18 @@ class TurnV2:
         kp_omega: float = 2.0,
         sign_omega: float = 1,
         omega_max: float = 1.8,
-        # lane 丢失时的盲差速续转 ω（沿弯道方向；不升档，等 lane 回来恢复视觉）
+        # lane 丢失且从没拿到过视觉时，盲差速续转 ω（拿到过视觉后沿用最后一次视觉 ω）
         fallback_omega: float = 0.8,
         # 出口判定：转过 min_align_rot 后 |error_angle|≤straight_tol 连续 sustain 帧 → done
         straight_tol_deg: float = 6.0,
         straight_sustain: int = 5,
         min_align_rot_deg: float = 8.0,
+        # 出口再加"实际转向已停"门控：低通后的 |θ̇| < tol_dot 才算真回正。
+        # 防宽弯里稳态 error_angle 本来就小（e_ss≈vx/(kp·R)，R 大就低于 straight_tol）
+        # 被误判成直道提前退出；弯中车一直在转 θ̇≠0，弯真结束才 θ̇→0。
+        tol_dot: float = 0.1,
+        # 过转判定要连续 overshoot_sustain 帧反向大误差（防弯入口瞬时 ea 反号误杀）
+        overshoot_sustain: int = 4,
         # 兜底：累计转过 max_turn_deg 仍不回正 → fail
         max_turn_deg: float = 135.0,
         r_eff: float = 0.30,
@@ -77,12 +85,18 @@ class TurnV2:
         self.min_align_rot = math.radians(float(min_align_rot_deg))
         self.max_turn = math.radians(float(max_turn_deg))
         self.r_eff = float(r_eff)
+        self.tol_dot = float(tol_dot)
+        self.overshoot_sustain = max(1, int(overshoot_sustain))
 
         self.phase: str = "idle"   # idle / turning / done / fail
         self.reason: str = ""      # done/fail 的原因
         self._start: float = 0.0
         self._ea_ref: int = 1      # 弯道识别时刻 error_angle 的符号（过转判定用）
         self._straight_count: int = 0
+        self._overshoot_count: int = 0
+        self._last_omega: Optional[float] = None  # 最后一次视觉 ω（lane 丢失续转用）
+        self._last_theta: Optional[float] = None  # θ̇ 低通用
+        self._theta_dot: float = 0.0
 
     # ── 接口（closed_loop.py 的 turn= 契约） ────────────────────
     @property
@@ -94,6 +108,10 @@ class TurnV2:
         self._start = float(theta_start)
         self._ea_ref = 1 if float(entry_sign) >= 0 else -1
         self._straight_count = 0
+        self._overshoot_count = 0
+        self._last_omega = None
+        self._last_theta = float(theta_start)
+        self._theta_dot = 0.0
         self.phase = "turning"
         self.reason = ""
 
@@ -104,6 +122,12 @@ class TurnV2:
         """返回 (ω, phase)；phase ∈ turning/done/fail。done/fail 后 ω 恒 0。"""
         if self.phase in ("done", "fail"):
             return 0.0, self.phase
+        dt = max(float(dt), 1e-3)
+        # 实际转向速率（低通）：出口用它区分"宽弯里 ea 本来就小"和"真直道"
+        if self._last_theta is not None:
+            inst = (float(theta_now) - self._last_theta) / dt
+            self._theta_dot += (inst - self._theta_dot) * min(1.0, dt * 8.0)
+        self._last_theta = float(theta_now)
         # 兜底：转太多了还没回正
         if abs(float(theta_now) - self._start) >= self.max_turn:
             self.phase, self.reason = "fail", "max_turn_deg"
@@ -111,27 +135,41 @@ class TurnV2:
 
         if lane is not None and lane.is_fresh and lane.error_angle is not None:
             ea = float(lane.error_angle)
-            # 回正：转过 min_align_rot 且 lane 平行，连续 sustain 帧 → done。
-            # 未攒够帧数时继续巡线（ω≈kp*ea，已很小），不在窗口里停车。
-            if self._rotated_enough(theta_now) and abs(ea) <= self.tol_a:
+            # 回正：转过 min_align_rot、lane 平行、且实际转向已停（|θ̇| 小）连续 sustain 帧 → done。
+            # θ̇ 门控防"宽弯里稳态 ea 小"被误判成直道（车还在转 θ̇≠0，弯真结束才 θ̇→0）。
+            if (self._rotated_enough(theta_now)
+                    and abs(ea) <= self.tol_a
+                    and abs(self._theta_dot) < self.tol_dot):
                 self._straight_count += 1
                 if self._straight_count >= self.sustain:
                     self.phase, self.reason = "done", "straight"
                     return 0.0, self.phase
             else:
                 self._straight_count = 0
-            # 过转：转过 min_align_rot 后反向残余大误差 → 交回直道 vy 回正
+            # 过转：转过 min_align_rot 后反向残余大误差，连续 overshoot_sustain 帧 → 交回直道 vy 回正。
+            # 攒帧防弯入口瞬时 ea 反号误杀；攒帧期间冻结旋转（不往回打，那该直道 vy 处理）。
             if (self._rotated_enough(theta_now)
                     and abs(ea) > self.tol_a
                     and math.copysign(1.0, ea) != self._ea_ref):
-                self.phase, self.reason = "done", "overshoot"
+                self._overshoot_count += 1
+                if self._overshoot_count >= self.overshoot_sustain:
+                    self.phase, self.reason = "done", "overshoot"
+                    return 0.0, self.phase
                 return 0.0, self.phase
+            else:
+                self._overshoot_count = 0
             # 视觉巡线：继续跟车道弯过去
             omega = self.sign_omega * self.kp_omega * ea
+            self._last_omega = omega
         else:
-            # lane 丢失：盲差速续转（沿弯道方向），不升档，等 lane 回来恢复视觉
+            # lane 丢失：沿用最后一次视觉 ω 盲差速续转（沿用而不是降 ω，防大弯丢线往外漂）；
+            # 从未拿到过视觉（start 后立刻丢线）才用 fallback_omega
             self._straight_count = 0
-            omega = self.sign_omega * self._ea_ref * self.fallback_omega
+            self._overshoot_count = 0
+            if self._last_omega is not None:
+                omega = self._last_omega
+            else:
+                omega = self.sign_omega * self._ea_ref * self.fallback_omega
         omega = max(-self.omega_max, min(self.omega_max, omega))
         return omega, self.phase
 
