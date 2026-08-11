@@ -337,6 +337,57 @@ class ChassisClient:
             timeout=timeout,
         )
 
+    # === runtime 侧巡线导航环（进程内闭环，2026-08-11） ===
+    # 50Hz lane-follow 控制环下沉到 runtime：读 streamer 缓存 + 直发轮速，
+    # 客户端只发低频生命周期调用（每次 mission / wait-key 启动一次）。
+    # 旧 runtime（无 /realtime/lane-nav/* 端点）→ HTTP 404，调用方回退客户端
+    # DoubleLoopRunner。
+
+    def start_lane_nav(self, *, hz=50.0, controller_type="straight",
+                       turn_cfg=None, watchdog_ms=500.0, lost_line_ms=None,
+                       crossroad_turn=None, timeout=10.0) -> dict:
+        """启动 runtime 巡线导航环（幂等：已跑返回 already_running）。"""
+        payload = {
+            "hz": float(hz),
+            "controller_type": controller_type,
+            "turn_cfg": turn_cfg or {},
+            "watchdog_ms": watchdog_ms,
+            "lost_line_ms": lost_line_ms,
+            "crossroad_turn": crossroad_turn,
+        }
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/lane-nav/start",
+            payload=payload, timeout=timeout,
+        )
+
+    def pause_lane_nav(self, timeout=5.0) -> dict:
+        """暂停 runtime 导航环（同步等零速 ack，进任务点前调用）。"""
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/lane-nav/pause",
+            payload={"timeout": 1.0}, timeout=timeout,
+        )
+
+    def resume_lane_nav(self, timeout=5.0) -> dict:
+        """恢复 runtime 导航环（loop 已死自动重建重启）。"""
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/lane-nav/resume",
+            payload={}, timeout=timeout,
+        )
+
+    def stop_lane_nav(self, force=True, timeout=5.0) -> dict:
+        """停止 runtime 导航环 + 兜底零速。"""
+        return self.http.post(
+            f"{self.http.api_prefix}/realtime/lane-nav/stop",
+            payload={"force": bool(force)}, timeout=timeout,
+        )
+
+    def lane_nav_state(self, timeout=5.0) -> dict:
+        """读 runtime 导航环状态 + 心跳（health.iter_count 每帧递增）。"""
+        return self.http.get(
+            f"{self.http.api_prefix}/realtime/lane-nav/state", timeout=timeout,
+        )
+
+
     def chassis_align(self, **kwargs) -> dict:
         """底盘视觉对齐（下沉到 runtime）。
 

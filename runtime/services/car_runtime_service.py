@@ -27,6 +27,7 @@ from runtime.services.inference_service import InferBackendService
 from ._common import normalize_value
 from .controller_watcher import ControllerWatcherMixin
 from .jobs_mixin import JobsMixin
+from .lane_nav import LaneNavController
 from .lifecycle_mixin import LifecycleMixin
 from .loops_mixin import LoopsMixin
 
@@ -161,6 +162,10 @@ class CarRuntimeService(
 
         # 2026-08-09: 底盘视觉对齐闭环锁。整段 1-15s 闭环独占 chassis velocity 下发。
         self._chassis_align_lock = threading.Lock()
+        # 2026-08-11: 巡线导航环（进程内闭环，不走每帧 HTTP）。
+        # 客户端只发低频 start/pause/resume/stop；控制环本身在这里读 streamer
+        # 缓存 + 直发轮速。见 runtime/services/lane_nav.py。
+        self.lane_nav = LaneNavController(self)
 
     @property
     def car_lock(self):

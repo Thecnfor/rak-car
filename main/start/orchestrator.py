@@ -126,6 +126,76 @@ DEFAULT_WAYPOINTS: List[Waypoint] = [
 ]
 
 
+class _NavHandle:
+    """导航环统一句柄 —— runtime 进程内闭环 或 客户端 DoubleLoopRunner。
+
+    2026-08-11 起优先 runtime 进程内闭环（读 streamer 缓存 + 直发轮速，无每帧
+    HTTP）；旧 runtime（无 /realtime/lane-nav/* 端点）回退客户端 runner。
+    调用方（_walk_waypoints / wait_key_then_run / _pause_lane / _resume_lane）
+    只调 start / pause / resume / stop，不关心后端。
+    """
+
+    def __init__(self, backend: str, api=None, runner=None, thread=None,
+                 start_kwargs: Optional[dict] = None) -> None:
+        self.backend = backend          # "runtime" | "client"
+        self._api = api                 # runtime 后端用的 ChassisClient
+        self._runner = runner           # client 后端用的 DoubleLoopRunner
+        self._thread = thread           # client 后端线程
+        self._start_kwargs = start_kwargs or {}
+        self._started = False
+
+    def start(self) -> bool:
+        """启动导航环。runtime 后端发 start_lane_nav 端点；client 后端 start 线程。"""
+        if self.backend == "runtime":
+            if self._started:
+                return True
+            try:
+                self._api.start_lane_nav(**self._start_kwargs)
+                self._started = True
+                return True
+            except Exception as exc:
+                logger.warning("runtime lane nav start failed: %s", exc)
+                return False
+        if self._thread is not None:
+            self._thread.start()
+            return True
+        return False
+
+    def pause(self, timeout: float = 1.0) -> bool:
+        if self.backend == "runtime":
+            try:
+                resp = self._api.pause_lane_nav()
+                r = resp.get("result") if isinstance(resp, dict) else None
+                return bool(isinstance(r, dict) and r.get("paused"))
+            except Exception:
+                return False
+        if self._runner is not None:
+            return self._runner.pause(timeout=timeout)
+        return True
+
+    def resume(self) -> None:
+        if self.backend == "runtime":
+            try:
+                self._api.resume_lane_nav()
+            except Exception:
+                pass
+            return
+        if self._runner is not None:
+            self._runner.resume()
+
+    def stop(self) -> None:
+        if self.backend == "runtime":
+            try:
+                self._api.stop_lane_nav(force=True)
+            except Exception:
+                pass
+            return
+        if self._runner is not None:
+            self._runner.stop()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+
+
 class PressDetector:
     """按鍵邊沿偵測 + 去抖（純邏輯，無 IO，可離線單測）。
 
@@ -264,46 +334,68 @@ class Orchestrator:
         else:
             logger.warning("ir_feed not active after 5s, IR reads may use slow fallback")
 
-        # 用 LANE_FOLLOW profile 装配 DoubleLoopRunner（#1）
+        # 用 LANE_FOLLOW profile 装配导航环（#1）
         # —— 不再自己 new CurvatureAdaptiveOuterLoop + WheelSmoother。
         profile = LANE_FOLLOW
         # 弯道阶梯转弯常开（巡线段随时可能遇弯）：CurveDetector 识别 →
         # StaircaseTurn θ 闭环 45→90→120°，lane 回正后交还 outer。
         # crossroad_turn（task_config.yml 顶层声明）：第几个弯出口紧接着十字路口，
         # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
-        from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
-        from main.task._config import (load_crossroad_turn, load_post_task1,
-                                       load_post_task6, load_turn_cfg)
         # 弯道识别/阶梯转弯参数从 task_config.yml turn: 段读（缺段回退类默认）。
         # 换场地调 yml, 不动代码 —— 2026-08-11 全流程对齐 lane_only.py 的 yml 化。
+        from main.task._config import (load_crossroad_turn, load_post_task1,
+                                       load_post_task6, load_turn_cfg)
         turn_cfg = load_turn_cfg()
-        runner = DoubleLoopRunner(
-            api=api,
-            outer=profile.build_outer(),
+        nav_start_kwargs = dict(
             hz=self.lane_hz,
+            controller_type=profile.controller_type.value,
+            turn_cfg=turn_cfg,
             watchdog_ms=profile.watchdog_ms,
             lost_line_ms=profile.lost_line_ms,
-            smoother=profile.build_smoother(),
-            turn=StaircaseTurn(**turn_cfg.get("staircase", {})),
-            detector=CurveDetector(**turn_cfg.get("detector", {})),
             crossroad_turn=load_crossroad_turn(),
         )
+        # 导航后端：优先 runtime 进程内闭环（读 streamer 缓存 + 直发轮速，
+        # 无每帧 HTTP，免疫客户端网络/时钟问题）；旧 runtime（无
+        # /realtime/lane-nav/* 端点）→ 回退客户端 DoubleLoopRunner。
+        # 探测用 GET state（廉价，不启动环）。
+        backend = "client"
+        try:
+            api.lane_nav_state()
+            backend = "runtime"
+        except Exception:
+            backend = "client"
+        if backend == "runtime":
+            nav = _NavHandle("runtime", api=api, start_kwargs=nav_start_kwargs)
+            logger.info("lane nav backend: runtime in-process loop (no per-frame HTTP)")
+        else:
+            # 旧 runtime：客户端 DoubleLoopRunner 装配与控制律与 runtime 完全一致。
+            from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
+            client_runner = DoubleLoopRunner(
+                api=api,
+                outer=profile.build_outer(),
+                hz=self.lane_hz,
+                watchdog_ms=profile.watchdog_ms,
+                lost_line_ms=profile.lost_line_ms,
+                smoother=profile.build_smoother(),
+                turn=StaircaseTurn(**turn_cfg.get("staircase", {})),
+                detector=CurveDetector(**turn_cfg.get("detector", {})),
+                crossroad_turn=load_crossroad_turn(),
+            )
+            client_thread = threading.Thread(
+                target=client_runner.run,
+                kwargs={"max_seconds": math.inf},
+                daemon=True, name="lane",
+            )
+            nav = _NavHandle("client", runner=client_runner, thread=client_thread)
+            logger.info("lane nav backend: client DoubleLoopRunner (fallback)")
         # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
         # None = task_config.yml 未配 / enabled=false → 保持现状 (只清零里程).
         post_task1 = load_post_task1()
         # task6 结束后同款盲转段 (读订单后掉头 120° 去 task7 投放), 见 post_task6.
         post_task6 = load_post_task6()
-
-        # 后台 A：DoubleLoopRunner 50Hz 巡线（#1：用 runner.pause/resume 控制暂停）
-        # max_seconds=inf：常驻，由 runner.stop() 终止
-        runner_thread = threading.Thread(
-            target=runner.run,
-            kwargs={"max_seconds": math.inf},
-            daemon=True, name="lane",
-        )
         # start_lane=False（一鍵啟動等待階段）→ 只建不啟，按鍵按下才 .start()
         if start_lane:
-            runner_thread.start()
+            nav.start()
 
         # 后台 B：里程计（全程累计，写共享 buffer）
         dis_buf = [0.0]
@@ -329,8 +421,7 @@ class Orchestrator:
         display_ui = None
 
         return {
-            "client": client, "api": api, "runner": runner,
-            "runner_thread": runner_thread,
+            "client": client, "api": api, "nav": nav,
             "dis_buf": dis_buf, "dis_epoch": dis_epoch,
             "tui_buf": tui_buf, "tui_running": tui_running,
             "display_ui": display_ui, "display_running": display_running,
@@ -344,8 +435,7 @@ class Orchestrator:
         返回 completed 列表。结束/异常时清理 runner / 线程 / feeds / 下位机屏幕。
         """
         api = state["api"]
-        runner = state["runner"]
-        runner_thread = state["runner_thread"]
+        nav = state["nav"]
         dis_buf = state["dis_buf"]
         dis_epoch = state["dis_epoch"]
         tui_buf = state["tui_buf"]
@@ -367,7 +457,7 @@ class Orchestrator:
                 # 触发后立即 pause 后台 lane 巡线 runner (settle_forward/back_off
                 # 要新建自己的 DoubleLoopRunner, 跟后台 A 的 runner 共享 lane_feed
                 # 但各自独立发轮速, 必须先 pause 否则两个 runner 互相打架 "原地抽搐".
-                self._pause_lane(runner, api)
+                self._pause_lane(nav, api)
                 # settle_forward_s: 沿中心车道线直行 N 秒 (走 move_along_lane,
                 # vy=0 + ω 锁对齐, 不偏航). 用户 2026-08-06 规定: task2 出弯后
                 # 沿车道直行 1.5s 拉直车身/车头, 不再让外环自由跑 (会偏).
@@ -538,7 +628,7 @@ class Orchestrator:
                                                 target_task_id=4)
                     else:
                         self._schedule_arm_home_reset()
-                self._resume_lane(runner)
+                self._resume_lane(nav)
                 completed.append(wp.name)
         except KeyboardInterrupt:
             logger.info("interrupted by user")
@@ -548,7 +638,8 @@ class Orchestrator:
             if task4_task5_handoff is not None and task4_task5_handoff.is_alive():
                 logger.info("[task4→task5] 收尾时 handoff 仍在跑, join 等它结束")
                 task4_task5_handoff.join()
-            # 终止 runner（#1）：stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
+            # 终止导航环（#1）：runtime 后端 stop_lane_nav（内部零速收尾）；
+            # client 后端 runner.stop() 唤醒 _pause.wait() 让 run() 看到 _stop，
             # join 等其 finally 块跑完（smoother 归零 + api.close()）。
             # 同时关掉 TUI + 下位机屏幕后台线程。
             tui_running.clear()
@@ -557,8 +648,7 @@ class Orchestrator:
                 api.stop_wheel_speeds()
             except Exception:
                 pass
-            runner.stop()
-            runner_thread.join(timeout=2.0)
+            nav.stop()
             try:
                 api.stop_lane_feed()
             except Exception:
@@ -642,8 +732,8 @@ class Orchestrator:
         state = self._init_mission(start_lane=False)
         while True:
             self._wait_board_key(state["client"], state["tui_buf"])
-            # 按下 → 立刻開始：啟動 runner 線程（首幀輪速 ~20-40ms 內下發）
-            state["runner_thread"].start()
+            # 按下 → 立刻開始：啟動導航環（runtime 首幀輪速 ~20-40ms 內下發）
+            state["nav"].start()
             threading.Thread(target=self._beep_async,
                              args=(state["client"],), daemon=True).start()
             try:
@@ -785,25 +875,26 @@ class Orchestrator:
     # ── 主线程辅助 ──────────────────────────────────────────
 
     @staticmethod
-    def _pause_lane(runner: DoubleLoopRunner, api: ChassisClient) -> None:
-        """暂停外环（#1）：runner.pause() 同步等到外环确认停住（已补发零速），
-        再主动发零速兜底（双保险，防止在途非零帧残留）。
+    def _pause_lane(nav: "_NavHandle", api: ChassisClient) -> None:
+        """暂停导航环：同步等到环确认停住（已补发零速），再主动发零速兜底
+        （双保险，防止在途非零帧残留）。
 
-        旧实现 pause() 是异步的：外环当前帧可能在 stop_wheel_speeds() 之后
-        又下发非零，且随后阻塞不再补零 → 车停不下来。现在 pause() 同步后才返回。
+        runtime 后端 pause_lane_nav 阻塞到 ack；client 后端 runner.pause() 同步
+        等到外环确认（旧实现 pause() 是异步的：外环当前帧可能在
+        stop_wheel_speeds() 之后又下发非零，且随后阻塞不再补零 → 车停不下来）。
         """
-        paused = runner.pause()
+        paused = nav.pause()
         if not paused:
-            logger.warning("runner.pause() 超时未确认，外环线程可能已退出，仍补发零速")
+            logger.warning("lane nav pause() 超时未确认，环可能已退出，仍补发零速")
         try:
             api.stop_wheel_speeds()
         except Exception:
             pass
 
     @staticmethod
-    def _resume_lane(runner: DoubleLoopRunner) -> None:
-        """恢复外环（#1）：resume() 唤醒 + 清 smoother 记忆，从静止起步。"""
-        runner.resume()
+    def _resume_lane(nav: "_NavHandle") -> None:
+        """恢复导航环：resume() 唤醒 + 清 smoother 记忆，从静止起步。"""
+        nav.resume()
 
     @staticmethod
     def _wait_until_triggered(wp: Waypoint, api: ChassisClient,

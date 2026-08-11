@@ -118,8 +118,7 @@ class TestWalkWaypointsEmptyCleanup(unittest.TestCase):
         state = {
             "client": MagicMock(),
             "api": MagicMock(),
-            "runner": MagicMock(),
-            "runner_thread": MagicMock(),
+            "nav": MagicMock(),
             "dis_buf": [0.0], "dis_epoch": [0],
             "tui_buf": [{}], "tui_running": MagicMock(),
             "display_ui": MagicMock(), "display_running": MagicMock(),
@@ -127,7 +126,7 @@ class TestWalkWaypointsEmptyCleanup(unittest.TestCase):
         }
         completed = orch._walk_waypoints(state, [])
         self.assertEqual(completed, [])
-        state["runner"].stop.assert_called_once()
+        state["nav"].stop.assert_called_once()
         state["api"].stop_wheel_speeds.assert_called_once()
 
 

@@ -168,6 +168,48 @@ def build_realtime_router(service):
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True, "result": result}
 
+    # === 巡线导航环（进程内闭环） ===
+    # 2026-08-11: 50Hz lane-follow 外环下沉 runtime。控制环本身在 service.lane_nav
+    # （读 streamer 缓存 + 直发轮速，无每帧网络往返），这里只是低频生命周期端点：
+    #   - start：启动/重建导航环（幂等，已跑返回 already_running）
+    #   - pause：进任务点前暂停（同步等零速 ack）
+    #   - resume：恢复（loop 已死自动重建）
+    #   - stop：停止 + 零速
+    #   - state：环状态 + 心跳（health.iter_count 每帧递增 = 环活着）
+    @router_v1.post("/realtime/lane-nav/start")
+    def v1_realtime_lane_nav_start(payload: dict = Body(default={})):
+        return {
+            "ok": True,
+            "result": service.lane_nav.start(**payload),
+        }
+
+    @router_v1.post("/realtime/lane-nav/pause")
+    def v1_realtime_lane_nav_pause(payload: dict = Body(default={})):
+        return {
+            "ok": True,
+            "result": service.lane_nav.pause(
+                timeout=payload.get("timeout", 1.0),
+            ),
+        }
+
+    @router_v1.post("/realtime/lane-nav/resume")
+    def v1_realtime_lane_nav_resume(payload: dict = Body(default={})):
+        return {
+            "ok": True,
+            "result": service.lane_nav.resume(**payload),
+        }
+
+    @router_v1.post("/realtime/lane-nav/stop")
+    def v1_realtime_lane_nav_stop(payload: dict = Body(default={})):
+        return {
+            "ok": True,
+            "result": service.lane_nav.stop(force=bool(payload.get("force", True))),
+        }
+
+    @router_v1.get("/realtime/lane-nav/state")
+    def v1_realtime_lane_nav_state():
+        return {"ok": True, "lane_nav": service.lane_nav.state()}
+
     @router_v1.post("/realtime/arm-velocity")
     def v1_realtime_arm_velocity(payload: dict = Body(default={})):
         """arm 4-DOF 直发 — 绕开 arm_queue, 供视觉伺服连续追踪。
