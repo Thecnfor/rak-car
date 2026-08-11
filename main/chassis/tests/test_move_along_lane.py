@@ -1,14 +1,15 @@
 """main/chassis/tests/test_move_along_lane.py
 ``move_along_lane`` 单测 (stdlib unittest, 离线无硬件)。
 
-核心不变量: 控制律 = ``StraightOuterLoop(vx_cruise=vx, strafe_v=0.0)``
-  - **vy 锁死** → 物理上只有 vx 平移（前进 vx>0 / 后退 vx<0），不横移 / 不侧滑。
-    判据: (w0+w1)-(w2+w3) = 4*vy（w0/w1 带 +vy, w2/w3 带 -vy）。
-  - **ω 照常视觉对齐** → strafe_v 不影响 ω 通道（error_angle PI + error_y cross-track）。
+2026-08-11 下沉后语义：循线闭环在 **runtime 进程内** 跑（``lane_dis_offset`` /
+``lane_time`` 官方极简法），``move_along_lane`` 只 POST 一次 ``/v1/execute``
+同步等结果。本测试验证委托正确性（距离模式 → lane_dis_offset、时间模式 →
+lane_time、dry_run 不下发、失败抛错）。
 """
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 # 路径: main/chassis/tests/ → repo_root（同 main/task/tests 的 bootstrap 写法,
 # 让 `python3 main/chassis/tests/test_move_along_lane.py` 也能直接跑）
@@ -16,31 +17,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from main.chassis.state import LaneState
-from main.chassis.controllers.straight import StraightOuterLoop
-from main.chassis.controllers.move_along_lane import _make_distance_stop
-
-
-class TestLaneLineForwardOnly(unittest.TestCase):
-    def test_vy_locked_zero_with_big_errors(self):
-        # 大横向误差 + 大角度误差: vy 仍必须为 0, 只有 vx + ω。
-        outer = StraightOuterLoop(vx_cruise=0.20, strafe_v=0.0)
-        w = outer.step(LaneState(error_y=0.5, error_angle=0.2), 0.02)
-        self.assertAlmostEqual(w[0] + w[1], w[2] + w[3], places=9)
-
-    def test_backward_vx_flips_wheel_pattern(self):
-        # vx<0 = 后退; 无误差 → 纯倒车轮速 [vx,-vx,-vx,vx]
-        outer = StraightOuterLoop(vx_cruise=-0.20, strafe_v=0.0)
-        w = outer.step(LaneState(error_y=0.0, error_angle=0.0), 0.02)
-        self.assertEqual(w, [-0.20, 0.20, 0.20, -0.20])
-
-    def test_omega_still_aligns_when_vx_locked(self):
-        # ω 通道不受 strafe_v 影响: 车头偏右(ea>0) → ω>0 左转, w0 = vx + r*ω > vx
-        outer = StraightOuterLoop(vx_cruise=0.20, strafe_v=0.0,
-                                  ea_deadband=0.001, kp_theta=2.0)
-        w = outer.step(LaneState(error_y=0.0, error_angle=0.05), 0.02)
-        self.assertGreater(w[0], 0.20)
-        self.assertGreater(w[0] + w[1], 0.0)  # w0+w1 = 2*r*ω > 0
+from main.chassis.controllers.move_along_lane import move_along_lane
 
 
 class TestMoveAlongLaneExposed(unittest.TestCase):
@@ -50,54 +27,70 @@ class TestMoveAlongLaneExposed(unittest.TestCase):
         self.assertTrue(callable(move_along_lane))
 
 
-class _FakeRunner:
-    """记录 stop() 是否被调。"""
+class _FakeHttp:
+    """记录对 runtime 的 execute_car_action 调用。"""
 
-    def __init__(self) -> None:
-        self.stopped = False
+    def __init__(self, result=None) -> None:
+        self.calls = []
+        self._result = result if result is not None else {"status": "succeeded", "result": None}
 
-    def stop(self) -> None:
-        self.stopped = True
+    def execute_car_action(self, name, *args, timeout=None, sync=False):
+        self.calls.append({"name": name, "args": args, "timeout": timeout, "sync": sync})
+        return self._result
 
 
-class TestDistanceStop(unittest.TestCase):
-    """``_make_distance_stop``：累计 lane_state.distance 到 target 就 stop。
+class _FakeApi:
+    def __init__(self, http=None) -> None:
+        self.http = http if http is not None else _FakeHttp()
 
-    distance 是单调路径长（前进/后退都累计）；runtime auto-init 重置 odometry
-    时 distance 回跳 → 重新记账。
-    """
 
-    def _tick_with(self, runner, distance_m=1.0, user=None):
-        holder = {"runner": runner}
-        return _make_distance_stop(distance_m, user, holder)
+class TestMoveAlongLaneDelegates(unittest.TestCase):
+    """move_along_lane 只委托 runtime 进程内 action，不建网络外环。"""
 
-    def test_stops_when_path_length_reaches_target(self):
-        runner = _FakeRunner()
-        tick = self._tick_with(runner, distance_m=1.0)
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=0.1), [])
-        self.assertFalse(runner.stopped)  # 起始帧只记账（start=0.1）
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=0.6), [])
-        self.assertFalse(runner.stopped)  # 0.5m < 1.0m
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=1.2), [])
-        self.assertTrue(runner.stopped)   # 1.1m >= 1.0m
+    def test_distance_mode_calls_lane_dis_offset(self):
+        http = _FakeHttp()
+        api = _FakeApi(http)
+        with patch("main.chassis.controllers.move_along_lane.ChassisClient") as mc:
+            mc.connect.return_value = api
+            move_along_lane(vx=0.2, distance_m=1.5)
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(http.calls[0]["name"], "lane_dis_offset")
+        self.assertEqual(http.calls[0]["args"], (0.2, 1.5))
+        self.assertTrue(http.calls[0]["sync"])
 
-    def test_reinit_resets_accumulator(self):
-        runner = _FakeRunner()
-        tick = self._tick_with(runner, distance_m=1.0)
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=3.0), [])  # 记账 start=3.0
-        # runtime 重置 odometry → distance 回跳到 0.2 → 重新从 0.2 记账
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=0.2), [])
-        self.assertFalse(runner.stopped)
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=1.1), [])  # 0.9m < 1.0m
-        self.assertFalse(runner.stopped)
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=1.3), [])  # 1.1m >= 1.0m
-        self.assertTrue(runner.stopped)
+    def test_backward_vx_passes_signed_speed(self):
+        http = _FakeHttp()
+        api = _FakeApi(http)
+        with patch("main.chassis.controllers.move_along_lane.ChassisClient") as mc:
+            mc.connect.return_value = api
+            move_along_lane(vx=-0.15, distance_m=2.0)
+        self.assertEqual(http.calls[0]["args"], (-0.15, 2.0))
 
-    def test_none_distance_does_not_stop(self):
-        runner = _FakeRunner()
-        tick = self._tick_with(runner, distance_m=1.0)
-        tick(LaneState(error_y=0.0, error_angle=0.0, distance=None), [])
-        self.assertFalse(runner.stopped)
+    def test_time_mode_calls_lane_time(self):
+        http = _FakeHttp()
+        api = _FakeApi(http)
+        with patch("main.chassis.controllers.move_along_lane.ChassisClient") as mc:
+            mc.connect.return_value = api
+            move_along_lane(vx=0.2, max_seconds=3.0)
+        self.assertEqual(len(http.calls), 1)
+        self.assertEqual(http.calls[0]["name"], "lane_time")
+        self.assertEqual(http.calls[0]["args"], (0.2, 3.0))
+
+    def test_dry_run_does_not_issue_action(self):
+        http = _FakeHttp()
+        api = _FakeApi(http)
+        with patch("main.chassis.controllers.move_along_lane.ChassisClient") as mc:
+            mc.connect.return_value = api
+            move_along_lane(vx=0.2, distance_m=1.0, dry_run=True)
+        self.assertEqual(http.calls, [])
+
+    def test_failed_status_raises(self):
+        http = _FakeHttp(result={"status": "failed", "error": "lane lost"})
+        api = _FakeApi(http)
+        with patch("main.chassis.controllers.move_along_lane.ChassisClient") as mc:
+            mc.connect.return_value = api
+            with self.assertRaises(RuntimeError):
+                move_along_lane(vx=0.2, distance_m=1.0)
 
 
 if __name__ == "__main__":

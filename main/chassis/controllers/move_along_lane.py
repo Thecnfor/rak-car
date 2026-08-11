@@ -1,25 +1,17 @@
 """main/chassis/controllers/move_along_lane.py
 沿中心车道线方向**只前进/后退**（视觉对齐）的底盘方法。
 
-控制律 = ``StraightOuterLoop(vx_cruise=vx, strafe_v=0.0)``：
-  - **vy 通道被 ``strafe_v=0`` 锁死** → 物理上只有 vx 平移（vx>0 前进 / vx<0 后退），
-    不会左右横移 / 侧滑。
-  - **ω 通道照常**用 error_angle PI + error_y cross-track 让车头始终对齐车道
-    中心线方向（车偏右 → 左转拉回，漂移归零 = 真平行）。
-  - 其余节律 / 软化 / 兜底走 ``subscribe_lane_state``（LANE_FOLLOW profile）。
+2026-08-11 下沉：循线闭环从网络外环（DoubleLoopRunner + ChassisClient 每帧
+WS 收 lane_state + HTTP 下发轮速）改为 **runtime 进程内**闭环 —— 直接调
+``MyCar.lane_dis_offset`` / ``MyCar.lane_time``（官方极简法，与
+``baidu_smartcar_2026/task/lane.py::auto_lane_tracing`` 同款：
+读 get_lane_results + lane_pid + set_velocity，不经过网络）。本函数只
+POST 一次 ``/v1/execute`` 同步等结果，不再每帧网络往返。
 
-**两种退出模式**：
-  - 时间模式（默认）：跑满 ``max_seconds`` 停。
+**两种退出模式**（由 runtime 底层闭环负责）：
+  - 时间模式（默认）：跑满 ``max_seconds`` 停（``lane_time``）。
   - 距离模式（``distance_m`` 设了）：沿车道累计行驶 ``distance_m`` 米后停
-    （用 ``LaneState.distance``，即 SDK odometry 的路径长累加器，前进/后退都累计；
-    车道跑偏时由 runner 的 watchdog / 丢线兜底急停）。
-
-实现说明：``move_along_lane`` 是装配方法（不是控制律类），放在 controllers 目录
-便于底盘组按"新写一个可调用方法"的路径落地；为避免 controllers ↔ 包 __init__
-的循环 import，``subscribe_lane_state`` 用延迟 import（调用时才解析，届时包已
-加载完毕——与 ``config/lane_follow.py`` 里 build_outer() 的延迟 import 同款）。
-距离模式要能中途 stop runner，所以自建 DoubleLoopRunner（同 run_lane_follow 的写法），
-``subscribe_lane_state`` 的公共参数语义保持一致。
+    （``lane_dis_offset``，SDK odometry 里程计）。
 
 **直接跑真车**（本文件自带 __main__ 入口）：
 
@@ -28,7 +20,6 @@
     python3 main/chassis/controllers/move_along_lane.py --vx -0.15 --seconds 3.0   # 后退
     python3 main/chassis/controllers/move_along_lane.py --vx 0.20 --distance 2.0    # 前进 2 米
     python3 main/chassis/controllers/move_along_lane.py --dry-run                   # 只看方向不下发
-    python3 main/chassis/controllers/move_along_lane.py --straight sign_theta=-1   # 方向反了
 """
 from __future__ import annotations
 
@@ -36,7 +27,7 @@ import argparse
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 # 路径: main/chassis/controllers/ → repo_root。直接 `python3 .../move_along_lane.py`
 # 跑真车时 `main` 才找得到；作为包模块被 import 时这行无害（同 test 文件的 bootstrap）。
@@ -44,44 +35,8 @@ _REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from main.chassis.state import LaneState
 from main.chassis.config import LANE_FOLLOW, LaneFollowProfile
-from main.chassis.controllers.straight import StraightOuterLoop
 from main.chassis.api import ChassisClient
-from main.chassis.loops.closed_loop import DoubleLoopRunner
-from main.chassis.loops.telemetry import lane_trace
-
-
-def _make_distance_stop(distance_m: float, user_on_tick: Optional[Callable], holder: dict) -> Callable[[LaneState, list[float]], None]:
-    """距离模式用的 on_tick：累计路径长到 ``distance_m`` 就调 ``holder["runner"].stop()``。
-
-    ``LaneState.distance`` = SDK odometry 路径长累加器（单调不减，前进/后退都累计）。
-    runtime auto-init 重置 odometry 时 distance 会回跳 → 检测到 d < start 就重新记账。
-    先透传 ``user_on_tick``（用户自己的每帧回调），再判距离。
-    """
-    start = [None]
-
-    def _tick(state: LaneState, wheels: list[float]) -> None:
-        if user_on_tick is not None:
-            try:
-                user_on_tick(state, wheels)
-            except Exception:
-                pass
-        d = state.distance
-        if d is None:
-            return
-        if start[0] is None:
-            start[0] = d
-            return
-        if d < start[0]:  # runtime 重置了 odometry → 重新记账
-            start[0] = d
-            return
-        if d - start[0] >= abs(distance_m):
-            runner = holder.get("runner")
-            if runner is not None:
-                runner.stop()
-
-    return _tick
 
 
 def move_along_lane(
@@ -93,12 +48,16 @@ def move_along_lane(
     hz: Optional[float] = None,
     dry_run: bool = False,
     with_trace: bool = False,
-    on_tick: Optional[Callable[[LaneState, list[float]], None]] = None,
-    stop_when: Optional[Callable[[LaneState, list[float]], bool]] = None,
-    calibrator: Optional["ErrorCalibrator"] = None,
+    on_tick=None,
+    stop_when=None,
+    calibrator=None,
     straight: Optional[dict] = None,
 ) -> None:
     """沿中心车道线方向**只前进/后退**（视觉对齐）的一键方法。
+
+    2026-08-11 下沉：循线闭环改在 **runtime 进程内** 跑（官方极简法
+    ``MyCar.lane_dis_offset`` / ``MyCar.lane_time``，每帧零网络往返）。
+    本函数只 POST 一次 ``/v1/execute`` 同步等结果。
 
     用法::
 
@@ -109,105 +68,34 @@ def move_along_lane(
 
     参数：
         vx          - 带符号前向速度 (m/s)：正=前进，负=后退。默认 0.20。
-        distance_m  - 目标行驶距离 (m)。设了则以距离为准：累计路径长到该值停
-                      （lane_state.distance，前进/后退都累计）。None = 纯时间模式。
-        max_seconds - 运行时长上限 (s)。纯时间模式默认 5.0；距离模式下默认按
-                      ``distance_m / |vx|`` 自动算 ~3 倍作为兜底，防止到不了距离干等。
-        profile     - 节律 / 软化 / 兜底 profile，默认 LANE_FOLLOW。
-        hz          - 循环频率，默认用 profile.hz。
-        dry_run     - True 时只跑控制律不下发轮速。
-        with_trace  - True 时每帧打印 lane 误差 + 轮速。默认 False（任务原语，
-                      避免 50Hz 刷屏；排障时再开）。
-        on_tick     - 覆盖 with_trace 的自定义回调。
-        calibrator  - 误差标定层（lane 模型裸输出 → 物理量）。
-        straight    - 透传 ``StraightOuterLoop`` 调参（kp_theta / sign_theta /
-                      k_ey_omega / omega_max …），现场方向反了改这里。
-                      ``vx_cruise`` 恒用 vx，``strafe_v`` 恒 0，不可覆盖。
-                      ω 矫正默认已温和化（omega_max=0.12 / kp_theta=0.8 /
-                      k_ey_omega=0.2），想更小/恢复激进用这个参数覆盖。
+        distance_m  - 目标行驶距离 (m)。设了则以距离为准（runtime 里程计累计到该值停）。
+                      None = 纯时间模式。
+        max_seconds - 运行时长上限 (s)。纯时间模式默认 5.0；距离模式下忽略（距离优先）。
+        profile / hz / with_trace / on_tick / stop_when / calibrator / straight
+                    - 网络外环（DoubleLoopRunner）时代的调参 / 每帧钩子。
+                      下沉后闭环在 runtime 进程内，这些不再参与，仅保留签名兼容。
     """
-    straight_kwargs = dict(straight or {})
-    # 只在此方法内温和化 ω 矫正（不影响 mission / lane_only 的 StraightOuterLoop 默认）：
-    # setdefault = 调用方显式传了 straight= 以调用方为准。
-    straight_kwargs.setdefault("omega_max", 0.12)    # 默认 0.25 → 矫正幅度钳低
-    straight_kwargs.setdefault("kp_theta", 0.8)      # 默认 1.5 → 反应更轻
-    straight_kwargs.setdefault("k_ey_omega", 0.2)    # 默认 0.5 → cross-track 贡献减小
-    straight_kwargs["vx_cruise"] = float(vx)
-    straight_kwargs["strafe_v"] = 0.0  # 锁死 vy：物理上只有前进/后退
-    outer = StraightOuterLoop(**straight_kwargs)
-
-    if distance_m is None:
-        # 纯时间模式：委托 subscribe_lane_state（原行为，max_seconds 默认 5.0）。
-        # subscribe_lane_state 无 stop_when 钩子 → 时间模式不生效，显式报错防静默踩坑。
-        if stop_when is not None:
-            raise ValueError("move_along_lane: stop_when 只在 distance_m 模式下生效"
-                             "（时间模式委托 subscribe_lane_state，无停止钩子）")
-        from main.chassis import subscribe_lane_state
-        return subscribe_lane_state(
-            outer=outer,
-            max_seconds=5.0 if max_seconds is None else max_seconds,
-            profile=profile,
-            hz=hz,
-            dry_run=dry_run,
-            with_trace=with_trace,
-            on_tick=on_tick,
-            calibrator=calibrator,
-        )
-
-    # 距离模式：自建 runner，on_tick 累计路径长到 distance_m → runner.stop()
     api = ChassisClient.connect()
-    effective_hz = profile.hz if hz is None else hz
-    try:
-        api.start_lane_feed(hz=effective_hz)
-    except Exception:
-        pass
-    if on_tick is None and with_trace:
-        on_tick = lane_trace(outer)
-    holder: dict = {"runner": None}
-
-    def combined_on_tick(state: LaneState, wheels: list[float]) -> None:
-        if on_tick is not None:
-            try:
-                on_tick(state, wheels)
-            except Exception:
-                pass
-        if stop_when is not None:
-            try:
-                if stop_when(state, wheels):
-                    runner = holder.get("runner")
-                    if runner is not None:
-                        runner.stop()
-            except Exception:
-                pass
-
-    distance_stop = _make_distance_stop(distance_m, None, holder)
-
-    def distance_and_target_stop(state: LaneState, wheels: list[float]) -> None:
-        distance_stop(state, wheels)
-        combined_on_tick(state, wheels)
-
-    runner = DoubleLoopRunner(
-        api=api,
-        outer=outer,
-        hz=effective_hz,
-        watchdog_ms=profile.watchdog_ms,
-        lost_line_ms=profile.lost_line_ms,
-        dry_run=dry_run,
-        smoother=profile.build_smoother(),
-        on_tick=distance_and_target_stop,
-        calibrator=calibrator,
-    )
-    holder["runner"] = runner
-    if max_seconds is None:
-        # 兜底：按距离/速度算 ~3 倍名义时间，防 lane 视觉一直给"还没到"却干等
-        max_seconds = abs(distance_m) / max(abs(vx), 0.05) * 3.0 + 2.0
-    try:
-        runner.run(max_seconds=float(max_seconds))
-    finally:
-        try:
-            api.stop_lane_feed()
-        except Exception:
-            pass
+    if dry_run:
+        return
+    if distance_m is not None:
+        # 距离模式 → runtime 进程内 lane_dis_offset(speed, dis_hold)，走到距离停。
+        secs = abs(float(distance_m)) / max(abs(float(vx)), 0.05) * 3.0 + 2.0
+        job = api.http.execute_car_action(
+            "lane_dis_offset", float(vx), abs(float(distance_m)),
+            timeout=secs + 5.0, sync=True,
+        )
+    else:
+        # 时间模式 → runtime 进程内 lane_time(speed, time_dur)，到时间停。
+        secs = 5.0 if max_seconds is None else float(max_seconds)
+        job = api.http.execute_car_action(
+            "lane_time", float(vx), secs,
+            timeout=secs + 5.0, sync=True,
+        )
+    status = (job or {}).get("status")
+    if status != "succeeded":
+        err = (job or {}).get("error") or (job or {}).get("result")
+        raise RuntimeError(f"move_along_lane 失败 (status={status}): {err}")
 
 
 def main(argv: list[str] | None = None) -> None:
