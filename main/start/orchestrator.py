@@ -273,7 +273,10 @@ class Orchestrator:
         # 那个弯换加固转弯（里程碑窗口出口+触发冷却），其余弯走原版逻辑。
         from main.chassis.controllers.odom_turn import CurveDetector, StaircaseTurn
         from main.task._config import (load_crossroad_turn, load_post_task1,
-                                       load_post_task6)
+                                       load_post_task6, load_turn_cfg)
+        # 弯道识别/阶梯转弯参数从 task_config.yml turn: 段读（缺段回退类默认）。
+        # 换场地调 yml, 不动代码 —— 2026-08-11 全流程对齐 lane_only.py 的 yml 化。
+        turn_cfg = load_turn_cfg()
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -281,8 +284,8 @@ class Orchestrator:
             watchdog_ms=profile.watchdog_ms,
             lost_line_ms=profile.lost_line_ms,
             smoother=profile.build_smoother(),
-            turn=StaircaseTurn(),
-            detector=CurveDetector(),
+            turn=StaircaseTurn(**turn_cfg.get("staircase", {})),
+            detector=CurveDetector(**turn_cfg.get("detector", {})),
             crossroad_turn=load_crossroad_turn(),
         )
         # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
