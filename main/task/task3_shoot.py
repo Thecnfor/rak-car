@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from main.api_client import RuntimeApiClient
+from main.task.task3.arm_poses import SHOOTING_ARM, arm_at_pose
 
 # task3_pipeline --save 默认路径 (main/task/task3/audit/task3_pipeline.json)
 DEFAULT_MANIFEST = (
@@ -29,14 +30,21 @@ DEFAULT_MANIFEST = (
 # 兜底等 max_wait_s (4 张 × 15s timeout 的最坏上界).
 MAX_JUDGE_WAIT_S = 90.0
 
-# 射击姿态 (y1 y2 x arm_angle hand_angle) —— 与 task3_pipeline.SHOOTING_ARM 一致.
+# 射击姿态 (y1 y2 x arm_angle hand_angle) —— 定义在 main/task/task3/arm_poses.py (orchestrator 共用).
 # cam2 随臂动: 编排/单任务模式 task3_shoot 直接拉 shoot_target (它不动臂),
-# 臂停在上一任务姿态 → cam2 看不到卡片. 必须在拉 subprocess 前摆好 (2026-08-09).
-SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
+# 臂停在上一任务姿态 → cam2 看不到卡片. orchestrator 已在 task2→射击区途中摆好,
+# 这里只在未到位时补摆 (2026-08-09).
 
 
 def _set_shooting_pose() -> int:
-    """摆射击姿态, 复用 task3_pipeline.run_arm_pose 的 subprocess 调 arm_seq_v9 做法."""
+    """摆射击姿态; orchestrator 途中已摆好 → 已在位则跳过, 省任务点串行等待."""
+    try:
+        client = RuntimeApiClient()
+        if arm_at_pose(client, SHOOTING_ARM):
+            print("[task3_shoot] 已在射击姿态, 跳过摆臂", flush=True)
+            return 0
+    except Exception as exc:
+        print(f"[task3_shoot] 读臂姿态失败, 重新摆臂: {exc}", file=sys.stderr)
     command = [
         sys.executable, "-m", "main.task.task3.arm_seq_v9",
         "--y1", SHOOTING_ARM[0], "--y2", SHOOTING_ARM[1], "--x", SHOOTING_ARM[2],

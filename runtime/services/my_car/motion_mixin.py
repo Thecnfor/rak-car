@@ -557,7 +557,7 @@ class MotionMixin:
                     # logger.info(f"location{self.get_odometry()} ok, arm_pose{self.arm.x_pose_now}")
                     self.set_velocity(0, 0, 0)
                     self.arm.x_speed(0)
-                    # return det[0],det[2]
+                    return det[0], det[2]
             else:
                 x_count(False)
                 y_count(False)

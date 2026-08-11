@@ -186,6 +186,8 @@ class Orchestrator:
         self.lane_hz = lane_hz
         self.ir_interval_s = ir_interval_s
         self._ball_counts: Dict[str, int] = {}
+        # task1→识别区 / task2→射击区 途中后台摆臂的完成句柄 (task3 用).
+        self._pending_arm_pose: Optional[Dict[str, Any]] = None
 
     @staticmethod
     def _load_waypoints_from_yaml(config_path: Optional[str]) -> Optional[List[Waypoint]]:
@@ -319,14 +321,9 @@ class Orchestrator:
                          args=(tui_buf, tui_running),
                          daemon=True, name="tui").start()
 
-        # 后台 D：下位机 led_show 屏幕 UI（250ms 刷新，带帧率限制）
+        # 下位机 led_show UI 默认关闭：避免 show_text 任务占用 runtime 队列和串口。
         display_running = threading.Event()
-        display_running.set()
-        from main.start.display_ui import Mc602Display
-        display_ui = Mc602Display(client, layout="20x5")
-        threading.Thread(target=self._display_ui_loop,
-                         args=(display_ui, tui_buf, display_running),
-                         daemon=True, name="display").start()
+        display_ui = None
 
         return {
             "client": client, "api": api, "runner": runner,
@@ -358,6 +355,7 @@ class Orchestrator:
 
         completed: List[str] = []
         task4_task5_handoff = None
+        self._pending_arm_pose = None   # 每次 mission 重置, 防上次中断残留
         try:
             for waypoint_index, wp in enumerate(waypoints):
                 logger.info("=== navigating to %s ===", wp.name)
@@ -456,6 +454,9 @@ class Orchestrator:
                         task4_task5_handoff = None
                     if wp.task_id == 5:
                         extra_kwargs["prev_ball_counts"] = dict(self._ball_counts)
+                    # 2026-08-09 用户: task3 识别/射击区, 车已停在任务点,
+                    # 先确认途中摆臂完成 (来不及就停下调整).
+                    self._wait_pending_arm_pose(wp.task_id)
                     task_result = self._run_task(client, wp, **extra_kwargs)
                     if not task_result.get("ok"):
                         logger.warning("task %s did not succeed, continuing to next waypoint", wp.name)
@@ -508,7 +509,32 @@ class Orchestrator:
                 # task4→task5 handoff 已在后台处理关仓 + Phase 1 姿态，
                 # 不能再启动通用 home reset 抢占同一条臂串口。
                 if task4_task5_handoff is None:
-                    self._schedule_arm_home_reset()
+                    if wp.task_id == 1:
+                        # 2026-08-09 用户: task1 结束后, 前往 task3 识别区的
+                        # 巡线途中后台摆好识别姿态 (来不及就等任务点停下调整).
+                        from main.task.task3.arm_poses import RECOGNITION_ARM
+                        self._schedule_arm_pose(RECOGNITION_ARM, "recognition",
+                                                target_task_id=3)
+                    elif wp.task_id == 3:
+                        # 2026-08-09 用户: task3 识别结束后, 前往 task2 水塔区的
+                        # 巡线途中后台摆好 task2 detection 姿态 (省 task2 init 摆臂).
+                        from main.task.task3.arm_poses import TASK2_DETECTION_ARM
+                        self._schedule_arm_pose(TASK2_DETECTION_ARM, "detection",
+                                                target_task_id=2)
+                    elif wp.task_id == 2:
+                        # 2026-08-09 用户: task2 结束后, 前往 task3 射击区的
+                        # 巡线途中后台摆好射击姿态.
+                        from main.task.task3.arm_poses import SHOOTING_ARM
+                        self._schedule_arm_pose(SHOOTING_ARM, "shooting",
+                                                target_task_id=8)
+                    elif wp.task_id == 8:
+                        # 2026-08-09 用户: task3 射击结束后, 前往 task4 收割区的
+                        # 巡线途中后台摆好 task4 P 姿态 (省 task4 初始 P 恢复).
+                        from main.task.task3.arm_poses import TASK4_P_ARM
+                        self._schedule_arm_pose(TASK4_P_ARM, "p_pose",
+                                                target_task_id=4)
+                    else:
+                        self._schedule_arm_home_reset()
                 self._resume_lane(runner)
                 completed.append(wp.name)
         except KeyboardInterrupt:
@@ -535,11 +561,13 @@ class Orchestrator:
             except Exception:
                 pass
             # 下位机屏幕清屏（best-effort）
-            try:
-                display_ui.clear()
-                display_ui.render(throttle_s=0.0)
-            except Exception:
-                pass
+            # display_ui 默认关闭，无需向 runtime 提交 show_text。
+            if display_ui is not None:
+                try:
+                    display_ui.clear()
+                    display_ui.render(throttle_s=0.0)
+                except Exception:
+                    pass
             # 注意：不要再调 api.close() —— runner 的 finally 已经调过了
             logger.info("mission completed: %s", completed)
         return completed
@@ -1133,6 +1161,64 @@ class Orchestrator:
 
         threading.Thread(target=_bg_reset, daemon=True,
                          name="arm-home-reset").start()
+
+    def _schedule_arm_pose(self, pose, label: str,
+                           target_task_id: Optional[int] = None) -> None:
+        """后台线程把机械臂摆到目标姿态 (不阻塞巡航), 供 task3 识别/射击区途中准备.
+
+        与 task3_shoot._set_shooting_pose 同款 subprocess 调 arm_seq_v9;
+        _wait_pending_arm_pose 在目标任务点前等待完成 (车已停, 来不及就停下调整).
+        """
+        import subprocess
+
+        done = threading.Event()
+
+        def _bg() -> None:
+            try:
+                command = [
+                    sys.executable, "-m", "main.task.task3.arm_seq_v9",
+                    "--y1", pose[0], "--y2", pose[1], "--x", pose[2],
+                    "--arm-angle", pose[3], "--hand-angle", pose[4],
+                ]
+                logger.info("[arm-pose] %s 后台摆臂启动: %s",
+                            label, " ".join(command))
+                rc = subprocess.run(command, check=False).returncode
+                logger.info("[arm-pose] %s 后台摆臂%s", label,
+                            "完成" if rc == 0 else f"失败 (rc={rc})")
+            except Exception as exc:
+                logger.warning("[arm-pose] %s 后台摆臂异常: %s", label, exc)
+            finally:
+                done.set()
+
+        threading.Thread(target=_bg, daemon=True,
+                         name=f"arm-pose-{label}").start()
+        self._pending_arm_pose = {
+            "label": label, "done": done, "target_task_id": target_task_id,
+        }
+
+    def _wait_pending_arm_pose(self, task_id: Optional[int],
+                               timeout_s: float = 60.0) -> None:
+        """目标任务点触发后 (车已停) 等待后台摆臂完成; 无 pending 直接返回.
+
+        若 pending 姿态不是给当前任务准备的, 不等待 (留给后续目标任务).
+        """
+        pending = getattr(self, "_pending_arm_pose", None)
+        if not pending:
+            return
+        if pending.get("target_task_id") not in (None, task_id):
+            return
+        self._pending_arm_pose = None
+        done = pending["done"]
+        label = pending["label"]
+        if done.is_set():
+            logger.info("[arm-pose] %s 途中摆臂已完成", label)
+            return
+        logger.info("[arm-pose] 车已停, 等待 %s 摆臂完成 (最多 %.0fs)...",
+                    label, timeout_s)
+        if done.wait(timeout_s):
+            logger.info("[arm-pose] %s 摆臂就绪", label)
+        else:
+            logger.warning("[arm-pose] %s 摆臂超时未完成, 任务内会再次确认姿态", label)
 
     @staticmethod
     def _run_task(client: RuntimeApiClient, wp: Waypoint,

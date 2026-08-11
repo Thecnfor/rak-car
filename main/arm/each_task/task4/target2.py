@@ -141,43 +141,6 @@ def _norm_xy(bbox_norm: dict) -> tuple[float, float, float, float]:
     return cx, cy, w, h
 
 
-def _is_ball_like(
-    bbox_norm: dict,
-    score: float,
-    aspect_tol: float,
-    area_min: float,
-    area_max: float,
-) -> bool:
-    """球形过滤: score / 宽高比 (≈1) / 面积 都过关才返回 True。
-
-    异常时返回 False (静默丢弃, 不抛)。
-    """
-    try:
-        cx, cy, w, h = _norm_xy(bbox_norm)
-    except (ValueError, TypeError):
-        return False
-    if w <= 0 or h <= 0:
-        return False
-    # 宽高比 (球 ≈ 1)
-    if abs(w / h - 1.0) > aspect_tol:
-        return False
-    area = w * h
-    if not (area_min <= area <= area_max):
-        return False
-    return True
-
-
-def _verify_ball_in_target1_pose(ball: dict) -> bool:
-    """**已弃用 2026-08-02** —— 用户要求 "识别到球就抓, 不用在最佳抓取位置"。
-
-    原 BALL_VERIFIED_* 7 项位置验证已删除 (constants.py 删 BALL_VERIFIED_*
-    13 常量 + 本函数也删除); 现 fetch_balls 只要球过 TARGET_* 4 项基础过滤
-    (score / aspect / area) 且 color 是蓝/黄, 即视为有效候选。
-
-    保留此 stub 是为兼容历史 import (target_blue.py / target_yellow.py 等
-    旧版本可能仍引用); 直接返回 True (永远通过)。
-    """
-    return True
 # ---------- 核心 API ----------
 
 def fetch_balls(
