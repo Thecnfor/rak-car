@@ -102,32 +102,26 @@ class LifecycleMixin:
         return None
 
     def _ensure_feeds_running(self, car):
-        """幂等启动 car 上的 5 路守护线程（lane/arm/task/ir/odom feed）。
+        """幂等启动循线和触发所需的低成本缓存 feed。
 
-        _create_car_locked 和 ensure_initialized 复用路径共用同一份逻辑，
-        两处不再各自写 5 段重复的 try/except。
+        arm/task feed 需要摄像头或串口高频轮询，改为由订阅或任务显式启动，
+        避免 runtime 初始化后常驻占用推理和串口资源。
         """
         try:
-            car.start_lane_feed(hz=50.0)
+            car.start_lane_feed(
+                hz=float(os.environ.get("RAK_CAR_LANE_FEED_HZ", "30"))
+            )
         except Exception as exc:
             logger.warning("lane_feed auto-start failed: {}".format(exc))
         try:
-            car.start_arm_feed(hz=20.0)
-        except Exception as exc:
-            logger.warning("arm_feed auto-start failed: {}".format(exc))
-        try:
-            car.start_task_feed(hz=30.0)
-        except Exception as exc:
-            logger.warning("task_feed auto-start failed: {}".format(exc))
-        try:
             car.start_ir_feed(
-                hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", str(50.0)))
+                hz=float(os.environ.get("RAK_CAR_IR_FEED_HZ", "20"))
             )
         except Exception as exc:
             logger.warning("ir_feed auto-start failed: {}".format(exc))
         try:
             car.start_odom_feed(
-                hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", str(50.0)))
+                hz=float(os.environ.get("RAK_CAR_ODOM_FEED_HZ", "20"))
             )
         except Exception as exc:
             logger.warning("odom_feed auto-start failed: {}".format(exc))

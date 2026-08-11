@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import sys
 import threading
 import time
@@ -236,6 +237,12 @@ class PressDetector:
         return False
 
 
+# 板键按下确认时长（秒）：要求 `pressed` 连续保持这么久才判定为一次真实按下。
+# 2026-08-11: 0.04 → 0.2。MC602 板键毛刺（<200ms 偶发按下采样）可能误触发 mission，
+# 进而加载 task/OCR 模型顶爆 3.2GB 内存 → 全系统卡；正常按压 ≥200ms，提上去抖不丢真实按键。
+_BOARD_KEY_CONFIRM_S = 0.2
+
+
 class Orchestrator:
     """巡线导航 + 任务点位调度器。"""
 
@@ -255,6 +262,10 @@ class Orchestrator:
                                len(self.waypoints))
         self.lane_hz = lane_hz
         self.ir_interval_s = ir_interval_s
+        # runtime 初始化（臂复位等）通常 ~40-60s；oneclick 启动期等它就绪的预算。
+        self._runtime_ready_budget = float(
+            os.environ.get("RAK_CAR_RUNTIME_READY_BUDGET", "75")
+        )
         self._ball_counts: Dict[str, int] = {}
         # task1→识别区 / task2→射击区 途中后台摆臂的完成句柄 (task3 用).
         self._pending_arm_pose: Optional[Dict[str, Any]] = None
@@ -296,6 +307,30 @@ class Orchestrator:
         logger.info("loaded %d waypoints from task_config.yml: %s", len(out), wp_summary)
         return out
 
+    @staticmethod
+    def _wait_runtime_ready(client, budget: float = 75.0, poll: float = 2.0,
+                            per_call_timeout: float = 8.0) -> None:
+        """等待 runtime 就绪，带预算重试，期间不崩进程。
+
+        旧逻辑单次 `wait_until_ready(timeout=10.0)` 在 runtime 初始化（~40-60s）期间
+        必超时 → 抛异常 → PM2 autorestart 反复重启（实测 3 次）。改为在 budget 内
+        反复重试：成功即返回；超 budget 仍未就绪才 raise（PM2 autorestart 兜底）。
+
+        可离线单测：client.wait_until_ready 由外部 mock。
+        """
+        deadline = time.time() + float(budget)
+        while True:
+            try:
+                if client.wait_until_ready(timeout=per_call_timeout):
+                    return
+            except Exception as exc:
+                logger.warning("wait runtime ready transient err: %s", exc)
+            if time.time() >= deadline:
+                raise RuntimeError(
+                    "runtime not ready within {:.0f}s (pm2 logs rak-car-api)".format(budget)
+                )
+            time.sleep(poll)
+
     def _init_mission(self, start_lane: bool = True) -> Dict[str, Any]:
         """建好整套任務機制並回傳 state（初始化/巡線/IR/里程計/TUI/下位機屏幕）。
 
@@ -304,8 +339,9 @@ class Orchestrator:
         由 wait_key_then_run 在按鍵按下瞬間才啟動（保證按下即開始、無預移動）。
         """
         client = RuntimeApiClient()
-        if not client.wait_until_ready(timeout=10.0):
-            raise RuntimeError("runtime not ready (pm2 logs rak-car-api)")
+        # runtime 初始化（臂复位等）需 ~40-60s，单次 wait 10s 必超时 → 崩进程 → PM2 反复重启。
+        # 改为带预算的重试：budget 内等待 runtime 就绪，超预算仍失败才 raise（PM2 autorestart 兜底）。
+        self._wait_runtime_ready(client, budget=self._runtime_ready_budget)
 
         # 任务启动前清零里程计：每次 run.py 从零点起算，避免沿用上次任务的累计距离。
         # 旧 car_start_2026.py 的 init() 会清零；orchestrator 接管后必须显式补上，
@@ -695,7 +731,7 @@ class Orchestrator:
         """等待 MC602 板上鍵按下（邊沿 + 40ms 時間窗口去抖）。等待期間屏幕顯示 READY。"""
         det = PressDetector(confirm_samples=1)
         press_start = None
-        confirm_duration_s = 0.04
+        confirm_duration_s = _BOARD_KEY_CONFIRM_S
         error_streak = 0
         tui_buf[0] = {"wp": "PRESS BOARD KEY", "dis": 0.0,
                       "ir_left": None, "ir_right": None, "state": "READY"}

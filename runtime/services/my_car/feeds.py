@@ -142,7 +142,7 @@ class FeedsMixin:
             if stop_event.wait(period):
                 return
 
-    def start_lane_feed(self, hz: float = 50.0):
+    def start_lane_feed(self, hz: float = 30.0):
         """
         启动 lane 误差缓存守护线程（只刷 lane_state，不下发轮速）。
 
@@ -270,14 +270,14 @@ class FeedsMixin:
         """
         return _stop_feed(self, "lane_feed", force)
 
-    def restart_lane_feed(self, hz: float = 50.0, force: bool = False):
+    def restart_lane_feed(self, hz: float = 30.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等,不丢状态)。"""
         if force:
             self.stop_lane_feed(force=True)
         return self.start_lane_feed(hz=hz)
 
     # === arm 位置推送守护线程（实时 y/x,给 WS subscribe_arm_state 订阅） ===
-    def start_arm_feed(self, hz: float = 20.0):
+    def start_arm_feed(self, hz: float = 10.0):
         """启动机械臂 y/x 位置守护线程,持续刷新 streamer.arm_state。
 
         与 start_lane_feed 模式一致:
@@ -379,7 +379,7 @@ class FeedsMixin:
     def stop_arm_feed(self, force: bool = False):
         return _stop_feed(self, "arm_feed", force)
 
-    def restart_arm_feed(self, hz: float = 20.0, force: bool = False):
+    def restart_arm_feed(self, hz: float = 10.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
         if force:
             self.stop_arm_feed(force=True)
@@ -465,7 +465,7 @@ class FeedsMixin:
             if stop_event.wait(period):
                 return
 
-    def start_task_feed(self, hz: float = 30.0):
+    def start_task_feed(self, hz: float = 15.0):
         """启动侧摄目标检测守护线程,持续刷新 streamer.task_state。
 
         与 start_lane_feed / start_arm_feed 模式一致:
@@ -577,14 +577,14 @@ class FeedsMixin:
         """
         return _stop_feed(self, "task_feed", force)
 
-    def restart_task_feed(self, hz: float = 30.0, force: bool = False):
+    def restart_task_feed(self, hz: float = 15.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
         if force:
             self.stop_task_feed(force=True)
         return self.start_task_feed(hz=hz)
 
     # === 2026-07-31：左右 IR 距离缓存守护线程（实时 IR,给 /realtime/ir/state 轮询 / WS 订阅） ===
-    def start_ir_feed(self, hz: float = 50.0):
+    def start_ir_feed(self, hz: float = 20.0):
         """启动左右 IR 距离守护线程,持续刷新 streamer.ir_state。
 
         与 start_lane_feed / start_arm_feed / start_task_feed 模式完全一致:
@@ -713,14 +713,14 @@ class FeedsMixin:
         """
         return _stop_feed(self, "ir_feed", force)
 
-    def restart_ir_feed(self, hz: float = 50.0, force: bool = False):
+    def restart_ir_feed(self, hz: float = 20.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
         if force:
             self.stop_ir_feed(force=True)
         return self.start_ir_feed(hz=hz)
 
     # === 2026-07-31：底盘里程计缓存守护线程（实时 odom,给 /realtime/odom/state 轮询 / WS 订阅） ===
-    def start_odom_feed(self, hz: float = 50.0):
+    def start_odom_feed(self, hz: float = 20.0):
         """启动底盘里程计守护线程,持续刷新 streamer.odom_state。
 
         与 start_ir_feed 同模式:
@@ -840,7 +840,7 @@ class FeedsMixin:
         """
         return _stop_feed(self, "odom_feed", force)
 
-    def restart_odom_feed(self, hz: float = 50.0, force: bool = False):
+    def restart_odom_feed(self, hz: float = 20.0, force: bool = False):
         """force=True 才 stop+start；否则只是 start(幂等)。"""
         if force:
             self.stop_odom_feed(force=True)
