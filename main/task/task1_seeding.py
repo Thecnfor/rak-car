@@ -912,7 +912,8 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
             else:
                 logger.info("  step 1 align 后 chassis 已在 S1 列 (odom %.3f), 跳过底盘移动", curr_x)
 
-            # (1.5) 切 S 姿态 — 全轴并发, timeout 5s (物理到位 ~3-4s, 之前 3s 不够)
+            # (1.5) 切 S 姿态 — 全轴并发, timeout 20s (物理到位 ~3-4s + 大臂 +90→-90 摆动
+            # 实测 ~5-6s, 之前 5s 不够会内部 TimeoutError, 虽不阻塞但结果不可信)
             # 用 sync=False + 手动 poll 避免 504 (track_chassis 后 runtime HTTP 会卡)
             logger.info("  切 S 姿态: arm=%s° x=%s y=%s hand=%s°",
                         s_arm, S_POSE_X_MM, S_POSE_Y_MM, S_POSE_HAND_DEG)
@@ -920,12 +921,28 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                 "arm", "composite_run",
                 kwargs={"arm": s_arm, "x": S_POSE_X_MM / 1000.0,
                         "y": S_POSE_Y_MM / 1000.0, "hand": S_POSE_HAND_DEG,
-                        "speed": COMPOSITE_SPEED_DEFAULT, "timeout": COMPOSITE_TIMEOUT_S_DEFAULT},
+                        "speed": COMPOSITE_SPEED_DEFAULT, "timeout": 20.0},
                 sync=False,
             )
             job_id = job.get("id")
             if job_id:
-                arm_client.http.wait_job(job_id, timeout=COMPOSITE_TIMEOUT_S_DEFAULT + 10)
+                arm_client.http.wait_job(job_id, timeout=30.0)
+            # x 到位校验 (2026-08-10 task4 同款补丁, 2026-08-12 移植到 task1):
+            # composite_run 并发时 move_x_position 假收敛 — 大臂旋转 + 串口争用下 X 只走一半
+            # (PLACE x=-235 → S x=-70 实测停在 -152, SDK 却报 x:true). 用 arm_feed
+            # 编码器 (唯一可信源) 校验, 未到位单轴补走 (arm=None 只动 X, 大臂已停不抢串口).
+            # 读数失败 (feed 未启 / 测试 mock 返回非数值) → 直接跳过补走, 不阻塞任务.
+            for _ in range(3):
+                try:
+                    actual_x = arm_client._read_x_mm_realtime()
+                    if actual_x is None or abs(float(actual_x) - S_POSE_X_MM) < 15.0:
+                        break
+                except (TypeError, ValueError):
+                    break
+                logger.warning("  切 S: x 未到位 (实际=%.0fmm 目标=%.0fmm), 单轴补走",
+                               actual_x, S_POSE_X_MM)
+                arm_client.composite_run(
+                    x_mm=S_POSE_X_MM, speed=COMPOSITE_SPEED_DEFAULT, timeout=15.0)
 
             # (2) 抓 — 优化#5: 超时直接跳过该列, 不走 fallback
             try:
