@@ -239,9 +239,9 @@ ARM_SERVO_DEADZONE: float = 0.05
 ARM_SERVO_RETRY_DEADZONE: float = 0.075
 """超时重试死区 = 0.05 × 1.5 (放大 0.5 倍, 更容易锁上)。"""
 ARM_SERVO_MAX_VEL: float = 0.05
-ARM_SERVO_TIMEOUT_S: float = 4.0
+ARM_SERVO_TIMEOUT_S: float = 8.0
 ARM_SERVO_RETRY_TIMEOUT_S: float = 4.0
-"""超时加时 4s, 总上限 8s。"""
+"""超时加时 4s, 总上限 12s。"""
 ARM_SERVO_SETTLE_HITS: int = 3
 ARM_SERVO_SIGN_ARM: float = 1.0
 ARM_SERVO_SIGN_X: float = 1.0
