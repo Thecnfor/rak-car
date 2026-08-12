@@ -271,7 +271,7 @@ task_cfg:
   # 读订单后掉头去 task7 投放. θ 增=逆时针, 所以顺时针 120° = -120; 实车方向反了再取正.
   post_task6:
     enabled: true
-    straight_m: 0.63        # 直行距离 (m, move_for 里程计闭环, 2026-08-08: 0.2 → 0.63)
+    straight_m: 0.78        # 直行距离 (m, move_for 里程计闭环, 2026-08-08: 0.2 → 0.63)
     turn_deg: -107.0        # 顺时针 120° (度, OdomTurnPID, 2026-08-10 急弯联调: -120 → -107)
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
