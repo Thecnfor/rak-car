@@ -44,7 +44,7 @@ task_cfg:
     arm_carry_pose:
       x_mm: -100
       arm_angle_deg: -90
-      y_mm: -100           # 上下输送时的中间高度 (现在 main loop 已不单独走, 留字段向后兼容)
+      y_mm: -120           # 上下输送时的中间高度 (现在 main loop 已不单独走, 留字段向后兼容)
       hand_angle_deg: -15
 
     arm_place_pose_T2:
@@ -55,7 +55,7 @@ task_cfg:
     arm_return_S1_pose:
       x_mm: -100
       arm_angle_deg: -90
-      y_mm: -100           # 回 S 姿态高度
+      y_mm: -120           # 回 S 姿态高度
       hand_angle_deg: -10
 
     init_y_mm: -100        # 初始化抬升高度 (扫描/伺服的起始高度)
@@ -106,7 +106,7 @@ task_cfg:
     # 与机械臂切 PLACE 姿态 (arm=+90 x=-300 y=-100 hand=0) 并发 (进入任务点就动臂).
     trigger_settle:
       enabled: true
-      lane_follow_m: 0.20   # 2026-08-12: 0.15 → 0.18 → 0.20 (用户: 触发后前移到任务点改为 0.20m)
+      lane_follow_m: 0.10   # 2026-08-12: 0.15 → 0.18 → 0.20 (用户: 触发后前移到任务点改为 0.20m)
       lane_speed_mps: 0.1
 
     # 2026-08-09: 抓苗视觉伺服传输开关 (同 task2/task6 pick_vision):
@@ -152,10 +152,10 @@ task_cfg:
       hand_angle_deg: -60
       y_mm: -10                 # 2026-08-06: -20 → -10 (抬高 10mm, 看清等级标)
 
-    first_cube_x_mm: -165
+    first_cube_x_mm: -145
     # 2026-08-09: 第二块 X 从 -210 改 -240 (用户实测摆放位置).
     # 识别/视觉对齐前姿态 X 由 cube_x_mm 决定, 见 _pick_cube.init_x_mm.
-    second_cube_x_mm: -240
+    second_cube_x_mm: -220
     # 2026-08-10: 转动大臂时的安全 X (所有块通用, 不再只第 1 块)。
     # -185 → -200 (改回通用安全区边界)。抓取 X 仍走 first_cube_x_mm。
     first_cube_safe_x_mm: -200
@@ -201,7 +201,7 @@ task_cfg:
     #   塔2: 第1块 -90, 第2/3块 = -90+5 = -85
     #   结构 [[塔1 第1/2/3块], [塔2 第1/2/3块]], 按 [tower_idx][picked] 取值.
     #   缺省回退 carry_pose.x_mm (-90).
-    carry_x_by_tower_mm: [[-80, -75, -75], [-90, -85, -85]]
+    carry_x_by_tower_mm: [[-60, -55, -55], [-60, -55, -55]]
 
     pick_pose:
       # 2026-08-04: 抓取 init 姿态 (S 形态, 视觉伺服起点).
@@ -289,7 +289,7 @@ waypoints:
   - name: task1_seeding
     task_id: 1
     task_module: main.task.task1_seeding
-    ir_threshold_m: 1.2
+    ir_threshold_m: 1.3
     ir_side: right
     dis_at_least_m: 0.5
     trigger_op: AND
@@ -309,8 +309,8 @@ waypoints:
     task_module: main.task.task2_water_tower
     ir_side: both                 # 2026-08-06: 两侧 IR 都到位才触发
     ir_threshold_m: null          # 不设共用阈值, 走 per-side
-    ir_threshold_left_m: 0.40     # 左 IR: 0.4m 内触发
-    ir_threshold_right_m: 0.60    # 右 IR: 0.6m 内触发
+    ir_threshold_left_m: 0.35   # 左 IR: 0.35m 内触发
+    ir_threshold_right_m: 0.70    # 右 IR: 0.7m 内触发
     dis_at_least_m: null           # 2026-08-06: 不在基地开始测, dis 不参与触发
     trigger_op: AND              # ir_ok AND True = 只看 IR
     # 2026-08-06: 出弯后沿中心车道线直行 2.0s (走 move_along_lane, vy=0 + ω 锁对齐; 08-08 1.5→2.0),
@@ -334,13 +334,13 @@ waypoints:
   #   trigger_op: AND
 
   # ----- task4 -----
-  - name: task4_harvest
-    task_id: 4
-    task_module: main.task.task4_harvest
-    ir_threshold_m: 0.70
-    ir_side: left
-    dis_at_least_m: null
-    trigger_op: AND
+  # #- name: task4_harvest
+  #   task_id: 4
+  #   task_module: main.task.task4_harvest
+  #   ir_threshold_m: 0.70
+  #   ir_side: left
+  #   dis_at_least_m: null
+  #   trigger_op: AND
 
   # ----- task5 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
   # - name: task5_sort
@@ -357,8 +357,8 @@ waypoints:
     task_module: main.task.task6_get_order
     ir_threshold_m: 0.50
     ir_side: right
-    dis_at_least_m: 13.0
-    trigger_op: OR
+    dis_at_least_m: 10.0
+    trigger_op: AND
 
   # ----- task7 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
   # - name: task7_deliver
