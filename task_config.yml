@@ -272,11 +272,19 @@ task_cfg:
     straight_m: 0.09        # 直行距离 (m, move_for 里程计闭环)
     turn_deg: -45.0         # 原地里程计 θ 转弯角度 (度, OdomTurnPID); 实车方向反了取负
 
+  # task2 结束后 (orchestrator 层): 保持巡线, 里程计累计到 cruise_until_m 时暂停巡线
+  # → move_for 前直行 straight_m → 恢复巡线 (2026-08-12 用户需求).
+  # 里程计在 task2 结束时已清零, 所以 cruise_until_m 从 0 起算.
+  post_task2:
+    enabled: true
+    cruise_until_m: 1.2       # 巡线中里程计到该值 (m) 触发暂停
+    straight_m: 1.5           # 暂停后前直行距离 (m, move_for 里程计闭环)
+
   # task6 结束后 (orchestrator 层): 清零里程 → 切断巡线视觉 → 直行 → 里程计 θ 顺时针转 120° → 恢复视觉 → 继续巡线
   # 读订单后掉头去 task7 投放. θ 增=逆时针, 所以顺时针 120° = -120; 实车方向反了再取正.
   post_task6:
     enabled: true
-    straight_m: 0.78        # 直行距离 (m, move_for 里程计闭环, 2026-08-08: 0.2 → 0.63)
+    straight_m: 0.75        # 直行距离 (m, move_for 里程计闭环, 2026-08-08: 0.2 → 0.63)
     turn_deg: -107.0        # 顺时针 120° (度, OdomTurnPID, 2026-08-10 急弯联调: -120 → -107)
 
 # 8 任务 + 1 终点 waypoint 编排配置 (main.start.orchestrator 用).
