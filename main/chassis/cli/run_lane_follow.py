@@ -202,14 +202,14 @@ def main(argv: list[str] | None = None) -> None:
              "默认 None=用 StraightOuterLoop 的默认 0.5。需按 error_y 标定尺度调。"
     )
     parser.add_argument(
-        "--turn", action="store_true",
-        help="接弯道转弯：CurveDetector(|error_angle|>20° 持续 5 帧)识别弯道 →\n"
-             "TurnV2 视觉巡线过弯（vx 巡航 + 外/内侧差速），lane 回正后交还直道巡航。\n"
-             "转弯底层在 controllers/turn_v2.py。"
+        "--no-turn", action="store_true",
+        help="关闭弯道转弯（默认开，对齐 run.py/orchestrator：弯道转弯常开）。\n"
+             "默认：CurveDetector(|ea|>18° 持续 3 帧)识别弯道 → TurnV2 视觉巡线过弯\n"
+             "（vx 巡航 + 外/内侧差速），lane 回正后交还直道巡航。"
     )
     parser.add_argument(
         "--turn-rearm-clean", type=int, default=None,
-        help="CurveDetector 触发后冷却帧数：连续 N 帧干净直道(|ea|≤20°)才允许再触发。\n"
+        help="CurveDetector 触发后冷却帧数：连续 N 帧干净直道(|ea|≤18°)才允许再触发。\n"
              "默认 0=关。弯道出口紧接着十字路口时可设 20 挡垃圾读数重触发。"
     )
     args = parser.parse_args(argv)
@@ -273,9 +273,10 @@ def main(argv: list[str] | None = None) -> None:
         cal_kwargs["ema_alpha"] = args.error_ema_alpha
     calibrator = ErrorCalibrator(**cal_kwargs) if cal_kwargs else None
 
-    # 弯道转弯：detector 识别 → turn 接管（视觉巡线 + 差速过弯）→ 回正交还 outer
+    # 弯道转弯常开（对齐 run.py/orchestrator：巡线段随时可能遇弯）：detector 识别 →
+    # turn 接管（视觉巡线 + 差速过弯）→ lane 回正后交还 outer。--no-turn 关闭纯巡线。
     turn = detector = None
-    if args.turn:
+    if not args.no_turn:
         from ..controllers.odom_turn import CurveDetector
         from ..controllers.turn_v2 import TurnV2
 
