@@ -289,14 +289,14 @@ waypoints:
     dis_at_least_m: 0.5
     trigger_op: AND
 
-  # ----- task3 (TODO) -----
-  - name: task3_pest_scout
-    task_id: 3
-    task_module: main.task.task3_pest_scout
-    ir_threshold_m: 1.05
-    ir_side: left
-    dis_at_least_m: 0.93
-    trigger_op: AND
+  # ----- task3 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
+  # - name: task3_pest_scout
+  #   task_id: 3
+  #   task_module: main.task.task3_pest_scout
+  #   ir_threshold_m: 1.05
+  #   ir_side: left
+  #   dis_at_least_m: 0.93
+  #   trigger_op: AND
 
   # ----- task2 -----
   - name: task2_water_tower
@@ -317,33 +317,34 @@ waypoints:
     back_off_speed_mps: 0.10    # 后退速度
 
   # ----- task3_shoot (2026-08-06 拆分, 跟在 task2 后面, 读识别 json + 射击) -----
-  - name: task3_shoot
-    task_id: 8
-    task_module: main.task.task3_shoot
-    # 触发靠 dis_at_least_m, IR 不参与 (跟 task1_ir 类似, 远距离触发靠 dis)
-    # task2 结束后里程计清零 (orchestrator 显式 reset + dis_epoch), 该 dis 相对 task2 出口起算.
-    ir_threshold_m: null
-    ir_side: any
-    dis_at_least_m: 2.70         # 相对 task2 出口: 里程计 distance=2.70m 时触发
-    trigger_op: AND
+  # [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
+  # - name: task3_shoot
+  #   task_id: 8
+  #   task_module: main.task.task3_shoot
+  #   # 触发靠 dis_at_least_m, IR 不参与 (跟 task1_ir 类似, 远距离触发靠 dis)
+  #   # task2 结束后里程计清零 (orchestrator 显式 reset + dis_epoch), 该 dis 相对 task2 出口起算.
+  #   ir_threshold_m: null
+  #   ir_side: any
+  #   dis_at_least_m: 2.70         # 相对 task2 出口: 里程计 distance=2.70m 时触发
+  #   trigger_op: AND
 
-  # ----- task4 -----
-  - name: task4_harvest
-    task_id: 4
-    task_module: main.task.task4_harvest
-    ir_threshold_m: 0.70
-    ir_side: left
-    dis_at_least_m: null
-    trigger_op: AND
+  # ----- task4 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
+  # - name: task4_harvest
+  #   task_id: 4
+  #   task_module: main.task.task4_harvest
+  #   ir_threshold_m: 0.70
+  #   ir_side: left
+  #   dis_at_least_m: null
+  #   trigger_op: AND
 
-  # ----- task5 -----
-  - name: task5_sort
-    task_id: 5
-    task_module: main.task.task5_sort
-    ir_threshold_m: 0.15
-    ir_side: left
-    dis_at_least_m: 0
-    trigger_op: AND
+  # ----- task5 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
+  # - name: task5_sort
+  #   task_id: 5
+  #   task_module: main.task.task5_sort
+  #   ir_threshold_m: 0.15
+  #   ir_side: left
+  #   dis_at_least_m: 0
+  #   trigger_op: AND
 
   # ----- task6 -----
   - name: task6_get_order
@@ -354,14 +355,14 @@ waypoints:
     dis_at_least_m: 13.0
     trigger_op: OR
 
-  # ----- task7 (TODO) -----
-  - name: task7_deliver
-    task_id: 7
-    task_module: main.task.task7_deliver
-    ir_threshold_m: 0.35
-    ir_side: left
-    dis_at_least_m: 0
-    trigger_op: AND
+  # ----- task7 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
+  # - name: task7_deliver
+  #   task_id: 7
+  #   task_module: main.task.task7_deliver
+  #   ir_threshold_m: 0.35
+  #   ir_side: left
+  #   dis_at_least_m: 0
+  #   trigger_op: AND
 
   # ----- finish -----
   - name: cruise_done

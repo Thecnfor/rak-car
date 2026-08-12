@@ -36,6 +36,14 @@ from main.chassis.tasks.read_ir import read_ir
 logger = logging.getLogger("main.start.orchestrator")
 
 
+class RestartFromTask1(Exception):
+    """运行时检测到 runtime auto-init (MyCar 重建) → 当前 mission 终止, 从 task1 重跑。
+
+    oneclick 模式下: 检测到 MC602 重启 / runtime auto_init 触发 → 抛此异常
+    → caller 重建 state → 立即从 waypoint[0] 重跑, 不等板键。
+    """
+
+
 @dataclass
 class Waypoint:
     """一个任务点位.
@@ -334,8 +342,18 @@ class Orchestrator:
         }
 
     def _walk_waypoints(self, state: Dict[str, Any],
-                        waypoints: List[Waypoint]) -> List[str]:
+                        waypoints: List[Waypoint],
+                        init_baseline: Optional[float] = None) -> List[str]:
         """按 waypoints 列表顺序导航并执行任务（機制由 _init_mission 建立）。
+
+        Args:
+            state: _init_mission 返回的 state 字典。
+            waypoints: 任务点位列表。
+            init_baseline: 一键启动模式下, mission 开始时由 _capture_init_baseline
+                拿到的 runtime state.last_init_at。每个 waypoint 完成后比对一次,
+                若 runtime 重新 init (MC602 重启) → 抛 RestartFromTask1,
+                让 caller 重建 state → 从 waypoint[0] 重跑。
+                None = 跳过检测 (普通 run/run_tasks 模式)。
 
         返回 completed 列表。结束/异常时清理 runner / 线程 / feeds / 下位机屏幕。
         """
@@ -537,6 +555,23 @@ class Orchestrator:
                         self._schedule_arm_home_reset()
                 self._resume_lane(runner)
                 completed.append(wp.name)
+                # oneclick 模式: 每个 waypoint 完成后检查 runtime 是否重新 init
+                # (MC602 重启 / runtime auto_init). 变化 → 抛 RestartFromTask1
+                # 让 caller 重建 state, 从 waypoint[0] 重跑.
+                if init_baseline is not None:
+                    try:
+                        if self._init_changed_since(state["client"], init_baseline):
+                            logger.warning(
+                                "runtime auto-init detected after %s "
+                                "(baseline=%.3f), restart from task1",
+                                wp.name, init_baseline,
+                            )
+                            raise RestartFromTask1(wp.name)
+                    except RestartFromTask1:
+                        raise
+                    except Exception as exc:
+                        # health 探测本身异常 → 不阻断流程, 仅打 warning
+                        logger.warning("[init-watch] %s 检测异常: %s", wp.name, exc)
         except KeyboardInterrupt:
             logger.info("interrupted by user")
         finally:
@@ -635,22 +670,42 @@ class Orchestrator:
         比賽計時從按下開始：等待階段完成全套初始化（含 5s IR feed 等待、lane 模型
         常駐熱載），按下瞬間只做「啟動 lane runner 線程 + 進 waypoint 迴圈」，
         beep 非阻塞不擋第一步挪車。任務完成後回 READY 可再按重跑。
+
+        2026-08-12: --wait-key 期间若 runtime auto-init (MC602 重启) 触发,
+        _walk_waypoints 检测到 state.last_init_at 跳变 → 抛 RestartFromTask1
+        → 这里捕获 → 重建 state → 内层循环立即从 task1 重跑, 不等板键.
+        任务正常完成 / 被 KeyboardInterrupt / 失败 → 外层仍回 READY 等下次按键.
         """
         state = self._init_mission(start_lane=False)
         while True:
             self._wait_board_key(state["client"], state["tui_buf"])
-            # 按下 → 立刻開始：啟動 runner 線程（首幀輪速 ~20-40ms 內下發）
-            state["runner_thread"].start()
-            threading.Thread(target=self._beep_async,
-                             args=(state["client"],), daemon=True).start()
-            try:
-                self._walk_waypoints(state, self.waypoints)
+            # 按下后內層循环: 跑一次 mission → 若 init 重新触发 → 立即从 task1 重跑
+            # → 否则 (正常完成 / 中断 / 失败) → break 回外层 wait_board_key
+            restart_pending = True
+            while restart_pending:
+                restart_pending = False
+                # 按下 → 立刻開始：啟動 runner 線程（首幀輪速 ~20-40ms 內下發）
+                state["runner_thread"].start()
                 threading.Thread(target=self._beep_async,
-                                 args=(state["client"], 3), daemon=True).start()
-            except KeyboardInterrupt:
-                logger.info("interrupted by user, back to READY")
-            except Exception as exc:
-                logger.exception("mission failed: %s", exc)
+                                 args=(state["client"],), daemon=True).start()
+                # 快照 runtime init 时间戳, mission 期间任何 waypoint 检测到变化
+                # → 抛 RestartFromTask1 → 内层循环重建 state 后重跑.
+                baseline = self._capture_init_baseline(state["client"])
+                try:
+                    self._walk_waypoints(state, self.waypoints,
+                                         init_baseline=baseline)
+                    threading.Thread(target=self._beep_async,
+                                     args=(state["client"], 3), daemon=True).start()
+                except KeyboardInterrupt:
+                    logger.info("interrupted by user, back to READY")
+                except RestartFromTask1 as exc:
+                    logger.warning("restart-from-task1: 自动从 task1 重跑 (%s)", exc)
+                    threading.Thread(target=self._beep_async,
+                                     args=(state["client"], 1), daemon=True).start()
+                    state = self._init_mission(start_lane=False)
+                    restart_pending = True
+                except Exception as exc:
+                    logger.exception("mission failed: %s", exc)
             # 完成/失敗 → 重建機制（_walk_waypoints 已清理 runner/線程），回 READY
             state = self._init_mission(start_lane=False)
 
@@ -1219,6 +1274,58 @@ class Orchestrator:
             logger.info("[arm-pose] %s 摆臂就绪", label)
         else:
             logger.warning("[arm-pose] %s 摆臂超时未完成, 任务内会再次确认姿态", label)
+
+    # ── runtime auto-init 监控 (oneclick: MC602 重启 → 从 task1 重跑) ─────
+
+    @staticmethod
+    def _capture_init_baseline(client) -> Optional[float]:
+        """mission 开始时快照 runtime state.last_init_at.
+
+        Returns:
+            float: 该值（runtime 在 lifecycle_mixin.py:216 写入的 time.time()）.
+            None: health 不可达 / 字段缺失 → caller 应跳过 init 检测.
+        """
+        try:
+            resp = client.get_health(timeout=0.5)
+        except Exception as exc:
+            logger.warning("capture_init_baseline: health probe failed: %s", exc)
+            return None
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return None
+        state = resp.get("state") or {}
+        if not isinstance(state, dict):
+            return None
+        return state.get("last_init_at")
+
+    @staticmethod
+    def _init_changed_since(client, baseline: Optional[float]) -> bool:
+        """检查 runtime 是否自 baseline 之后重新 init 过 (MyCar 重建).
+
+        Args:
+            client: RuntimeApiClient (走 GET /v1/health).
+            baseline: mission 开始时由 _capture_init_baseline 拿到的 last_init_at,
+                None 表示「未知 / 跳过检测」.
+
+        Returns:
+            True: runtime 已重新 init (state.last_init_at > baseline)
+                  → caller 应抛 RestartFromTask1.
+            False: 未变化 / 探测失败 / 字段缺失 — 不抛, 避免网络抖动误触发.
+        """
+        if baseline is None:
+            return False  # 不知道基线 → 不告警
+        try:
+            resp = client.get_health(timeout=1.0)
+        except Exception:
+            return False  # 网络/超时 → 不告警
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return False
+        state = resp.get("state") or {}
+        if not isinstance(state, dict):
+            return False
+        current = state.get("last_init_at")
+        if current is None:
+            return False  # runtime 还没初始化完 → 视为未变化
+        return current > baseline  # 严格 >, 同 timestamp 视为未变化
 
     @staticmethod
     def _run_task(client: RuntimeApiClient, wp: Waypoint,
