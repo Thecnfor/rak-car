@@ -53,7 +53,7 @@ class TurnV2:
         self,
         *,
         # 弯中前向巡航（继续巡线的 vx 分量；差速来自 omega，vx 恒定）
-        vx_cruise: float = 0.20,
+        vx_cruise: float = 0.30,
         # 视觉转向：ω = sign_omega * kp_omega * error_angle（同 orthogonal 符号约定，
         # 实车方向反了翻 sign_omega，不用改控制律）
         kp_omega: float = 2.0,
