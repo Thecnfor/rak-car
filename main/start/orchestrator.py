@@ -278,8 +278,7 @@ class Orchestrator:
         # StaircaseTurn 移除，转弯统一走 turn_v2。
         from main.chassis.controllers.odom_turn import CurveDetector
         from main.chassis.controllers.turn_v2 import TurnV2
-        from main.task._config import (load_post_task1, load_post_task2,
-                                       load_post_task6)
+        from main.task._config import (load_post_task1, load_post_task6)
         runner = DoubleLoopRunner(
             api=api,
             outer=profile.build_outer(),
@@ -293,9 +292,6 @@ class Orchestrator:
         # task1 结束后: 清零里程 → 切断视觉 → 直行 → 里程计 θ 转 → 恢复视觉.
         # None = task_config.yml 未配 / enabled=false → 保持现状 (只清零里程).
         post_task1 = load_post_task1()
-        # task2 结束后: 保持巡线, 里程计到 cruise_until_m 时暂停巡线前直行 straight_m
-        # (2026-08-12 用户需求), 见 post_task2.
-        post_task2 = load_post_task2()
         # task6 结束后同款盲转段 (读订单后掉头 120° 去 task7 投放), 见 post_task6.
         post_task6 = load_post_task6()
 
@@ -339,8 +335,7 @@ class Orchestrator:
             "dis_buf": dis_buf, "dis_epoch": dis_epoch,
             "tui_buf": tui_buf, "tui_running": tui_running,
             "display_ui": display_ui, "display_running": display_running,
-            "post_task1": post_task1, "post_task2": post_task2,
-            "post_task6": post_task6,
+            "post_task1": post_task1, "post_task6": post_task6,
         }
 
     def _walk_waypoints(self, state: Dict[str, Any],
@@ -369,7 +364,6 @@ class Orchestrator:
         display_running = state["display_running"]
         display_ui = state["display_ui"]
         post_task1 = state["post_task1"]
-        post_task2 = state["post_task2"]
         post_task6 = state["post_task6"]
         client = state["client"]
 
@@ -558,10 +552,6 @@ class Orchestrator:
                     else:
                         self._schedule_arm_home_reset()
                 self._resume_lane(runner)
-                # task2 结束后: 保持巡线 → 里程计累计到 cruise_until_m → 暂停巡线
-                # → move_for 前直行 straight_m → 恢复巡线 (2026-08-12 用户需求).
-                if wp.task_id == 2 and post_task2 is not None:
-                    self._post_task2_cruise_straight(runner, api, dis_buf, post_task2)
                 completed.append(wp.name)
                 # oneclick 模式: 每个 waypoint 完成后检查 runtime 是否重新 init
                 # (MC602 重启 / runtime auto_init). 变化 → 抛 RestartFromTask1
@@ -1002,39 +992,6 @@ class Orchestrator:
         else:
             logger.error("[post-task1] lane fresh %d 次均失败，将强制 resume（ risking watchdog）",
                          max_retries)
-
-    def _post_task2_cruise_straight(self, runner: DoubleLoopRunner,
-                                    api: ChassisClient, dis_buf: list,
-                                    seg: Dict[str, Any]) -> None:
-        """task2 结束后: 保持巡线 → 里程计累计到 cruise_until_m → 暂停巡线
-        → move_for 前直行 straight_m → 恢复巡线 (2026-08-12 用户需求).
-
-        巡线由后台 runner 线程继续跑, 主线程只轮询 dis_buf; 到阈值后
-        _pause_lane 同步等外环停住 (零速兜底), 再 move_for 直行 (不碰 lane_feed,
-        lane 全程新鲜, 恢复时不会触发 watchdog 误急停), 最后 _resume_lane.
-        里程计在 task2 结束时已清零, 所以 cruise_until_m 从 0 起算.
-        """
-        cruise_m = float(seg.get("cruise_until_m", 0.0))
-        straight_m = float(seg.get("straight_m", 0.0))
-        if cruise_m <= 0 or straight_m <= 0:
-            logger.info("[post-task2] cruise_until_m / straight_m 未配置, 跳过")
-            return
-        logger.info("[post-task2] 巡线中等待里程计 ≥ %.2fm (当前 %.2fm)...",
-                    cruise_m, dis_buf[0])
-        deadline = time.monotonic() + 30.0   # 兜底: 30s 到不了也继续, 不卡死 mission
-        while dis_buf[0] < cruise_m and time.monotonic() < deadline:
-            time.sleep(0.02)
-        if dis_buf[0] < cruise_m:
-            logger.warning("[post-task2] 30s 未到 %.2fm (dis=%.2f), 超时继续",
-                           cruise_m, dis_buf[0])
-        self._pause_lane(runner, api)
-        try:
-            logger.info("[post-task2] 前直行 %.2f m", straight_m)
-            api.move_for(dx_m=straight_m)
-        except Exception as exc:
-            logger.warning("[post-task2] move_for %.2f 失败: %s", straight_m, exc)
-        self._resume_lane(runner)
-        logger.info("[post-task2] 恢复巡线")
 
     @staticmethod
     def _turn_theta_deg(api: ChassisClient, turn_deg: float,

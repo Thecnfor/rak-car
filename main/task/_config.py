@@ -117,16 +117,6 @@ def load_post_task1() -> Optional[Dict[str, Any]]:
     return _load_post_task("post_task1")
 
 
-def load_post_task2() -> Optional[Dict[str, Any]]:
-    """读取 task_config.yml 中 task_cfg.post_task2 段 (task2 结束后巡线中途定位直行).
-
-    task2 (水塔) 结束后保持巡线, 里程计累计到 cruise_until_m 时暂停巡线 →
-    move_for 前直行 straight_m → 恢复巡线。里程计在 task2 结束时已清零,
-    所以 cruise_until_m 是"task2 之后走了多少米"。
-    """
-    return _load_post_task("post_task2")
-
-
 def load_post_task6() -> Optional[Dict[str, Any]]:
     """读取 task_config.yml 中 task_cfg.post_task6 段 (task6 结束后一段位移+转弯).
 
