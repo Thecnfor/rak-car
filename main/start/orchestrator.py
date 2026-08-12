@@ -540,11 +540,12 @@ class Orchestrator:
                         self._schedule_arm_pose(TASK2_DETECTION_ARM, "detection",
                                                 target_task_id=2)
                     elif wp.task_id == 2:
-                        # 2026-08-09 用户: task2 结束后, 前往 task3 射击区的
-                        # 巡线途中后台摆好射击姿态.
-                        from main.task.task3.arm_poses import SHOOTING_ARM
-                        self._schedule_arm_pose(SHOOTING_ARM, "shooting",
-                                                target_task_id=8)
+                        # 2026-08-12 用户指令(更新): task2 结束后, 下一个实际任务是 task6
+                        # (接单; task3 已跳过), 巡线途中后台摆好 task6 读单姿态
+                        # → task6 _enter_read_pose 的 4 轴 composite 到位/小幅调整.
+                        from main.task.task3.arm_poses import TASK6_READ_ARM
+                        self._schedule_arm_pose(TASK6_READ_ARM, "read_order",
+                                                target_task_id=6)
                     elif wp.task_id == 8:
                         # 2026-08-09 用户: task3 射击结束后, 前往 task4 收割区的
                         # 巡线途中后台摆好 task4 P 姿态 (省 task4 初始 P 恢复).

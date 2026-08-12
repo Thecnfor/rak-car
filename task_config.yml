@@ -106,7 +106,7 @@ task_cfg:
     # 与机械臂切 PLACE 姿态 (arm=+90 x=-300 y=-100 hand=0) 并发 (进入任务点就动臂).
     trigger_settle:
       enabled: true
-      lane_follow_m: 0.18   # 2026-08-12: 0.15 → 0.18 (用户: 触发后前移到任务点改为 0.18m)
+      lane_follow_m: 0.20   # 2026-08-12: 0.15 → 0.18 → 0.20 (用户: 触发后前移到任务点改为 0.20m)
       lane_speed_mps: 0.1
 
     # 2026-08-09: 抓苗视觉伺服传输开关 (同 task2/task6 pick_vision):

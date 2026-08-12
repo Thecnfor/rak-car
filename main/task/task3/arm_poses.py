@@ -22,6 +22,9 @@ SHOOTING_ARM = ("-0.100", "-0.150", "-0.200", "90", "-90")
 TASK2_DETECTION_ARM = ("-0.100", "-0.010", "-0.200", "-96", "-60")
 # task4 P 姿态 (对齐 target4 POSE_P: x=-295 y=-160 arm=+90 hand=+10)
 TASK4_P_ARM = ("-0.100", "-0.160", "-0.295", "90", "10")
+# task6 读单姿态 (对齐 test/task6_config.yml reposition_pose:
+# x=-150 y=-150 arm=-80 hand=-60; task6 接单先读订单, 4 轴一步到位, y1=y2=-150)
+TASK6_READ_ARM = ("-0.150", "-0.150", "-0.150", "-80", "-60")
 
 
 def arm_at_pose(client, pose, tol_m: float = 0.020, tol_deg: float = 12.0) -> bool:
