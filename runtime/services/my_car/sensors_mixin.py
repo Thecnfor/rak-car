@@ -5,6 +5,8 @@
 从 my_car.py 拆出：sensor_init、存储仓舵机、射击继电器、灯光、数码管、
 蓝牙手柄、电池、IR 距离。依赖 MyCar 在 __init__ 里构造各 SDK 实例。
 """
+import logging
+import os
 import time
 
 from smartcar.whalesbot.vehicle import (
@@ -18,9 +20,23 @@ from smartcar.whalesbot.vehicle.base.controller_wrap import Battry, PoutD
 
 from runtime.core.key_input import board_key_pressed
 
+logger = logging.getLogger("my_car.sensors")
+
 # 射击继电器高电平保持时长 (s) = 枪口继电器激活时间.
 # 2026-08-12 用户: 0.25 → 0.28 → 0.32 (0.25/0.28 疑似激活不够射不出弹, 现场逐档上调看效果).
+# 2026-08-12: 改环境变量 RAK_CAR_SHOOT_RELAY_HOLD_S 可调 (默认 0.32), 现场调参不用改代码.
+#   ⚠️ 过长有过烧风险 (README 红线), clamp [0.05, 1.0]; 弹弱的根因多半不是时长
+#   (电磁阀全开 <200ms), 先用 shooting() 的电池电压遥测确认是否供电跌落.
 SHOOT_RELAY_HOLD_S = 0.32
+try:
+    _hold = float(os.environ.get("RAK_CAR_SHOOT_RELAY_HOLD_S", "0.32"))
+    if 0.05 <= _hold <= 1.0:
+        SHOOT_RELAY_HOLD_S = _hold
+    else:
+        logger.warning("RAK_CAR_SHOOT_RELAY_HOLD_S=%r 越界 [0.05,1.0], 保持默认 0.32", _hold)
+except (TypeError, ValueError):
+    logger.warning("RAK_CAR_SHOOT_RELAY_HOLD_S=%r 非法, 保持默认 0.32",
+                   os.environ.get("RAK_CAR_SHOOT_RELAY_HOLD_S"))
 
 
 class SensorsMixin:
@@ -126,16 +142,46 @@ class SensorsMixin:
             "state": bool(state),
         }
 
+    def _read_battery(self):
+        """best-effort 电池电压 (V), 失败返回 None。不打断射击时序。"""
+        try:
+            return float(self.battery.read())
+        except Exception:
+            return None
+
+    @staticmethod
+    def _fmt_v(v):
+        return f"{v:.2f}" if v is not None else "n/a"
+
     def shooting(self):
         # 继电器触发型枪口：单次触发必须保证固定高电平脉冲，并可靠拉低收尾。
         self.shoot.set(0)
         time.sleep(0.05)
+        v_idle = self._read_battery()       # 射前空闲电压 (诊断基准)
         try:
             self.shoot.set(1)
-            time.sleep(SHOOT_RELAY_HOLD_S)   # 继电器激活时长 (0.28s, 可调)
+            # 吸合后立即读电压 —— 抓浪涌跌落 (读 ~10-20ms, 会轻微拉长脉冲, 无碍)
+            v_during = self._read_battery()
+            time.sleep(SHOOT_RELAY_HOLD_S)  # 继电器激活时长 (默认 0.32s, env 可调)
         finally:
             self.shoot.set(0)
+        v_after = self._read_battery()       # 收尾后电压 (看是否回落)
         time.sleep(0.2)
+        logger.info(
+            "shooting hold=%.2fs voltage(V) idle=%s during=%s after=%s "
+            "drop=%.2f", SHOOT_RELAY_HOLD_S, self._fmt_v(v_idle),
+            self._fmt_v(v_during), self._fmt_v(v_after),
+            (v_idle - v_during) if (v_idle is not None and v_during is not None) else -1.0,
+        )
+        # 返回值让业务层/诊断脚本直接读电压 (判定: 吸合瞬间跌落 >~1.5V → 供电不足).
+        return {
+            "hold_s": SHOOT_RELAY_HOLD_S,
+            "v_idle": v_idle,
+            "v_during": v_during,
+            "v_after": v_after,
+            "v_drop": (round(v_idle - v_during, 3)
+                       if (v_idle is not None and v_during is not None) else None),
+        }
 
     def set_shoot_state(self, value):
         self.shoot.set(1 if value else 0)
