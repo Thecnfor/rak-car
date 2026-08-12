@@ -1126,10 +1126,17 @@ def run(client: Optional[RuntimeApiClient] = None) -> Dict[str, Any]:
                                          [-50.0, -65.0, -80.0])
                     deliver_y = deliver_ys[min(picked, len(deliver_ys) - 1)]
                     d_back = -chassis_at_tower_m
-                    # 2026-08-09: 投放 X 分水塔 (carry_x_by_tower_mm[tower_idx], 缺省 carry.x_mm)
+                    # 2026-08-12: 投放 X 既分水塔也分梯度 (carry_x_by_tower_mm[tower_idx][picked],
+                    # 缺省 carry.x_mm). 2026-08-09: 只分水塔 (carry_xs[tower_idx]).
                     carry_xs = cfg.get("carry_x_by_tower_mm") or []
                     if carry_xs and tower_idx < len(carry_xs):
-                        carry_x_mm = float(carry_xs[tower_idx])
+                        _carry_x_row = carry_xs[tower_idx]
+                        if isinstance(_carry_x_row, (list, tuple)):
+                            # 二维: 按块取 (第1/2/3块), 越界 clamp 到末块
+                            carry_x_mm = float(_carry_x_row[min(picked, len(_carry_x_row) - 1)])
+                        else:
+                            # 兼容旧一维格式 (只分塔)
+                            carry_x_mm = float(_carry_x_row)
                     else:
                         carry_x_mm = float(carry["x_mm"])
                     # 每座塔第 1 块放块前 X 收到 -235, 其余 -260 (2026-08-10 用户)

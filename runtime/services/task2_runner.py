@@ -757,7 +757,13 @@ def run_task2(car) -> Dict[str, Any]:
                     d_back = -chassis_at_tower_m
                     carry_xs = cfg.get("carry_x_by_tower_mm") or []
                     if carry_xs and tower_idx < len(carry_xs):
-                        carry_x_mm = float(carry_xs[tower_idx])
+                        _carry_x_row = carry_xs[tower_idx]
+                        if isinstance(_carry_x_row, (list, tuple)):
+                            # 2026-08-12: 投放 X 分梯度 (第2/3块相同, 都较第1块 +5), clamp 到末块
+                            carry_x_mm = float(_carry_x_row[min(picked, len(_carry_x_row) - 1)])
+                        else:
+                            # 兼容旧一维格式 (只分塔)
+                            carry_x_mm = float(_carry_x_row)
                     else:
                         carry_x_mm = float(carry["x_mm"])
                     retract_x = (FIRST_DELIVER_RETRACT_X_MM if picked == 0
