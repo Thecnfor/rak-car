@@ -19,6 +19,9 @@ module.exports = {
         RAK_CAR_PUBLIC_HOST: "192.168.6.231",
         RAK_CAR_PUBLIC_STREAM_PORT: "5050",
         RAK_CAR_PUBLIC_STREAM_PATH: "/stream/",
+        /* /console/ 工程化控制台（web/ 前端 monitor+teach）默认挂载；
+           车端要省内存时置 1 不加载该静态站（/console 404）。 */
+        RAK_CAR_DISABLE_WEB_CONSOLE: "1",
         RAK_CAR_AUTO_INIT: "1",
         RAK_CAR_RESET_ARM: "1",
         RAK_CAR_RESET_X_VELOCITY: "0.04",

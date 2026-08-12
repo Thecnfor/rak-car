@@ -89,8 +89,10 @@ def create_app():
     app.include_router(create_legacy_router(service))
     # 工程化控制台静态站：StaticFiles 必须直接 app.mount（老 starlette 的
     # include_router 不携带 Mount，见 routers/web_console.py 模块 docstring）
-    from .routers.web_console import mount_web_console
-    mount_web_console(app)
+    # RAK_CAR_DISABLE_WEB_CONSOLE=1 时不挂 StaticFiles（省内存）
+    if settings.get_web_console_enabled():
+        from .routers.web_console import mount_web_console
+        mount_web_console(app)
     return app
 
 

@@ -120,6 +120,15 @@ def get_public_stream_path():
     )
 
 
+def get_web_console_enabled():
+    """是否挂载 /console/ 工程化控制台静态站（web/ 前端：monitor + teach）。
+
+    默认开启；车端要省内存时用 env RAK_CAR_DISABLE_WEB_CONSOLE=1 关闭
+    （不挂 StaticFiles、不注册 /console 路由）。
+    """
+    return not _bool_env("RAK_CAR_DISABLE_WEB_CONSOLE", False)
+
+
 def get_api_v1_prefix():
     return os.getenv("RAK_CAR_API_PREFIX", API_V1_PREFIX)
 
