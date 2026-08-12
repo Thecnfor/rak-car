@@ -218,6 +218,7 @@ Lane following uses ZMQ port 5001 (`img_size: [128,128]`), task detection uses 5
 | `RAK_CAR_MEMORY_PRESSURE_MB` | `1500` | runtime RSS threshold that triggers feed-degrade (ir→odom→arm→task, lane is never degraded) |
 | `RAK_CAR_RSS_LIMIT_MB` | `1800` | runtime RSS hard limit; `>95%` also drops MJPEG quality (80→60) and resolution (×0.5) |
 | `RAK_CAR_RESET_X_VELOCITY` | unset (doc); `0.04` in production | X-axis reset velocity used on `RAK_CAR_RESET_ARM` init |
+| `RAK_CAR_SHOOT_RELAY_HOLD_S` | `0.32` | 射击继电器激活时长 (s)，clamp [0.05,1.0]（`sensors_mixin.py::shooting()`）。默认值继承 2026-08-12 现场 0.25→0.28→0.32 上调结论；弹弱的主因不是时长，现场先跑 `main/misc/diag_shoot.py` 看 v_drop 判定供电 vs 气压 |
 
 **Production overrides win.** The values in `ecosystem.config.js` are what the car actually runs under; this table documents the library defaults. Also: `ecosystem.config.js` sets `max_memory_restart: "1200M"` — PM2 force-restarts the daemon if RSS exceeds 1.2GB (the runtime parent only; `infer_back_end.py` subprocess is not covered).
 
