@@ -10,7 +10,7 @@ get_order:
     复位: X=-150, arm=-85°, hand=-45°, Y=-120
 
   # 摆姿势同时底盘直行到任务点 (move_along_lane, 与 4 轴复合并发)
-  approach_straight_m: 0.2     # 直行距离 (m) 2026-08-08: 0.5→0.3→0.2→0.15→0.2
+  approach_straight_m: 0.1     # 直行距离 (m) 2026-08-08: 0.5→0.3→0.2→0.15→0.2; 2026-08-12: 0.2 → 0.1
   approach_straight_vx: 0.20   # 直行速度 (m/s)
 
   push_bar_pose:
