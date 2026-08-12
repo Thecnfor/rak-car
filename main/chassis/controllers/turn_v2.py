@@ -56,7 +56,7 @@ class TurnV2:
         vx_cruise: float = 0.27,
         # 视觉转向：ω = sign_omega * kp_omega * error_angle（同 orthogonal 符号约定，
         # 实车方向反了翻 sign_omega，不用改控制律）
-        kp_omega: float = 2.3,
+        kp_omega: float = 2.5,
         sign_omega: float = 1,
         omega_max: float = 1.8,
         # lane 丢失且从没拿到过视觉时，盲差速续转 ω（拿到过视觉后沿用最后一次视觉 ω）
