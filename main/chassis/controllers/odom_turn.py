@@ -138,7 +138,7 @@ class CurveDetector:
     十字路口反复过不去（2026-08-05 实车：45° 弯出口即十字路口）。
     """
 
-    def __init__(self, tol_deg: float = 18.0, sustain: int = 4, sign_cal: int = 1,
+    def __init__(self, tol_deg: float = 18.0, sustain: int = 3, sign_cal: int = 1,
                  rearm_clean: int = 0) -> None:
         self.tol = math.radians(float(tol_deg))
         self.sustain = max(1, int(sustain))
