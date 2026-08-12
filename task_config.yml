@@ -333,14 +333,14 @@ waypoints:
   #   dis_at_least_m: 2.70         # 相对 task2 出口: 里程计 distance=2.70m 时触发
   #   trigger_op: AND
 
-  # ----- task4 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
-  # - name: task4_harvest
-  #   task_id: 4
-  #   task_module: main.task.task4_harvest
-  #   ir_threshold_m: 0.70
-  #   ir_side: left
-  #   dis_at_least_m: null
-  #   trigger_op: AND
+  # ----- task4 -----
+  - name: task4_harvest
+    task_id: 4
+    task_module: main.task.task4_harvest
+    ir_threshold_m: 0.70
+    ir_side: left
+    dis_at_least_m: null
+    trigger_op: AND
 
   # ----- task5 (TODO) -----  [2026-08-12 用户跳过, 恢复去掉下方 # 即可]
   # - name: task5_sort
